@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+jobs:
+  workflow-policy:
+    name: CI / workflow-policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - name: Install policy dependencies
+        run: npm ci --prefix .github/scripts --ignore-scripts --no-audit --no-fund
+      - name: Install verified actionlint
+        env:
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          set -euo pipefail
+          tool_dir="${RUNNER_TEMP}/aaa-muse-actionlint"
+          mkdir -p "${tool_dir}"
+          curl --fail --silent --show-error --location --max-time 120 \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz \
+            --output "${tool_dir}/actionlint.tar.gz"
+          printf '%s  %s\n' "${ACTIONLINT_SHA256}" "${tool_dir}/actionlint.tar.gz" | sha256sum --check -
+          tar -xzf "${tool_dir}/actionlint.tar.gz" -C "${tool_dir}" actionlint
+          printf '%s\n' "${tool_dir}" >> "${GITHUB_PATH}"
+      - name: Test production policies
+        run: node --test .github/scripts/review-policy.test.mjs .github/scripts/codeql-policy.test.mjs .github/scripts/ci-policy.test.mjs
+      - name: Enforce runner and timeout policy
+        run: make check-ci-policy
+      - name: Lint workflows
+        run: make check-workflows

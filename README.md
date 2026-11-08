@@ -6,7 +6,7 @@ The broker owns the conversation record. Muse proposes answers or client tool ca
 
 ## Status
 
-**Planning and discovery, as of November 8, 2026.** This repository contains project documentation and an Apache-2.0 license. The [feature issues](https://github.com/markhuangai/AaA-muse-ai/issues) cover an MVP PoC followed by v0.1.0. No broker, worker, portal, installer, package, or container image has been implemented or published by this project.
+**CI bootstrap and application discovery, as of November 8, 2026.** The repository contains project documentation, an Apache-2.0 license, and the initial workflow-policy, CodeQL, and AI review workflows. Live PR verification of this bootstrap is pending. The [feature issues](https://github.com/markhuangai/AaA-muse-ai/issues) cover an MVP PoC followed by v0.1.0. No broker, worker, portal, installer, package, or container image has been implemented or published by this project.
 
 No live Muse account has been connected or tested, no worker has been installed, and no account credentials have been collected. Model wake, structured decisions, client tool continuation, streaming transport, isolation, and recovery remain unverified on the intended accounts. There are no installation commands yet.
 
@@ -166,6 +166,54 @@ Unit statement coverage must be strictly greater than 90% separately for the Go 
 
 T0 adds AI review and CodeQL before application work. Component checks arrive with their owning tickets. After the live PoC passes, a dedicated CI feature enforces coverage and coding standards before the remaining release features proceed. Use standard free GitHub-hosted Linux runners and explicit job timeouts of at most 30 minutes throughout, including review, security scans, builds, and releases. Split long suites into bounded jobs; timeout and missing checks must never count as success. The PoC and release live-account investigations run on the owner's authorized environment.
 
+### Initial workflow gates
+
+[CI](.github/workflows/ci.yml) runs `CI / workflow-policy`: real policy tests, runner/time-budget enforcement, and actionlint 1.7.12. Only literal `ubuntu-latest`, `ubuntu-24.04`, or `ubuntu-22.04` runners and integer job timeouts from 1 through 30 minutes are admitted. Dynamic runner or timeout expressions and unbounded reusable jobs need an explicit policy change before use. Language matrix entries inherit the job's enforced budget.
+
+[CodeQL](.github/workflows/codeql.yml) always analyzes Actions and detects tracked Go and JavaScript/TypeScript sources, including CI helpers. Go uses autobuild; interpreted languages use no build. `CodeQL analysis` requires a unique latest completed successful execution for every selected language. Missing, failed, skipped, cancelled, or ambiguous analyses fail the aggregate. Rerunning a failed language can reuse another language's earlier success from the same run.
+
+[AI review](.github/workflows/ai-pr-review.yml) uses stable `markhuangai/ai-pr-reviewer@v1`, per the user's November 8 decision. At 18:44:16 UTC that alias named release `v1.2.2` at source `b7065733e002c0f87d725f23a8c1ff550530adcf`. Commit-SHA action references are rejected by that bootstrap. `@v1` intentionally permits future stable v1 updates; runs record observed release metadata and the action's own runtime-resolution diagnostics. Failures block completion; do not silently substitute a reference or relax model settings. [S19]
+
+The direct `pull_request` route admits same-repository PRs authored and triggered by `Z-M-Huang`. Other PRs use the default-branch `workflow_run` definition after a verified successful CodeQL PR run. The resolver checks workflow provenance, repository, source, actors, and a unique current open non-draft PR targeting `main`. Executable helpers come from the workflow revision. The privileged job installs no PR dependencies and runs no PR setup/build commands; the reviewer creates its own pristine snapshot and provides restricted read-only tools. Pending/final statuses belong to the resolved head, with a fresh fence before final publication.
+
+Required organization secrets are `PR_REVIEW_PAT`, `AI_ENDPOINT`, and `LOCAL_AI_SECRET`. Their names were verified as available during planning; validity requires a real run. The PAT needs target-repository Contents and Pull requests read/write, Commit statuses write, and linked Issues read access. `GITHUB_TOKEN` permissions do not grant permissions to that PAT. Never print their values or change credentials/settings to bypass a failure.
+
+Review settings are model `auto`, effort `xhigh`, six parallel goals, 200 turns, no automatic approval, a 25-minute review-step limit, and a 30-minute job limit. An incomplete review publishes an error when finalization can run; a hard timeout or missing status remains a failure. `AI PR review / PR #N` means execution completed with marked review evidence for that head, not that all findings are resolved. Delivery also requires review-loop dispositions. For issue #1, the user selected these gates instead of mandatory Codex/CodeRabbit outcomes.
+
+Local prerequisites are Node.js 24+, npm, and actionlint 1.7.12 on `PATH` (or set `ACTIONLINT` to its executable). The private tooling package locks YAML 2.9.1. CI verifies the actionlint Linux amd64 archive against SHA-256 `8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8`. The lint target uses actionlint's own checks without optional ShellCheck or pyflakes dependencies.
+
+```sh
+npm ci --prefix .github/scripts --ignore-scripts --no-audit --no-fund
+node --test .github/scripts/review-policy.test.mjs
+node --test .github/scripts/codeql-policy.test.mjs
+node --test .github/scripts/ci-policy.test.mjs
+make check-ci-policy
+make check-workflows
+```
+
+For this delivery, run checks only after a conformant independent plan audit. Require real CodeQL and marked AI review results on the bootstrap PR, then fresh results after a later push. Before merge the default-branch `workflow_run` route has policy/static validation only; do not call it live-qualified until observed after merge. CI helper tests do not establish application coverage or Muse qualification.
+
+### CI diagnosis
+
+Collect the run without inspecting process memory or application tables:
+
+```sh
+gh run view RUN_ID --repo markhuangai/AaA-muse-ai --log
+gh run view RUN_ID --repo markhuangai/AaA-muse-ai --log | rg 'review[.]|codeql[.]|ci[.]|ai-pr-reviewer'
+```
+
+Normal GitHub logs retain trigger, repository, actors, PR, run/attempt, expected/observed head, selected languages, reasons, and final status. Essential events use INFO/NOTICE/ERROR without DEBUG. Log only diagnostic metadata, missing setting names, and safe HTTP/request identifiers; omit credential and endpoint values, authorization material, raw event payloads, and raw API error bodies. The action adds secret-redacted operation/duration diagnostics. Existing GitHub run-log retention applies; no retention setting changes or workflow artifact uploads are introduced.
+
+| Evidence | Diagnosis and corrective action |
+| --- | --- |
+| `review.loading_gate` or `review.rejected` | Inspect trust/rejection reason and heads. An untrusted direct event waits for the trusted completion route; stale output cannot satisfy a newer head. |
+| `review.settings` with nonempty `missing` | Ask the owner to supply the named setting; its value is never needed in logs. |
+| `review.api_failed` or action request diagnostics | Use operation, HTTP status, request ID, and action permission/rate-limit metadata to distinguish authorization, quota, and transport failures. Do not retry unexplained errors. |
+| `codeql.languages` and `codeql.result` | Compare required languages and latest attempts. Repair the failed or absent analysis; another language's success cannot replace it. |
+| `review.status` with `incomplete_review` or `missing_marked_review` | Inspect action completion and timeout diagnostics. Preserve the error; partial or absent review evidence cannot pass. |
+
+The missing-setting policy test captures the production preflight's actual stdout and verifies that supplied credential sentinels never appear. These are CI-only diagnostics; no application logger or runtime payload-capture mechanism is introduced.
+
 ## Decision log
 
 This log starts with the November 8, 2026 handoff and the decisions approved in this session. A design decision is not evidence of working software. Extend it with the question, source/live observation, exact revision or observation timestamp, decision, concrete failure mode, mitigation, and verification result. Preserve failed experiments and reasons for rejecting alternatives; redact account identifiers and retain no raw credentials.
@@ -180,6 +228,7 @@ This log starts with the November 8, 2026 handoff and the decisions approved in 
 | 2026-11-08 / deployment and portal login | S1 clarification: React portal and Go API share one Alpine image/HTTP port; read-only mounted YAML contains `control-portal.password`; operator owns reverse-proxy TLS | A password could leak or proxy assumptions could break access; use redacted configuration, expiring memory-only sessions, and real same-origin/proxy smoke checks | Requirements confirmed; image, login, and proxy path unimplemented |
 | 2026-11-08 / sessions and failover | S1 clarification: pin identified sessions, keep full history as baseline, and retry eligible interrupted turns on a replacement worker | Delta context may omit tool results; stale inference may duplicate output; compare context strategies in the live PoC, fence old generations, preserve call IDs, and stop after exposed output/uncertain client-tool state | Experiment and failover contracts planned; no live session/context evidence |
 | 2026-11-08 / coding standards and CI | S1 clarification: service/repository pattern, KISS, 1,000-line code limit, unit coverage >90%, free hosted jobs capped at 30 minutes | Mock-only success could conceal integration failure and slow checks could time out; test real logic with boundary substitutes, retain real integration/live receipts, and shard bounded jobs | Standards documented; no source code, coverage, or CI workflow yet |
+| 2026-11-08 / initial review and security workflows | Approved issue #1 plan and explicit user clarification: stable reviewer `@v1`, workflow policy, dynamic CodeQL, and marked exact-head AI review; mandatory Codex/CodeRabbit outcomes waived for this delivery | A moving action or stale/missing result could falsely pass; record release evidence, restrict executable trust, fence heads, and reject incomplete results | Independent gpt-6.1-sol/max audit conformant at 19:08:39 UTC; all 24 local policy tests, runner/budget scan, actionlint 1.7.12, and whitespace checks passed; live PR verification pending |
 
 ## Evidence register
 
@@ -204,6 +253,8 @@ The original handoff reports public inspection on November 8, 2026. Except for t
 | S15 | [CLIProxyAPI][S15] | Handoff: native Meta support concerns Muse Code or Meta Model API credentials, separate from personal Muse agents and their multimedia workflow |
 | S16 | [useapi.net Muse API][S16] | Advertised paid multi-account relay comparison, not independently tested and outside the preferred project foundation |
 | S17 | [GitHub Packages npm registry documentation][S17] | **Rechecked November 8, 2026.** Installing public npm packages requires authentication; scoped package publication and registry credentials are separate from this service's enrollment and worker tokens |
+| S18 | [Dense-Mem AI review workflow][S18] and [CodeQL workflow](https://github.com/markhuangai/dense-mem/blob/e031ac50fc551d965b285efd8e02d9c6c7e3cd3d/.github/workflows/codeql.yml) | **Rechecked November 8, 2026.** Apache-2.0 reference at `e031ac50fc551d965b285efd8e02d9c6c7e3cd3d`; adapted with shorter budgets, bootstrap trust, dynamic languages, and Muse-specific goals. Unrelated application, memory, and release policies were not adopted |
+| S19 | [AI reviewer bootstrap and runtime][S19] | **Rechecked November 8, 2026, 18:44:16 UTC.** Stable `v1` named `v1.2.2` at `b7065733e002c0f87d725f23a8c1ff550530adcf`; commit references are unsupported. Source implements pristine snapshots, restricted tools, redacted diagnostics, and failure on incomplete reviews. Source/metadata evidence does not prove a successful run here |
 
 The handoff also excluded `TriTue2011/muse2api` for insufficient licensing/maintenance evidence and `ninja-c9/muse2api` after repository/content requests returned 404. These are dated findings, not claims about current availability. Neither is an adopted dependency.
 
@@ -227,3 +278,5 @@ This repository uses the [Apache License 2.0](LICENSE). External code and servic
 [S15]: https://github.com/router-for-me/CLIProxyAPI
 [S16]: https://useapi.net/docs/api-muse-v1
 [S17]: https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-npm-registry
+[S18]: https://github.com/markhuangai/dense-mem/blob/e031ac50fc551d965b285efd8e02d9c6c7e3cd3d/.github/workflows/ai-pr-review.yml
+[S19]: https://github.com/markhuangai/ai-pr-reviewer/blob/b7065733e002c0f87d725f23a8c1ff550530adcf/src/bootstrap.ts
