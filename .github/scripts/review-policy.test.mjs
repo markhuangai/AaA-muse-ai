@@ -3,7 +3,7 @@ import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 import {
   beginReview, bootstrapAllowed, duplicateReview, fenceReason, finalReviewState,
-  finishReview, markedReview, missingSettings, resolveReview, workflowRunReason,
+  finishReview, markedReview, missingSettings, recordReviewerRelease, resolveReview, workflowRunReason,
 } from './review-policy.mjs';
 
 const head = 'a'.repeat(40);
@@ -179,6 +179,47 @@ test('finalizer publishes success only for marked complete current-head review',
   assert.equal(h.state.published.at(-1).state, 'error');
   assert.equal(h.state.published.at(-1).sha, head);
   assert.equal(h.state.logs.at(-1).observed_head, newerHead);
+});
+
+test('release helper resolves the annotated v1 alias and records normalized stable source evidence', async () => {
+  const records = [];
+  const aliasSha = 'c'.repeat(40);
+  const sourceSha = 'd'.repeat(40);
+  const github = { rest: { git: {
+    getRef: async params => {
+      assert.deepEqual(params, { owner: 'markhuangai', repo: 'ai-pr-reviewer', ref: 'tags/v1' });
+      return { data: { object: { type: 'tag', sha: aliasSha } } };
+    },
+    getTag: async params => {
+      assert.deepEqual(params, { owner: 'markhuangai', repo: 'ai-pr-reviewer', tag_sha: aliasSha });
+      return { data: { message: '\nv1.2.2\n', object: { type: 'commit', sha: sourceSha } } };
+    },
+  } } };
+  await recordReviewerRelease({ github, core: { info: line => records.push(JSON.parse(line)) } });
+  assert.deepEqual(records, [{ level: 'INFO', event: 'review.release', action_ref: 'v1',
+    observed_release: 'v1.2.2', observed_source_sha: sourceSha }]);
+});
+
+test('release helper rejects lightweight aliases, incompatible versions, and non-commit sources', async () => {
+  const core = { info() { assert.fail('Rejected metadata must not emit release evidence.'); } };
+  const lightweight = { rest: { git: {
+    getRef: async () => ({ data: { object: { type: 'commit', sha: 'c'.repeat(40) } } }),
+    getTag: async () => { assert.fail('A lightweight alias must be rejected before tag lookup.'); },
+  } } };
+  await assert.rejects(recordReviewerRelease({ github: lightweight, core }), /annotated stable release alias/);
+  const validTag = { message: 'v1.2.2', object: { type: 'commit', sha: 'd'.repeat(40) } };
+  for (const tag of [
+    { ...validTag, message: 'v2.0.0' }, { ...validTag, message: 'v1.2.2-rc.0' },
+    { ...validTag, message: 'main' },
+    { ...validTag, object: { ...validTag.object, type: 'tag' } },
+    { ...validTag, object: { ...validTag.object, sha: 'not-a-commit-sha' } },
+  ]) {
+    const github = { rest: { git: {
+      getRef: async () => ({ data: { object: { type: 'tag', sha: 'c'.repeat(40) } } }),
+      getTag: async () => ({ data: tag }),
+    } } };
+    await assert.rejects(recordReviewerRelease({ github, core }), /invalid stable release metadata/);
+  }
 });
 
 test('production settings logs reconstruct missing input without printing admitted credentials', () => {
