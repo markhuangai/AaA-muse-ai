@@ -1,0 +1,104 @@
+# Adapted for AaA-muse-ai from Apache-2.0 Dense-Mem at e031ac50fc551d965b285efd8e02d9c6c7e3cd3d.
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+env:
+  SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+
+jobs:
+  languages:
+    name: Select CodeQL languages
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      languages: ${{ steps.select.outputs.languages }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          ref: ${{ env.SOURCE_SHA }}
+      - name: Detect tracked sources
+        id: select
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const { execFileSync } = await import('node:child_process');
+            const { pathToFileURL } = await import('node:url');
+            const { selectLanguages } = await import(pathToFileURL(`${process.env.GITHUB_WORKSPACE}/.github/scripts/codeql-policy.mjs`));
+            const { logEvent } = await import(pathToFileURL(`${process.env.GITHUB_WORKSPACE}/.github/scripts/ci-log.mjs`));
+            const paths = execFileSync('git', ['ls-files', '-z'], { encoding: 'utf8' }).split('\0').filter(Boolean);
+            const languages = selectLanguages(paths);
+            core.setOutput('languages', JSON.stringify(languages));
+            logEvent(core, 'info', 'codeql.languages', { source_sha: process.env.SOURCE_SHA, languages });
+
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    needs: languages
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        language: ${{ fromJSON(needs.languages.outputs.languages) }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          ref: ${{ env.SOURCE_SHA }}
+      - name: Set up Go
+        if: matrix.language == 'go'
+        uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          cache: false
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.language == 'go' && 'autobuild' || 'none' }}
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: /language:${{ matrix.language }}
+
+  result:
+    name: CodeQL analysis
+    needs: [languages, analyze]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          ref: ${{ env.SOURCE_SHA }}
+      - name: Require every selected language
+        uses: actions/github-script@v9
+        env:
+          REQUIRED_LANGUAGES: ${{ needs.languages.outputs.languages }}
+        with:
+          script: |
+            const { pathToFileURL } = await import('node:url');
+            const { requireAnalyses } = await import(pathToFileURL(`${process.env.GITHUB_WORKSPACE}/.github/scripts/codeql-policy.mjs`));
+            let languages;
+            try { languages = JSON.parse(process.env.REQUIRED_LANGUAGES); }
+            catch { core.setFailed('Required CodeQL language selection is missing or invalid.'); return; }
+            await requireAnalyses({ github, core,
+              context: { ...context, repo: context.repo, sha: process.env.SOURCE_SHA },
+              languages, runAttempt: Number(process.env.GITHUB_RUN_ATTEMPT) });
