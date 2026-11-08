@@ -39,8 +39,40 @@ jobs:
           tar -xzf "${tool_dir}/actionlint.tar.gz" -C "${tool_dir}" actionlint
           printf '%s\n' "${tool_dir}" >> "${GITHUB_PATH}"
       - name: Test production policies
-        run: node --test .github/scripts/review-policy.test.mjs .github/scripts/codeql-policy.test.mjs .github/scripts/ci-policy.test.mjs
+        run: node --test .github/scripts/*.test.mjs
       - name: Enforce runner and timeout policy
         run: make check-ci-policy
       - name: Lint workflows
         run: make check-workflows
+
+  service:
+    name: CI / service
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify exact source
+        env:
+          SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+      - name: Check service
+        run: make check-service
+      - name: Unit statements and race checks
+        run: make test-service-unit
+      - name: Real HTTP and PostgreSQL integration
+        run: make test-service
+
+  image:
+    name: CI / image
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Packaged startup and diagnostic failures
+        run: make smoke-image

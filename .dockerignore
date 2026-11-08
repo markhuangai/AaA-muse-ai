@@ -1,0 +1,9 @@
+.git
+.codex
+.artifacts
+node_modules
+config.yaml
+.env
+**/node_modules
+**/*_test.go
+tests

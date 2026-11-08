@@ -1,0 +1,52 @@
+services:
+  service:
+    build:
+      context: .
+      args:
+        SOURCE_SHA: ${SOURCE_SHA:-development}
+        SOURCE_DIRTY: ${SOURCE_DIRTY:-true}
+    ports:
+      - "${MUSE_HTTP_PORT:-8080}:${MUSE_HTTP_PORT:-8080}"
+    environment:
+      MUSE_HTTP_PORT: ${MUSE_HTTP_PORT:-8080}
+      MUSE_PUBLIC_URL: ${MUSE_PUBLIC_URL:?Set an HTTPS public origin}
+      MUSE_DATABASE_URL: ${MUSE_DATABASE_URL:?Set the PostgreSQL URL}
+      MUSE_PORTAL_PASSWORD: ${MUSE_PORTAL_PASSWORD:?Set a portal password}
+      MUSE_MANAGEMENT_KEY: ${MUSE_MANAGEMENT_KEY:-}
+    volumes:
+      - type: bind
+        source: ./config.yaml
+        target: /etc/aaa-muse-ai/config.yaml
+        read_only: true
+        bind:
+          create_host_path: false
+      - diagnostics:/var/lib/aaa-muse-ai/diagnostics
+    depends_on:
+      database:
+        condition: service_healthy
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+  database:
+    image: postgres:18.6-alpine@sha256:123b17998ccaf47e53b502e8c6a1e79afd8f579c6f3eec83c563da026f957395
+    environment:
+      POSTGRES_DB: aaa_muse
+      POSTGRES_USER: aaa_muse
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set the database password}
+    volumes:
+      - database:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aaa_muse -d aaa_muse"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+volumes:
+  database:
+  diagnostics:

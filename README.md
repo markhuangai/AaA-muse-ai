@@ -6,11 +6,76 @@ The broker owns the conversation record. Muse proposes answers or client tool ca
 
 ## Status
 
-**CI bootstrap and application discovery, as of November 8, 2026.** The repository contains project documentation, an Apache-2.0 license, and the initial workflow-policy, CodeQL, and AI review workflows. Initial live verification passed on [PR #22](https://github.com/markhuangai/AaA-muse-ai/pull/22) at `adfa5f5ac9ef61c17bd7985abe031a94abd66b8e`; that PR retains later-head and final delivery receipts. [S20] The [feature issues](https://github.com/markhuangai/AaA-muse-ai/issues) cover an MVP PoC followed by v0.1.0. No broker, worker, portal, installer, package, or container image has been implemented or published by this project.
+**Service foundation locally verified, as of November 8, 2026.** Issue #2 adds the Go service, PostgreSQL schema bootstrap, strict YAML, management authentication, protected diagnostic export, and Docker packaging. Independent plan audit and the required local checks passed; current-head remote CI/review receipts belong to the delivery PR. [S21] CI bootstrap [PR #22](https://github.com/markhuangai/AaA-muse-ai/pull/22) merged at `68312d8f326472dd203933e8c6416a9a8b1f08b5`; its initial live workflow receipt is S20. The [feature issues](https://github.com/markhuangai/AaA-muse-ai/issues) cover an MVP PoC followed by v0.1.0. No inference broker, worker, portal, installer, or release artifact is available yet. GHCR publication and candidate dispatch remain unverified until observed after merge.
 
-No live Muse account has been connected or tested, no worker has been installed, and no account credentials have been collected. Model wake, structured decisions, client tool continuation, streaming transport, isolation, and recovery remain unverified on the intended accounts. There are no installation commands yet.
+No live Muse account has been connected or tested, no worker has been installed, and no account credentials have been collected. Model wake, structured decisions, client tool continuation, streaming transport, isolation, and recovery remain unverified on the intended accounts. Service startup below does not qualify Muse inference.
 
 The [evidence register](#evidence-register) separates the supplied investigation handoff from sources rechecked in this session. Read [AGENTS.md](AGENTS.md) before contributing.
+
+## Run the service
+
+Docker and Docker Compose are required; host Go is unnecessary. Copy [config.example.yaml](config.example.yaml) to `config.yaml`. Create a private `.env` with real replacements for these placeholders:
+
+```dotenv
+MUSE_HTTP_PORT=8080
+MUSE_PUBLIC_URL=https://muse.example.com
+POSTGRES_PASSWORD=<database-password>
+MUSE_DATABASE_URL=postgres://aaa_muse:<URL-encoded-database-password>@database:5432/aaa_muse?sslmode=disable
+MUSE_PORTAL_PASSWORD=<distinct-portal-password>
+```
+
+The database password in the URL must match `POSTGRES_PASSWORD`, with URL encoding where needed. These files are ignored by Git. Compose forwards the example's environment references; forward any additional references explicitly in your Compose configuration. Configuration changes apply on restart. Unknown/duplicate fields, multiple documents, unsupported aliases, unresolved or empty required references, invalid settings, Bearer keys containing whitespace or HTTP control bytes, and reused credential values are rejected without printing their contents. Rejections identify a numeric source location and a schema-safe field path; unknown field names and client labels are masked.
+
+```sh
+docker compose up --build -d
+docker compose logs --no-color service
+```
+
+The service runs as UID/GID `10001:10001`; its mounted YAML must be readable by that user. The example uses environment references so no credentials need to be embedded in its readable YAML. Keep any YAML containing literal credentials protected while granting that UID access. Compose mounts it read-only at `/etc/aaa-muse-ai/config.yaml`. Override the path with `--config` when invoking the binary directly.
+
+An empty `management.key` generates a 256-bit key, printed once as `MANAGEMENT_KEY=...` after successful startup. That key changes on each process restart and is excluded from structured logs, protected captures, status, and exports. Treat access to container stdout as credential access. To keep a configured key, set `management.key: "${MUSE_MANAGEMENT_KEY}"` and supply that environment variable. The required portal password is separate and is never generated or printed. Portal login and client model routes are not implemented here.
+
+The default HTTP port is `8080`. `GET /healthz` reports process liveness. `GET /readyz` returns `200` only when the database is available and schema bootstrap completed, otherwise `503`. Database loss after startup does not disable liveness, authenticated status, or diagnostic export. Startup connection attempts are limited to three; schema/checksum incompatibility stops startup immediately. Embedded migrations use a transaction and advisory lock and never run destructive down migrations.
+
+Save `Authorization: Bearer <management-key>` in a protected `0600` header file outside the checkout. Set `ADMIN_HEADER_FILE` to that file and `ORIGIN` to the service origin:
+
+```sh
+curl -fsS --header @"$ADMIN_HEADER_FILE" "$ORIGIN/api/v1/admin/status"
+curl -fsS --header @"$ADMIN_HEADER_FILE" "$ORIGIN/api/v1/admin/diagnostics/export?request_id=$REQUEST_ID"
+```
+
+Status includes source revision/dirty state, uptime, schema/readiness, and redacted effective settings. It makes no Muse-readiness claim. Management routes reject client and portal credentials. Supported routes accept GET without a body; the shared body ceiling is 1 MiB. Unknown query parameters and unsupported methods fail explicitly.
+
+The operator supplies HTTPS domain routing and TLS through Traefik, Nginx, or another proxy. The service listens on plain HTTP behind that proxy, exposes one port, and has no CORS middleware, certificate management, or bundled proxy. Its configured public URL must be an HTTPS origin.
+
+### Runtime diagnostics
+
+INFO JSON events go to container stdout; DEBUG detail is always retained in the protected diagnostic volume for authenticated export and the future portal. Compose bounds stdout logs to three 10 MiB files. Protected capture defaults to seven days or 128 MiB, whichever limit is reached first; directory/file permissions are `0700`/`0600`. The retention period may be reduced to 1–7 days and capacity to 6 KiB–128 MiB through YAML. Credentials are redacted before capture.
+
+Export uses NDJSON: a metadata line followed by event chunks. Filter with RFC3339 `since`/`until`, `request_id`, or `operation_id`. Each record is at most 6 KiB. Group by `capture_id`, order by `chunk`, decode `data_base64`, concatenate, and verify `payload_sha256` to reconstruct the complete redacted JSON event. The metadata reports capture count and incomplete, expired, capacity-pruned, or unmatched identity evidence, plus requested intervals outside capture coverage. Export records a snapshot reference and outcome rather than recapturing its own response.
+
+Use the response's `X-Request-Id` to reconstruct an operation from export alone. `auth.denied` identifies expected/observed roles; `readiness.changed` identifies database degradation/recovery; startup database events include the target, attempts, timing, safe cause, and terminal outcome. Startup failures remain available through `docker compose logs --no-color service`; they do not require a working HTTP process. Capture-write failure emits `diagnostics.capture_failed` on stderr and stops the service. Repair the reported storage permission/capacity problem before restarting.
+
+Response exchanges retain attempted output and distinguish attempted/written byte counts. An observable client-write error emits `request.write_failed` and marks the outcome `interrupted`; a status code alone does not prove that the client received the response. Detailed causes remain in the protected DEBUG capture.
+
+### Builds and validation
+
+The image pins Go 1.27.3, Alpine 3.24, and the CA bundle from its pinned Go builder. Compose pins PostgreSQL 18.6 and mounts its version-18 storage at `/var/lib/postgresql`. The Go module pins pgx 5.11.0 (MIT) and Go YAML 3.0.6 (MIT/Apache); their transitive dependencies are locked in `go.sum`. No external application code is copied.
+
+```sh
+make check-service
+make test-service-unit
+make test-service
+make smoke-image
+```
+
+Checks use Docker; integration scripts require Python 3. Unit coverage is separate from integration and must exceed 90% of raw statements across every first-party Go package. Test resources carry unique ownership labels and disposable volumes; cleanup verifies ownership and retains receipts under ignored `.artifacts/`. Do not delete deployment volumes when cleaning tests. Ordinary `docker compose down` retains deployment data; the operator decides its retention.
+
+`CI / service` checks formatting/builds, unit coverage/races, and real HTTP/PostgreSQL behavior. `CI / image` exercises packaged startup and diagnostic failures. Existing workflow-policy, CodeQL (including Go), and marked AI-review checks remain required. Issue #2 additionally requires Codex on every head and ignores CodeRabbit by direct user decision.
+
+The default-branch candidate workflow accepts an exact SHA already on main or the current head of a unique same-repository non-draft PR to main, checks actor permission, tests the image, fences the source again, and exports a one-day archive with source/tree, archive SHA-256, and image-config digest receipts. It has no package-write permission. Candidate dispatch is not yet live-qualified.
+
+After human merge, successful exact-main CI can trigger GHCR publication of `ghcr.io/markhuangai/aaa-muse-ai:sha-<commit>`. Publication rebuilds and smoke-tests its own image, refuses conflicting existing source-SHA content, and records the immutable registry digest; consumers should pin that digest. No mutable `latest` tag or versioned product release is added. The publication workflow remains unverified until its first authorized post-merge observation.
 
 ## Confirmed decisions
 
@@ -229,6 +294,7 @@ This log starts with the November 8, 2026 handoff and the decisions approved in 
 | 2026-11-08 / sessions and failover | S1 clarification: pin identified sessions, keep full history as baseline, and retry eligible interrupted turns on a replacement worker | Delta context may omit tool results; stale inference may duplicate output; compare context strategies in the live PoC, fence old generations, preserve call IDs, and stop after exposed output/uncertain client-tool state | Experiment and failover contracts planned; no live session/context evidence |
 | 2026-11-08 / coding standards and CI | S1 clarification: service/repository pattern, KISS, 1,000-line code limit, unit coverage >90%, free hosted jobs capped at 30 minutes | Mock-only success could conceal integration failure and slow checks could time out; test real logic with boundary substitutes, retain real integration/live receipts, and shard bounded jobs | Standards documented; no source code, coverage, or CI workflow yet |
 | 2026-11-08 / initial review and security workflows | Approved issue #1 plan and explicit user clarification: stable reviewer `@v1`, workflow policy, dynamic CodeQL, and marked exact-head AI review; mandatory Codex/CodeRabbit outcomes waived for this delivery | A moving action or stale/missing result could falsely pass; record release evidence, restrict executable trust, fence heads, and reject incomplete results | Independent gpt-6.1-sol/max audit conformant at 19:08:39 UTC; 24 local tests and required checks passed. Initial head `adfa5f5` passed all nine remote checks; marked six-goal review at 19:24:51 UTC found no actionable issues. Full later-head receipts remain in PR #22 [S20] |
+| 2026-11-08 / service foundation and delivery | Direct approval of issue #2: current checkout, Go/PostgreSQL foundation, authenticated HTTP diagnostic export, one-time generated-key stdout exception, and GHCR publication after human merge; require all CI, CodeQL, marked AI review, and Codex, ignoring CodeRabbit | Configuration/capture could expose credentials and migrations/cleanup could damage state; redact before capture, reject unusable keys, transact migrations, isolate disposable storage, and preserve deployment volumes. Dynamic Docker ports and differing image/config digests required observed identity checks | Independent gpt-6.1-sol/max audit conformant after four rounds before tests; Go unit/race checks passed at 716/742 raw first-party statements. Both real-stack targets passed 22 cases and verified cleanup. Coverage counting was corrected to union duplicate blocks and exclude third-party cache packages. No Muse, candidate-dispatch, or publication qualification claimed [S21] |
 
 ## Evidence register
 
@@ -256,6 +322,7 @@ The original handoff reports public inspection on November 8, 2026. Except for t
 | S18 | [Dense-Mem AI review workflow][S18] and [CodeQL workflow](https://github.com/markhuangai/dense-mem/blob/e031ac50fc551d965b285efd8e02d9c6c7e3cd3d/.github/workflows/codeql.yml) | **Rechecked November 8, 2026.** Apache-2.0 reference at `e031ac50fc551d965b285efd8e02d9c6c7e3cd3d`; adapted with shorter budgets, bootstrap trust, dynamic languages, and Muse-specific goals. Unrelated application, memory, and release policies were not adopted |
 | S19 | [AI reviewer bootstrap and runtime][S19] | **Rechecked November 8, 2026, 18:44:16 UTC.** Stable `v1` named `v1.2.2` at `b7065733e002c0f87d725f23a8c1ff550530adcf`; commit references are unsupported. Source implements pristine snapshots, restricted tools, redacted diagnostics, and failure on incomplete reviews. Source/metadata evidence does not prove a successful run here |
 | S20 | [Initial marked AI review][S20], [CI run](https://github.com/markhuangai/AaA-muse-ai/actions/runs/42513938000), [CodeQL run](https://github.com/markhuangai/AaA-muse-ai/actions/runs/42513938121), [AI workflow run](https://github.com/markhuangai/AaA-muse-ai/actions/runs/42513938019) | **Observed November 8, 2026.** All nine checks passed at `adfa5f5ac9ef61c17bd7985abe031a94abd66b8e`; stored Actions and JavaScript/TypeScript analyses match that exact head. Six-goal marked review completed at 19:24:51 UTC with no actionable findings. Logs confirm release `v1.2.2`, runtime source `b7065733e002c0f87d725f23a8c1ff550530adcf`, linked-issue access, matching expected/observed heads, and successful reviewer cleanup. No application or live Muse qualification follows |
+| S21 | [Issue #2 delivery contract][S21], local audit and test receipts | **Observed November 8, 2026, by 23:32 UTC**, in the worktree based on `68312d8f326472dd203933e8c6416a9a8b1f08b5`, before publication. Four-round independent pre-test audit passed at content manifest `3f284415bab8ed025d9a2f9647cc7bb60e48dffb364b1f09ce31f17b9bda52e2`; the PR records post-audit corrections. Final local Go checks passed with 716/742 unit statements, 31 policy tests, actionlint 1.7.12, and 22 cases each for service integration and packaged-image smoke, including log-only failure diagnosis and overlapping migrations. Each final stack run removed 20 owned containers, 20 volumes, and one network. Earlier coverage-accounting and test-address/failed-startup harness failures were retained and corrected. Exact current-head remote receipts remain a PR delivery gate; no live Muse or registry publication is established |
 
 The handoff also excluded `TriTue2011/muse2api` for insufficient licensing/maintenance evidence and `ninja-c9/muse2api` after repository/content requests returned 404. These are dated findings, not claims about current availability. Neither is an adopted dependency.
 
@@ -282,3 +349,4 @@ This repository uses the [Apache License 2.0](LICENSE). External code and servic
 [S18]: https://github.com/markhuangai/dense-mem/blob/e031ac50fc551d965b285efd8e02d9c6c7e3cd3d/.github/workflows/ai-pr-review.yml
 [S19]: https://github.com/markhuangai/ai-pr-reviewer/blob/b7065733e002c0f87d725f23a8c1ff550530adcf/src/bootstrap.ts
 [S20]: https://github.com/markhuangai/AaA-muse-ai/pull/22#pullrequestreview-5819314153
+[S21]: https://github.com/markhuangai/AaA-muse-ai/issues/2
