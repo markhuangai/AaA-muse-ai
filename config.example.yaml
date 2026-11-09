@@ -9,7 +9,6 @@ control-portal:
   password: "${MUSE_PORTAL_PASSWORD}"
 client-keys: {}
 limits:
-  max-workers: 1
   max-jobs: 1
   in-flight-per-worker: 1
 diagnostics:

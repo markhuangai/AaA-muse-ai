@@ -24,6 +24,7 @@ import (
 )
 
 type Repository interface {
+	service.WorkerRepository
 	Bootstrap(context.Context) error
 	Ping(context.Context) error
 	Close()
@@ -136,7 +137,8 @@ func Run(ctx context.Context, args []string, build service.Build, d Dependencies
 		}
 	}
 	svc := service.New(repo, c, build, instance, d.Now, logger)
-	handler := &httpapi.Handler{Service: svc, Authority: auth.New(c), Exporter: store, Logger: logger, Random: d.Random, Now: d.Now, Failed: failed}
+	authority := auth.New(c)
+	handler := &httpapi.Handler{Service: svc, Workers: service.NewWorkers(repo, authority, d.Random, d.Now), Authority: authority, Exporter: store, Logger: logger, Random: d.Random, Now: d.Now, Failed: failed}
 	server := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 * 1024, ErrorLog: slog.NewLogLogger(logger.Handler(), slog.LevelError)}
 	result := make(chan error, 1)
 	go func() { result <- server.Serve(listener) }()

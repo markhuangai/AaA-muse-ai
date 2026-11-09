@@ -7,6 +7,7 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -16,8 +17,21 @@ import (
 
 type Redactor struct{ secrets []string }
 
+var workerSecrets = regexp.MustCompile(`muse_(?:enroll|worker)_[A-Za-z0-9_-]{43}`)
+
+func RedactWorkerSecrets(value string) string {
+	return workerSecrets.ReplaceAllString(value, "[REDACTED]")
+}
+
 func NewRedactor(secrets []string) *Redactor {
 	values := append([]string{}, secrets...)
+	for _, secret := range secrets {
+		encoded, _ := json.Marshal(secret)
+		escaped := string(encoded[1 : len(encoded)-1])
+		if escaped != secret {
+			values = append(values, escaped)
+		}
+	}
 	sort.Slice(values, func(i, j int) bool { return len(values[i]) > len(values[j]) })
 	return &Redactor{secrets: values}
 }
@@ -27,7 +41,7 @@ func (r *Redactor) text(value string) string {
 			value = strings.ReplaceAll(value, secret, "[REDACTED]")
 		}
 	}
-	return value
+	return RedactWorkerSecrets(value)
 }
 func (r *Redactor) value(key string, value any) any {
 	lower := strings.ToLower(key)

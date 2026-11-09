@@ -17,7 +17,7 @@ import (
 //go:embed migrations/*.sql
 var migrations embed.FS
 
-const SchemaVersion = 1
+const SchemaVersion = 2
 const migrationLock int64 = 0x4141414d555345
 
 type Pool interface {
@@ -29,6 +29,7 @@ type Repository struct{ pool Pool }
 
 type Failure struct {
 	Reason, SQLState, Expected, Observed string
+	Outcome                              string
 	cause                                error
 }
 
@@ -51,7 +52,7 @@ func Classify(err error) *Failure {
 	if errors.As(err, &pe) {
 		f.SQLState = pe.Code
 		switch pe.Code {
-		case "57P03":
+		case "57P01", "57P03":
 			f.Reason = "database_unavailable"
 		case "28P01", "28000":
 			f.Reason = "database_authentication_failed"
@@ -92,20 +93,24 @@ func (r *Repository) Bootstrap(ctx context.Context) error {
 	if _, err = tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", migrationLock); err != nil {
 		return Classify(err)
 	}
-	ddl, err := migrations.ReadFile("migrations/001_initial.sql")
-	if err != nil {
-		return err
+	var scripts [SchemaVersion][]byte
+	var checksums [SchemaVersion]string
+	for i, path := range []string{"migrations/001_initial.sql", "migrations/002_worker_identities.sql"} {
+		scripts[i], err = migrations.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		hash := sha256.Sum256(scripts[i])
+		checksums[i] = hex.EncodeToString(hash[:])
 	}
-	if _, err = tx.Exec(ctx, string(ddl)); err != nil {
+	if _, err = tx.Exec(ctx, string(scripts[0])); err != nil {
 		return Classify(err)
 	}
-	hash := sha256.Sum256(ddl)
-	checksum := hex.EncodeToString(hash[:])
 	rows, err := tx.Query(ctx, "SELECT version, checksum FROM aaa_schema_migrations ORDER BY version")
 	if err != nil {
 		return Classify(err)
 	}
-	found := false
+	applied := 0
 	for rows.Next() {
 		var version int
 		var actual string
@@ -113,23 +118,32 @@ func (r *Repository) Bootstrap(ctx context.Context) error {
 			rows.Close()
 			return Classify(err)
 		}
-		if version != SchemaVersion {
+		if version < 1 || version > SchemaVersion {
 			rows.Close()
 			return &Failure{Reason: "schema_version_incompatible", Expected: fmt.Sprint(SchemaVersion), Observed: fmt.Sprint(version)}
 		}
-		if actual != checksum {
+		if version != applied+1 {
 			rows.Close()
-			return &Failure{Reason: "migration_checksum_mismatch", Expected: checksum, Observed: actual}
+			return &Failure{Reason: "schema_version_incompatible", Expected: fmt.Sprint(applied + 1), Observed: fmt.Sprint(version)}
 		}
-		found = true
+		if actual != checksums[version-1] {
+			rows.Close()
+			return &Failure{Reason: "migration_checksum_mismatch", Expected: checksums[version-1], Observed: actual}
+		}
+		applied++
 	}
 	err = rows.Err()
 	rows.Close()
 	if err != nil {
 		return Classify(err)
 	}
-	if !found {
-		if _, err = tx.Exec(ctx, "INSERT INTO aaa_schema_migrations (version, checksum) VALUES ($1, $2)", SchemaVersion, checksum); err != nil {
+	for i := applied; i < SchemaVersion; i++ {
+		if i > 0 {
+			if _, err = tx.Exec(ctx, string(scripts[i])); err != nil {
+				return Classify(err)
+			}
+		}
+		if _, err = tx.Exec(ctx, "INSERT INTO aaa_schema_migrations (version, checksum) VALUES ($1, $2)", i+1, checksums[i]); err != nil {
 			return Classify(err)
 		}
 	}

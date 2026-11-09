@@ -66,18 +66,19 @@ func TestConfiguration(t *testing.T) {
 
 func TestRejectedConfiguration(t *testing.T) {
 	cases := map[string]string{
-		"syntax":         "control-portal: [portal-sentinel",
-		"empty":          "",
-		"sequence":       "- hello",
-		"documents":      fixture + "---\nhello: world\n",
-		"second-invalid": fixture + "---\n[",
-		"unknown":        fixture + "unknown: portal-sentinel\n",
-		"duplicate":      fixture + "management:\n  key: replacement\n",
-		"type":           fixture + "limits:\n  max-jobs: invalid\n",
-		"missing-env":    strings.ReplaceAll(fixture, "portal-sentinel", "${ABSENT}"),
-		"bad-env":        strings.ReplaceAll(fixture, "portal-sentinel", "${BAD-NAME}"),
-		"alias":          fixture + "limits: &base\n  max-jobs: 1\nother: *base\n",
-		"oversize":       strings.Repeat("#", 1024*1024+1),
+		"syntax":               "control-portal: [portal-sentinel",
+		"empty":                "",
+		"sequence":             "- hello",
+		"documents":            fixture + "---\nhello: world\n",
+		"second-invalid":       fixture + "---\n[",
+		"unknown":              fixture + "unknown: portal-sentinel\n",
+		"duplicate":            fixture + "management:\n  key: replacement\n",
+		"type":                 fixture + "limits:\n  max-jobs: invalid\n",
+		"missing-env":          strings.ReplaceAll(fixture, "portal-sentinel", "${ABSENT}"),
+		"bad-env":              strings.ReplaceAll(fixture, "portal-sentinel", "${BAD-NAME}"),
+		"alias":                fixture + "limits: &base\n  max-jobs: 1\nother: *base\n",
+		"oversize":             strings.Repeat("#", 1024*1024+1),
+		"removed-worker-limit": fixture + "limits:\n  max-workers: 1\n",
 	}
 	for name, input := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -124,7 +125,6 @@ func TestConfigurationValidation(t *testing.T) {
 		"client-long":        func(c *Config) { c.ClientKeys = map[string]Secret{strings.Repeat("x", 101): "key"} },
 		"client-empty":       func(c *Config) { c.ClientKeys = map[string]Secret{"client": " "} },
 		"client-reuse":       func(c *Config) { c.ClientKeys = map[string]Secret{"client": c.Management.Key} },
-		"limits":             func(c *Config) { c.Limits.MaxWorkers = 0 },
 		"jobs":               func(c *Config) { c.Limits.MaxJobs = 0 },
 		"flight":             func(c *Config) { c.Limits.InFlight = 2 },
 		"level":              func(c *Config) { c.Diagnostics.Level = "trace" },

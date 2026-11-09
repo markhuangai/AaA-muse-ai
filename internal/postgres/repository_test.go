@@ -75,12 +75,18 @@ func baselineChecksum() string {
 }
 
 func TestBootstrapTransaction(t *testing.T) {
-	for _, existing := range []bool{false, true} {
-		t.Run(map[bool]string{false: "fresh", true: "existing"}[existing], func(t *testing.T) {
+	for _, existing := range []int{0, 1, 2} {
+		t.Run([]string{"fresh", "upgrade", "current"}[existing], func(t *testing.T) {
 			r := &rows{}
-			if existing {
+			if existing >= 1 {
 				r.versions = []int{1}
 				r.checksums = []string{baselineChecksum()}
+			}
+			if existing == 2 {
+				ddl, _ := migrations.ReadFile("migrations/002_worker_identities.sql")
+				hash := sha256.Sum256(ddl)
+				r.versions = append(r.versions, 2)
+				r.checksums = append(r.checksums, hex.EncodeToString(hash[:]))
 			}
 			tx := &transaction{rows: r}
 			p := &pool{tx: tx}
@@ -94,14 +100,11 @@ func TestBootstrapTransaction(t *testing.T) {
 			if tx.arguments[0][0] != migrationLock {
 				t.Fatal("wrong lock ownership")
 			}
-			want := 3
-			if existing {
-				want = 2
-			}
+			want := []int{5, 4, 2}[existing]
 			if len(tx.commands) != want {
 				t.Fatal("unexpected migration execution")
 			}
-			if !existing && (tx.arguments[2][0] != 1 || tx.arguments[2][1] != baselineChecksum()) {
+			if existing == 0 && (tx.arguments[2][0] != 1 || tx.arguments[2][1] != baselineChecksum()) {
 				t.Fatal("wrong durable version/checksum")
 			}
 			if repo.Ping(context.Background()) != nil {
@@ -116,7 +119,7 @@ func TestBootstrapTransaction(t *testing.T) {
 }
 
 func TestBootstrapFailures(t *testing.T) {
-	for _, name := range []string{"ping", "begin", "lock", "ddl", "query", "scan", "rows", "newer", "older", "checksum", "insert", "commit"} {
+	for _, name := range []string{"ping", "begin", "lock", "ddl", "query", "scan", "rows", "newer", "older", "gap", "checksum", "insert", "second-ddl", "second-insert", "commit"} {
 		t.Run(name, func(t *testing.T) {
 			tx := &transaction{rows: &rows{}}
 			p := &pool{tx: tx}
@@ -138,7 +141,7 @@ func TestBootstrapFailures(t *testing.T) {
 			case "rows":
 				tx.rows.endErr = failure
 			case "newer":
-				tx.rows.versions = []int{2}
+				tx.rows.versions = []int{3}
 				tx.rows.checksums = []string{"x"}
 			case "older":
 				tx.rows.versions = []int{0}
@@ -148,6 +151,13 @@ func TestBootstrapFailures(t *testing.T) {
 				tx.rows.checksums = []string{"x"}
 			case "insert":
 				tx.failExec = 3
+			case "gap":
+				tx.rows.versions = []int{2}
+				tx.rows.checksums = []string{"x"}
+			case "second-ddl":
+				tx.failExec = 4
+			case "second-insert":
+				tx.failExec = 5
 			case "commit":
 				tx.commitErr = failure
 			}
@@ -165,7 +175,7 @@ func TestFailureClassificationAndConnection(t *testing.T) {
 	for _, tc := range []struct {
 		err           error
 		reason, state string
-	}{{&pgconn.PgError{Code: "57P03"}, "database_unavailable", "57P03"}, {&pgconn.PgError{Code: "28P01"}, "database_authentication_failed", "28P01"}, {&pgconn.PgError{Code: "28000"}, "database_authentication_failed", "28000"}, {&pgconn.PgError{Code: "3D000"}, "database_missing", "3D000"}, {&pgconn.PgError{Code: "53300"}, "postgres_error", "53300"}, {context.DeadlineExceeded, "database_unavailable", ""}, {&net.OpError{Op: "dial", Err: errors.New("refused")}, "database_unavailable", ""}, {errors.New("ordinary"), "database_operation_failed", ""}} {
+	}{{&pgconn.PgError{Code: "57P01"}, "database_unavailable", "57P01"}, {&pgconn.PgError{Code: "57P03"}, "database_unavailable", "57P03"}, {&pgconn.PgError{Code: "28P01"}, "database_authentication_failed", "28P01"}, {&pgconn.PgError{Code: "28000"}, "database_authentication_failed", "28000"}, {&pgconn.PgError{Code: "3D000"}, "database_missing", "3D000"}, {&pgconn.PgError{Code: "53300"}, "postgres_error", "53300"}, {context.DeadlineExceeded, "database_unavailable", ""}, {&net.OpError{Op: "dial", Err: errors.New("refused")}, "database_unavailable", ""}, {errors.New("ordinary"), "database_operation_failed", ""}} {
 		f := Classify(tc.err)
 		if f.Reason != tc.reason || f.SQLState != tc.state || f.Detail() == "" || f.Unwrap() != tc.err {
 			t.Fatal("wrong cause mapping")
