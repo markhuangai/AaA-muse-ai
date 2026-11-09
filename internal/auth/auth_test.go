@@ -56,3 +56,24 @@ func TestCredentialRoles(t *testing.T) {
 		t.Fatal("accepted failed identifier entropy")
 	}
 }
+
+func TestCredentialComparisonRequiresExactValue(t *testing.T) {
+	c := authConfig()
+	c.Management.Key = "management-key"
+	c.Portal.Password = "portal-password-with-a-different-length"
+	c.ClientKeys = map[string]config.Secret{"first": "client", "second": "another-client-key"}
+	a := New(c)
+	for value, role := range map[string]string{
+		string(c.Management.Key): "management", string(c.Portal.Password): "portal",
+		"client": "client", "another-client-key": "client",
+	} {
+		if a.Role("Bearer "+value) != role {
+			t.Fatalf("exact credential did not identify %s", role)
+		}
+		for _, wrong := range []string{value[:len(value)-1], value + "x", "x" + value[1:]} {
+			if a.Role("Bearer "+wrong) != "unauthenticated" {
+				t.Fatal("accepted a partial or changed credential")
+			}
+		}
+	}
+}

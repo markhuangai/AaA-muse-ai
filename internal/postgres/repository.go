@@ -51,6 +51,8 @@ func Classify(err error) *Failure {
 	if errors.As(err, &pe) {
 		f.SQLState = pe.Code
 		switch pe.Code {
+		case "57P03":
+			f.Reason = "database_unavailable"
 		case "28P01", "28000":
 			f.Reason = "database_authentication_failed"
 		case "3D000":

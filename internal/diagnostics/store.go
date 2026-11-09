@@ -54,6 +54,11 @@ type retentionState struct {
 	CreatedAt     time.Time `json:"created_at"`
 	PrunedThrough time.Time `json:"pruned_through"`
 }
+type retainedCapture struct {
+	name string
+	time time.Time
+	size int64
+}
 
 type Store struct {
 	mu            sync.Mutex
@@ -64,6 +69,8 @@ type Store struct {
 	maxBytes      int64
 	sequence      uint64
 	state         retentionState
+	retained      []retainedCapture
+	retainedBytes int64
 }
 
 func Open(files Files, dir, instance string, now func() time.Time, retention time.Duration, maxBytes int64) (*Store, error) {
@@ -90,6 +97,9 @@ func Open(files Files, dir, instance string, now func() time.Time, retention tim
 		return nil, err
 	}
 	if err = s.saveState(); err != nil {
+		return nil, err
+	}
+	if err = s.loadCaptures(); err != nil {
 		return nil, err
 	}
 	if err = s.prune(); err != nil {
@@ -148,9 +158,11 @@ func (s *Store) Write(payload []byte) (int, error) {
 		output.Write(b)
 		output.WriteByte('\n')
 	}
-	if err := s.atomic("capture-"+id+".ndjson", output.Bytes()); err != nil {
+	name := "capture-" + id + ".ndjson"
+	if err := s.atomic(name, output.Bytes()); err != nil {
 		return 0, err
 	}
+	s.remember(retainedCapture{name: name, time: event.Time, size: int64(output.Len())})
 	if err := s.prune(); err != nil {
 		return 0, err
 	}
@@ -175,46 +187,61 @@ func (s *Store) captures() ([]fs.DirEntry, error) {
 	return captures, nil
 }
 
-func (s *Store) prune() error {
+func (s *Store) readCapture(name string) ([]byte, Record, error) {
+	b, err := s.files.ReadFile(filepath.Join(s.dir, name))
+	if err != nil {
+		return nil, Record{}, err
+	}
+	line, _, _ := bytes.Cut(b, []byte("\n"))
+	var r Record
+	if json.Unmarshal(line, &r) != nil {
+		return nil, Record{}, errors.New("capture_file_invalid")
+	}
+	return b, r, nil
+}
+
+func (s *Store) loadCaptures() error {
 	entries, err := s.captures()
 	if err != nil {
 		return err
 	}
-	var total int64
 	for _, e := range entries {
-		info, err := e.Info()
+		b, r, err := s.readCapture(e.Name())
 		if err != nil {
 			return err
 		}
-		total += info.Size()
+		s.remember(retainedCapture{name: e.Name(), time: r.Time, size: int64(len(b))})
 	}
-	for _, e := range entries {
-		info, err := e.Info()
-		if err != nil {
+	return nil
+}
+
+func (s *Store) remember(c retainedCapture) {
+	i := sort.Search(len(s.retained), func(i int) bool { return s.retained[i].time.After(c.time) })
+	s.retained = append(s.retained, retainedCapture{})
+	copy(s.retained[i+1:], s.retained[i:])
+	s.retained[i] = c
+	s.retainedBytes += c.size
+}
+
+func (s *Store) prune() error {
+	cutoff := s.now().Add(-s.retention)
+	for len(s.retained) > 0 {
+		oldest := s.retained[0]
+		if s.retainedBytes <= s.maxBytes && !oldest.time.Before(cutoff) {
+			break
+		}
+		if oldest.time.After(s.state.PrunedThrough) {
+			s.state.PrunedThrough = oldest.time
+		}
+		if err := s.saveState(); err != nil {
 			return err
 		}
-		b, err := s.files.ReadFile(filepath.Join(s.dir, e.Name()))
-		if err != nil {
+		if err := s.files.Remove(filepath.Join(s.dir, oldest.name)); err != nil {
 			return err
 		}
-		line, _, _ := bytes.Cut(b, []byte("\n"))
-		var r Record
-		if json.Unmarshal(line, &r) != nil {
-			return errors.New("capture_file_invalid")
-		}
-		if total <= s.maxBytes && !r.Time.Before(s.now().Add(-s.retention)) {
-			continue
-		}
-		if r.Time.After(s.state.PrunedThrough) {
-			s.state.PrunedThrough = r.Time
-		}
-		if err = s.saveState(); err != nil {
-			return err
-		}
-		if err = s.files.Remove(filepath.Join(s.dir, e.Name())); err != nil {
-			return err
-		}
-		total -= info.Size()
+		s.retainedBytes -= oldest.size
+		s.retained[0] = retainedCapture{}
+		s.retained = s.retained[1:]
 	}
 	return nil
 }
@@ -245,7 +272,7 @@ func (s *Store) Snapshot(filter Filter) (Snapshot, error) {
 		return Snapshot{}, err
 	}
 	for _, e := range entries {
-		b, err := s.files.ReadFile(filepath.Join(s.dir, e.Name()))
+		b, _, err := s.readCapture(e.Name())
 		if err != nil {
 			return Snapshot{}, err
 		}

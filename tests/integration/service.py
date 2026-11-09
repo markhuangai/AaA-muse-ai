@@ -89,7 +89,7 @@ class Harness:
                                  "-v", volume + ":/var/lib/postgresql", POSTGRES).stdout.strip())
         deadline = time.monotonic() + 60
         while time.monotonic() < deadline:
-            if self.docker("exec", self.db, "pg_isready", "-U", "postgres", "-d", "aaa_muse", success=False).returncode == 0:
+            if self.docker("exec", self.db, "pg_isready", "-h", "127.0.0.1", "-U", "postgres", "-d", "aaa_muse", success=False).returncode == 0:
                 return
             time.sleep(0.2)
         raise RuntimeError("PostgreSQL did not become ready")

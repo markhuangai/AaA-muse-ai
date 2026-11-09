@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/markhuangai/AaA-muse-ai/internal/config"
 	"github.com/markhuangai/AaA-muse-ai/internal/diagnostics"
 	"github.com/markhuangai/AaA-muse-ai/internal/postgres"
@@ -178,7 +179,7 @@ func (w *failAfterWriter) Write(b []byte) (int, error) {
 }
 
 func TestConnectRetriesAndDiagnosis(t *testing.T) {
-	for _, name := range []string{"eventual", "exhausted", "migration", "checksum", "sleep-cancelled", "already-cancelled", "open-failed"} {
+	for _, name := range []string{"eventual", "exhausted", "starting", "starting-exhausted", "migration", "checksum", "sleep-cancelled", "already-cancelled", "open-failed"} {
 		t.Run(name, func(t *testing.T) {
 			d, _, _, _ := fixtureDependencies(t, false)
 			var output bytes.Buffer
@@ -206,8 +207,11 @@ func TestConnectRetriesAndDiagnosis(t *testing.T) {
 				case "open-failed":
 					return nil, &postgres.Failure{Reason: "database_configuration_invalid"}
 				}
-				if name == "eventual" && attempts == 3 {
+				if (name == "eventual" || name == "starting") && attempts == 3 {
 					return &fakeRepository{}, nil
+				}
+				if name == "starting" || name == "starting-exhausted" {
+					return &fakeRepository{bootErr: &pgconn.PgError{Code: "57P03", Message: "database system is starting up"}}, nil
 				}
 				return &fakeRepository{bootErr: context.DeadlineExceeded}, nil
 			}
@@ -218,7 +222,7 @@ func TestConnectRetriesAndDiagnosis(t *testing.T) {
 				cancel()
 			}
 			repo, err := connect(ctx, c, d, logger)
-			if name == "eventual" {
+			if name == "eventual" || name == "starting" {
 				if err != nil || repo == nil || attempts != 3 || sleeps != 2 {
 					t.Fatal("retry recovery failed")
 				}
@@ -233,6 +237,12 @@ func TestConnectRetriesAndDiagnosis(t *testing.T) {
 			}
 			if (name == "migration" || name == "checksum" || name == "open-failed") && attempts != 1 {
 				t.Fatal("retried deterministic failure")
+			}
+			if (name == "exhausted" || name == "starting-exhausted") && (attempts != 3 || sleeps != 2) {
+				t.Fatal("unavailable database exceeded the retry bound")
+			}
+			if strings.HasPrefix(name, "starting") && !strings.Contains(output.String(), "57P03") {
+				t.Fatal("transient PostgreSQL diagnosis lost its SQLSTATE")
 			}
 			if !strings.Contains(output.String(), "startup-fixture") || !strings.Contains(output.String(), "database_host") {
 				t.Fatal("diagnostic correlation or dependency target missing")

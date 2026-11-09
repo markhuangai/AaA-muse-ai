@@ -1,7 +1,6 @@
 package auth
 
 import (
-	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
@@ -33,14 +32,14 @@ func ID(random io.Reader) (string, error) {
 }
 
 type Authority struct {
-	management, portal [32]byte
-	clients            [][32]byte
+	management, portal []byte
+	clients            [][]byte
 }
 
 func New(c config.Config) *Authority {
-	a := &Authority{management: sha256.Sum256([]byte(c.Management.Key)), portal: sha256.Sum256([]byte(c.Portal.Password))}
+	a := &Authority{management: []byte(c.Management.Key), portal: []byte(c.Portal.Password)}
 	for _, key := range c.ClientKeys {
-		a.clients = append(a.clients, sha256.Sum256([]byte(key)))
+		a.clients = append(a.clients, []byte(key))
 	}
 	return a
 }
@@ -53,15 +52,15 @@ func (a *Authority) Role(header string) string {
 	if value == "" || strings.ContainsAny(value, " \t\r\n") {
 		return "unauthenticated"
 	}
-	h := sha256.Sum256([]byte(value))
-	if subtle.ConstantTimeCompare(h[:], a.management[:]) == 1 {
+	credential := []byte(value)
+	if subtle.ConstantTimeCompare(credential, a.management) == 1 {
 		return "management"
 	}
-	if subtle.ConstantTimeCompare(h[:], a.portal[:]) == 1 {
+	if subtle.ConstantTimeCompare(credential, a.portal) == 1 {
 		return "portal"
 	}
 	for _, client := range a.clients {
-		if subtle.ConstantTimeCompare(h[:], client[:]) == 1 {
+		if subtle.ConstantTimeCompare(credential, client) == 1 {
 			return "client"
 		}
 	}

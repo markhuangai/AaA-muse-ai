@@ -194,6 +194,83 @@ func TestCorruptChunksAreExplicit(t *testing.T) {
 	if _, err = s.Snapshot(Filter{}); err == nil {
 		t.Fatal("invalid metadata not rejected")
 	}
+	if _, err = Open(OSFiles{}, s.dir, "replacement", func() time.Time { return *now }, time.Hour, 1024*1024); err == nil {
+		t.Fatal("invalid retained metadata accepted on restart")
+	}
+}
+
+type countingFiles struct {
+	OSFiles
+	reads, scans int
+}
+
+func (f *countingFiles) ReadFile(p string) ([]byte, error) {
+	f.reads++
+	return f.OSFiles.ReadFile(p)
+}
+func (f *countingFiles) ReadDir(p string) ([]fs.DirEntry, error) {
+	f.scans++
+	return f.OSFiles.ReadDir(p)
+}
+
+func TestCaptureWritesDoNotRescanHistory(t *testing.T) {
+	s, now := openFixture(t, 128*1024*1024)
+	files := &countingFiles{}
+	s.files = files
+	var out bytes.Buffer
+	logger := fixtureLogger(s, now, &out)
+	for i := 0; i < 64; i++ {
+		logger.Info("fixture")
+	}
+	if files.reads != 0 || files.scans != 0 {
+		t.Fatal("log writes reread retained history")
+	}
+	capacity := s.retainedBytes
+	reopened, err := Open(files, s.dir, "replacement", func() time.Time { return *now }, 7*24*time.Hour, capacity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reopened.retained) != 64 || reopened.retainedBytes != capacity || files.reads != 65 || files.scans != 1 {
+		t.Fatal("restart did not rebuild retained size/time metadata once")
+	}
+	files.reads, files.scans = 0, 0
+	fixtureLogger(reopened, now, &out).Info("fixture")
+	if files.reads != 0 || files.scans != 0 || reopened.retainedBytes > capacity || len(reopened.retained) >= 65 {
+		t.Fatal("capacity pruning rescanned history or exceeded its bound")
+	}
+	snapshot, err := reopened.Snapshot(Filter{})
+	if err != nil || snapshot.Metadata.Complete || snapshot.Metadata.Captures != len(reopened.retained) {
+		t.Fatal("indexed pruning lost completeness metadata")
+	}
+	var actualBytes int64
+	for _, b := range snapshot.Records {
+		actualBytes += int64(len(b))
+	}
+	if actualBytes != reopened.retainedBytes {
+		t.Fatal("retained byte accounting differs from the stored captures")
+	}
+}
+
+func TestRetentionIndexOrdersEventTimes(t *testing.T) {
+	s, now := openFixture(t, 128*1024*1024)
+	base := *now
+	var out bytes.Buffer
+	logger := fixtureLogger(s, now, &out)
+	*now = base.Add(time.Hour)
+	logger.Info("newer")
+	*now = base.Add(-time.Hour)
+	logger.Info("older")
+	*now = base.Add(7 * 24 * time.Hour)
+	snapshot, err := s.Snapshot(Filter{})
+	if err != nil || snapshot.Metadata.Captures != 1 || snapshot.Metadata.Complete {
+		t.Fatal("out-of-order event timestamps broke expiry pruning")
+	}
+	if payloads(t, snapshot)[0]["msg"] != "newer" || !s.state.PrunedThrough.Equal(base.Add(-time.Hour)) {
+		t.Fatal("expiry removed the wrong capture")
+	}
+	if _, err = Open(&failingFiles{fail: "read", after: 1}, s.dir, "replacement", func() time.Time { return *now }, 7*24*time.Hour, s.maxBytes); err == nil {
+		t.Fatal("ignored retained-capture read failure on restart")
+	}
 }
 
 type failingFiles struct {
@@ -267,7 +344,7 @@ func TestCaptureIOFailures(t *testing.T) {
 			}
 		})
 	}
-	for _, method := range []string{"write", "chmod", "rename", "readdir", "read", "remove"} {
+	for _, method := range []string{"write", "chmod", "rename", "remove"} {
 		t.Run("capture-"+method, func(t *testing.T) {
 			s, now := openFixture(t, 6144)
 			files := &failingFiles{}
@@ -282,6 +359,29 @@ func TestCaptureIOFailures(t *testing.T) {
 			}
 		})
 	}
+	for _, method := range []string{"readdir", "read"} {
+		t.Run("snapshot-"+method, func(t *testing.T) {
+			s, now := openFixture(t, 6144)
+			files := &failingFiles{}
+			s.files = files
+			var out bytes.Buffer
+			fixtureLogger(s, now, &out).Info("existing")
+			files.fail = method
+			if _, err := s.Snapshot(Filter{}); err == nil {
+				t.Fatal("ignored export read failure")
+			}
+		})
+	}
+	t.Run("prune-state-write", func(t *testing.T) {
+		s, now := openFixture(t, 6144)
+		var out bytes.Buffer
+		fixtureLogger(s, now, &out).Info("existing")
+		s.files = &failingFiles{fail: "write", after: 1}
+		payload := []byte(`{"time":"2026-11-08T01:02:03Z","msg":"large","level":"DEBUG","data":"` + strings.Repeat("x", 12000) + `"}`)
+		if _, err := s.Write(payload); err == nil {
+			t.Fatal("ignored retention-state write failure")
+		}
+	})
 	s, now := openFixture(t, 1024*1024)
 	if _, err := s.Write([]byte("bad")); err == nil {
 		t.Fatal("accepted invalid event")

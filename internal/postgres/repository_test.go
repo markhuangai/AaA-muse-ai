@@ -165,7 +165,7 @@ func TestFailureClassificationAndConnection(t *testing.T) {
 	for _, tc := range []struct {
 		err           error
 		reason, state string
-	}{{&pgconn.PgError{Code: "28P01"}, "database_authentication_failed", "28P01"}, {&pgconn.PgError{Code: "28000"}, "database_authentication_failed", "28000"}, {&pgconn.PgError{Code: "3D000"}, "database_missing", "3D000"}, {&pgconn.PgError{Code: "53300"}, "postgres_error", "53300"}, {context.DeadlineExceeded, "database_unavailable", ""}, {&net.OpError{Op: "dial", Err: errors.New("refused")}, "database_unavailable", ""}, {errors.New("ordinary"), "database_operation_failed", ""}} {
+	}{{&pgconn.PgError{Code: "57P03"}, "database_unavailable", "57P03"}, {&pgconn.PgError{Code: "28P01"}, "database_authentication_failed", "28P01"}, {&pgconn.PgError{Code: "28000"}, "database_authentication_failed", "28000"}, {&pgconn.PgError{Code: "3D000"}, "database_missing", "3D000"}, {&pgconn.PgError{Code: "53300"}, "postgres_error", "53300"}, {context.DeadlineExceeded, "database_unavailable", ""}, {&net.OpError{Op: "dial", Err: errors.New("refused")}, "database_unavailable", ""}, {errors.New("ordinary"), "database_operation_failed", ""}} {
 		f := Classify(tc.err)
 		if f.Reason != tc.reason || f.SQLState != tc.state || f.Detail() == "" || f.Unwrap() != tc.err {
 			t.Fatal("wrong cause mapping")
