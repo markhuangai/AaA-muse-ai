@@ -175,11 +175,16 @@ class WorkerAuth(Harness):
             require(status == 200 and json.loads(body)["id"] == value["worker"]["id"] and json.loads(body)["name"] == "shared display name", "rename changed authority")
         echoed_secrets = [a["credential"], self.issue()["enrollment_code"]]
         for secret in echoed_secrets:
-            status, _, response = self.api(path, self.admin, "PATCH", {"name": "echo " + secret})
-            require(status == 200 and secret not in response.decode(), "rename returned issued secret")
-            for route, key in (("/api/v1/admin/workers", self.admin), ("/api/v1/worker/status", a["credential"])):
-                status, _, response = self.api(route, key)
-                require(status == 200 and secret not in response.decode() and "echo [REDACTED]" in response.decode(), "ordinary worker response disclosed issued secret")
+            for name, expected in (("echo " + secret, "echo [REDACTED]"), ("muse_worker_" + "A" * 31 + secret, "[REDACTED]")):
+                status, headers, response = self.api(path, self.admin, "PATCH", {"name": name})
+                require(status == 200 and json.loads(response)["name"] == expected, "rename returned a recoverable issued secret")
+                event, _ = self.diagnose(headers["X-Request-Id"], "worker.rename_exchange")
+                require(event["after"]["name"] == expected, "protected rename exchange retained a recoverable issued secret")
+                for route, key in (("/api/v1/admin/workers", self.admin), ("/api/v1/worker/status", a["credential"])):
+                    status, _, response = self.api(route, key)
+                    value = json.loads(response)
+                    record = next(w for w in value["workers"] if w["id"] == a["worker"]["id"]) if "workers" in value else value
+                    require(status == 200 and record["name"] == expected, "ordinary worker response disclosed a recoverable issued secret")
         _, _, exported = self.api("/api/v1/admin/diagnostics/export", self.admin)
         _, events = self.decode_export(exported)
         self.assert_private(json.dumps(events))

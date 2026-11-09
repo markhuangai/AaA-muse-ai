@@ -20,7 +20,7 @@ type Redactor struct{ secrets []string }
 var workerSecrets = regexp.MustCompile(`muse_(?:enroll|worker)_[A-Za-z0-9_-]{43}`)
 
 func RedactWorkerSecrets(value string) string {
-	return workerSecrets.ReplaceAllString(value, "[REDACTED]")
+	return (&Redactor{}).text(value)
 }
 
 func NewRedactor(secrets []string) *Redactor {
@@ -36,7 +36,16 @@ func NewRedactor(secrets []string) *Redactor {
 	return &Redactor{secrets: values}
 }
 func (r *Redactor) text(value string) string {
-	spans := workerSecrets.FindAllStringIndex(value, -1)
+	var spans [][]int
+	for offset := 0; offset < len(value); {
+		match := workerSecrets.FindStringIndex(value[offset:])
+		if match == nil {
+			break
+		}
+		start := offset + match[0]
+		spans = append(spans, []int{start, offset + match[1]})
+		offset = start + 1
+	}
 	for _, secret := range r.secrets {
 		if secret == "" {
 			continue

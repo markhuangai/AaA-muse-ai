@@ -68,9 +68,15 @@ func TestOverlappingSecretsAreFullyRedacted(t *testing.T) {
 			{"literal_overlap", []string{"abc", "cde"}, "before abcde after", "before [REDACTED] after"},
 			{"self_overlap", []string{"aba"}, "before ababa after", "before [REDACTED] after"},
 			{"separate", []string{"private", ""}, "private before " + token + " after", "[REDACTED] before [REDACTED] after"},
+			{"overlapping_worker_prefix", nil, auth.WorkerPrefix + strings.Repeat("A", 31) + token, "[REDACTED]"},
+			{"overlapping_enrollment_prefix", nil, auth.EnrollmentPrefix + strings.Repeat("A", 31) + token, "[REDACTED]"},
+			{"separated_tokens", nil, "before " + token + " between " + token + " after", "before [REDACTED] between [REDACTED] after"},
 		}
 		for _, tc := range cases {
 			t.Run(prefix+tc.name, func(t *testing.T) {
+				if tc.secrets == nil && RedactWorkerSecrets(tc.input) != tc.want {
+					t.Fatal("response-name masking left an overlapping token suffix")
+				}
 				s, now := openFixture(t, 128*1024*1024)
 				response, err := json.Marshal(map[string]string{"credential": tc.input})
 				if err != nil {
