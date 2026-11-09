@@ -4,7 +4,7 @@ SERVICE_IMAGE ?= aaa-muse-ai-service:local
 SOURCE_SHA ?= $(shell git rev-parse HEAD)
 SOURCE_DIRTY ?= $(shell test -z "$$(git --no-optional-locks status --porcelain --untracked-files=all)" && echo false || echo true)
 
-.PHONY: check-ci-policy check-workflows check-service test-service-unit test-service smoke-image image
+.PHONY: check-ci-policy check-workflows check-service test-service-unit test-service test-worker-auth smoke-image image
 
 check-ci-policy:
 	node .github/scripts/ci-policy.mjs
@@ -24,6 +24,9 @@ image:
 
 test-service: image
 	python3 tests/integration/service.py --image $(SERVICE_IMAGE) --suite service --source-sha $(SOURCE_SHA) --source-dirty $(SOURCE_DIRTY)
+
+test-worker-auth: image
+	python3 -B tests/integration/worker_auth.py --image $(SERVICE_IMAGE) --source-sha $(SOURCE_SHA) --source-dirty $(SOURCE_DIRTY)
 
 smoke-image: image
 	python3 tests/integration/service.py --image $(SERVICE_IMAGE) --suite image --source-sha $(SOURCE_SHA) --source-dirty $(SOURCE_DIRTY)

@@ -7,6 +7,7 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -16,18 +17,68 @@ import (
 
 type Redactor struct{ secrets []string }
 
+var workerSecrets = regexp.MustCompile(`muse_(?:enroll|worker)_[A-Za-z0-9_-]{43}`)
+
+func RedactWorkerSecrets(value string) string {
+	return (&Redactor{}).text(value)
+}
+
 func NewRedactor(secrets []string) *Redactor {
 	values := append([]string{}, secrets...)
+	for _, secret := range secrets {
+		encoded, _ := json.Marshal(secret)
+		escaped := string(encoded[1 : len(encoded)-1])
+		if escaped != secret {
+			values = append(values, escaped)
+		}
+	}
 	sort.Slice(values, func(i, j int) bool { return len(values[i]) > len(values[j]) })
 	return &Redactor{secrets: values}
 }
 func (r *Redactor) text(value string) string {
+	var spans [][]int
+	for offset := 0; offset < len(value); {
+		match := workerSecrets.FindStringIndex(value[offset:])
+		if match == nil {
+			break
+		}
+		start := offset + match[0]
+		spans = append(spans, []int{start, offset + match[1]})
+		offset = start + 1
+	}
 	for _, secret := range r.secrets {
-		if secret != "" {
-			value = strings.ReplaceAll(value, secret, "[REDACTED]")
+		if secret == "" {
+			continue
+		}
+		for offset := 0; offset < len(value); {
+			index := strings.Index(value[offset:], secret)
+			if index < 0 {
+				break
+			}
+			start := offset + index
+			spans = append(spans, []int{start, start + len(secret)})
+			offset = start + 1
 		}
 	}
-	return value
+	if len(spans) == 0 {
+		return value
+	}
+	sort.Slice(spans, func(i, j int) bool { return spans[i][0] < spans[j][0] })
+	var out strings.Builder
+	offset := 0
+	for i := 0; i < len(spans); {
+		start, end := spans[i][0], spans[i][1]
+		i++
+		for i < len(spans) && spans[i][0] <= end {
+			end = max(end, spans[i][1])
+			i++
+		}
+		out.WriteString(value[offset:start])
+		out.WriteString("[REDACTED]")
+		offset = end
+	}
+	out.WriteString(value[offset:])
+	return out.String()
 }
 func (r *Redactor) value(key string, value any) any {
 	lower := strings.ToLower(key)

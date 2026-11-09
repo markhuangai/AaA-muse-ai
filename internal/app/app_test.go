@@ -24,6 +24,7 @@ import (
 )
 
 type fakeRepository struct {
+	service.WorkerRepository
 	bootErr error
 	closed  atomic.Bool
 }
@@ -202,7 +203,7 @@ func TestConnectRetriesAndDiagnosis(t *testing.T) {
 				attempts++
 				switch name {
 				case "migration":
-					return &fakeRepository{bootErr: &postgres.Failure{Reason: "schema_version_incompatible", Expected: "1", Observed: "2"}}, nil
+					return &fakeRepository{bootErr: &postgres.Failure{Reason: "schema_version_incompatible", Expected: "2", Observed: "3"}}, nil
 				case "checksum":
 					return &fakeRepository{bootErr: &postgres.Failure{Reason: "migration_checksum_mismatch"}}, nil
 				case "open-failed":

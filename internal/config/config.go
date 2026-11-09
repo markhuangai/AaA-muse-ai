@@ -41,9 +41,8 @@ type Config struct {
 	} `yaml:"control-portal" json:"control_portal"`
 	ClientKeys map[string]Secret `yaml:"client-keys" json:"client_keys"`
 	Limits     struct {
-		MaxWorkers int `yaml:"max-workers" json:"max_workers"`
-		MaxJobs    int `yaml:"max-jobs" json:"max_jobs"`
-		InFlight   int `yaml:"in-flight-per-worker" json:"in_flight_per_worker"`
+		MaxJobs  int `yaml:"max-jobs" json:"max_jobs"`
+		InFlight int `yaml:"in-flight-per-worker" json:"in_flight_per_worker"`
 	} `yaml:"limits" json:"limits"`
 	Diagnostics struct {
 		Level         string `yaml:"level" json:"level"`
@@ -66,7 +65,7 @@ func Defaults() Config {
 	var c Config
 	c.Server.Listen = "0.0.0.0:8080"
 	c.ClientKeys = map[string]Secret{}
-	c.Limits.MaxWorkers, c.Limits.MaxJobs, c.Limits.InFlight = 1, 1, 1
+	c.Limits.MaxJobs, c.Limits.InFlight = 1, 1
 	c.Diagnostics.Level, c.Diagnostics.Directory = "info", "/var/lib/aaa-muse-ai/diagnostics"
 	c.Diagnostics.RetentionDays, c.Diagnostics.MaxBytes = 7, 128*1024*1024
 	return c
@@ -258,7 +257,7 @@ func (c Config) Validate() error {
 		}
 		seen[string(key)] = true
 	}
-	if c.Limits.MaxWorkers < 1 || c.Limits.MaxJobs < 1 || c.Limits.InFlight != 1 {
+	if c.Limits.MaxJobs < 1 || c.Limits.InFlight != 1 {
 		return bad("limits", "positive_limits_and_single_in_flight_required")
 	}
 	if _, ok := map[string]bool{"debug": true, "info": true, "warn": true, "error": true}[c.Diagnostics.Level]; !ok {

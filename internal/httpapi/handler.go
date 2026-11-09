@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/markhuangai/AaA-muse-ai/internal/auth"
@@ -23,6 +24,7 @@ type Exporter interface {
 }
 type Handler struct {
 	Service   *service.Service
+	Workers   *service.Workers
 	Authority *auth.Authority
 	Exporter  Exporter
 	Logger    *slog.Logger
@@ -33,11 +35,12 @@ type Handler struct {
 
 type response struct {
 	http.ResponseWriter
-	code               int
-	body               bytes.Buffer
-	capture            bool
-	attempted, written int
-	writeErr           error
+	code                   int
+	body                   bytes.Buffer
+	capture                bool
+	attempted, written     int
+	writeErr               error
+	workerID, enrollmentID string
 }
 
 func (w *response) WriteHeader(code int) {
@@ -73,15 +76,12 @@ func (h *Handler) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 	}
 	out.Header().Set("X-Request-Id", id)
 	out.Header().Set("Cache-Control", "no-store")
-	route := "unmatched"
-	switch r.URL.Path {
-	case "/healthz", "/readyz", "/api/v1/admin/status", "/api/v1/admin/diagnostics/export":
-		route = r.URL.Path
-	}
+	route, requestedWorker := routeFor(r.URL.Path)
 	logger := h.Logger.With("request_id", id, "route", route)
 	w := &response{ResponseWriter: out, capture: route != "/api/v1/admin/diagnostics/export"}
 	role := h.Authority.Role(r.Header.Get("Authorization"))
 	defer func() {
+		logger = logger.With("worker_id", w.workerID, "enrollment_id", w.enrollmentID)
 		outcome, detail := "completed", ""
 		if w.writeErr != nil {
 			outcome, detail = "interrupted", w.writeErr.Error()
@@ -94,16 +94,41 @@ func (h *Handler) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 404, map[string]any{"error": "not_found"})
 		return
 	}
-	if route == "/api/v1/admin/status" || route == "/api/v1/admin/diagnostics/export" {
-		if role != "management" {
-			logger.Warn("auth.denied", "expected_role", "management", "observed_role", role)
+	expectedRole := ""
+	if strings.HasPrefix(route, "/api/v1/admin/") {
+		expectedRole = "management"
+	} else if route == "/api/v1/worker/status" {
+		expectedRole = "worker"
+	}
+	var identity workerView
+	if expectedRole != "" {
+		credential := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		if role == "unauthenticated" && strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") && strings.HasPrefix(credential, auth.WorkerPrefix) && h.Workers != nil {
+			record, err := h.Workers.Authenticate(r.Context(), logger, credential)
+			w.workerID = record.ID
+			if err != nil {
+				workerError(w, err)
+				return
+			}
+			role, identity = "worker", viewWorker(record)
+		}
+		if role != expectedRole {
+			event := "auth.denied"
+			if route == "/api/v1/worker/status" || route == "/api/v1/admin/enrollments" || strings.HasPrefix(route, "/api/v1/admin/workers") {
+				event = "worker.auth_denied"
+			}
+			if role == "worker" && requestedWorker != "" && requestedWorker != identity.ID {
+				event = "worker.scope_denied"
+			}
+			logger.Warn(event, "expected_role", expectedRole, "observed_role", role, "authenticated_worker_id", identity.ID, "requested_worker_id", requestedWorker, "reason", "role_not_permitted")
 			w.Header().Set("WWW-Authenticate", "Bearer")
 			writeJSON(w, 401, map[string]any{"error": "unauthorized"})
 			return
 		}
 	}
-	if r.Method != http.MethodGet {
-		w.Header().Set("Allow", http.MethodGet)
+	method := routeMethod(route)
+	if r.Method != method {
+		w.Header().Set("Allow", method)
 		writeJSON(w, 405, map[string]any{"error": "method_not_allowed"})
 		return
 	}
@@ -118,7 +143,7 @@ func (h *Handler) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	if len(body) > 0 {
+	if r.Method == http.MethodGet && len(body) > 0 {
 		logger.Warn("request.rejected", "reason", "get_body_unsupported", "omitted_body_bytes", len(body))
 		writeJSON(w, 400, map[string]any{"error": "get_body_unsupported"})
 		return
@@ -148,6 +173,8 @@ func (h *Handler) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, h.Service.Status(r.Context(), logger))
 	case "/api/v1/admin/diagnostics/export":
 		h.export(w, r, logger)
+	default:
+		h.workerRequest(w, r, logger, route, requestedWorker, identity, body)
 	}
 }
 

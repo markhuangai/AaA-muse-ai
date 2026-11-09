@@ -64,6 +64,8 @@ jobs:
         run: make test-service-unit
       - name: Real HTTP and PostgreSQL integration
         run: make test-service
+      - name: Worker enrollment, revocation, and diagnosis
+        run: make test-worker-auth
 
   image:
     name: CI / image
