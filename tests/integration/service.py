@@ -348,6 +348,11 @@ class Harness:
         inaccessible["diagnostics"]["directory"] = "/root/inaccessible"
         result, _ = self.startup_failure("capture.permissions", config=inaccessible, expected="diagnostics.capture_failed")
         require(result["cause"] == "filesystem_permission_denied", "capture failure lacks corrective cause")
+        invalid_options = self.configuration()
+        invalid_options["database"]["url"] = invalid_options["database"]["url"].replace("sslmode=disable", "sslmode=invalid")
+        result, events = self.startup_failure("database.invalid_options", config=invalid_options, expected="db.connect_failed")
+        require(result["cause"] == "database_configuration_invalid" and result["attempt"] == 1, "invalid database options lack a safe immediate diagnosis")
+        require(not any(event["msg"] == "db.retry_scheduled" for event in events), "invalid database options were retried")
         unavailable = self.configuration()
         unavailable["database"]["url"] = unavailable["database"]["url"].replace("@db:", "@missing-db:")
         result, events = self.startup_failure("database.unavailable", config=unavailable, expected="db.connect_failed")

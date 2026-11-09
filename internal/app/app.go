@@ -41,7 +41,13 @@ type Dependencies struct {
 }
 
 func Production(stdout, stderr io.Writer) Dependencies {
-	return Dependencies{ReadFile: os.ReadFile, LookupEnv: os.LookupEnv, Random: rand.Reader, Now: time.Now, Sleep: sleep, Files: diagnostics.OSFiles{}, OpenDB: func(ctx context.Context, u string) (Repository, error) { return postgres.Open(ctx, u) }, Listen: net.Listen, Stdout: stdout, Stderr: stderr}
+	return Dependencies{ReadFile: os.ReadFile, LookupEnv: os.LookupEnv, Random: rand.Reader, Now: time.Now, Sleep: sleep, Files: diagnostics.OSFiles{}, OpenDB: func(ctx context.Context, u string) (Repository, error) {
+		repo, err := postgres.Open(ctx, u)
+		if err != nil {
+			return nil, err
+		}
+		return repo, nil
+	}, Listen: net.Listen, Stdout: stdout, Stderr: stderr}
 }
 func sleep(ctx context.Context, delay time.Duration) error {
 	timer := time.NewTimer(delay)

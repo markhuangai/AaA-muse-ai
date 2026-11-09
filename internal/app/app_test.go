@@ -3,6 +3,7 @@ package app
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -329,5 +330,67 @@ func TestRuntimeHelpers(t *testing.T) {
 	}
 	if _, err := d.OpenDB(context.Background(), "postgres://%"); err == nil {
 		t.Fatal("production connector ignored invalid input")
+	}
+	repo, err := d.OpenDB(context.Background(), "postgres://db/muse?sslmode=disable")
+	if err != nil || repo == nil {
+		t.Fatal("production connector lost a valid repository")
+	}
+	repo.Close()
+}
+
+func TestProductionDatabaseConfigurationFailure(t *testing.T) {
+	d, out, errout, _ := fixtureDependencies(t, false)
+	d.OpenDB = Production(out, errout).OpenDB
+	for _, u := range []string{"postgres://%", "postgres://db/muse?sslmode=invalid"} {
+		if repo, err := d.OpenDB(context.Background(), u); err == nil || repo != nil {
+			t.Fatal("failed production connector returned a repository interface")
+		}
+	}
+	read := d.ReadFile
+	d.ReadFile = func(path string) ([]byte, error) {
+		b, err := read(path)
+		return bytes.ReplaceAll(b, []byte("@db/muse"), []byte("@db/muse?sslmode=invalid")), err
+	}
+	if Run(context.Background(), nil, service.Build{}, d) != 1 {
+		t.Fatal("invalid database options did not stop startup")
+	}
+	if !strings.Contains(out.String(), `"msg":"db.connect_failed"`) || !strings.Contains(out.String(), `"cause":"database_configuration_invalid"`) || !strings.Contains(out.String(), `"attempt":1`) || !strings.Contains(out.String(), `"outcome":"startup_stopped"`) {
+		t.Fatal("invalid database options lost safe startup diagnosis")
+	}
+	if strings.Contains(out.String(), "private-sentinel") || strings.Contains(errout.String(), "private-sentinel") {
+		t.Fatal("database configuration error exposed credentials")
+	}
+	b, err := d.ReadFile("fixture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := config.Parse(b, d.LookupEnv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := diagnostics.Open(d.Files, c.Diagnostics.Directory, "validation", d.Now, 7*24*time.Hour, c.Diagnostics.MaxBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := store.Snapshot(diagnostics.Filter{})
+	if err != nil || !snapshot.Metadata.Complete || snapshot.Metadata.Captures != 3 {
+		t.Fatal("database startup failure capture is incomplete")
+	}
+	var captured bytes.Buffer
+	for _, file := range snapshot.Records {
+		for _, line := range bytes.Split(bytes.TrimSpace(file), []byte("\n")) {
+			var record diagnostics.Record
+			if err := json.Unmarshal(line, &record); err != nil {
+				t.Fatal(err)
+			}
+			payload, err := base64.StdEncoding.DecodeString(record.Data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			captured.Write(payload)
+		}
+	}
+	if strings.Contains(captured.String(), "private-sentinel") || !strings.Contains(captured.String(), "db.exchange_failed") {
+		t.Fatal("database failure detail is missing or exposes credentials")
 	}
 }
