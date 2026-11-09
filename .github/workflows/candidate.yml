@@ -1,0 +1,95 @@
+name: Candidate image
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact source commit on main or a current same-repository PR
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      source_sha: ${{ steps.resolve.outputs.source_sha }}
+      tree_sha: ${{ steps.resolve.outputs.tree_sha }}
+      pr: ${{ steps.resolve.outputs.pr }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - name: Resolve authorized exact source
+        id: resolve
+        uses: actions/github-script@v9
+        env:
+          REQUESTED_SOURCE: ${{ inputs.source_sha }}
+        with:
+          script: |
+            const { resolveCandidate } = await import(`${process.env.GITHUB_WORKSPACE}/.github/scripts/image-policy.mjs`);
+            const result = await resolveCandidate({ github, context, sourceSHA: process.env.REQUESTED_SOURCE });
+            for (const [key, value] of Object.entries(result)) core.setOutput(key, value ?? '');
+  build:
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
+      TREE_SHA: ${{ needs.resolve.outputs.tree_sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: trusted
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          path: source
+          persist-credentials: false
+      - name: Verify source and build tested image
+        working-directory: source
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test "$(git rev-parse HEAD^{tree})" = "$TREE_SHA"
+          make smoke-image SOURCE_SHA="$SOURCE_SHA" SOURCE_DIRTY=false SERVICE_IMAGE=aaa-muse-candidate:tested
+      - name: Fence source before candidate export
+        uses: actions/github-script@v9
+        env:
+          PR_NUMBER: ${{ needs.resolve.outputs.pr }}
+        with:
+          script: |
+            const { fenceCandidate } = await import(`${process.env.GITHUB_WORKSPACE}/trusted/.github/scripts/image-policy.mjs`);
+            await fenceCandidate({ github, context, sourceSHA: process.env.SOURCE_SHA, pr: process.env.PR_NUMBER });
+      - name: Record immutable archive and image identities
+        env:
+          CANDIDATE_DIR: ${{ runner.temp }}/aaa-muse-candidate
+        run: |
+          mkdir -p "$CANDIDATE_DIR"
+          docker save aaa-muse-candidate:tested -o "$CANDIDATE_DIR/image.tar"
+          node --input-type=module <<'JS'
+          import { createHash } from 'node:crypto';
+          import { readFileSync, writeFileSync } from 'node:fs';
+          import { execFileSync } from 'node:child_process';
+          import { imageConfigDigest } from './trusted/.github/scripts/image-policy.mjs';
+          const image = JSON.parse(execFileSync('docker', ['image', 'inspect', 'aaa-muse-candidate:tested'], { encoding: 'utf8' }))[0];
+          const archive = readFileSync(`${process.env.CANDIDATE_DIR}/image.tar`);
+          const receipt = { source_sha: process.env.SOURCE_SHA, tree_sha: process.env.TREE_SHA,
+            image_id: image.Id, image_config_digest: imageConfigDigest(image),
+            archive_sha256: createHash('sha256').update(archive).digest('hex') };
+          writeFileSync(`${process.env.CANDIDATE_DIR}/receipt.json`, JSON.stringify(receipt));
+          console.log(JSON.stringify(receipt));
+          JS
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: candidate-${{ env.SOURCE_SHA }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/aaa-muse-candidate
+          if-no-files-found: error
+          retention-days: 1
+          overwrite: false

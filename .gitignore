@@ -1,2 +1,5 @@
 .codex
 node_modules/
+.artifacts/
+config.yaml
+.env

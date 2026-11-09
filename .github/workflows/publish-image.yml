@@ -1,0 +1,93 @@
+name: Publish service image
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+
+permissions:
+  actions: read
+  contents: read
+  pull-requests: read
+
+jobs:
+  resolve:
+    if: github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      source_sha: ${{ steps.resolve.outputs.source_sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - name: Require exact successful merged main source
+        id: resolve
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const { resolvePublication } = await import(`${process.env.GITHUB_WORKSPACE}/.github/scripts/image-policy.mjs`);
+            core.setOutput('source_sha', await resolvePublication({ github, context }));
+  publish:
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    concurrency:
+      group: service-image-${{ needs.resolve.outputs.source_sha }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      packages: write
+    env:
+      SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
+      IMAGE: ghcr.io/markhuangai/aaa-muse-ai
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: trusted
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          path: source
+          persist-credentials: false
+      - name: Build and test publication bytes
+        working-directory: source
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          make smoke-image SOURCE_SHA="$SOURCE_SHA" SOURCE_DIRTY=false SERVICE_IMAGE="$IMAGE:sha-$SOURCE_SHA"
+      - name: Check immutable destination
+        id: destination
+        env:
+          REGISTRY_TOKEN: ${{ github.token }}
+        run: |
+          node --input-type=module <<'JS'
+          import { appendFileSync } from 'node:fs';
+          import { execFileSync } from 'node:child_process';
+          import { imageConfigDigest, registryManifest } from './trusted/.github/scripts/image-policy.mjs';
+          const image = JSON.parse(execFileSync('docker', ['image', 'inspect', `${process.env.IMAGE}:sha-${process.env.SOURCE_SHA}`], { encoding: 'utf8' }))[0];
+          const result = await registryManifest({ token: process.env.REGISTRY_TOKEN, image: 'markhuangai/aaa-muse-ai', tag: `sha-${process.env.SOURCE_SHA}`, expectedConfig: imageConfigDigest(image) });
+          appendFileSync(process.env.GITHUB_OUTPUT, `exists=${result.exists}\n`);
+          JS
+      - name: Publish previously absent source-SHA image
+        if: steps.destination.outputs.exists == 'false'
+        env:
+          REGISTRY_TOKEN: ${{ github.token }}
+        run: |
+          printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          docker push "$IMAGE:sha-$SOURCE_SHA"
+      - name: Verify published bytes and digest
+        env:
+          REGISTRY_TOKEN: ${{ github.token }}
+        run: |
+          node --input-type=module <<'JS'
+          import { execFileSync } from 'node:child_process';
+          import { imageConfigDigest, registryManifest } from './trusted/.github/scripts/image-policy.mjs';
+          const image = JSON.parse(execFileSync('docker', ['image', 'inspect', `${process.env.IMAGE}:sha-${process.env.SOURCE_SHA}`], { encoding: 'utf8' }))[0];
+          const expectedConfig = imageConfigDigest(image);
+          const result = await registryManifest({ token: process.env.REGISTRY_TOKEN, image: 'markhuangai/aaa-muse-ai', tag: `sha-${process.env.SOURCE_SHA}`, expectedConfig });
+          if (!result.exists) throw new Error('published_manifest_missing');
+          console.log(JSON.stringify({ event: 'publication.verified', source_sha: process.env.SOURCE_SHA, image: `${process.env.IMAGE}@${result.digest}`, image_config_digest: expectedConfig }));
+          JS

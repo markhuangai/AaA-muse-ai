@@ -1,0 +1,19 @@
+server:
+  listen: "0.0.0.0:${MUSE_HTTP_PORT}"
+  public-url: "${MUSE_PUBLIC_URL}"
+database:
+  url: "${MUSE_DATABASE_URL}"
+management:
+  key: ""
+control-portal:
+  password: "${MUSE_PORTAL_PASSWORD}"
+client-keys: {}
+limits:
+  max-workers: 1
+  max-jobs: 1
+  in-flight-per-worker: 1
+diagnostics:
+  level: info
+  directory: /var/lib/aaa-muse-ai/diagnostics
+  retention-days: 7
+  max-bytes: 134217728
