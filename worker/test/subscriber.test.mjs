@@ -1,8 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Subscriber } from '../dist/subscriber.js';
-import { encode, parse } from '../dist/json.js';
-import { fixture, enrolled, until, ID, JOB, CONN, claimed } from './helpers.mjs';
+import { encode, parse, integer } from '../dist/json.js';
+import { fixture, enrolled, until, ID, JOB, CONN, KEY, claimed } from './helpers.mjs';
 
 const opened = { protocol_version: 1, connection_id: CONN, connection_generation: 1 };
 const health = id => ({ ...opened, challenge_id: id });
@@ -54,6 +54,37 @@ test('transient stream reconnects have bounded delays and keep the original cred
   const warnings = f.output.map(JSON.parse).filter(e => e.msg === 'worker.stream_retrying');
   assert.deepEqual(warnings.map(e => e.delay_ms), [1000, 2000, 4000, 8000, 16000, 30000, 30000]);
   assert.equal(parse(await f.state.read('connection.json')).status, 'offline');
+});
+
+test('an exhausted HTML heartbeat outage reconnects and restores authenticated health', async t => {
+  const f = await fixture(t); await enrolled(f);
+  const stop = new AbortController(); let streams = 0, heartbeats = 0;
+  f.broker.override = async call => {
+    if (call.path.endsWith('/events')) {
+      streams++;
+      const connection = { ...opened, connection_id: CONN.slice(0, -1) + streams, connection_generation: streams };
+      const frames = [['connection.opened', connection], ['health.challenge', { ...connection, challenge_id: 'health-' + streams }]].map(([type, data], i) => `id: ${streams}-${i}\nevent: ${type}\ndata: ${encode(data)}\n\n`).join('');
+      return new Response(new ReadableStream({ start(c) { c.enqueue(Buffer.from(frames)); } }), { headers: { 'content-type': 'text/event-stream' } });
+    }
+    if (call.path.endsWith('/heartbeat')) {
+      if (++heartbeats <= 3) return new Response('<html>Unavailable ' + KEY + '</html>', { status: 503 });
+      stop.abort();
+    }
+  };
+  await new Subscriber(f.worker).run(stop.signal);
+  assert.equal(streams, 2); assert.equal(heartbeats, 4);
+  const calls = f.broker.calls.filter(c => c.path.endsWith('/heartbeat'));
+  assert.equal(new Set(calls.slice(0, 3).map(c => c.options.body)).size, 1);
+  assert.equal(integer(calls[3].input.connection_generation), 2);
+  const saved = parse(await f.state.read('connection.json'));
+  assert.equal(saved.status, 'online'); assert.equal(integer(saved.connection_generation), 2);
+  const warnings = f.output.map(JSON.parse).filter(e => e.msg === 'worker.stream_retrying');
+  assert.equal(warnings.length, 1); assert.equal(warnings[0].http_status, 503);
+  assert.equal(warnings[0].response_validation_cause, 'invalid_json');
+  const exported = await f.logger.capture.export({}, true);
+  assert.equal(JSON.parse(exported.split('\n')[0]).complete, true);
+  assert(!exported.includes(KEY)); assert(!f.output.join('').includes(KEY));
+  assert(!f.broker.calls.some(c => c.path.endsWith('/decisions')));
 });
 
 test('health and cancellation validate assignment identity before acting', async t => {

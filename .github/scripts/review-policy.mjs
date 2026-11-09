@@ -212,12 +212,12 @@ export async function finishReview({ github, context, core, env = process.env })
 
 export async function recordReviewerRelease({ github, core }) {
   const repo = { owner: 'markhuangai', repo: 'ai-pr-reviewer' };
-  const { data: reference } = await github.rest.git.getRef({ ...repo, ref: 'tags/v1' });
-  if (reference.object.type !== 'tag') throw new Error('Reviewer v1 must resolve through an annotated stable release alias.');
+  const { data: reference } = await github.rest.git.getRef({ ...repo, ref: 'tags/v1-prerelease' });
+  if (reference.object.type !== 'tag') throw new Error('Reviewer v1-prerelease must resolve through an annotated prerelease alias.');
   const { data: tag } = await github.rest.git.getTag({ ...repo, tag_sha: reference.object.sha });
   const release = tag.message.trim();
-  if (!/^v1\.\d+\.\d+$/.test(release) || tag.object.type !== 'commit' || !shaPattern.test(tag.object.sha)) {
-    throw new Error('Reviewer v1 has invalid stable release metadata.');
+  if (!/^v1\.\d+\.\d+-rc\.\d+$/.test(release) || tag.object.type !== 'commit' || !shaPattern.test(tag.object.sha)) {
+    throw new Error('Reviewer v1-prerelease has invalid release-candidate metadata.');
   }
-  logEvent(core, 'info', 'review.release', { action_ref: 'v1', observed_release: release, observed_source_sha: tag.object.sha });
+  logEvent(core, 'info', 'review.release', { action_ref: 'v1-prerelease', observed_release: release, observed_source_sha: tag.object.sha });
 }

@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import test from 'node:test';
+import { parse } from 'yaml';
 import {
   beginReview, bootstrapAllowed, duplicateReview, fenceReason, finalReviewState,
   finishReview, markedReview, missingSettings, recordReviewerRelease, resolveReview, workflowRunReason,
@@ -181,23 +183,25 @@ test('finalizer publishes success only for marked complete current-head review',
   assert.equal(h.state.logs.at(-1).observed_head, newerHead);
 });
 
-test('release helper resolves the annotated v1 alias and records normalized stable source evidence', async () => {
+test('release helper records the annotated prerelease alias used by the actual workflow', async () => {
+  const workflow = parse(readFileSync(new URL('../workflows/ai-pr-review.yml', import.meta.url), 'utf8'));
+  assert.equal(workflow.jobs.review.steps.find(step => step.id === 'reviewer').uses, 'markhuangai/ai-pr-reviewer@v1-prerelease');
   const records = [];
   const aliasSha = 'c'.repeat(40);
   const sourceSha = 'd'.repeat(40);
   const github = { rest: { git: {
     getRef: async params => {
-      assert.deepEqual(params, { owner: 'markhuangai', repo: 'ai-pr-reviewer', ref: 'tags/v1' });
+      assert.deepEqual(params, { owner: 'markhuangai', repo: 'ai-pr-reviewer', ref: 'tags/v1-prerelease' });
       return { data: { object: { type: 'tag', sha: aliasSha } } };
     },
     getTag: async params => {
       assert.deepEqual(params, { owner: 'markhuangai', repo: 'ai-pr-reviewer', tag_sha: aliasSha });
-      return { data: { message: '\nv1.2.2\n', object: { type: 'commit', sha: sourceSha } } };
+      return { data: { message: '\nv1.2.3-rc.0\n', object: { type: 'commit', sha: sourceSha } } };
     },
   } } };
   await recordReviewerRelease({ github, core: { info: line => records.push(JSON.parse(line)) } });
-  assert.deepEqual(records, [{ level: 'INFO', event: 'review.release', action_ref: 'v1',
-    observed_release: 'v1.2.2', observed_source_sha: sourceSha }]);
+  assert.deepEqual(records, [{ level: 'INFO', event: 'review.release', action_ref: 'v1-prerelease',
+    observed_release: 'v1.2.3-rc.0', observed_source_sha: sourceSha }]);
 });
 
 test('release helper rejects lightweight aliases, incompatible versions, and non-commit sources', async () => {
@@ -206,10 +210,11 @@ test('release helper rejects lightweight aliases, incompatible versions, and non
     getRef: async () => ({ data: { object: { type: 'commit', sha: 'c'.repeat(40) } } }),
     getTag: async () => { assert.fail('A lightweight alias must be rejected before tag lookup.'); },
   } } };
-  await assert.rejects(recordReviewerRelease({ github: lightweight, core }), /annotated stable release alias/);
-  const validTag = { message: 'v1.2.2', object: { type: 'commit', sha: 'd'.repeat(40) } };
+  await assert.rejects(recordReviewerRelease({ github: lightweight, core }), /annotated prerelease alias/);
+  const validTag = { message: 'v1.2.3-rc.0', object: { type: 'commit', sha: 'd'.repeat(40) } };
   for (const tag of [
-    { ...validTag, message: 'v2.0.0' }, { ...validTag, message: 'v1.2.2-rc.0' },
+    { ...validTag, message: 'v2.0.0-rc.0' }, { ...validTag, message: 'v1.2.2' },
+    { ...validTag, message: 'v1.2.3-beta.0' },
     { ...validTag, message: 'main' },
     { ...validTag, object: { ...validTag.object, type: 'tag' } },
     { ...validTag, object: { ...validTag.object, sha: 'not-a-commit-sha' } },
@@ -218,7 +223,7 @@ test('release helper rejects lightweight aliases, incompatible versions, and non
       getRef: async () => ({ data: { object: { type: 'tag', sha: 'c'.repeat(40) } } }),
       getTag: async () => ({ data: tag }),
     } } };
-    await assert.rejects(recordReviewerRelease({ github, core }), /invalid stable release metadata/);
+    await assert.rejects(recordReviewerRelease({ github, core }), /invalid release-candidate metadata/);
   }
 });
 

@@ -58,9 +58,16 @@ export class Transport {
         requestId = response.headers.get('x-request-id') ?? '';
         requireValue(response.status < 300 || response.status >= 400, 'redirect_forbidden');
         const raw = await this.body(response);
-        const data = object(parse(raw));
-        await this.logger.log('DEBUG', 'worker.http_exchange', { ...correlation, request_id: requestId, endpoint: this.endpoint, route, method, attempt, duration_ms: this.sys.now() - started, http_status: response.status, input: input === undefined ? null : parse(input), output: data });
-        if (!response.ok) throw new Failure(response.status === 401 ? 'worker_unauthorized' : 'broker_rejected', { ...correlation, request_id: requestId, http_status: response.status, reason: typeof data.error === 'string' ? data.error : 'invalid_error_response' }, response.status === 429 || response.status >= 500);
+        let data: ObjectValue = {};
+        let responseValidation = '';
+        try { data = object(parse(raw)); }
+        catch (error) {
+          if (response.ok || !(error instanceof Failure)) throw error;
+          responseValidation = error.code;
+        }
+        const validation = responseValidation ? { response_validation_cause: responseValidation } : {};
+        await this.logger.log('DEBUG', 'worker.http_exchange', { ...correlation, ...validation, request_id: requestId, endpoint: this.endpoint, route, method, attempt, duration_ms: this.sys.now() - started, http_status: response.status, input: input === undefined ? null : parse(input), output: responseValidation ? raw : data });
+        if (!response.ok) throw new Failure(response.status === 401 ? 'worker_unauthorized' : 'broker_rejected', { ...correlation, ...validation, request_id: requestId, http_status: response.status, reason: typeof data.error === 'string' ? data.error : 'invalid_error_response' }, response.status === 429 || response.status >= 500);
         return { data, requestId, status: response.status };
       } catch (error) {
         const failure = error instanceof Failure ? error : new Failure('broker_unreachable', { cause: cause(error), request_id: requestId }, !/CERT|TLS|SSL/.test(cause(error)));
