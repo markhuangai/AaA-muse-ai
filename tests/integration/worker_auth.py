@@ -233,6 +233,28 @@ class WorkerAuth(Harness):
             require('"level":"DEBUG"' not in logs, "DEBUG reached INFO stdout")
         self.receipt("workers.durable_revocation_reconnect_and_diagnosis", service_restart=True, database_restart=True, credential_lifetime="until_revoked", corrective_action="restore PostgreSQL availability")
 
+    def overlapping_secret_diagnosis(self):
+        config = self.configuration()
+        config["control-portal"]["password"] = "muse"
+        container, self.origin_url, _ = self.launch(config=config)
+        self.ready(container, self.origin_url)
+        status, headers, body = self.api("/api/v1/admin/enrollments", self.admin, "POST")
+        require(status == 201, "overlapping-secret enrollment issuance failed")
+        registration = json.loads(body)
+        self.secrets.append(registration["enrollment_code"])
+        _, events = self.diagnose(headers["X-Request-Id"], "enrollment.issued")
+        exchange = next(e for e in events if e["msg"] == "request.exchange")
+        require(json.loads(exchange["response"])["enrollment_code"] == "[REDACTED]", "overlapping configured secret left a recoverable enrollment code")
+        status, headers, _ = self.enroll(registration)
+        require(status == 201, "overlapping-secret worker issuance failed")
+        _, events = self.diagnose(headers["X-Request-Id"], "worker.enrolled")
+        exchange = next(e for e in events if e["msg"] == "request.exchange")
+        require(json.loads(exchange["response"])["credential"] == "[REDACTED]", "overlapping configured secret left a recoverable reconnect credential")
+        logs = self.logs(container)
+        self.assert_private(logs)
+        require('"level":"DEBUG"' not in logs, "DEBUG reached INFO stdout")
+        self.receipt("workers.overlapping_secret_diagnosis", enrollment_code_fully_redacted=True, reconnect_credential_fully_redacted=True, export_complete=True)
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -254,6 +276,7 @@ def main():
         a, b = h.functional_workers(winner)
         h.names_and_boundaries(a, b)
         h.restart_and_revoke([first, second], a, b)
+        h.overlapping_secret_diagnosis()
         h.private("results.json", json.dumps({"suite": args.suite, "source_sha": args.source_sha, "receipts": h.receipts}))
     finally:
         h.cleanup()

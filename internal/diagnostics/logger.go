@@ -36,12 +36,40 @@ func NewRedactor(secrets []string) *Redactor {
 	return &Redactor{secrets: values}
 }
 func (r *Redactor) text(value string) string {
+	spans := workerSecrets.FindAllStringIndex(value, -1)
 	for _, secret := range r.secrets {
-		if secret != "" {
-			value = strings.ReplaceAll(value, secret, "[REDACTED]")
+		if secret == "" {
+			continue
+		}
+		for offset := 0; offset < len(value); {
+			index := strings.Index(value[offset:], secret)
+			if index < 0 {
+				break
+			}
+			start := offset + index
+			spans = append(spans, []int{start, start + len(secret)})
+			offset = start + 1
 		}
 	}
-	return RedactWorkerSecrets(value)
+	if len(spans) == 0 {
+		return value
+	}
+	sort.Slice(spans, func(i, j int) bool { return spans[i][0] < spans[j][0] })
+	var out strings.Builder
+	offset := 0
+	for i := 0; i < len(spans); {
+		start, end := spans[i][0], spans[i][1]
+		i++
+		for i < len(spans) && spans[i][0] <= end {
+			end = max(end, spans[i][1])
+			i++
+		}
+		out.WriteString(value[offset:start])
+		out.WriteString("[REDACTED]")
+		offset = end
+	}
+	out.WriteString(value[offset:])
+	return out.String()
 }
 func (r *Redactor) value(key string, value any) any {
 	lower := strings.ToLower(key)
