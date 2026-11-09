@@ -1,6 +1,6 @@
 import { State } from './state.js';
 import { Logger } from './diagnostics.js';
-import { Transport, origin, type Network } from './transport.js';
+import { Transport, origin, validateBody, type Network } from './transport.js';
 import { cause, Failure, requireValue } from './errors.js';
 import { decision, encode, identifier, integer, object, parse, text, type ObjectValue, type Value } from './json.js';
 import { correlation, job, version } from './protocol.js';
@@ -108,7 +108,9 @@ export class Worker {
         }
       }
       const id = this.state.sys.uuid();
-      const value = { kind, submission_id: id, state: 'pending', body: encode(build(id)), decision_input: decisionInput, origin: this.config.origin, worker_id: this.config.worker_id, ...correlation(j), started_at: new Date(this.state.sys.now()).toISOString() };
+      const body = encode(build(id));
+      validateBody(body);
+      const value = { kind, submission_id: id, state: 'pending', body, decision_input: decisionInput, origin: this.config.origin, worker_id: this.config.worker_id, ...correlation(j), started_at: new Date(this.state.sys.now()).toISOString() };
       await journals.write(`operation-${id}.json`, encode(value));
       await journals.write(pointer, encode({ submission_id: id }));
       return value;
@@ -159,7 +161,7 @@ export class Worker {
       await this.identity(transport);
       current = await this.getJob(transport, id);
       try {
-        requireValue(Buffer.byteLength(input) <= 1024 * 1024, 'body_too_large');
+        validateBody(input);
         await this.logger.log('DEBUG', 'worker.decision_input', { ...correlation(current), input: parse(input), input_complete: true });
       } catch (error) {
         if (error instanceof Failure && error.code === 'diagnostics_unavailable') throw error;

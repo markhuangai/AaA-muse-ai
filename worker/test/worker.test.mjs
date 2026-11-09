@@ -103,6 +103,33 @@ test('rejected decisions can be corrected; invalid, foreign and stale results ca
   await assert.rejects(fresh.claim(transport, JOB, { connection_id: CONN, connection_generation: 2 }), /recovered_claim_not_current/).catch(error => { throw error; });
 });
 
+test('oversized complete decisions leave no journal and allow a shorter correction', async t => {
+  const f = await fixture(t); const transport = await enrolled(f);
+  await f.worker.claim(transport, JOB, { connection_id: CONN, connection_generation: 1 });
+  const journals = await f.state.child('journals');
+  const before = await journals.list();
+  const limit = 1024 * 1024;
+  const overhead = Buffer.byteLength(encode({ type: 'final', text: '' }));
+  const input = encode({ type: 'final', text: 'x'.repeat(limit - overhead - 4) });
+  assert.equal(Buffer.byteLength(input), 1_048_572);
+  await assert.rejects(f.worker.submit(JOB, input), error => {
+    assert.equal(error.code, 'body_too_large');
+    assert.equal(error.fields.max_bytes, limit);
+    assert(error.fields.observed_bytes > limit);
+    return true;
+  });
+  assert.deepEqual(await journals.list(), before);
+  assert.equal(f.broker.calls.filter(c => c.path.endsWith('/decisions')).length, 0);
+  assert.equal(f.broker.jobs.get(JOB).state, 'claimed');
+  const result = await f.worker.submit(JOB, '{"type":"final","text":"corrected"}');
+  assert.equal(result.experiment.state, 'completed');
+  assert.equal(f.broker.calls.filter(c => c.path.endsWith('/decisions')).length, 1);
+  const events = (await f.logger.capture.export({ operation_id: f.broker.jobs.get(JOB).experiment_id }, true)).trimEnd().split('\n').map(JSON.parse);
+  assert.equal(events[0].complete, true);
+  assert(events.some(e => e.msg === 'worker.decision_rejected' && e.cause === 'body_too_large' && e.observed_bytes > e.max_bytes));
+  assert(events.some(e => e.msg === 'worker.operation_accepted' && e.submission_id === result.submission_id));
+});
+
 test('explicit idle acknowledgement is bound to stopped assignment and stays queued until broker confirmation', async t => {
   const f = await fixture(t); await enrolled(f);
   f.broker.jobs.set(JOB, claimed());

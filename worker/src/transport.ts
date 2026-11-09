@@ -21,6 +21,11 @@ export function origin(input: string): string {
   requireValue(url.protocol === 'https:' && !url.username && !url.password && url.pathname === '/' && !url.search && !url.hash, 'https_origin_required');
   return url.origin;
 }
+export function validateBody(input?: string): void {
+  const limit = 1024 * 1024;
+  const bytes = input === undefined ? 0 : Buffer.byteLength(input);
+  requireValue(bytes <= limit, 'body_too_large', { max_bytes: limit, observed_bytes: bytes });
+}
 
 export class Transport {
   constructor(readonly endpoint: string, readonly credential: string, readonly logger: Logger, readonly sys: System, readonly net: Network = network) { origin(endpoint); }
@@ -42,7 +47,7 @@ export class Transport {
   }
   async request(route: string, method = 'GET', input?: string, correlation: Record<string, Value> = {}, attempts = 3): Promise<Reply> {
     requireValue(/^\/api\/v1\/worker\/[a-z0-9/_-]+$/.test(route), 'invalid_worker_route');
-    requireValue(input === undefined || Buffer.byteLength(input) <= 1024 * 1024, 'body_too_large');
+    validateBody(input);
     for (let attempt = 1; ; attempt++) {
       const started = this.sys.now();
       const controller = new AbortController();
