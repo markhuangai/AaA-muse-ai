@@ -1,6 +1,7 @@
 package diagnostics
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -9,6 +10,7 @@ import (
 	"log/slog"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -95,8 +97,25 @@ func (r *Redactor) value(key string, value any) any {
 		return r.text(v)
 	case map[string]any:
 		out := map[string]any{}
+		var masked []string
 		for k, x := range v {
-			out[k] = r.value(k, x)
+			if r.text(k) == k {
+				out[k] = r.value(k, x)
+			} else {
+				masked = append(masked, k)
+			}
+		}
+		sort.Strings(masked)
+		for _, k := range masked {
+			base := r.text(k)
+			key := base
+			for suffix := 2; ; suffix++ {
+				if _, exists := out[key]; !exists {
+					break
+				}
+				key = base + "#" + strconv.Itoa(suffix)
+			}
+			out[key] = r.value(k, v[k])
 		}
 		return out
 	case []any:
@@ -116,13 +135,15 @@ func (r *Redactor) Replace(_ []string, a slog.Attr) slog.Attr {
 	value := a.Value.Resolve().Any()
 	b, err := json.Marshal(value)
 	if err != nil {
-		return slog.String(a.Key, "[UNENCODABLE]")
+		return slog.String(r.text(a.Key), "[UNENCODABLE]")
 	}
 	var plain any
-	if json.Unmarshal(b, &plain) != nil {
-		return slog.String(a.Key, "[UNENCODABLE]")
+	decoder := json.NewDecoder(bytes.NewReader(b))
+	decoder.UseNumber()
+	if decoder.Decode(&plain) != nil {
+		return slog.String(r.text(a.Key), "[UNENCODABLE]")
 	}
-	return slog.Any(a.Key, r.value(a.Key, plain))
+	return slog.Any(r.text(a.Key), r.value(a.Key, plain))
 }
 
 type handler struct {

@@ -215,15 +215,15 @@ class Harness:
             require(waiters >= 2, "two service bootstraps did not overlap at the real migration barrier")
         self.ready(first, origin)
         self.ready(second, second_origin)
-        require(self.sql("SELECT count(*) FROM aaa_schema_migrations;") == "2", "concurrent migration duplicated schema versions")
-        self.receipt("migration.concurrent_bootstrap", blocked_instances=waiters, schema_versions=2)
+        require(self.sql("SELECT count(*) FROM aaa_schema_migrations;") == "3", "concurrent migration duplicated schema versions")
+        self.receipt("migration.concurrent_bootstrap", blocked_instances=waiters, schema_versions=3)
         info = self.inspect(first)
         config_mount = next(mount for mount in info["Mounts"] if mount["Destination"] == "/etc/aaa-muse-ai/config.yaml")
         require(config_mount["RW"] is False, "configuration mount is writable")
         code, headers, body = self.request(origin, "/api/v1/admin/status", self.admin)
         require(code == 200 and not any(name.lower().startswith("access-control-") for name in headers), "status or proxy boundary failed")
         status = json.loads(body)
-        require(status["schema_version"] == 2 and status["ready"], "wrong status schema/readiness")
+        require(status["schema_version"] == 3 and status["ready"], "wrong status schema/readiness")
         require(status["build"]["revision"] == self.args.source_sha, "HTTP source identity mismatch")
         self.assert_private(body.decode())
         denied = None
@@ -270,30 +270,46 @@ class Harness:
             probes = [event for event in events if event["msg"] == "db.probe"]
             outcomes = [event for event in events if event["msg"] == "request.completed"]
             require(metadata["complete"] and len(changes) == 1 and changes[0]["ready"] is expected_ready and changes[0]["previous_ready"] is not expected_ready, "logs do not explain readiness transition")
-            require(changes[0]["schema_version"] == 2 and changes[0]["database_host"] == "db:5432" and bool(changes[0]["cause"]), "readiness evidence lacks expected state, target or cause")
+            require(changes[0]["schema_version"] == 3 and changes[0]["database_host"] == "db:5432" and bool(changes[0]["cause"]), "readiness evidence lacks expected state, target or cause")
             require(len(probes) == 1 and probes[0]["duration_ms"] >= 0 and len(outcomes) == 1 and outcomes[0]["status"] == expected_status, "readiness diagnosis lacks timing or final outcome")
             self.assert_private(json.dumps(events))
         self.receipt("readiness.log_only_diagnosis", degradation_request=down_headers["X-Request-Id"], recovery_request=recovery_id, corrective_action="restore PostgreSQL availability")
         require(self.sql("SELECT value FROM test_persistence;") == "retained", "database restart lost persisted state")
         self.assert_private(self.logs(first))
-        self.receipt("service.state_and_boundaries", schema_versions=2, database_recovery=True, readonly_config=True, http_ports=1)
+        self.receipt("service.state_and_boundaries", schema_versions=3, database_recovery=True, readonly_config=True, http_ports=1)
         return first, origin, volume
 
     def migration_upgrade(self):
-        self.sql("CREATE DATABASE aaa_muse_legacy;")
-        initial = Path("internal/postgres/migrations/001_initial.sql").read_bytes()
-        checksum = hashlib.sha256(initial).hexdigest()
-        fixture = initial.decode() + "INSERT INTO aaa_schema_migrations(version, checksum) VALUES (1, '" + checksum + "'); CREATE TABLE upgrade_marker(value TEXT); INSERT INTO upgrade_marker VALUES ('preserved');"
-        self.docker("exec", "-i", self.db, "psql", "-X", "-v", "ON_ERROR_STOP=1", "-U", "postgres", "-d", "aaa_muse_legacy", input_text=fixture)
-        config = self.configuration()
-        config["database"]["url"] = config["database"]["url"].replace("/aaa_muse?", "/aaa_muse_legacy?")
-        container, origin, _ = self.launch(config)
-        self.ready(container, origin)
-        _, _, body = self.request(origin, "/api/v1/admin/status", self.admin)
-        require(json.loads(body)["schema_version"] == 2, "v1 database did not upgrade")
-        state = self.docker("exec", self.db, "psql", "-X", "-U", "postgres", "-d", "aaa_muse_legacy", "-Atc", "SELECT value FROM upgrade_marker; SELECT checksum FROM aaa_schema_migrations WHERE version=1; SELECT count(*) FROM aaa_schema_migrations;").stdout.splitlines()
-        require(state == ["preserved", checksum, "2"], "upgrade changed old data/checksum or duplicated migrations")
-        self.receipt("migration.v1_upgrade", preserved_v1_checksum=checksum, schema_version=2)
+        for old_version in (1, 2):
+            database = "aaa_muse_legacy_" + str(old_version)
+            self.sql("CREATE DATABASE " + database + ";")
+            scripts = [Path("internal/postgres/migrations/001_initial.sql"), Path("internal/postgres/migrations/002_worker_identities.sql")]
+            checksums = [hashlib.sha256(path.read_bytes()).hexdigest() for path in scripts]
+            fixture = ""
+            for i in range(old_version):
+                fixture += scripts[i].read_text() + "INSERT INTO aaa_schema_migrations(version, checksum) VALUES (" + str(i + 1) + ", '" + checksums[i] + "');"
+            fixture += "CREATE TABLE upgrade_marker(value TEXT); INSERT INTO upgrade_marker VALUES ('preserved');"
+            worker_id, revoked_id = secrets.token_hex(16), secrets.token_hex(16)
+            credential, revoked_key = "muse_worker_" + secrets.token_urlsafe(32), "muse_worker_" + secrets.token_urlsafe(32)
+            credential_hash = hashlib.sha256(credential.encode()).hexdigest()
+            if old_version == 2:
+                fixture += "INSERT INTO aaa_workers(id,name,credential_hash,registered_at,revoked_at) VALUES ('" + worker_id + "','preserved worker',decode('" + credential_hash + "','hex'),CURRENT_TIMESTAMP,NULL),('" + revoked_id + "','revoked worker',decode('" + hashlib.sha256(revoked_key.encode()).hexdigest() + "','hex'),CURRENT_TIMESTAMP,CURRENT_TIMESTAMP);"
+            self.docker("exec", "-i", self.db, "psql", "-X", "-v", "ON_ERROR_STOP=1", "-U", "postgres", "-d", database, input_text=fixture)
+            config = self.configuration()
+            config["database"]["url"] = config["database"]["url"].replace("/aaa_muse?", "/" + database + "?")
+            container, origin, _ = self.launch(config)
+            self.ready(container, origin)
+            _, _, body = self.request(origin, "/api/v1/admin/status", self.admin)
+            require(json.loads(body)["schema_version"] == 3, "legacy database did not upgrade")
+            state = self.docker("exec", self.db, "psql", "-X", "-U", "postgres", "-d", database, "-Atc", "SELECT value FROM upgrade_marker; SELECT checksum FROM aaa_schema_migrations WHERE version=1; SELECT count(*) FROM aaa_schema_migrations;").stdout.splitlines()
+            require(state == ["preserved", checksums[0], "3"], "upgrade changed old data/checksum or duplicated migrations")
+            if old_version == 2:
+                status, _, body = self.request(origin, "/api/v1/worker/status", credential)
+                require(status == 200 and json.loads(body)["id"] == worker_id, "v2 scoped identity lost during upgrade")
+                require(self.request(origin, "/api/v1/worker/status", revoked_key)[0] == 401, "upgrade restored revoked authority")
+                retained = self.docker("exec", self.db, "psql", "-X", "-U", "postgres", "-d", database, "-Atc", "SELECT checksum FROM aaa_schema_migrations WHERE version=2; SELECT encode(credential_hash,'hex') FROM aaa_workers WHERE id='" + worker_id + "';").stdout.splitlines()
+                require(retained == [checksums[1], credential_hash], "v2 checksum or worker credential changed")
+            self.receipt("migration.v" + str(old_version) + "_upgrade", preserved_checksum=checksums[old_version - 1], schema_version=3)
 
     def generated_key(self):
         container, origin, _ = self.launch(self.configuration(generated=True))
@@ -408,9 +424,9 @@ class Harness:
         result, _ = self.startup_failure("migration.checksum_rejected", expected="db.migration_failed")
         require(result["cause"] == "migration_checksum_mismatch" and len(result["expected"]) == 64 and result["observed"] == "deliberately-invalid-test-checksum", "migration diagnosis lacks expected/observed checksum")
         checksum = hashlib.sha256(Path("internal/postgres/migrations/002_worker_identities.sql").read_bytes()).hexdigest()
-        self.sql("UPDATE aaa_schema_migrations SET checksum='" + checksum + "', version=3 WHERE version=2;")
+        self.sql("UPDATE aaa_schema_migrations SET checksum='" + checksum + "' WHERE version=2; UPDATE aaa_schema_migrations SET version=4 WHERE version=3;")
         result, _ = self.startup_failure("migration.newer_schema_rejected", expected="db.migration_failed")
-        require(result["cause"] == "schema_version_incompatible" and result["expected"] == "2" and result["observed"] == "3" and result["attempt"] == 1, "migration version diagnosis is incomplete or retried")
+        require(result["cause"] == "schema_version_incompatible" and result["expected"] == "3" and result["observed"] == "4" and result["attempt"] == 1, "migration version diagnosis is incomplete or retried")
         require(self.sql("SELECT value FROM test_persistence;") == "retained", "rejected migration removed existing data")
 
     def capture_failure_stops(self, container, origin):

@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/markhuangai/AaA-muse-ai/internal/inference"
 	"github.com/markhuangai/AaA-muse-ai/internal/worker"
 )
 
@@ -43,6 +44,11 @@ func (r *Repository) workerTransaction(ctx context.Context, action func(pgx.Tx) 
 		var rejected *worker.Rejection
 		if errors.As(err, &rejected) && outcome == "rolled_back" {
 			rejected.Outcome = outcome
+			return
+		}
+		var inferenceRejected *inference.Rejection
+		if errors.As(err, &inferenceRejected) && outcome == "rolled_back" {
+			inferenceRejected.Fields["transaction_outcome"] = outcome
 			return
 		}
 		if rollback != nil && !errors.Is(rollback, pgx.ErrTxClosed) {

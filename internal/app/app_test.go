@@ -25,13 +25,15 @@ import (
 
 type fakeRepository struct {
 	service.WorkerRepository
+	service.InferenceRepository
 	bootErr error
 	closed  atomic.Bool
 }
 
-func (r *fakeRepository) Bootstrap(context.Context) error { return r.bootErr }
-func (r *fakeRepository) Ping(context.Context) error      { return nil }
-func (r *fakeRepository) Close()                          { r.closed.Store(true) }
+func (r *fakeRepository) Bootstrap(context.Context) error                    { return r.bootErr }
+func (r *fakeRepository) Ping(context.Context) error                         { return nil }
+func (r *fakeRepository) Close()                                             { r.closed.Store(true) }
+func (r *fakeRepository) InferenceWorkers(context.Context) ([]string, error) { return nil, nil }
 
 func fixtureDependencies(t *testing.T, generated bool) (Dependencies, *bytes.Buffer, *bytes.Buffer, *fakeRepository) {
 	t.Helper()
@@ -203,7 +205,7 @@ func TestConnectRetriesAndDiagnosis(t *testing.T) {
 				attempts++
 				switch name {
 				case "migration":
-					return &fakeRepository{bootErr: &postgres.Failure{Reason: "schema_version_incompatible", Expected: "2", Observed: "3"}}, nil
+					return &fakeRepository{bootErr: &postgres.Failure{Reason: "schema_version_incompatible", Expected: "3", Observed: "4"}}, nil
 				case "checksum":
 					return &fakeRepository{bootErr: &postgres.Failure{Reason: "migration_checksum_mismatch"}}, nil
 				case "open-failed":

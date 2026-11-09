@@ -25,6 +25,7 @@ type Exporter interface {
 type Handler struct {
 	Service   *service.Service
 	Workers   *service.Workers
+	Broker    *service.Broker
 	Authority *auth.Authority
 	Exporter  Exporter
 	Logger    *slog.Logger
@@ -38,6 +39,7 @@ type response struct {
 	code                   int
 	body                   bytes.Buffer
 	capture                bool
+	stream                 bool
 	attempted, written     int
 	writeErr               error
 	workerID, enrollmentID string
@@ -87,7 +89,14 @@ func (h *Handler) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 			outcome, detail = "interrupted", w.writeErr.Error()
 			logger.Warn("request.write_failed", "cause", "client_write_failed", "attempted_bytes", w.attempted, "written_bytes", w.written)
 		}
-		logger.Debug("request.exchange", "method", r.Method, "role", role, "status", w.code, "response", w.body.String(), "response_capture", map[bool]string{true: "full_attempted", false: "retained_snapshot_reference"}[w.capture], "outcome", outcome, "write_error", detail, "attempted_bytes", w.attempted, "written_bytes", w.written)
+		captureKind := "full_attempted"
+		if !w.capture {
+			captureKind = "retained_snapshot_reference"
+		}
+		if w.stream {
+			captureKind = "per_event"
+		}
+		logger.Debug("request.exchange", "method", r.Method, "role", role, "status", w.code, "response", w.body.String(), "response_capture", captureKind, "outcome", outcome, "write_error", detail, "attempted_bytes", w.attempted, "written_bytes", w.written)
 		logger.Info("request.completed", "method", r.Method, "role", role, "status", w.code, "outcome", outcome, "duration_ms", h.Now().Sub(started).Milliseconds())
 	}()
 	if route == "unmatched" {
@@ -97,7 +106,7 @@ func (h *Handler) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 	expectedRole := ""
 	if strings.HasPrefix(route, "/api/v1/admin/") {
 		expectedRole = "management"
-	} else if route == "/api/v1/worker/status" {
+	} else if strings.HasPrefix(route, "/api/v1/worker/") && route != "/api/v1/worker/enroll" {
 		expectedRole = "worker"
 	}
 	var identity workerView
@@ -114,10 +123,10 @@ func (h *Handler) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 		}
 		if role != expectedRole {
 			event := "auth.denied"
-			if route == "/api/v1/worker/status" || route == "/api/v1/admin/enrollments" || strings.HasPrefix(route, "/api/v1/admin/workers") {
+			if strings.HasPrefix(route, "/api/v1/worker/") || route == "/api/v1/admin/enrollments" || strings.HasPrefix(route, "/api/v1/admin/workers") {
 				event = "worker.auth_denied"
 			}
-			if role == "worker" && requestedWorker != "" && requestedWorker != identity.ID {
+			if role == "worker" && strings.HasPrefix(route, "/api/v1/admin/workers/") && requestedWorker != "" && requestedWorker != identity.ID {
 				event = "worker.scope_denied"
 			}
 			logger.Warn(event, "expected_role", expectedRole, "observed_role", role, "authenticated_worker_id", identity.ID, "requested_worker_id", requestedWorker, "reason", "role_not_permitted")
@@ -174,7 +183,11 @@ func (h *Handler) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 	case "/api/v1/admin/diagnostics/export":
 		h.export(w, r, logger)
 	default:
-		h.workerRequest(w, r, logger, route, requestedWorker, identity, body)
+		if strings.Contains(route, "/experiments") || route == "/api/v1/worker/events" || route == "/api/v1/worker/heartbeat" || strings.HasPrefix(route, "/api/v1/worker/jobs/") {
+			h.inferenceRequest(w, r, logger, route, requestedWorker, identity, body)
+		} else {
+			h.workerRequest(w, r, logger, route, requestedWorker, identity, body)
+		}
 	}
 }
 

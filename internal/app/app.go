@@ -25,6 +25,7 @@ import (
 
 type Repository interface {
 	service.WorkerRepository
+	service.InferenceRepository
 	Bootstrap(context.Context) error
 	Ping(context.Context) error
 	Close()
@@ -35,6 +36,7 @@ type Dependencies struct {
 	Random         io.Reader
 	Now            func() time.Time
 	Sleep          func(context.Context, time.Duration) error
+	Wait           func(context.Context, time.Duration) error
 	Files          diagnostics.Files
 	OpenDB         func(context.Context, string) (Repository, error)
 	Listen         func(string, string) (net.Listener, error)
@@ -42,7 +44,7 @@ type Dependencies struct {
 }
 
 func Production(stdout, stderr io.Writer) Dependencies {
-	return Dependencies{ReadFile: os.ReadFile, LookupEnv: os.LookupEnv, Random: rand.Reader, Now: time.Now, Sleep: sleep, Files: diagnostics.OSFiles{}, OpenDB: func(ctx context.Context, u string) (Repository, error) {
+	return Dependencies{ReadFile: os.ReadFile, LookupEnv: os.LookupEnv, Random: rand.Reader, Now: time.Now, Sleep: sleep, Wait: sleep, Files: diagnostics.OSFiles{}, OpenDB: func(ctx context.Context, u string) (Repository, error) {
 		repo, err := postgres.Open(ctx, u)
 		if err != nil {
 			return nil, err
@@ -138,8 +140,13 @@ func Run(ctx context.Context, args []string, build service.Build, d Dependencies
 	}
 	svc := service.New(repo, c, build, instance, d.Now, logger)
 	authority := auth.New(c)
-	handler := &httpapi.Handler{Service: svc, Workers: service.NewWorkers(repo, authority, d.Random, d.Now), Authority: authority, Exporter: store, Logger: logger, Random: d.Random, Now: d.Now, Failed: failed}
-	server := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 * 1024, ErrorLog: slog.NewLogLogger(logger.Handler(), slog.LevelError)}
+	broker := service.NewBroker(repo, d.Random, d.Now, d.Wait, c.Limits.MaxJobs)
+	serveCtx, cancelServe := context.WithCancel(ctx)
+	defer cancelServe()
+	handler := &httpapi.Handler{Service: svc, Workers: service.NewWorkers(repo, authority, d.Random, d.Now), Broker: broker, Authority: authority, Exporter: store, Logger: logger, Random: d.Random, Now: d.Now, Failed: failed}
+	server := &http.Server{Handler: handler, BaseContext: func(net.Listener) context.Context { return serveCtx }, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 * 1024, ErrorLog: slog.NewLogLogger(logger.Handler(), slog.LevelError)}
+	brokerDone := make(chan struct{})
+	go func() { defer close(brokerDone); broker.Run(serveCtx, logger) }()
 	result := make(chan error, 1)
 	go func() { result <- server.Serve(listener) }()
 	startup.Info("server.started", "listen", c.Server.Listen, "schema_version", postgres.SchemaVersion)
@@ -154,11 +161,18 @@ func Run(ctx context.Context, args []string, build service.Build, d Dependencies
 			code = 1
 		}
 	}
+	cancelServe()
 	stop, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err = server.Shutdown(stop); err != nil {
 		_ = server.Close()
 		logger.Error("server.shutdown_failed", "cause", "shutdown_timeout")
+		code = 1
+	}
+	select {
+	case <-brokerDone:
+	case <-stop.Done():
+		logger.Error("inference.shutdown_failed", "cause", "shutdown_timeout")
 		code = 1
 	}
 	logger.Info("server.stopped", "exit_code", code)
