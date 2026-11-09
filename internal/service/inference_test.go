@@ -266,3 +266,46 @@ func TestCancellationBusyHoldAndConnectionFencing(t *testing.T) {
 		t.Fatal("old stream cleanup affected replacement connection or erased busy hold")
 	}
 }
+
+func TestQueuedContextDeliveryAcrossReconnect(t *testing.T) {
+	for _, kind := range []string{"delta", "full"} {
+		t.Run(kind, func(t *testing.T) {
+			b, m, log, _ := inferenceFixture()
+			ctx := context.Background()
+			c := connectInference(t, b, m, log, "worker-a")
+			e := createInference(t, b, log, "worker-a", "create", 0)
+			j := claimInference(t, b, log, c, e, "initial-claim")
+			_, err := b.Decide(ctx, log, "worker-a", j.ID, submission(j, c, "tool-call", inference.Item{Type: "tool_call", CallID: "call", Name: "read_file", Arguments: map[string]any{"path": "client-only"}}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			probe := &inference.Probe{Kind: kind}
+			if kind == "delta" {
+				probe.BaseReceiptID = j.ID
+			}
+			data, err := b.ToolResult(ctx, log, e.ID, inference.ToolResult{Version: 1, SubmissionID: "tool-result", CallID: "call", Output: "exact client result", ContextProbe: probe})
+			e = decodeResult[inference.Experiment](t, data, err)
+			data, err = b.Job(ctx, log, "worker-a", e.CurrentJobID)
+			queued := decodeResult[inference.Job](t, data, err)
+			if err = b.Disconnect(ctx, log, "worker-a", c.ID, c.Generation); err != nil {
+				t.Fatal(err)
+			}
+			replacement := connectInference(t, b, m, log, "worker-a")
+			data, err = b.Claim(ctx, log, "worker-a", queued.ID, inference.Claim{Version: 1, SubmissionID: "reconnected-claim", ConnectionID: replacement.ID, ConnectionGeneration: replacement.Generation})
+			if kind == "delta" {
+				requireInferenceReason(t, err, "context_base_connection_changed")
+				stored := m.states["worker-a"].Jobs[queued.ID]
+				before, _ := json.Marshal(queued)
+				after, _ := json.Marshal(stored)
+				if !bytes.Equal(before, after) || stored.Held || len(m.states["worker-a"].Experiments[e.ID].Messages) != 4 || m.receipts["worker:worker-a:reconnected-claim"] != nil {
+					t.Fatal("rejected delta claim mutated delivery, history, slot or receipts")
+				}
+			} else {
+				claimed := decodeResult[inference.Job](t, data, err)
+				if claimed.Context.Kind != "full" || len(claimed.Context.Messages) != 4 || claimed.ConnectionID != replacement.ID || claimed.Context.Messages[3].Output != "exact client result" {
+					t.Fatal("full context did not remain claimable after reconnect")
+				}
+			}
+		})
+	}
+}

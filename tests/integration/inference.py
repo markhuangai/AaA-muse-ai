@@ -359,6 +359,36 @@ class Inference(WorkerAuth):
         reconnect.stop()
         self.receipt("inference.disconnect_reconnect_revocation", busy_hold_preserved=True, stale_output_rejected=True)
 
+    def queued_context_reconnect(self):
+        worker = self.new_worker()
+        peer = self.peer(worker)
+        for kind in ("delta", "full"):
+            e = self.create(worker, "queued " + kind + " context across reconnect")
+            job, _, _ = self.claim(worker, peer, e)
+            call_id = "reconnect-" + kind
+            self.decision(worker, peer, job, {"type": "tool_call", "call_id": call_id, "name": "read_file", "arguments": {"path": "client-only"}})
+            probe = {"kind": kind}
+            if kind == "delta":
+                probe["base_receipt_id"] = job["id"]
+            continuation, _ = self.checked("/api/v1/admin/experiments/" + e["id"] + "/tool-results", self.admin, "POST", {"protocol_version": 1, "submission_id": secrets.token_hex(12), "call_id": call_id, "output": "exact reconnect result", "context_probe": probe}, want=202)
+            queued, _ = self.checked("/api/v1/worker/jobs/" + continuation["current_job_id"], worker["credential"])
+            old_generation = peer.opened["connection_generation"]
+            peer.stop()
+            peer = self.peer(worker)
+            require(peer.opened["connection_generation"] > old_generation, "reconnect reused generation")
+            claimed, headers, request = self.claim(worker, peer, continuation, want=409 if kind == "delta" else 200)
+            if kind == "delta":
+                event, _ = self.diagnose(headers["X-Request-Id"], "lease.rejected", "context_base_connection_changed")
+                require(event["evidence"]["expected_connection_generation"] == old_generation and event["evidence"]["observed_connection_generation"] == peer.opened["connection_generation"], "delta rejection lost base/current connection evidence")
+                stored, _ = self.checked("/api/v1/worker/jobs/" + queued["id"], worker["credential"])
+                require(stored == queued and self.status(worker)["work_status"] == "idle" and len(self.experiment(e["id"])["messages"]) == 4, "rejected delta claim mutated retained delivery/history or busy hold")
+                self.cancel(e["id"])
+            else:
+                require(claimed["context"]["kind"] == "full" and len(claimed["context"]["messages"]) == 4 and claimed["context"]["messages"][-1]["output"] == "exact reconnect result", "full continuation lost canonical context after reconnect")
+                self.decision(worker, peer, claimed, {"type": "final", "text": claimed["context"]["messages"][-1]["output"]})
+        peer.stop()
+        self.receipt("inference.queued_context_reconnect", delta_claim_status=409, full_claim_status=200, rejected_delivery_unchanged=True)
+
     def missing_health_and_bounds(self, worker):
         peer = self.peer(worker, reply=False)
         self.until(lambda: self.status(worker)["connection_status"] == "offline", "missing health replies did not mark offline", timeout=35)
@@ -474,6 +504,7 @@ def main():
         h.receipt("inference.accepted_receipt_after_expiry", original_job=retry_job["id"], history_items=5)
         peer = h.restart(a, peer, service)
         h.disconnect_and_revoke(a, peer)
+        h.queued_context_reconnect()
         h.revocation_races()
         h.missing_health_and_bounds(unresponsive)
         final_worker = h.new_worker()

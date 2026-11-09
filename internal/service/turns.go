@@ -47,6 +47,9 @@ func (b *Broker) newJob(s *inference.State, e *inference.Experiment, probe *infe
 		}
 	}
 	j := &inference.Job{Version: 1, ID: id, ExperimentID: e.ID, ConversationID: e.ConversationID, WorkerID: e.WorkerID, State: "queued", CreatedAt: s.Now, DeadlineAt: e.DeadlineAt, Context: d}
+	if d.Kind == "delta" {
+		j.ConnectionID, j.ConnectionGeneration = s.Connection.ID, s.Connection.Generation
+	}
 	s.Jobs[id] = j
 	e.State = "queued"
 	e.CurrentJobID = id
@@ -183,6 +186,9 @@ func (b *Broker) Claim(ctx context.Context, logger *slog.Logger, workerID, id st
 		}
 		if j.State != "queued" {
 			return nil, inference.Reject("job_not_queued", 409, "expected_state", "queued", "observed_state", j.State)
+		}
+		if j.Context.Kind == "delta" && (j.ConnectionID != s.Connection.ID || j.ConnectionGeneration != s.Connection.Generation) {
+			return nil, inference.Reject("context_base_connection_changed", 409, "base_receipt_id", j.Context.BaseReceiptID, "expected_connection_id", j.ConnectionID, "expected_connection_generation", j.ConnectionGeneration, "observed_connection_id", s.Connection.ID, "observed_connection_generation", s.Connection.Generation)
 		}
 		lease, err := auth.ID(b.random)
 		if err != nil {
