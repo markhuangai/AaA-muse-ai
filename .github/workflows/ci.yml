@@ -66,6 +66,8 @@ jobs:
         run: make test-service
       - name: Worker enrollment, revocation, and diagnosis
         run: make test-worker-auth
+      - name: Inference turns, SSE health, and client-tool continuation
+        run: make test-inference
 
   image:
     name: CI / image

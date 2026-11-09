@@ -12,6 +12,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/markhuangai/AaA-muse-ai/internal/diagnostics"
+	"github.com/markhuangai/AaA-muse-ai/internal/inference"
 	"github.com/markhuangai/AaA-muse-ai/internal/worker"
 )
 
@@ -33,7 +34,7 @@ func routeFor(path string) (string, string) {
 			}
 		}
 	}
-	return "unmatched", ""
+	return inferenceRoute(path)
 }
 
 func routeMethod(route string) string {
@@ -42,6 +43,8 @@ func routeMethod(route string) string {
 		return http.MethodPost
 	case "/api/v1/admin/workers/{id}":
 		return http.MethodPatch
+	case "/api/v1/admin/experiments", "/api/v1/admin/experiments/{id}/cancel", "/api/v1/admin/experiments/{id}/tool-results", "/api/v1/worker/heartbeat", "/api/v1/worker/jobs/{id}/claim", "/api/v1/worker/jobs/{id}/decisions":
+		return http.MethodPost
 	default:
 		return http.MethodGet
 	}
@@ -49,13 +52,23 @@ func routeMethod(route string) string {
 
 type workerView struct {
 	worker.Record
-	ConnectionStatus   string `json:"connection_status"`
+	inference.Projection
 	InferenceReadiness string `json:"inference_readiness"`
 }
 
 func viewWorker(w worker.Record) workerView {
 	w.Name = diagnostics.RedactWorkerSecrets(w.Name)
-	return workerView{Record: w, ConnectionStatus: "not_observed", InferenceReadiness: "unverified"}
+	return workerView{Record: w, Projection: inference.Projection{ConnectionStatus: "not_observed", WorkStatus: "unknown"}, InferenceReadiness: "unverified"}
+}
+
+func (h *Handler) projectedWorker(r *http.Request, logger *slog.Logger, record worker.Record, own bool) (workerView, error) {
+	v := viewWorker(record)
+	if h.Broker == nil {
+		return v, nil
+	}
+	p, err := h.Broker.Projection(r.Context(), logger, record.ID, own)
+	v.Projection = p
+	return v, err
 }
 
 func workerError(w http.ResponseWriter, err error) {
@@ -170,11 +183,21 @@ func (h *Handler) workerRequest(w *response, r *http.Request, logger *slog.Logge
 		}
 		workers := make([]workerView, 0, len(records))
 		for _, record := range records {
-			workers = append(workers, viewWorker(record))
+			v, err := h.projectedWorker(r, logger, record, false)
+			if err != nil {
+				inferenceError(w, err)
+				return
+			}
+			workers = append(workers, v)
 		}
 		writeJSON(w, 200, map[string]any{"workers": workers})
 	case "/api/v1/worker/status":
-		writeJSON(w, 200, identity)
+		v, err := h.projectedWorker(r, logger, identity.Record, true)
+		if err != nil {
+			inferenceError(w, err)
+			return
+		}
+		writeJSON(w, 200, v)
 	case "/api/v1/admin/workers/{id}":
 		record, err := h.Workers.Rename(r.Context(), logger, id, input[field].(string))
 		w.workerID = id
@@ -182,7 +205,12 @@ func (h *Handler) workerRequest(w *response, r *http.Request, logger *slog.Logge
 			workerError(w, err)
 			return
 		}
-		writeJSON(w, 200, viewWorker(record))
+		v, err := h.projectedWorker(r, logger, record, false)
+		if err != nil {
+			inferenceError(w, err)
+			return
+		}
+		writeJSON(w, 200, v)
 	case "/api/v1/admin/workers/{id}/revoke":
 		record, err := h.Workers.Revoke(r.Context(), logger, id)
 		w.workerID = id
@@ -190,6 +218,11 @@ func (h *Handler) workerRequest(w *response, r *http.Request, logger *slog.Logge
 			workerError(w, err)
 			return
 		}
-		writeJSON(w, 200, viewWorker(record))
+		v, err := h.projectedWorker(r, logger, record, false)
+		if err != nil {
+			inferenceError(w, err)
+			return
+		}
+		writeJSON(w, 200, v)
 	}
 }

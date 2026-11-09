@@ -3,6 +3,7 @@ package diagnostics
 import (
 	"bytes"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"log/slog"
 	"strings"
@@ -107,5 +108,66 @@ func TestOverlappingSecretsAreFullyRedacted(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestProtectedLoggerPreservesJSONNumbers(t *testing.T) {
+	s, now := openFixture(t, 128*1024*1024)
+	var stdout bytes.Buffer
+	logger := NewLogger(&stdout, s, slog.LevelInfo, NewRedactor([]string{"private-number-sentinel"}), func() time.Time { return *now }, func(error) { t.Fatal("capture failed") }).With("request_id", "numeric-context")
+	logger.Debug("inference.context", "arguments", map[string]any{"n": json.Number("9007199254740993"), "scale": json.Number("1e+20"), "credential": "private-number-sentinel"})
+	snapshot, err := s.Snapshot(Filter{RequestID: "numeric-context"})
+	if err != nil || !snapshot.Metadata.Complete {
+		t.Fatal("capture missing")
+	}
+	var raw bytes.Buffer
+	for _, file := range snapshot.Records {
+		for _, line := range bytes.Split(bytes.TrimSpace(file), []byte("\n")) {
+			var record Record
+			if json.Unmarshal(line, &record) != nil {
+				t.Fatal("bad chunk")
+			}
+			b, err := base64.StdEncoding.DecodeString(record.Data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			raw.Write(b)
+		}
+	}
+	if !bytes.Contains(raw.Bytes(), []byte("9007199254740993")) || !bytes.Contains(raw.Bytes(), []byte("1e+20")) || bytes.Contains(raw.Bytes(), []byte("private-number-sentinel")) || stdout.Len() != 0 {
+		t.Fatal("diagnostic capture rounded numbers, exposed authority, or bypassed INFO filtering")
+	}
+}
+
+func TestProtectedExportRedactsObjectKeysWithoutLosingEvidence(t *testing.T) {
+	s, now := openFixture(t, 128*1024*1024)
+	token, err := auth.Token(auth.WorkerPrefix, rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configured := "private-admin-sentinel"
+	var stdout bytes.Buffer
+	logger := NewLogger(&stdout, s, slog.LevelInfo, NewRedactor([]string{configured}), func() time.Time { return *now }, func(error) { t.Fatal("capture failed") }).With("operation_id", "key-redaction")
+	logger.Debug("request.inference_input", "input", map[string]any{token: "unsupported-field", configured: "another-field", "[REDACTED]": "literal-field", "[REDACTED]#2": "another-literal-field"})
+	logger.Debug("inference.exchange", "tools", []any{map[string]any{"parameters": map[string]any{"properties": map[string]any{token: map[string]any{"type": "string"}, configured: map[string]any{"type": "number"}}}}}, "arguments", map[string]any{token: "client-evidence", configured: json.Number("9007199254740993")})
+	logger.Info("key.fixture", token, "attribute-evidence")
+	snapshot, err := s.Snapshot(Filter{OperationID: "key-redaction"})
+	if err != nil || !snapshot.Metadata.Complete || snapshot.Metadata.Captures != 3 {
+		t.Fatal("key-redaction export incomplete")
+	}
+	events := payloads(t, snapshot)
+	encoded, _ := json.Marshal(events)
+	for _, secret := range []string{token, configured} {
+		if bytes.Contains(encoded, []byte(secret)) || strings.Contains(stdout.String(), secret) {
+			t.Fatal("object or attribute key exposed authority")
+		}
+	}
+	input := events[0]["input"].(map[string]any)
+	if len(input) != 4 || input["[REDACTED]"] != "literal-field" || input["[REDACTED]#2"] != "another-literal-field" || input["[REDACTED]#3"] == input["[REDACTED]#4"] {
+		t.Fatal("masked keys overwrote nonsecret evidence")
+	}
+	properties := events[1]["tools"].([]any)[0].(map[string]any)["parameters"].(map[string]any)["properties"].(map[string]any)
+	if len(properties) != 2 || len(events[1]["arguments"].(map[string]any)) != 2 || events[2]["[REDACTED]"] != "attribute-evidence" {
+		t.Fatal("nested schema/argument or attribute evidence lost")
 	}
 }
