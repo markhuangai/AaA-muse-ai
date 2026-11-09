@@ -80,3 +80,57 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - name: Packaged startup and diagnostic failures
         run: make smoke-image
+
+  worker:
+    name: CI / worker
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24.22.2
+      - name: Verify exact source
+        env:
+          SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+      - name: Install locked worker development dependencies
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Check worker types
+        run: npm run check --workspace worker
+      - name: Worker unit statement coverage
+        run: npm test --workspace worker
+      - name: Packed CLI with real HTTPS, SSE and PostgreSQL
+        run: make test-worker-transport
+
+  worker-package:
+    name: CI / worker-package
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24.22.2
+      - name: Verify exact source
+        env:
+          SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+      - name: Install locked build dependencies
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Build and verify Node 24 archive
+        run: make worker-package
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22.12.0
+      - name: Verify the same compiled package on the minimum runtime
+        run: npm run test:package --workspace worker
+      - name: Exercise production worker logic on the minimum runtime
+        working-directory: worker
+        run: node --test test/*.test.mjs

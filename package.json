@@ -1,0 +1,6 @@
+{
+  "name": "aaa-muse-ai",
+  "private": true,
+  "workspaces": ["worker"],
+  "engines": { "node": ">=22.12.0" }
+}
