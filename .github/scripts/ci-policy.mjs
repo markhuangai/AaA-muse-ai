@@ -18,8 +18,9 @@ export function checkWorkflow(source, filename = 'workflow') {
     if (!job || typeof job !== 'object') return [`${prefix}: invalid job`];
     if (!standardRunners.has(job['runs-on'])) errors.push(`${prefix}: runs-on must be a literal standard hosted Ubuntu runner`);
     const timeout = job['timeout-minutes'];
-    if (!Number.isInteger(timeout) || timeout < 1 || timeout > 30) {
-      errors.push(`${prefix}: timeout-minutes must be a literal integer from 1 through 30`);
+    const maximum = filename === 'ai-pr-review.yml' && name === 'review' ? 45 : 30;
+    if (!Number.isInteger(timeout) || timeout < 1 || timeout > maximum) {
+      errors.push(`${prefix}: timeout-minutes must be a literal integer from 1 through ${maximum}`);
     }
     return errors;
   });

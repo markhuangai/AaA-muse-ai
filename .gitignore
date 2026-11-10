@@ -3,3 +3,4 @@ node_modules/
 .artifacts/
 config.yaml
 .env
+worker/dist/

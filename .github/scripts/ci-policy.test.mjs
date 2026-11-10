@@ -43,6 +43,20 @@ test('every job needs its own literal integer timeout from one through thirty mi
   assert.match(checkWorkflow(workflow() + '\n  forgotten:\n    runs-on: ubuntu-latest\n')[0], /jobs.forgotten/);
 });
 
+test('only the approved AI review job has a forty-five-minute budget with cleanup headroom', () => {
+  const review = budget => workflow('ubuntu-latest', budget).replace('  check:', '  review:');
+  assert.deepEqual(checkWorkflow(review('45'), 'ai-pr-review.yml'), []);
+  assert.match(checkWorkflow(review('46'), 'ai-pr-review.yml')[0], /1 through 45/);
+  assert.match(checkWorkflow(review('45'), 'other.yml')[0], /1 through 30/);
+  assert.match(checkWorkflow(workflow('ubuntu-latest', '45'), 'ai-pr-review.yml')[0], /1 through 30/);
+  for (const budget of ['0', '"45"', '44.5', '${{ matrix.timeout }}']) {
+    assert.match(checkWorkflow(review(budget), 'ai-pr-review.yml')[0], /timeout-minutes/);
+  }
+  const config = parse(readFileSync(new URL('../workflows/ai-pr-review.yml', import.meta.url), 'utf8'));
+  assert.equal(config.jobs.review['timeout-minutes'], 45);
+  assert.equal(config.jobs.review.steps.find(step => step.id === 'reviewer')['timeout-minutes'], 40);
+});
+
 test('invalid YAML, duplicate keys, absent jobs, and unbounded reusable jobs fail closed', () => {
   for (const source of ['jobs: [', 'name: empty', 'jobs: []', 'jobs: {}', 'jobs:\n  job: null']) {
     assert.ok(checkWorkflow(source).length > 0);
