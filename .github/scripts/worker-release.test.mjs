@@ -80,7 +80,7 @@ test('publication rejects dirty source, conflicting tags, registry content, and 
     f => { f.state.registry = { name: f.receipt.package, version: f.receipt.version, dist: { tarball: 'https://npm.pkg.github.com/archive' } }; f.state.registryBytes = Buffer.from('wrong'); }]) {
     const f = fixture(); const prepared = await prepareRelease(f); change(f);
     await assert.rejects(publishRelease({ ...f, prepared, archive: f.state.archive, token: 'fixture-token' }));
-    assert.equal(f.state.uploads, 0); assert(!f.state.requests.some(r => r.url.startsWith('https://foreign.test')));
+    assert.equal(f.state.uploads, 0); assert(!f.state.requests.some(r => new URL(r.url).hostname === 'foreign.test'));
   }
   const f = fixture(); const prepared = await prepareRelease(f);
   await assert.rejects(publishRelease({ ...f, prepared, archive: f.state.archive, token: 'fixture-token', fetcher: async () => new Response('{}', { status: 403 }) }), /registry_metadata_failed/);
