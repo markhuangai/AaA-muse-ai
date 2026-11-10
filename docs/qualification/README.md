@@ -69,6 +69,9 @@ and reconstructable chunks. Do not send a manual Muse message to export during
 a measured window. Collect afterward through authorized access; record any
 intervention and begin a new quiet period before another trial.
 
+Previously recorded interventions remain in the report across imports and
+restarts, even if they are removed from the observation input file.
+
 The collector cannot authenticate an observer's honesty or inspect hidden Muse
 state. An operator must verify the referenced observations. Report validation
 checks linked recorded evidence and refuses missing evidence; it is not native
@@ -118,7 +121,9 @@ never substitute a browser reload for an unobserved runtime-recovery claim.
 The default `--stage all` attempts these stages in order and stops when a required
 native gate is unavailable. Update passive observation/export inputs and use
 `--stage finalize` to reassess without queuing work. Completed or failed cases
-are never rerun in the same directory. A crash with uncertain side effects
+are never rerun in the same directory. If a broker export failed after the case
+outcome was saved, finalization resumes that read-only export and context import
+while preserving the original trial timestamps. A crash with uncertain side effects
 requires evidence review and a new run; the driver refuses automatic replay.
 Accepted client tools are never re-executed. Preserve the old directory.
 
@@ -166,8 +171,10 @@ exports and failed runs as investigation evidence, outside disposable cleanup.
 | Wrong tool or result | `qualification.decision_failed`, WARN | Inspect proposed decision, issued client-only path, exact result and call ID in protected exchanges; do not execute a guessed command. |
 | Missing observation/export | `qualification.evidence_incomplete`, ERROR | Read named missing receipts and omissions; obtain authorized evidence or retain an inconclusive outcome. |
 
-Broker exports use `GET /api/v1/admin/diagnostics/export?operation_id=EXPERIMENT_ID`
-with the protected management header. Worker exports use the existing installed
+Broker exports use `GET /api/v1/admin/diagnostics/export?operation_id=EXPERIMENT_ID&since=CREATED_AT`
+with the protected management header and the broker's recorded experiment creation
+time. Unrelated older pruning does not invalidate current evidence; pruning within
+the measured interval still makes the capture incomplete. Worker exports use the existing installed
 CLI. Check completeness before filtering by operation/request/conversation/job
 IDs. No business-table queries or runtime-memory inspection are needed.
 

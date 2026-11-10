@@ -99,6 +99,17 @@ test('a rejected delta candidate does not invalidate complete full-history evide
   assert.ok(result.cases.find(item=>item.id==='delta').failed.length);
 });
 
+test('an observed delta conversation switch rejects the candidate while absent observations stay inconclusive',()=>{
+  const {report,evidence}=completeFixture();
+  const observations=report.observations.filter(entry=>entry.kind==='model_turn'&&entry.case_id==='delta');
+  observations[1].native_conversation_id='different-observed-native';report.context_strategy.delta='rejected_candidate';
+  const result=validateReport(report,evidence);
+  assert.equal(result.observed_result,'pass');
+  assert.ok(result.cases.find(item=>item.id==='delta').failed.includes('delta:delta_native_base'));
+  report.observations=report.observations.filter(entry=>entry!==observations[1]);
+  assert.equal(validateReport(report,evidence).observed_result,'inconclusive');
+});
+
 test('conclusive failure requires reproducible complete evidence; missing access is inconclusive',()=>{
   const {report,evidence}=completeFixture();
   report.cases[1].observed.final_text='wrong-result-1';report.cases[1].observed.messages.at(-1).text='wrong-result-1';
@@ -209,7 +220,7 @@ test('private inputs and HTTPS origin prevent credential exposure or redirects',
 });
 
 async function harness(t,{mode='normal'}={}) {
-  const root=await temporary(t);let clock=Date.UTC(2026,0,2),sequence=0;
+  const root=await temporary(t);let clock=Date.UTC(2026,0,2),sequence=0,exportAttempts=0;
   const logs=[],requests=[],experiments=new Map();
   const observations=join(root,'observations.json'),workerExports=[];
   const entries=[{kind:'setup_ended',time:new Date(clock-1000).toISOString(),worker_id:'worker-1',observer:'synthetic',source_ref:'synthetic-setup'}, {kind:'artifact_identity',time:new Date(clock-1000).toISOString(),observer:'synthetic',source_ref:'synthetic-image',service_sha:'a'.repeat(40),image_digest:'sha256:'+'b'.repeat(64)}];
@@ -227,13 +238,20 @@ async function harness(t,{mode='normal'}={}) {
       if(body.messages.some(message=>message.type==='tool_call'&&!body.tools.some(tool=>tool.name===message.name))){res.statusCode=400;return res.end('{"error":"unknown_tool"}');}
       const id=`exp-${sequence}`,job=`job-${sequence}`;
       const context={receipt_id:job,kind:'full',base_prefix:0,history_count:body.messages.length,canonical_sha256:hash(JSON.stringify(body.messages)),messages:body.messages,tools:body.tools};
-      const exp={id,worker_id:'worker-1',conversation_id:`conv-${sequence}`,current_job_id:job,messages:body.messages,state:'queued'};
+      const exp={id,worker_id:'worker-1',conversation_id:`conv-${sequence}`,created_at:new Date(clock-5000).toISOString(),current_job_id:job,messages:body.messages,state:'queued'};
       experiments.set(id,{exp,body,contexts:[{time:stamp(),level:'DEBUG',msg:'inference.context',job_id:job,operation_id:id,worker_id:'worker-1',conversation_id:exp.conversation_id,context}],polls:0});
       return res.end(JSON.stringify(exp));
     }
     if(req.url.startsWith('/api/v1/admin/diagnostics/export?')){
+      exportAttempts++;
+      if(mode==='export-once'&&exportAttempts===1){res.statusCode=503;return res.end('{"error":"service_unavailable"}');}
       const id=new URL(req.url,'http://fixture').searchParams.get('operation_id'),saved=experiments.get(id);
-      return res.end(exportFixture([...saved.contexts,{time:stamp(),level:'DEBUG',msg:'inference.exchange',operation:'read',operation_id:id,conversation_id:saved.exp.conversation_id,worker_id:'worker-1',output:saved.exp}]));
+      const raw=exportFixture([...saved.contexts,{time:stamp(),level:'DEBUG',msg:'inference.exchange',operation:'read',operation_id:id,conversation_id:saved.exp.conversation_id,worker_id:'worker-1',output:saved.exp}]);
+      const since=new URL(req.url,'http://fixture').searchParams.get('since');
+      if(mode==='pruned-measured'||mode==='pruned-old'&&(!since||Date.parse(since)<=Date.parse(saved.exp.created_at)-60000)){
+        const lines=raw.trimEnd().split('\n'),metadata=JSON.parse(lines[0]);metadata.complete=false;metadata.omissions=['expired_or_capacity_pruned_evidence'];lines[0]=JSON.stringify(metadata);return res.end(lines.join('\n')+'\n');
+      }
+      return res.end(raw);
     }
     const [,id,action]=req.url.match(/^\/api\/v1\/admin\/experiments\/([^/]+)(?:\/(.*))?$/)??[];
     const saved=experiments.get(id);if(!saved){res.statusCode=404;return res.end('{}');}
@@ -384,6 +402,41 @@ test('missing and incomplete worker exports retain an incomplete assessment and 
   }
 });
 
+test('broker export selects the server creation boundary and still rejects pruning within the measured interval',async t=>{
+  const h=await harness(t,{mode:'pruned-old'});await h.collector.initialize();await h.collector.runCase('trial-1');
+  const item=h.collector.report.cases[0],request=h.requests.find(req=>req.path.startsWith('/api/v1/admin/diagnostics/export?'));
+  assert.equal(new URL(request.path,'http://fixture').searchParams.get('since'),item.initial.created_at);
+  assert.ok(Date.parse(item.initial.created_at)<Date.parse(item.started_at));
+  const current=await harness(t,{mode:'pruned-measured'});await current.collector.initialize();
+  await assert.rejects(current.collector.runCase('trial-1'),/capture_incomplete/);
+  assert.equal(current.collector.report.exports.length,0);
+});
+
+test('completed trial evidence resumes after a failed read-only export without rerunning jobs or tools',async t=>{
+  const h=await harness(t,{mode:'export-once'});await h.collector.initialize();
+  await assert.rejects(h.collector.runCase('trial-1'),/http_503/);
+  const first=h.collector.report.cases[0],finished=first.finished_at,turns=first.turns.map(turn=>[turn.started_at,turn.finished_at]);
+  assert.ok(finished);assert.equal(h.collector.report.exports.length,0);
+  const posts=h.requests.filter(req=>req.method==='POST').length;
+  await h.collector.collect('finalize');
+  const recovered=h.collector.report.cases[0];
+  assert.equal(recovered.finished_at,finished);assert.deepEqual(recovered.turns.map(turn=>[turn.started_at,turn.finished_at]),turns);
+  assert.ok(h.collector.report.exports.some(ref=>ref.source==='broker'&&ref.case_id==='trial-1'));
+  assert.ok(recovered.turns.every(turn=>turn.context));assert.equal(h.requests.filter(req=>req.method==='POST').length,posts);
+  const exports=h.requests.filter(req=>req.path.startsWith('/api/v1/admin/diagnostics/export?')).length;
+  await h.collector.collect('finalize');assert.equal(h.requests.filter(req=>req.path.startsWith('/api/v1/admin/diagnostics/export?')).length,exports);
+});
+
+test('collector records an observed delta switch as rejected using the actual decoded evidence',async t=>{
+  const h=await harness(t),fixture=completeFixture();await h.collector.initialize();
+  fixture.report.observations.filter(entry=>entry.kind==='model_turn'&&entry.case_id==='delta')[1].native_conversation_id='different-native';
+  h.entries.splice(0,h.entries.length,...fixture.report.observations);await h.writeObservations();
+  for(const [file,raw]of fixture.files)await h.evidence.state.write(file,raw);
+  h.collector.report=fixture.report;
+  const result=await h.collector.finalize();
+  assert.equal(h.collector.report.context_strategy.delta,'rejected_candidate');assert.equal(result.observed_result,'pass');assert.equal(result.verdict,'inconclusive');
+});
+
 test('collector records correlated delta bases and truly interleaves two sessions',async t=>{
   const h=await harness(t);await h.collector.initialize();await h.collector.runCase('delta');
   const delta=h.collector.report.cases[0];assert.equal(delta.tool_result_request.context_probe.base_receipt_id,delta.turns[0].job_id);
@@ -415,9 +468,25 @@ test('interventions and changed client fixtures stop execution without fabricati
   const h=await harness(t);await h.collector.initialize();
   h.entries.push({kind:'intervention',time:new Date(Date.parse(h.stamp())+60000).toISOString(),observer:'synthetic',source_ref:'synthetic-manual-click'});await h.writeObservations();
   await assert.rejects(h.collector.begin('trial-1'),/intervention_during_quiet_window/);
-  h.entries.pop();await h.writeObservations();
-  const item=await h.collector.begin('trial-1');await h.collector.poll(item,'waiting_for_tool');
-  await h.evidence.state.write(item.fixture.path,'changed-client-fixture');
-  await assert.rejects(h.collector.result(item),/client_fixture_changed/);
-  assert.equal(h.requests.filter(req=>req.path.endsWith('/tool-results')).length,0);
+  const clean=await harness(t);await clean.collector.initialize();
+  const item=await clean.collector.begin('trial-1');await clean.collector.poll(item,'waiting_for_tool');
+  await clean.evidence.state.write(item.fixture.path,'changed-client-fixture');
+  await assert.rejects(clean.collector.result(item),/client_fixture_changed/);
+  assert.equal(clean.requests.filter(req=>req.path.endsWith('/tool-results')).length,0);
+});
+
+test('recorded interventions survive an edited observation file and resumed collection',async t=>{
+  const h=await harness(t);await h.collector.initialize();
+  const intervention={kind:'intervention',time:h.stamp(),observer:'synthetic',source_ref:'synthetic-recorded-manual-action'};
+  h.entries.push(intervention);await h.writeObservations();await h.collector.observe();await h.collector.save();
+  h.entries.pop();await h.writeObservations();h.collector.report=undefined;
+  await h.collector.initialize();
+  assert.ok(h.collector.report.observations.some(entry=>entry.source_ref===intervention.source_ref));
+  await assert.rejects(h.collector.begin('trial-1'),/intervention_during_quiet_window/);
+  assert.equal(h.requests.filter(req=>req.method==='POST').length,0);
+  await fs.writeFile(h.collector.observationPath,'invalid json',{mode:0o600});
+  const result=await h.collector.finalize();
+  assert.equal(result.verdict,'inconclusive');
+  assert.ok(h.collector.report.observations.some(entry=>entry.source_ref===intervention.source_ref));
+  assert.ok(h.collector.report.evidence_import_failures.some(entry=>entry.source==='observations'));
 });

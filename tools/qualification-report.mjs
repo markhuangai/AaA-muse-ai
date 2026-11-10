@@ -29,6 +29,7 @@ function inspectCase(item, report, evidence) {
   const initialMessages = item.request?.messages ?? [];
   if (turns[0]?.context?.kind !== 'full' || !same(turns[0]?.context?.messages,initialMessages)) fail('initial_full_delivery');
   const native = observations.filter(entry => entry.kind === 'model_turn' && entry.case_id === item.id && provenance(entry) && identifier(entry.native_conversation_id));
+  const nativeMatches = (entry,turn) => entry.job_id === turn.job_id && typeof entry.account_memory_observation === 'string' && entry.account_memory_observation.length && same(entry.effective_instructions, initialMessages.filter(message => ['system','developer'].includes(message.role)));
   for (const turn of turns) {
     if (time(turn.finished_at) - time(turn.started_at) >= 300000 || time(turn.finished_at) < time(turn.started_at)) fail('turn_deadline');
     const context = contexts.find(event => event.job_id === turn.job_id)?.context;
@@ -40,13 +41,14 @@ function inspectCase(item, report, evidence) {
     if (noModel && item.observed?.state === 'completed') fail('contradictory_native_observation');
     if (!emission && !negative) miss('wake_emitted');
     if (!w.some(event => event.msg === 'worker.context' && event.job_id === turn.job_id && event.worker_id === item.worker_id && same(event.context, turn.context)) && !negative) miss('authenticated_model_context_read');
-    if (!native.some(entry => entry.job_id === turn.job_id && typeof entry.account_memory_observation === 'string' && entry.account_memory_observation.length && same(entry.effective_instructions, initialMessages.filter(message => ['system','developer'].includes(message.role))))) { if (!negative) miss('native_model_turn'); }
+    if (!native.some(entry => nativeMatches(entry,turn)) && !negative) miss('native_model_turn');
     if (context?.kind === 'full' && (context.base_prefix !== 0 || context.base_receipt_id || context.history_count !== context.messages?.length)) fail('full_context_contract');
     if (!['full','delta'].includes(context?.kind)) fail('unsupported_context_kind');
     if (context?.kind === 'delta') {
       const base = turns.find(previous => previous.job_id === context.base_receipt_id);
       if (!base || context.base_prefix !== base.context?.history_count || context.base_sha256 !== base.context?.canonical_sha256 || context.history_count !== context.base_prefix + context.messages?.length) fail('delta_base_contract');
-      if (new Set(native.map(entry => entry.native_conversation_id)).size !== 1) miss('delta_native_base');
+      if (!turns.every(previous => native.some(entry => nativeMatches(entry,previous)))) miss('delta_native_base');
+      else if (new Set(native.filter(entry => turns.some(previous => nativeMatches(entry,previous))).map(entry => entry.native_conversation_id)).size !== 1) fail('delta_native_base');
     }
   }
   if (!item.initial || !item.observed || !same(item.initial.messages, item.request?.messages)) miss('canonical_input');

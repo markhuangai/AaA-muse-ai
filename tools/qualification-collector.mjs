@@ -25,7 +25,7 @@ export class Collector {
     for (const entry of source.entries) need(typeof entry.kind === 'string' && instant(entry.time) && typeof entry.source_ref === 'string' && typeof entry.observer === 'string', 'invalid_observation_entry');
     const safe = this.logger.redactor.value(source);
     need(same(safe, source), 'observation_contains_sensitive_material');
-    if (this.report) this.report.observations = source.entries;
+    if (this.report) this.report.observations = retainInterventions(this.report.observations, source.entries);
     return source;
   }
   async api(path, method = 'GET', body, item, timeout = 10000) {
@@ -59,7 +59,7 @@ export class Collector {
     if (saved) {
       this.report = JSON.parse(saved);
       need(this.report.worker_id === this.workerID && this.report.origin === this.origin && this.report.evidence_kind === this.evidenceKind, 'run_identity_conflict');
-      this.report.observations = observations.entries;
+      this.report.observations = retainInterventions(this.report.observations, observations.entries);
       need(!this.report.cases.some(item => !item.finished_at), 'unfinished_case_requires_evidence_review_new_run');
       return;
     }
@@ -104,7 +104,7 @@ export class Collector {
     const item = {id,kind,worker_id:this.workerID,session_marker:expected.session,started_at:this.stamp(),fixture,challenge,expected,request:{protocol_version:1,submission_id:this.uuid(),worker_id:this.workerID,messages,tools,timeout_seconds:kind === 'tool' ? 3600 : 300,context_probe:{kind:'full'}},turns:[],last_boundary:'create_pending'};
     this.report.cases.push(item); await this.save();
     const experiment = await this.api('/api/v1/admin/experiments','POST',item.request,item);
-    need(experiment.worker_id === this.workerID && identifier(experiment.id) && identifier(experiment.conversation_id), 'experiment_identity_mismatch');
+    need(experiment.worker_id === this.workerID && identifier(experiment.id) && identifier(experiment.conversation_id) && instant(experiment.created_at), 'experiment_identity_or_creation_time_mismatch');
     Object.assign(item,{experiment_id:experiment.id,conversation_id:experiment.conversation_id,initial:experiment,observed:experiment,last_boundary:'job_queued'});
     item.turns.push({job_id:experiment.current_job_id,started_at:item.started_at}); await this.save();
     return item;
@@ -179,19 +179,25 @@ export class Collector {
     await this.log('WARN','qualification.decision_failed',{case_id:item.id,operation_id:item.experiment_id,conversation_id:item.conversation_id,worker_id:this.workerID,last_boundary:item.last_boundary,cause:error.message,proposed:item.observed?.messages?.at(-1),fixture_owner:'client_driver',elapsed_ms:this.now()-Date.parse(item.started_at)});
   }
   async finish(item) {
-    if (item.finished_at) return;
-    item.observed = await this.api(`/api/v1/admin/experiments/${item.experiment_id}`,'GET',undefined,item);
-    item.finished_at = this.stamp(); await this.save();
-    const raw = await this.api(`/api/v1/admin/diagnostics/export?operation_id=${item.experiment_id}`);
+    if (item.finished_at && this.report.exports.some(ref => ref.source === 'broker' && ref.case_id === item.id)) return;
+    const resumed = Boolean(item.finished_at);
+    if (!resumed) {
+      item.observed = await this.api(`/api/v1/admin/experiments/${item.experiment_id}`,'GET',undefined,item);
+      item.finished_at = this.stamp(); await this.save();
+    }
+    need(instant(item.initial?.created_at),'experiment_creation_time_missing');
+    const query = new URLSearchParams({operation_id:item.experiment_id,since:item.initial.created_at});
+    const raw = await this.api(`/api/v1/admin/diagnostics/export?${query}`);
     const ref = await attachExport(this.state,'broker',item.id,raw,this.logger.redactor);
     this.report.exports.push(ref);
     const events = decodeExport(raw).events;
     for (const turn of item.turns) turn.context = events.find(event => event.msg === 'inference.context' && event.job_id === turn.job_id)?.context;
-    await this.log('INFO','qualification.case_finished',{case_id:item.id,operation_id:item.experiment_id,conversation_id:item.conversation_id,worker_id:this.workerID,state:item.observed?.state,last_boundary:item.last_boundary,elapsed_ms:this.now()-Date.parse(item.started_at)});
+    await this.log('INFO','qualification.case_finished',{case_id:item.id,operation_id:item.experiment_id,conversation_id:item.conversation_id,worker_id:this.workerID,state:item.observed?.state,last_boundary:item.last_boundary,elapsed_ms:Date.parse(item.finished_at)-Date.parse(item.started_at),evidence_resumed:resumed});
     await this.save();
   }
   async runCase(id, kind = 'tool', replay) {
-    if (this.report.cases.some(item => item.id === id)) return;
+    const existing = this.report.cases.find(item => item.id === id);
+    if (existing) { await this.finish(existing); return; }
     const item = await this.begin(id,kind,replay);
     try {
       await this.poll(item,kind === 'tool' ? 'waiting_for_tool' : 'completed');
@@ -265,7 +271,12 @@ export class Collector {
     };
     let observations = {worker_exports:[]};
     try { observations = await this.observe(); }
-    catch (error) { this.report.observations=[]; await importFailure('observations','all',error); }
+    catch (error) { this.report.observations=retainInterventions(this.report.observations,[]); await importFailure('observations','all',error); }
+    for (const item of this.report.cases.filter(item => item.finished_at)) {
+      if (this.report.exports.some(ref => ref.source === 'broker' && ref.case_id === item.id)) continue;
+      try { await this.finish(item); }
+      catch (error) { await importFailure('broker',item.id,error); }
+    }
     for (const ref of observations.worker_exports) {
       try {
         need(identifier(ref.case_id), 'invalid_worker_export_case');
@@ -276,8 +287,9 @@ export class Collector {
     }
     this.report.finished_at = this.stamp();
     const evidence = await readExports(this.report,name => this.state.read(name));
-    const delta = this.report.cases.find(item => item.id === 'delta');
-    this.report.context_strategy.delta = delta ? (delta.failure || delta.observed?.state !== 'completed' || !same(parseJSON(delta.observed.final_text),delta.expected) ? 'rejected_candidate' : 'accepted_candidate') : 'inconclusive';
+    this.report.context_strategy.delta = 'inconclusive';
+    const delta = validateReport(this.report,evidence).cases.find(item => item.id === 'delta');
+    if (delta && !delta.missing.length) this.report.context_strategy.delta = delta.failed.length ? 'rejected_candidate' : 'accepted_candidate';
     let result = validateReport(this.report,evidence);
     this.report.verdict = result.verdict;
     result = validateReport(this.report,evidence);
@@ -290,3 +302,7 @@ export class Collector {
 }
 
 function parseJSON(value) { try { return JSON.parse(value); } catch { return undefined; } }
+
+function retainInterventions(previous, incoming) {
+  return [...incoming,...previous.filter(entry => entry.kind === 'intervention' && !incoming.some(next => same(entry,next)))];
+}
