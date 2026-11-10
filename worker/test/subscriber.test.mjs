@@ -254,3 +254,34 @@ test('a context response captured before accepted idle cannot revive its confirm
   assert(events.some(e => e.msg === 'worker.job_progress' && e.state === 'ack_confirmed' && e.progress === 'broker_already_confirmed_idle' && e.observed_state === 'interrupted' && e.observed_held === true && e.acknowledgement_required === false));
   assert(!f.output.some(line => JSON.parse(line).level === 'DEBUG'));
 });
+
+test('a rejected obsolete claim is replaced once on the healthy subscription without another job event', async t => {
+  const f = await fixture(t); await enrolled(f);
+  const stop = new AbortController(); let streams = 0, current;
+  f.broker.override = async call => {
+    if (call.path.endsWith('/events')) {
+      current = { ...opened, connection_id: CONN.slice(0, -1) + ++streams, connection_generation: streams };
+      const frames = [['connection.opened', current], ['health.challenge', { ...current, challenge_id: 'health-' + streams }], ['job.available', { worker_id: ID, job_id: JOB }]];
+      if (streams === 2) frames.push(['health.challenge', { ...current, challenge_id: 'after-recovery' }]);
+      return new Response(new ReadableStream({ start(c) { c.enqueue(Buffer.from(frames.map(([type, data], i) => `id: ${streams}-${i}\nevent: ${type}\ndata: ${encode(data)}\n\n`).join(''))); } }), { headers: { 'content-type': 'text/event-stream' } });
+    }
+    if (call.path.endsWith('/claim')) {
+      if (streams === 1) return new Response('{"error":"unavailable"}', { status: 503 });
+      if (call.input.connection_id !== current.connection_id) return new Response('{"error":"stale_connection"}', { status: 409, headers: { 'x-request-id': 'obsolete-claim' } });
+    }
+    if (call.input?.challenge_id === 'after-recovery') stop.abort();
+  };
+  await new Subscriber(f.worker).run(stop.signal);
+  const claims = f.broker.calls.filter(c => c.path.endsWith('/claim'));
+  assert.equal(streams, 2); assert.equal(claims.length, 5);
+  assert.equal(new Set(claims.slice(0, 4).map(c => c.options.body)).size, 1);
+  assert.notEqual(claims[4].input.submission_id, claims[0].input.submission_id);
+  assert.equal(integer(claims[4].input.connection_generation), 2);
+  const journals = await f.state.child('journals');
+  assert.equal(parse(await journals.read('operation-' + claims[0].input.submission_id + '.json')).state, 'rejected');
+  assert.equal(parse(await journals.read('operation-' + claims[4].input.submission_id + '.json')).state, 'accepted');
+  assert.equal(f.broker.jobs.get(JOB).state, 'claimed'); assert.equal(f.broker.jobs.get(JOB).held, true);
+  assert.equal(parse(await f.state.read('pending.json')).jobs.length, 1);
+  assert(!f.broker.calls.some(c => c.path.endsWith('/decisions')));
+  assert(f.output.map(JSON.parse).some(e => e.msg === 'worker.claim_retrying' && e.request_id === 'obsolete-claim' && e.previous_submission_id === claims[0].input.submission_id && e.submission_id === claims[4].input.submission_id && e.operation_attempt === 2));
+});

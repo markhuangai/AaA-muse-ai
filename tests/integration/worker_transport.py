@@ -160,6 +160,51 @@ class WorkerTransport(Inference):
         require(any(e.get("request_id") == rejected[0]["request_id"] and e["msg"] == "decision.rejected" for e in broker_events), "worker/broker request correlation differs")
         self.receipt("worker.tool_loop_interleaving_delta_and_lost_response", package_sha256=self.package_receipt["sha256"], canonical_messages=5, log_only_diagnosis=True, client_fixture_absent_in_worker=True, exact_large_integer=True)
 
+    def claim_rejection_recovery(self, worker):
+        self.proxy.fail_claims = 3
+        e = self.create(worker, "recover an unsent claim", tools=False)
+        self.wait_job(worker, e)
+        failed = self.proxy.failed_claims
+        require(len(failed) == 3 and len({json.dumps(v, sort_keys=True) for v in failed}) == 1, "unsent claim attempts changed identity or reached the broker")
+        events = self.decoded(worker, e["id"])
+        refusal = [v for v in events if v["msg"] == "worker.http_exchange" and v["route"].endswith("/claim") and v["http_status"] == 409 and v["output"].get("error") == "stale_connection"]
+        retries = [v for v in events if v["msg"] == "worker.claim_retrying"]
+        accepted = [v for v in events if v["msg"] == "worker.operation_accepted" and v.get("operation") == "claim"]
+        require(refusal and retries and accepted, "claim recovery cannot be reconstructed from worker logs")
+        require(retries[-1]["previous_submission_id"] == failed[0]["submission_id"] and accepted[-1]["submission_id"] != failed[0]["submission_id"], "fresh claim did not follow definitive rejection of its original journal")
+        broker = self.export_operation(e["id"])
+        require(len([v for v in broker if v["msg"] == "job.claimed"]) == 1, "claim recovery acquired more than one assignment")
+        self.diagnose(refusal[-1]["request_id"], "lease.rejected", "stale_connection")
+        self.submit_cli(worker, e["current_job_id"], {"type": "final", "text": "claimed once"})
+        self.receipt("worker.unsent_claim_rejected_then_replaced", request_id=refusal[-1]["request_id"], unsent_attempts=3, accepted_assignments=1, log_only_diagnosis=True)
+
+    def delayed_context_after_decision(self, worker):
+        e = self.create(worker, "delayed context after accepted final", tools=False)
+        job_id = e["current_job_id"]
+        self.wait_job(worker, e)
+        self.proxy.delay_context_job = job_id
+        self.proxy.context_captured.clear()
+        self.proxy.release_context.clear()
+        showing = self.container(worker["state"], ["job-show", "--job-id", job_id])
+        self.docker("start", showing)
+        try:
+            require(self.proxy.context_captured.wait(timeout=5), "context response was not captured before acceptance")
+            self.submit_cli(worker, job_id, {"type": "final", "text": "completed before the old context"})
+            require(not json.loads((worker["state"] / "pending.json").read_text())["jobs"], "accepted final did not clear pending work")
+        finally:
+            self.proxy.release_context.set()
+        self.until(lambda: not self.inspect(showing)["State"]["Running"], "delayed context command did not finish")
+        require(self.inspect(showing)["State"]["ExitCode"] == 0, "delayed context command failed")
+        output = self.logs(showing)
+        self.assert_private(output)
+        self.private("delayed-context-output.log", output)
+        require(not json.loads((worker["state"] / "pending.json").read_text())["jobs"], "old claimed response revived an accepted decision")
+        events = self.decoded(worker, e["id"])
+        require(any(v["msg"] == "worker.job_progress" and v.get("progress") == "broker_already_accepted_decision" and v["state"] == "completed" and v["observed_state"] == "claimed" and v["observed_held"] for v in events), "logs cannot reconstruct the accepted decision versus old claimed snapshot")
+        accepted = [v for v in events if v["msg"] == "worker.operation_accepted" and v.get("operation") == "decision"]
+        self.diagnose(accepted[-1]["request_id"], "decision.accepted")
+        self.receipt("worker.accepted_decision_survives_delayed_context", request_id=accepted[-1]["request_id"], pending_jobs=0, log_only_diagnosis=True)
+
     def cancellation_reconnect(self, worker):
         e = self.create(worker, "stopped worker assignment", tools=False)
         self.wait_job(worker, e)
@@ -284,6 +329,8 @@ def main():
         h.command(worker, "run", want=1)
         h.long_health(worker)
         h.tool_loop(worker)
+        h.claim_rejection_recovery(worker)
+        h.delayed_context_after_decision(worker)
         h.expired_heartbeat(worker)
         h.cancellation_reconnect(worker)
         h.offline_ack_reconnect(worker)

@@ -19,6 +19,11 @@ class TLSFixture:
         self.dropped = 0
         self.expire_heartbeat = False
         self.delayed_heartbeat = None
+        self.fail_claims = 0
+        self.failed_claims = []
+        self.delay_context_job = None
+        self.context_captured = threading.Event()
+        self.release_context = threading.Event()
         self.events = []
         self.cert = harness.root.resolve() / "tls-cert.pem"
         key = harness.root.resolve() / "tls-key.pem"
@@ -43,6 +48,19 @@ class TLSFixture:
                     fixture.connections.append(connection)
                 try:
                     body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                    with fixture.lock:
+                        reject = self.path.endswith("/claim") and fixture.fail_claims > 0
+                        if reject:
+                            fixture.fail_claims -= 1
+                            fixture.failed_claims.append(json.loads(body))
+                    if reject:
+                        payload = b'{"error":"fixture_unavailable"}'
+                        self.send_response(503)
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Content-Length", str(len(payload)))
+                        self.end_headers()
+                        self.wfile.write(payload)
+                        return
                     if self.path == "/api/v1/worker/heartbeat":
                         identity = json.loads(body)["connection_id"]
                         with fixture.lock:
@@ -60,10 +78,16 @@ class TLSFixture:
                     if not streaming:
                         payload = response.read()
                         with fixture.lock:
+                            delayed_context = self.command == "GET" and fixture.delay_context_job is not None and self.path == "/api/v1/worker/jobs/" + fixture.delay_context_job
+                            if delayed_context:
+                                fixture.delay_context_job = None
                             drop = fixture.drop_decision and self.path.endswith("/decisions") and response.status == 200
                             if drop:
                                 fixture.drop_decision = False
                                 fixture.dropped += 1
+                        if delayed_context:
+                            fixture.context_captured.set()
+                            fixture.release_context.wait(timeout=8)
                         if drop:
                             fixture.harness.private("lost-decision-request.json", body.decode())
                             self.connection.shutdown(socket.SHUT_RDWR)

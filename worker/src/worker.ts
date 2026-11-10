@@ -83,6 +83,17 @@ export class Worker {
   async publish(j: ObjectValue, phase: string, progress: string): Promise<void> {
     if (phase === 'claimed') phase = 'pending';
     await this.state.withLock('cues', async () => {
+      if (phase === 'pending') {
+        const journals = await this.state.child('journals');
+        const pointer = await journals.read(`decision-${text(j.id)}.json`);
+        const saved = pointer ? await journals.read(`operation-${identifier(object(parse(pointer)).submission_id)}.json`) : undefined;
+        const accepted = saved ? object(parse(saved)) : undefined;
+        if (accepted?.state === 'accepted' && accepted.kind === 'decision' && accepted.origin === this.config.origin && accepted.worker_id === j.worker_id && accepted.job_id === j.id && integer(accepted.generation) === integer(j.generation) && object(parse(text(accepted.body))).lease_id === j.lease_id) {
+          phase = text(object(accepted.result).state);
+          requireValue(['completed', 'waiting_for_tool'].includes(phase), 'invalid_decision_journal');
+          progress = 'broker_already_accepted_decision';
+        }
+      }
       if (phase === 'cancelled' || phase === 'interrupted') {
         const saved = await (await this.state.child('acks')).read(`${text(j.id)}.json`);
         const ack = saved ? object(parse(saved)) : undefined;
@@ -146,9 +157,21 @@ export class Worker {
     }
   }
   async claim(transport: Transport, id: string, connection: ObjectValue): Promise<void> {
-    const current = await this.getJob(transport, id);
-    const op = await this.operation('claim', current, submission => ({ protocol_version: 1, submission_id: submission, connection_id: connection.connection_id, connection_generation: connection.connection_generation }));
-    await this.send(transport, current, op);
+    let current = await this.getJob(transport, id);
+    const build = (submission: string): ObjectValue => ({ protocol_version: 1, submission_id: submission, connection_id: connection.connection_id, connection_generation: connection.connection_generation });
+    let op = await this.operation('claim', current, build);
+    try { await this.send(transport, current, op); }
+    catch (error) {
+      const submitted = object(parse(text(op.body)));
+      if (!(error instanceof Failure && error.code === 'broker_rejected' && error.fields.http_status === 409 && error.fields.reason === 'stale_connection') ||
+          (submitted.connection_id === connection.connection_id && integer(submitted.connection_generation) === integer(connection.connection_generation))) throw error;
+      current = await this.getJob(transport, id);
+      if (current.state !== 'queued') throw error;
+      const previous = op.submission_id;
+      op = await this.operation('claim', current, build);
+      await this.logger.log('WARN', 'worker.claim_retrying', { ...correlation(current), ...error.fields, submission_id: op.submission_id, previous_submission_id: previous, connection_id: connection.connection_id, connection_generation: connection.connection_generation, operation_attempt: 2, observed_state: current.state });
+      await this.send(transport, current, op);
+    }
     const observed = await this.getJob(transport, id);
     requireValue(observed.state === 'claimed' && observed.held === true && observed.connection_id === connection.connection_id && integer(observed.connection_generation) === integer(connection.connection_generation), 'recovered_claim_not_current', { ...correlation(observed), observed_state: observed.state });
     await this.publish(observed, 'pending', 'awaiting_muse_decision');

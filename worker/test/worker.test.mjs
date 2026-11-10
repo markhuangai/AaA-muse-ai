@@ -162,3 +162,71 @@ test('pending cues retain unconfirmed, differently fenced and active work', asyn
   assert.equal(parse(await acks.read(JOB + '.json')).state, 'confirmed');
   assert(!f.broker.calls.some(call => call.input?.idle_ack || call.path.endsWith('/decisions')));
 });
+
+test('obsolete claim replacement requires a definitive stale rejection and still-queued work, and is bounded', async t => {
+  for (const [reason, state, generation, limit, status] of [
+    ['stale_connection', 'queued', 1, 1, 409],
+    ['worker_busy', 'queued', 2, 1, 409],
+    ['context_base_connection_changed', 'queued', 2, 1, 409],
+    ['stale_connection', 'claimed', 2, 1, 409],
+    ['stale_connection', 'queued', 2, 2, 409],
+    ['stale_connection', 'queued', 2, 1, 400],
+  ]) {
+    const f = await fixture(t); const transport = await enrolled(f);
+    await f.worker.operation('claim', delivery(), submission => ({ protocol_version: 1, submission_id: submission, connection_id: CONN, connection_generation: 1 }));
+    if (state === 'claimed') f.broker.jobs.set(JOB, claimed());
+    f.broker.override = async c => c.path.endsWith('/claim') ? new Response(encode({ error: reason }), { status }) : undefined;
+    await assert.rejects(f.worker.claim(transport, JOB, { connection_id: CONN, connection_generation: generation }), error => error.code === 'broker_rejected' && error.fields.reason === reason);
+    assert.equal(f.broker.calls.filter(c => c.path.endsWith('/claim')).length, limit);
+    assert.equal(f.broker.jobs.get(JOB).state, state);
+    assert(!f.broker.calls.some(c => c.path.endsWith('/decisions')));
+  }
+});
+
+test('accepted final and tool decisions cannot be revived by delayed claimed context', async t => {
+  for (const input of ['{"type":"final","text":"done"}', '{"type":"tool_call","call_id":"call","name":"read_file","arguments":{"path":"client"}}']) {
+    const f = await fixture(t); const transport = await enrolled(f);
+    await f.worker.claim(transport, JOB, { connection_id: CONN, connection_generation: 1 });
+    let release, captured, blocked = false;
+    const ready = new Promise(done => { captured = done; }); const gate = new Promise(done => { release = done; });
+    f.broker.override = async call => {
+      if (!blocked && call.path.endsWith('/' + JOB)) {
+        blocked = true; const raw = encode(f.broker.jobs.get(JOB)); captured(); await gate;
+        return new Response(raw);
+      }
+    };
+    const showing = f.worker.show(JOB); t.after(() => release()); await ready;
+    const accepted = await f.worker.submit(JOB, input);
+    assert.equal(parse(await f.state.read('pending.json')).jobs.length, 0);
+    release(); await showing;
+    assert.equal(parse(await f.state.read('pending.json')).jobs.length, 0);
+    const cue = parse(await (await f.state.child('cues')).read(JOB + '.json'));
+    assert.equal(cue.state, accepted.experiment.state); assert.equal(cue.needs_attention, false);
+    const events = (await f.logger.capture.export({}, true)).trimEnd().split('\n').map(JSON.parse);
+    assert.equal(events[0].complete, true);
+    assert(events.some(e => e.msg === 'worker.job_progress' && e.progress === 'broker_already_accepted_decision' && e.state === accepted.experiment.state && e.observed_state === 'claimed' && e.observed_held && !e.acknowledgement_required));
+    assert.equal(f.broker.calls.filter(c => c.path.endsWith('/decisions')).length, 1);
+  }
+});
+
+test('cue suppression requires an accepted decision for the same owner and exact assignment', async t => {
+  const f = await fixture(t); const transport = await enrolled(f);
+  await f.worker.claim(transport, JOB, { connection_id: CONN, connection_generation: 1 });
+  const old = await f.worker.getJob(transport, JOB);
+  const accepted = await f.worker.submit(JOB, '{"type":"final","text":"done"}');
+  const journals = await f.state.child('journals'); const name = 'operation-' + accepted.submission_id + '.json';
+  const exact = parse(await journals.read(name));
+  for (const mismatch of [{ state: 'pending' }, { state: 'uncertain' }, { state: 'rejected' }, { kind: 'claim' }, { origin: 'https://other.test' }, { worker_id: JOB }, { job_id: ID }, { generation: 2 }, { body: encode({ ...parse(exact.body), lease_id: 'a'.repeat(32) }) }]) {
+    await journals.write(name, encode({ ...exact, ...mismatch }));
+    await f.worker.publish(old, 'claimed', 'stale_snapshot');
+    assert.equal(parse(await f.state.read('pending.json')).jobs.length, 1);
+  }
+  await journals.write(name, encode(exact));
+  const other = '9'.repeat(32); f.broker.jobs.set(other, delivery(other));
+  await f.worker.claim(transport, other, { connection_id: CONN, connection_generation: 1 });
+  await f.worker.publish(old, 'claimed', 'stale_snapshot');
+  const remaining = parse(await f.state.read('pending.json')).jobs;
+  assert.equal(remaining.length, 1); assert.equal(remaining[0].job_id, other);
+  await journals.write(name, encode({ ...exact, result: { state: 'claimed' } }));
+  await assert.rejects(f.worker.publish(old, 'claimed', 'invalid_journal'), /invalid_decision_journal/);
+});
