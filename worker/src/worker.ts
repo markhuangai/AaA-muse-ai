@@ -83,6 +83,13 @@ export class Worker {
   async publish(j: ObjectValue, phase: string, progress: string): Promise<void> {
     if (phase === 'claimed') phase = 'pending';
     await this.state.withLock('cues', async () => {
+      if (phase === 'cancelled' || phase === 'interrupted') {
+        const saved = await (await this.state.child('acks')).read(`${text(j.id)}.json`);
+        const ack = saved ? object(parse(saved)) : undefined;
+        if (ack?.state === 'confirmed' && ack.job_id === j.id && integer(ack.generation) === integer(j.generation) && ack.lease_id === j.lease_id) {
+          phase = 'ack_confirmed'; progress = 'broker_already_confirmed_idle';
+        }
+      }
       const cues = await this.state.child('cues');
       const cue = { protocol_version: 1, ...correlation(j), state: phase, progress, updated_at: new Date(this.state.sys.now()).toISOString(), needs_attention: ['pending', 'cancelled', 'interrupted'].includes(phase) };
       await cues.write(`${text(j.id)}.json`, encode(cue));
@@ -93,7 +100,7 @@ export class Worker {
       }
       await this.state.write('pending.json', encode({ protocol_version: 1, worker_id: this.config.worker_id, jobs: values, updated_at: cue.updated_at }));
     });
-    await this.logger.log(phase === 'cancelled' || phase === 'interrupted' ? 'WARN' : 'INFO', 'worker.job_progress', { ...correlation(j), state: phase, progress, reason: j.reason ?? '', acknowledgement_required: j.held === true && j.state !== 'claimed', elapsed_ms: j.claimed_at ? this.state.sys.now() - Date.parse(text(j.claimed_at)) : 0 });
+    await this.logger.log(phase === 'cancelled' || phase === 'interrupted' ? 'WARN' : 'INFO', 'worker.job_progress', { ...correlation(j), state: phase, progress, observed_state: j.state, observed_held: j.held, reason: j.reason ?? '', acknowledgement_required: phase !== 'ack_confirmed' && j.held === true && j.state !== 'claimed', elapsed_ms: j.claimed_at ? this.state.sys.now() - Date.parse(text(j.claimed_at)) : 0 });
   }
   async operation(kind: string, j: ObjectValue, build: (submission: string) => ObjectValue, decisionInput = ''): Promise<ObjectValue> {
     const journals = await this.state.child('journals');

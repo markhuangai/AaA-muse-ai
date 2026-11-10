@@ -142,3 +142,23 @@ test('explicit idle acknowledgement is bound to stopped assignment and stays que
   f.broker.jobs.get(JOB).generation = 1; f.broker.jobs.get(JOB).held = false;
   assert.equal((await f.worker.ack(JOB)).acknowledgement, 'confirmed');
 });
+
+test('pending cues retain unconfirmed, differently fenced and active work', async t => {
+  const f = await fixture(t); await enrolled(f);
+  const acks = await f.state.child('acks');
+  const exact = { job_id: JOB, generation: 1, lease_id: 'f'.repeat(32), state: 'confirmed' };
+  for (const ack of [undefined, { ...exact, state: 'queued' }, { ...exact, job_id: ID }, { ...exact, generation: 2 }, { ...exact, lease_id: 'a'.repeat(32) }]) {
+    if (ack) await acks.write(JOB + '.json', encode(ack));
+    for (const state of ['cancelled', 'interrupted']) {
+      await f.worker.publish(claimed({ state }), state, 'needs_explicit_ack');
+      const cues = parse(await f.state.read('pending.json')).jobs;
+      assert.equal(cues.length, 1); assert.equal(cues[0].state, state); assert.equal(cues[0].needs_attention, true);
+    }
+  }
+  await acks.write(JOB + '.json', encode(exact));
+  await f.worker.publish(claimed(), 'claimed', 'active_work');
+  const active = parse(await f.state.read('pending.json')).jobs;
+  assert.equal(active.length, 1); assert.equal(active[0].state, 'pending');
+  assert.equal(parse(await acks.read(JOB + '.json')).state, 'confirmed');
+  assert(!f.broker.calls.some(call => call.input?.idle_ack || call.path.endsWith('/decisions')));
+});

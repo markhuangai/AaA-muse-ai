@@ -189,6 +189,29 @@ class WorkerTransport(Inference):
         require(any(e["msg"] == "worker.idle_confirmed" for e in events), "explicit acknowledgement lacks broker outcome")
         self.receipt("worker.disconnect_fencing_explicit_ack_and_restart", identity_preserved=True, no_automatic_inference_retry=True)
 
+    def offline_ack_reconnect(self, worker):
+        e = self.create(worker, "queued acknowledgement before restart", tools=False)
+        job_id = e["current_job_id"]
+        self.wait_job(worker, e)
+        self.docker("stop", "--time", "5", worker["daemon"])
+        self.until(lambda: self.experiment(e["id"])["state"] == "interrupted", "stopped daemon did not fence the assignment")
+        queued = json.loads(self.command(worker, "decision-submit", "--job-id", job_id, "--ack-idle"))
+        require(queued["acknowledgement"] == "queued", "stopped daemon did not retain queued acknowledgement")
+        self.start(worker)
+        first = json.loads((worker["state"] / "connection.json").read_text())["last_heartbeat_at"]
+        self.until(lambda: json.loads((worker["state"] / "connection.json").read_text())["last_heartbeat_at"] > first, "buffered cancellation was not followed by another health boundary", timeout=20)
+        require(json.loads((worker["state"] / "acks" / (job_id + ".json")).read_text())["state"] == "confirmed", "reconnected daemon did not confirm the queued acknowledgement")
+        require(self.status(worker)["work_status"] == "idle", "confirmed assignment still holds the worker")
+        require(not json.loads((worker["state"] / "pending.json").read_text())["jobs"], "buffered cancellation revived confirmed idle work")
+        self.command(worker, "job-show", "--job-id", job_id)
+        require(not json.loads((worker["state"] / "pending.json").read_text())["jobs"], "context read revived confirmed idle work")
+        events = self.decoded(worker, e["id"])
+        accepted = [v for v in events if v["msg"] == "worker.idle_confirmed" and v.get("job_id") == job_id]
+        preserved = [v for v in events if v["msg"] == "worker.job_progress" and v.get("job_id") == job_id and v.get("progress") == "broker_already_confirmed_idle"]
+        require(accepted and len(preserved) >= 2 and all(v["state"] == "ack_confirmed" and not v["acknowledgement_required"] for v in preserved), "logs cannot reconstruct confirmation followed by preserved cancellation/context cues")
+        self.diagnose(accepted[0]["request_id"], "worker.idle_confirmed")
+        self.receipt("worker.offline_queued_ack_survives_buffered_cancel_and_show", request_id=accepted[0]["request_id"], pending_jobs=0, acknowledgement="confirmed", log_only_diagnosis=True)
+
     def expired_heartbeat(self, worker):
         prior = json.loads((worker["state"] / "connection.json").read_text())
         self.proxy.expire_heartbeat = True
@@ -263,6 +286,7 @@ def main():
         h.tool_loop(worker)
         h.expired_heartbeat(worker)
         h.cancellation_reconnect(worker)
+        h.offline_ack_reconnect(worker)
         h.scope_permissions_and_health(worker)
         h.private("results.json", json.dumps({"suite": "worker-transport", "synthetic_decisions": True, "source_sha": args.source_sha, "package_sha256": h.package_receipt["sha256"], "receipts": h.receipts}))
     finally:
