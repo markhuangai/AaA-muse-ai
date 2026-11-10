@@ -73,11 +73,12 @@ export class Capture {
   async write(event: Record<string, Value>): Promise<void> {
     await this.state.withLock('capture', async () => {
       const payload = Buffer.from(encode(event));
+      const payloadHash = digest(payload);
       const id = this.state.sys.uuid();
       const records: string[] = [];
       const chunks = Math.ceil(payload.length / 2048);
       for (let i = 0; i < chunks; i++) {
-        const record = encode({ type: 'event', time: event.time, event: event.msg, level: event.level, instance_id: event.instance_id, operation_id: event.operation_id, request_id: event.request_id, capture_id: id, chunk: i, chunks, payload_sha256: digest(payload), data_base64: payload.subarray(i * 2048, (i + 1) * 2048).toString('base64') });
+        const record = encode({ type: 'event', time: event.time, event: event.msg, level: event.level, instance_id: event.instance_id, operation_id: event.operation_id, request_id: event.request_id, capture_id: id, chunk: i, chunks, payload_sha256: payloadHash, data_base64: payload.subarray(i * 2048, (i + 1) * 2048).toString('base64') });
         requireValue(Buffer.byteLength(record) + 1 <= 6144, 'capture_record_too_large');
         records.push(record);
       }

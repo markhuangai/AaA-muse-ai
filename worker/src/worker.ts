@@ -94,7 +94,7 @@ export class Worker {
           progress = 'broker_already_accepted_decision';
         }
       }
-      if (phase === 'cancelled' || phase === 'interrupted') {
+      if (phase === 'pending' || phase === 'cancelled' || phase === 'interrupted') {
         const saved = await (await this.state.child('acks')).read(`${text(j.id)}.json`);
         const ack = saved ? object(parse(saved)) : undefined;
         if (ack?.state === 'confirmed' && ack.job_id === j.id && integer(ack.generation) === integer(j.generation) && ack.lease_id === j.lease_id) {
@@ -112,6 +112,25 @@ export class Worker {
       await this.state.write('pending.json', encode({ protocol_version: 1, worker_id: this.config.worker_id, jobs: values, updated_at: cue.updated_at }));
     });
     await this.logger.log(phase === 'cancelled' || phase === 'interrupted' ? 'WARN' : 'INFO', 'worker.job_progress', { ...correlation(j), state: phase, progress, observed_state: j.state, observed_held: j.held, reason: j.reason ?? '', acknowledgement_required: phase !== 'ack_confirmed' && j.held === true && j.state !== 'claimed', elapsed_ms: j.claimed_at ? this.state.sys.now() - Date.parse(text(j.claimed_at)) : 0 });
+  }
+  async reconcile(transport: Transport, status: ObjectValue): Promise<void> {
+    const ids = new Set<string>();
+    if (status.current_job) ids.add(identifier(object(status.current_job).job_id));
+    const cues = await this.state.child('cues');
+    for (const name of (await cues.list()).filter(n => /^[A-Za-z0-9_-]+\.json$/.test(n))) {
+      const cue = object(parse((await cues.read(name))!));
+      if (cue.needs_attention === true) ids.add(identifier(cue.job_id));
+    }
+    const saved = await this.state.read('pending.json');
+    if (saved) {
+      const pending = object(parse(saved));
+      requireValue(pending.worker_id === this.config.worker_id && Array.isArray(pending.jobs), 'invalid_pending_cues');
+      for (const cue of pending.jobs as Value[]) ids.add(identifier(object(cue).job_id));
+    }
+    for (const id of ids) {
+      const current = await this.getJob(transport, id);
+      await this.publish(current, text(current.state), 'reconciled_existing_assignment');
+    }
   }
   async operation(kind: string, j: ObjectValue, build: (submission: string) => ObjectValue, decisionInput = ''): Promise<ObjectValue> {
     const journals = await this.state.child('journals');
@@ -160,7 +179,8 @@ export class Worker {
     let current = await this.getJob(transport, id);
     const build = (submission: string): ObjectValue => ({ protocol_version: 1, submission_id: submission, connection_id: connection.connection_id, connection_generation: connection.connection_generation });
     let op = await this.operation('claim', current, build);
-    try { await this.send(transport, current, op); }
+    let accepted: ObjectValue;
+    try { accepted = await this.send(transport, current, op); }
     catch (error) {
       const submitted = object(parse(text(op.body)));
       if (!(error instanceof Failure && error.code === 'broker_rejected' && error.fields.http_status === 409 && error.fields.reason === 'stale_connection') ||
@@ -170,11 +190,13 @@ export class Worker {
       const previous = op.submission_id;
       op = await this.operation('claim', current, build);
       await this.logger.log('WARN', 'worker.claim_retrying', { ...correlation(current), ...error.fields, submission_id: op.submission_id, previous_submission_id: previous, connection_id: connection.connection_id, connection_generation: connection.connection_generation, operation_attempt: 2, observed_state: current.state });
-      await this.send(transport, current, op);
+      accepted = await this.send(transport, current, op);
     }
     const observed = await this.getJob(transport, id);
-    requireValue(observed.state === 'claimed' && observed.held === true && observed.connection_id === connection.connection_id && integer(observed.connection_generation) === integer(connection.connection_generation), 'recovered_claim_not_current', { ...correlation(observed), observed_state: observed.state });
-    await this.publish(observed, 'pending', 'awaiting_muse_decision');
+    const stopped = observed.state === 'cancelled' || observed.state === 'interrupted';
+    const sameAssignment = integer(observed.generation) === integer(accepted.generation) && observed.lease_id === accepted.lease_id && observed.connection_id === accepted.connection_id && integer(observed.connection_generation) === integer(accepted.connection_generation);
+    requireValue(sameAssignment && (stopped || (observed.state === 'claimed' && observed.held === true && observed.connection_id === connection.connection_id && integer(observed.connection_generation) === integer(connection.connection_generation))), 'recovered_claim_not_current', { ...correlation(observed), observed_state: observed.state });
+    await this.publish(observed, stopped ? text(observed.state) : 'pending', stopped ? 'awaiting_explicit_idle_acknowledgement' : 'awaiting_muse_decision');
   }
   async show(id: string): Promise<ObjectValue> {
     const transport = await this.load();

@@ -24,6 +24,10 @@ class TLSFixture:
         self.delay_context_job = None
         self.context_captured = threading.Event()
         self.release_context = threading.Event()
+        self.pause_claim = False
+        self.claim_captured = threading.Event()
+        self.release_claim = threading.Event()
+        self.decision_sizes = []
         self.events = []
         self.cert = harness.root.resolve() / "tls-cert.pem"
         key = harness.root.resolve() / "tls-key.pem"
@@ -78,6 +82,11 @@ class TLSFixture:
                     if not streaming:
                         payload = response.read()
                         with fixture.lock:
+                            paused_claim = fixture.pause_claim and self.path.endswith('/claim') and response.status == 200
+                            if paused_claim:
+                                fixture.pause_claim = False
+                            if self.path.endswith('/decisions') and response.status == 200:
+                                fixture.decision_sizes.append(len(payload))
                             delayed_context = self.command == "GET" and fixture.delay_context_job is not None and self.path == "/api/v1/worker/jobs/" + fixture.delay_context_job
                             if delayed_context:
                                 fixture.delay_context_job = None
@@ -88,6 +97,9 @@ class TLSFixture:
                         if delayed_context:
                             fixture.context_captured.set()
                             fixture.release_context.wait(timeout=8)
+                        if paused_claim:
+                            fixture.claim_captured.set()
+                            fixture.release_claim.wait(timeout=8)
                         if drop:
                             fixture.harness.private("lost-decision-request.json", body.decode())
                             self.connection.shutdown(socket.SHUT_RDWR)

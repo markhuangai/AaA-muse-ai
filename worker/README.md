@@ -54,11 +54,13 @@ Duplicate keys, trailing input, unknown fields, invalid IDs, unsupported decisio
 
 Full context is the normal baseline. Delta context is carried only when the broker supplies a qualification probe with its explicit base receipt. A stale delta after reconnect is rejected; cancel that experiment and create a full-context replacement explicitly. The CLI does not invent a new context base or automatically retry inference.
 
-Requests are bounded to 10 seconds and three attempts. Immutable journal bodies and submission IDs are saved before mutations and reused across retries, including after restart. A received receipt describes an accepted operation, not a fresh assignment. Claimed work is checked against current broker state before exposure as actionable work.
+Requests are bounded to 10 seconds and three attempts, with a 1 MiB request ceiling and a 3 MiB response ceiling that includes duplicated final text and broker metadata. Immutable journal bodies and submission IDs are saved before mutations and reused across retries, including after restart. A received receipt describes an accepted operation, not a fresh assignment. Claimed work is checked against current broker state before exposure as actionable work. Cancellation or expiry during that check retains its exact stopped assignment for explicit acknowledgement while health continues.
 
 The subscriber retries transient stream failures with delays capped at 30 seconds. Revocation, invalid protocol, unsafe state and credential/TLS failures stop it explicitly. Only one daemon may own a state directory. Live or ambiguous owners are rejected; stale owners may be recovered only when their process is provably dead. An abandoned recovery guard fails closed and requires operator inspection.
 
 Cancellation, a deadline, or disconnect fences late results but does not prove that Muse stopped. The broker retains the busy hold. Send `--ack-idle` only after that exact assignment has finished/stopped. The CLI queues its job/generation/lease tuple for a fresh health challenge; output distinguishes `queued` from `confirmed`. Ordinary heartbeats and restarts never supply this acknowledgement automatically.
+
+Startup reconciles the broker's current assignment and persisted actionable cues, including when the broker is idle. This repairs interrupted cue publication after an accepted decision. A delayed context read cannot revive an exact assignment with an accepted decision or confirmed explicit idle acknowledgement; other assignments and uncertain stopped work retain their cues.
 
 ## Protected state and diagnostics
 

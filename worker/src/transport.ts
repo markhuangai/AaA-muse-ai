@@ -29,7 +29,8 @@ export function validateBody(input?: string): void {
 
 export class Transport {
   constructor(readonly endpoint: string, readonly credential: string, readonly logger: Logger, readonly sys: System, readonly net: Network = network) { origin(endpoint); }
-  async body(response: Response, limit = 2 * 1024 * 1024): Promise<string> {
+  // Final receipts duplicate answer text from the bounded canonical context and add broker metadata.
+  async body(response: Response, limit = 3 * 1024 * 1024): Promise<string> {
     if (!response.body) return '';
     const reader = response.body.getReader();
     const buffers: Uint8Array[] = [];

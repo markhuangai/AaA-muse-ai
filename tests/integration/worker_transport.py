@@ -234,6 +234,112 @@ class WorkerTransport(Inference):
         require(any(e["msg"] == "worker.idle_confirmed" for e in events), "explicit acknowledgement lacks broker outcome")
         self.receipt("worker.disconnect_fencing_explicit_ack_and_restart", identity_preserved=True, no_automatic_inference_retry=True)
 
+    def stopped_claim_reconciliation(self, worker):
+        for stopped in ('cancelled', 'interrupted'):
+            self.proxy.pause_claim = True
+            self.proxy.claim_captured.clear()
+            self.proxy.release_claim.clear()
+            e = self.create(worker, 'stopped during claim reconciliation', tools=False, timeout=2 if stopped == 'interrupted' else 300)
+            job_id = e['current_job_id']
+            try:
+                require(self.proxy.claim_captured.wait(timeout=5), 'broker did not accept the paused claim')
+                if stopped == 'cancelled':
+                    self.cancel(e['id'])
+                else:
+                    self.until(lambda: self.experiment(e['id'])['state'] == stopped, 'paused claim never reached its deadline', timeout=5)
+            finally:
+                self.proxy.release_claim.set()
+            def retained():
+                pending = worker['state'] / 'pending.json'
+                return pending.exists() and any(j['job_id'] == job_id and j['state'] == stopped for j in json.loads(pending.read_text())['jobs'])
+            self.until(retained, 'stopped claim lost its actionable cue')
+            require(self.inspect(worker['daemon'])['State']['Running'] and self.status(worker)['work_status'] == 'busy', 'stopped claim terminated the subscriber or released its hold')
+            prior = json.loads((worker['state'] / 'connection.json').read_text())['last_heartbeat_at']
+            self.until(lambda: json.loads((worker['state'] / 'connection.json').read_text())['last_heartbeat_at'] > prior, 'stopped claim prevented continued health', timeout=20)
+            self.command(worker, 'decision-submit', '--job-id', job_id, '--ack-idle')
+            self.until(lambda: self.status(worker)['work_status'] == 'idle', 'explicit stopped-claim acknowledgement did not release hold', timeout=20)
+            events = self.decoded(worker, e['id'])
+            progress = [v for v in events if v['msg'] == 'worker.job_progress' and v.get('progress') == 'awaiting_explicit_idle_acknowledgement' and v['state'] == stopped and v['acknowledgement_required']]
+            require(progress, 'stopped-claim evidence omits cause or retained acknowledgement')
+            accepted = [v for v in events if v['msg'] == 'worker.operation_accepted' and v.get('operation') == 'claim']
+            self.diagnose(accepted[0]['request_id'], 'job.claimed')
+            self.receipt('worker.stopped_claim_reconciliation', stopped_state=stopped, continued_health=True, explicit_acknowledgement=True, request_id=accepted[0]['request_id'], log_only_diagnosis=True)
+
+    def idle_startup_reconciliation(self, worker):
+        for boundary in ('cue', 'index'):
+            e = self.create(worker, 'accepted decision before failed cue publication', tools=False)
+            job_id = e['current_job_id']
+            self.wait_job(worker, e)
+            target = worker['state'] / ('cues/' + job_id + '.json' if boundary == 'cue' else 'pending.json')
+            target.chmod(0o644)
+            try:
+                self.submit_cli(worker, job_id, {'type': 'final', 'text': 'accepted before cue write'}, want=1)
+            finally:
+                target.chmod(0o600)
+            require(self.experiment(e['id'])['state'] == 'completed' and self.status(worker)['current_job'] is None, 'cue failure did not follow accepted final')
+            pointer = json.loads((worker['state'] / 'journals' / ('decision-' + job_id + '.json')).read_text())
+            journal = json.loads((worker['state'] / 'journals' / ('operation-' + pointer['submission_id'] + '.json')).read_text())
+            require(journal['state'] == 'accepted' and json.loads((worker['state'] / 'pending.json').read_text())['jobs'], 'accepted journal and stale aggregate boundary were not reached')
+            self.docker('stop', '--time', '5', worker['daemon'])
+            self.start(worker)
+            require(not json.loads((worker['state'] / 'pending.json').read_text())['jobs'], 'idle restart retained completed work')
+            events = self.decoded(worker, e['id'])
+            require(any(v['msg'] == 'worker.job_progress' and v.get('progress') == 'reconciled_existing_assignment' and v['observed_state'] == 'accepted' for v in events), 'restart evidence omits accepted cue recovery')
+            self.diagnose(journal['request_id'], 'decision.accepted')
+            self.receipt('worker.idle_startup_reconciles_accepted_cue', boundary=boundary, pending_jobs=0, request_id=journal['request_id'], log_only_diagnosis=True)
+
+    def delayed_claimed_after_idle(self, worker):
+        e = self.create(worker, 'claimed snapshot after confirmed idle', tools=False)
+        job_id = e['current_job_id']
+        self.wait_job(worker, e)
+        self.proxy.delay_context_job = job_id
+        self.proxy.context_captured.clear()
+        self.proxy.release_context.clear()
+        showing = self.container(worker['state'], ['job-show', '--job-id', job_id])
+        self.docker('start', showing)
+        try:
+            require(self.proxy.context_captured.wait(timeout=5), 'claimed response was not captured')
+            self.cancel(e['id'])
+            self.command(worker, 'decision-submit', '--job-id', job_id, '--ack-idle')
+            self.proxy.interrupt()
+            ack = worker['state'] / 'acks' / (job_id + '.json')
+            self.until(lambda: json.loads(ack.read_text())['state'] == 'confirmed', 'fresh challenge did not confirm idle', timeout=6)
+            require(not json.loads((worker['state'] / 'pending.json').read_text())['jobs'], 'confirmation left pending work')
+        finally:
+            self.proxy.release_context.set()
+        self.until(lambda: not self.inspect(showing)['State']['Running'], 'old claimed response did not finish')
+        require(self.inspect(showing)['State']['ExitCode'] == 0, 'old claimed context failed')
+        output = self.logs(showing)
+        self.assert_private(output)
+        self.private('claimed-after-idle-output.log', output)
+        require(not json.loads((worker['state'] / 'pending.json').read_text())['jobs'], 'claimed response revived confirmed idle')
+        events = self.decoded(worker, e['id'])
+        require(any(v['msg'] == 'worker.job_progress' and v.get('progress') == 'broker_already_confirmed_idle' and v['observed_state'] == 'claimed' and v['observed_held'] and v['state'] == 'ack_confirmed' and not v['acknowledgement_required'] for v in events), 'logs omit stale claimed view versus confirmed idle')
+        accepted = [v for v in events if v['msg'] == 'worker.idle_confirmed']
+        self.diagnose(accepted[-1]['request_id'], 'worker.idle_confirmed')
+        self.receipt('worker.confirmed_idle_survives_old_claimed_context', pending_jobs=0, request_id=accepted[-1]['request_id'], log_only_diagnosis=True)
+
+    def near_limit_final_receipt(self, worker):
+        e = self.create(worker, 'near-limit final receipt', tools=False)
+        job_id = e['current_job_id']
+        shown = self.wait_job(worker, e)
+        messages = shown['context']['messages'] + [{'type': 'message', 'role': 'assistant', 'text': ''}]
+        overhead = len(json.dumps({'messages': messages, 'tools': []}, separators=(',', ':')).encode())
+        answer = '<' * ((1024 * 1024 - overhead) // 6)
+        decision = {'type': 'final', 'text': answer}
+        accepted = self.submit_cli(worker, job_id, decision)
+        require(accepted['experiment']['final_text'] == answer and accepted['experiment']['messages'][-1]['text'] == answer, 'large final receipt changed text')
+        require(self.proxy.decision_sizes[-1] > 2 * 1024 * 1024, 'real escaped broker receipt did not exceed the former bound')
+        repeated = self.submit_cli(worker, job_id, decision)
+        require(repeated['submission_id'] == accepted['submission_id'] and repeated['experiment'] == accepted['experiment'], 'large accepted receipt was not replayable')
+        events = self.decoded(worker, e['id'])
+        exchanges = [v for v in events if v['msg'] == 'worker.http_exchange' and v['route'].endswith('/decisions')]
+        require(len(exchanges) == 2 and all(v['output']['final_text'] == answer and v['input']['decision']['text'] == answer for v in exchanges), 'large accepted exchange evidence is incomplete')
+        broker = self.export_operation(e['id'])
+        require(len([v for v in broker if v['msg'] == 'decision.accepted']) == 1, 'large decision replay duplicated acceptance')
+        self.diagnose(exchanges[0]['request_id'], 'decision.accepted')
+        self.receipt('worker.near_limit_escaped_receipt', response_bytes=self.proxy.decision_sizes[-1], final_characters=len(answer), accepted_once=True, request_id=exchanges[0]['request_id'], log_only_diagnosis=True)
+
     def offline_ack_reconnect(self, worker):
         e = self.create(worker, "queued acknowledgement before restart", tools=False)
         job_id = e["current_job_id"]
@@ -331,6 +437,10 @@ def main():
         h.tool_loop(worker)
         h.claim_rejection_recovery(worker)
         h.delayed_context_after_decision(worker)
+        h.stopped_claim_reconciliation(worker)
+        h.idle_startup_reconciliation(worker)
+        h.delayed_claimed_after_idle(worker)
+        h.near_limit_final_receipt(worker)
         h.expired_heartbeat(worker)
         h.cancellation_reconnect(worker)
         h.offline_ack_reconnect(worker)

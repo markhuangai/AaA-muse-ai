@@ -36,6 +36,7 @@ test('HTTP retries preserve exact bodies, classify causal errors, and keep crede
   await assert.rejects(tls.request('/api/v1/worker/status'), error => !error.retryable);
   assert.equal(await transport.body(new Response()), '');
   await assert.rejects(transport.body(new Response('x'.repeat(20)), 10), /response_too_large/);
+  await assert.rejects(transport.body(new Response('x'.repeat(3 * 1024 * 1024 + 1))), error => error.code === 'response_too_large' && error.fields.max_bytes === 3 * 1024 * 1024);
 });
 
 test('HTML and empty transient HTTP errors retry identical requests and retain redacted evidence', async t => {

@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import * as fs from 'node:fs/promises';
+import crypto from 'node:crypto';
+import { syncBuiltinESMExports } from 'node:module';
 import { State } from '../dist/state.js';
 import { Capture, Logger, Redactor } from '../dist/diagnostics.js';
 import { parse, encode } from '../dist/json.js';
@@ -50,4 +52,23 @@ test('retention and capture failures provide honest omissions and stop required 
   const logger = new Logger(f.state, new Capture(broken), line => f.output.push(line));
   await assert.rejects(logger.log('INFO', 'required_operation'), /diagnostics_unavailable/);
   const error = JSON.parse(f.output.at(-1)); assert.equal(error.msg, 'worker.capture_failed'); assert.equal(error.stopped_operation, 'required_operation'); assert(!f.output.join('').includes(KEY));
+});
+
+test('large diagnostic captures hash the payload once and reconstruct every bounded chunk', async t => {
+  const f = await fixture(t);
+  const payload = 'large-λ-'.repeat(400_000);
+  const createHash = crypto.createHash;
+  let hashes = 0;
+  try {
+    crypto.createHash = (...args) => { hashes++; return createHash(...args); };
+    syncBuiltinESMExports();
+    await f.logger.log('DEBUG', 'worker.large_exchange', { operation_id: 'large', payload, credential: KEY });
+  } finally { crypto.createHash = createHash; syncBuiltinESMExports(); }
+  assert.equal(hashes, 1);
+  assert.equal(f.output.length, 0);
+  const raw = await f.logger.capture.export({ operation_id: 'large' }, false);
+  assert(raw.trimEnd().split('\n').length > 1000);
+  for (const line of raw.trimEnd().split('\n').slice(1)) assert(Buffer.byteLength(line) + 1 <= 6144);
+  const events = (await f.logger.capture.export({ operation_id: 'large' }, true)).trimEnd().split('\n').map(JSON.parse);
+  assert.equal(events[0].complete, true); assert.equal(events[1].payload, payload); assert.equal(events[1].credential, '[REDACTED]');
 });

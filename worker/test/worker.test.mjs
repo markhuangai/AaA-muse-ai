@@ -149,18 +149,64 @@ test('pending cues retain unconfirmed, differently fenced and active work', asyn
   const exact = { job_id: JOB, generation: 1, lease_id: 'f'.repeat(32), state: 'confirmed' };
   for (const ack of [undefined, { ...exact, state: 'queued' }, { ...exact, job_id: ID }, { ...exact, generation: 2 }, { ...exact, lease_id: 'a'.repeat(32) }]) {
     if (ack) await acks.write(JOB + '.json', encode(ack));
-    for (const state of ['cancelled', 'interrupted']) {
+    for (const state of ['cancelled', 'interrupted', 'claimed']) {
       await f.worker.publish(claimed({ state }), state, 'needs_explicit_ack');
       const cues = parse(await f.state.read('pending.json')).jobs;
-      assert.equal(cues.length, 1); assert.equal(cues[0].state, state); assert.equal(cues[0].needs_attention, true);
+      assert.equal(cues.length, 1); assert.equal(cues[0].state, state === 'claimed' ? 'pending' : state); assert.equal(cues[0].needs_attention, true);
     }
   }
   await acks.write(JOB + '.json', encode(exact));
-  await f.worker.publish(claimed(), 'claimed', 'active_work');
+  await f.worker.publish(claimed({ generation: 2, lease_id: 'a'.repeat(32) }), 'claimed', 'different_assignment');
   const active = parse(await f.state.read('pending.json')).jobs;
   assert.equal(active.length, 1); assert.equal(active[0].state, 'pending');
   assert.equal(parse(await acks.read(JOB + '.json')).state, 'confirmed');
   assert(!f.broker.calls.some(call => call.input?.idle_ack || call.path.endsWith('/decisions')));
+});
+
+test('stopped claim recovery fences every receipt assignment mismatch', async t => {
+  for (const mismatch of [{ generation: 2 }, { lease_id: 'a'.repeat(32) }, { connection_id: 'a'.repeat(32) }, { connection_generation: 2 }]) {
+    const f = await fixture(t); const transport = await enrolled(f);
+    f.broker.override = async call => {
+      if (call.path.endsWith('/' + JOB) && f.broker.jobs.get(JOB).state === 'claimed') Object.assign(f.broker.jobs.get(JOB), { state: 'interrupted', ...mismatch });
+    };
+    await assert.rejects(f.worker.claim(transport, JOB, { connection_id: CONN, connection_generation: 1 }), /recovered_claim_not_current/);
+    assert.equal(await f.state.read('pending.json'), undefined);
+  }
+});
+
+test('near-limit HTML-escaped final receipts remain accepted and replayable without reducing request admission', async t => {
+  const f = await fixture(t); const transport = await enrolled(f);
+  await f.worker.claim(transport, JOB, { connection_id: CONN, connection_generation: 1 });
+  const current = f.broker.jobs.get(JOB);
+  const htmlJSON = value => JSON.stringify(value).replaceAll('<', '\\u003c');
+  const messages = [...current.context.messages, { type: 'message', role: 'assistant', text: '' }];
+  const overhead = Buffer.byteLength(htmlJSON({ messages, tools: current.context.tools }));
+  const answer = '<'.repeat(Math.floor((1024 * 1024 - overhead) / 6));
+  messages.at(-1).text = answer;
+  const canonicalBytes = Buffer.byteLength(htmlJSON({ messages, tools: current.context.tools }));
+  assert(canonicalBytes <= 1024 * 1024 && canonicalBytes > 1024 * 1024 - 6);
+  let responseBytes = 0;
+  f.broker.override = async call => {
+    if (!call.path.endsWith('/decisions')) return;
+    assert.equal(call.input.decision.text, answer);
+    current.state = 'accepted'; current.held = false;
+    const result = { id: current.experiment_id, worker_id: ID, conversation_id: current.conversation_id, state: 'completed', current_job_id: JOB, created_at: current.created_at, deadline_at: current.deadline_at, tools: current.context.tools, messages, final_text: answer, remote_outcome: 'decision_observed' };
+    const raw = htmlJSON(result); responseBytes = Buffer.byteLength(raw);
+    return new Response(raw, { headers: { 'x-request-id': 'near-context-limit' } });
+  };
+  const input = encode({ type: 'final', text: answer });
+  const accepted = await f.worker.submit(JOB, input);
+  assert(responseBytes > 2 * 1024 * 1024);
+  assert.equal(accepted.experiment.final_text, answer);
+  assert.equal(accepted.experiment.messages.at(-1).text, answer);
+  const repeated = await new Worker(f.state, f.logger, f.net).submit(JOB, input);
+  assert.equal(repeated.submission_id, accepted.submission_id);
+  const journal = parse(await (await f.state.child('journals')).read('operation-' + accepted.submission_id + '.json'));
+  assert.equal(journal.state, 'accepted'); assert.equal(journal.result.final_text, answer);
+  assert.equal(parse(await f.state.read('pending.json')).jobs.length, 0);
+  const events = (await f.logger.capture.export({ operation_id: current.experiment_id }, true)).trimEnd().split('\n').map(JSON.parse);
+  assert.equal(events[0].complete, true);
+  assert(events.some(e => e.msg === 'worker.http_exchange' && e.request_id === 'near-context-limit' && e.output.final_text === answer && e.input.decision.text === answer));
 });
 
 test('obsolete claim replacement requires a definitive stale rejection and still-queued work, and is bounded', async t => {

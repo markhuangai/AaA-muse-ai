@@ -52,11 +52,7 @@ export class Subscriber {
     const release = await worker.state.lock('daemon', false);
     try {
       const status = await worker.identity(transport);
-      if (status.current_job) {
-        const held = object(status.current_job);
-        const current = await worker.getJob(transport, text(held.job_id));
-        await worker.publish(current, text(current.state), 'reconciled_existing_assignment');
-      }
+      await worker.reconcile(transport, status);
       let attempt = 0;
       await worker.logger.log('INFO', 'worker.started', { worker_id: worker.config.worker_id, endpoint: worker.config.origin, inference_readiness: 'unverified' });
       while (!signal.aborted) {

@@ -1,5 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import * as fs from 'node:fs/promises';
+import { State } from '../dist/state.js';
 import { Subscriber } from '../dist/subscriber.js';
 import { Worker } from '../dist/worker.js';
 import { encode, parse, integer } from '../dist/json.js';
@@ -226,9 +228,9 @@ test('a buffered cancellation and later context read preserve confirmed idle aft
 });
 
 test('a context response captured before accepted idle cannot revive its confirmed assignment', async t => {
+  for (const capturedState of ['claimed', 'interrupted']) {
   const f = await fixture(t); const transport = await enrolled(f);
-  f.broker.jobs.set(JOB, claimed({ state: 'interrupted' }));
-  await f.worker.ack(JOB);
+  f.broker.jobs.set(JOB, claimed({ state: capturedState }));
   let release, captured, blocked = false;
   const ready = new Promise(done => { captured = done; });
   const gate = new Promise(done => { release = done; });
@@ -243,6 +245,8 @@ test('a context response captured before accepted idle cannot revive its confirm
   const showing = f.worker.show(JOB);
   t.after(() => release());
   await ready;
+  f.broker.jobs.get(JOB).state = 'interrupted';
+  await f.worker.ack(JOB);
   const subscriber = new Subscriber(f.worker); subscriber.active = opened;
   await subscriber.heartbeat(transport, health('accepted-before-old-read'));
   assert.equal(parse(await f.state.read('pending.json')).jobs.length, 0);
@@ -251,8 +255,69 @@ test('a context response captured before accepted idle cannot revive its confirm
   assert.equal(parse(await (await f.state.child('acks')).read(JOB + '.json')).state, 'confirmed');
   const events = (await f.logger.capture.export({}, true)).trimEnd().split('\n').map(JSON.parse);
   assert.equal(events[0].complete, true);
-  assert(events.some(e => e.msg === 'worker.job_progress' && e.state === 'ack_confirmed' && e.progress === 'broker_already_confirmed_idle' && e.observed_state === 'interrupted' && e.observed_held === true && e.acknowledgement_required === false));
+  assert(events.some(e => e.msg === 'worker.job_progress' && e.state === 'ack_confirmed' && e.progress === 'broker_already_confirmed_idle' && e.observed_state === capturedState && e.observed_held === true && e.acknowledgement_required === false));
   assert(!f.output.some(line => JSON.parse(line).level === 'DEBUG'));
+  }
+});
+
+test('cancellation between accepted claim and reconciliation retains its cue and continued health', async t => {
+  for (const state of ['cancelled', 'interrupted']) {
+    const f = await fixture(t); await enrolled(f);
+    const stop = new AbortController();
+    const frames = [['connection.opened', opened], ['job.available', { worker_id: ID, job_id: JOB }], ['health.challenge', health('after-stopped-claim')]];
+    f.broker.override = async call => {
+      if (call.path.endsWith('/events')) return new Response(new ReadableStream({ start(c) { c.enqueue(Buffer.from(frames.map(([type, data], i) => `id: race-${i}\nevent: ${type}\ndata: ${encode(data)}\n\n`).join(''))); } }), { headers: { 'content-type': 'text/event-stream' } });
+      if (call.path.endsWith('/' + JOB) && f.broker.jobs.get(JOB).state === 'claimed') Object.assign(f.broker.jobs.get(JOB), { state, reason: state === 'cancelled' ? 'client_cancelled' : 'deadline_exceeded' });
+      if (call.input?.challenge_id === 'after-stopped-claim') stop.abort();
+    };
+    await new Subscriber(f.worker).run(stop.signal);
+    const pending = parse(await f.state.read('pending.json')).jobs;
+    assert.equal(pending.length, 1); assert.equal(pending[0].state, state);
+    assert.equal(f.broker.jobs.get(JOB).held, true);
+    assert.equal(f.broker.calls.filter(c => c.path.endsWith('/heartbeat')).length, 1);
+    assert(!f.broker.calls.some(c => c.input?.idle_ack || c.path.endsWith('/decisions')));
+    const events = (await f.logger.capture.export({}, true)).trimEnd().split('\n').map(JSON.parse);
+    assert.equal(events[0].complete, true);
+    assert(events.some(e => e.msg === 'worker.job_progress' && e.progress === 'awaiting_explicit_idle_acknowledgement' && e.state === state && e.acknowledgement_required));
+  }
+});
+
+test('restart reconciles accepted decisions across both cue write boundaries even when the broker is idle', async t => {
+  for (const boundary of ['cue', 'index']) for (const decision of [{ type: 'final', text: 'done' }, { type: 'tool_call', call_id: 'call', name: 'read_file', arguments: {} }]) {
+    const f = await fixture(t); const transport = await enrolled(f);
+    await f.worker.claim(transport, JOB, opened);
+    const state = new State(f.state.root, { ...fs, open: async (path, ...args) => {
+      if ((boundary === 'cue' && path.includes('/cues/.' + JOB + '.json.')) || (boundary === 'index' && path.includes('/.pending.json.'))) throw Object.assign(new Error('simulated storage outage'), { code: 'ENOSPC' });
+      return await fs.open(path, ...args);
+    } }, f.state.sys);
+    await assert.rejects(new Worker(state, f.logger, f.net).submit(JOB, encode(decision)), /simulated storage outage/);
+    const journals = await f.state.child('journals');
+    const submission = parse(await journals.read('decision-' + JOB + '.json')).submission_id;
+    assert.equal(parse(await journals.read('operation-' + submission + '.json')).state, 'accepted');
+    assert.equal(parse(await f.state.read('pending.json')).jobs.length, 1);
+    const stop = new AbortController();
+    f.broker.override = async call => { if (call.path.endsWith('/status')) stop.abort(); };
+    await new Subscriber(new Worker(f.state, f.logger, f.net)).run(stop.signal);
+    assert.equal(parse(await f.state.read('pending.json')).jobs.length, 0);
+    assert.equal(f.broker.calls.filter(c => c.path.endsWith('/decisions')).length, 1);
+    const events = (await f.logger.capture.export({}, true)).trimEnd().split('\n').map(JSON.parse);
+    assert.equal(events[0].complete, true);
+    assert(events.some(e => e.msg === 'worker.job_progress' && e.progress === 'reconciled_existing_assignment' && e.observed_state === 'accepted'));
+  }
+});
+
+test('restart repairs an actionable per-job cue missing from the aggregate and retains uncertain stopped work', async t => {
+  const f = await fixture(t); await enrolled(f);
+  f.broker.jobs.set(JOB, claimed({ state: 'interrupted', held: false }));
+  await f.worker.publish(f.broker.jobs.get(JOB), 'interrupted', 'unknown_remote_outcome');
+  await f.state.write('pending.json', encode({ protocol_version: 1, worker_id: ID, jobs: [] }));
+  const stop = new AbortController();
+  f.broker.override = async call => { if (call.path.endsWith('/status')) stop.abort(); };
+  await new Subscriber(new Worker(f.state, f.logger, f.net)).run(stop.signal);
+  const pending = parse(await f.state.read('pending.json')).jobs;
+  assert.equal(pending.length, 1); assert.equal(pending[0].state, 'interrupted');
+  assert.equal(pending[0].progress, 'reconciled_existing_assignment');
+  assert(!f.broker.calls.some(c => c.input?.idle_ack || c.path.endsWith('/decisions')));
 });
 
 test('a rejected obsolete claim is replaced once on the healthy subscription without another job event', async t => {
