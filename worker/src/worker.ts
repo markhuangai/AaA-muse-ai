@@ -81,6 +81,7 @@ export class Worker {
     return job((await transport.request(`/api/v1/worker/jobs/${id}`, 'GET', undefined, { job_id: id, worker_id: text(this.config.worker_id) })).data, text(this.config.worker_id), id);
   }
   async publish(j: ObjectValue, phase: string, progress: string): Promise<void> {
+    if (phase === 'claimed') phase = 'pending';
     await this.state.withLock('cues', async () => {
       const cues = await this.state.child('cues');
       const cue = { protocol_version: 1, ...correlation(j), state: phase, progress, updated_at: new Date(this.state.sys.now()).toISOString(), needs_attention: ['pending', 'cancelled', 'interrupted'].includes(phase) };
@@ -150,7 +151,7 @@ export class Worker {
     await this.identity(transport);
     const current = await this.getJob(transport, id);
     await this.logger.log('DEBUG', 'worker.context', { ...correlation(current), context: current.context });
-    await this.publish(current, current.state === 'claimed' ? 'pending' : text(current.state), 'context_shown');
+    await this.publish(current, text(current.state), 'context_shown');
     return { protocol_version: 1, ...correlation(current), state: current.state, context: current.context };
   }
   async submit(id: string, input: string): Promise<ObjectValue> {

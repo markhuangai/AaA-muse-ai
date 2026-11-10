@@ -189,6 +189,25 @@ class WorkerTransport(Inference):
         require(any(e["msg"] == "worker.idle_confirmed" for e in events), "explicit acknowledgement lacks broker outcome")
         self.receipt("worker.disconnect_fencing_explicit_ack_and_restart", identity_preserved=True, no_automatic_inference_retry=True)
 
+    def expired_heartbeat(self, worker):
+        prior = json.loads((worker["state"] / "connection.json").read_text())
+        self.proxy.expire_heartbeat = True
+        def recovered():
+            current = json.loads((worker["state"] / "connection.json").read_text())
+            return current.get("connection_id") != prior["connection_id"] and current.get("status") == "online" and self.status(worker)["connection_status"] == "online"
+        self.until(recovered, "expired heartbeat did not establish a fresh healthy subscription", timeout=55)
+        events = self.decoded(worker)
+        refused = [e for e in events if e["msg"] == "worker.http_exchange" and e["route"].endswith("/heartbeat") and e["http_status"] == 409 and e["input"]["connection_id"] == prior["connection_id"] and e["output"].get("error") == "stale_connection"]
+        require(refused, "real broker never rejected the delayed heartbeat as stale")
+        failure = refused[-1]
+        retry = [e for e in events if e["msg"] == "worker.stream_retrying" and e.get("request_id") == failure["request_id"] and e.get("reason") == "stale_connection"]
+        require(retry and retry[-1]["last_event_id"] and retry[-1]["delay_ms"] <= 30000, "stale heartbeat lacks correlated reconnect evidence")
+        healthy = [e for e in events if e["msg"] == "worker.http_exchange" and e["route"].endswith("/heartbeat") and e["http_status"] == 200 and e["input"]["connection_generation"] > prior["connection_generation"]]
+        require(healthy, "fresh connection never answered an authenticated health challenge")
+        self.diagnose(failure["request_id"], "lease.rejected", "stale_connection")
+        require((worker["state"] / "credential.key").read_text().strip() == worker["credential"], "heartbeat recovery replaced worker identity")
+        self.receipt("worker.expired_heartbeat_reconnect", request_id=failure["request_id"], old_generation=prior["connection_generation"], new_generation=healthy[-1]["input"]["connection_generation"], log_only_diagnosis=True, identity_preserved=True)
+
     def scope_permissions_and_health(self, worker):
         foreign = self.cli_worker("foreign")
         self.start(foreign)
@@ -242,6 +261,7 @@ def main():
         h.command(worker, "run", want=1)
         h.long_health(worker)
         h.tool_loop(worker)
+        h.expired_heartbeat(worker)
         h.cancellation_reconnect(worker)
         h.scope_permissions_and_health(worker)
         h.private("results.json", json.dumps({"suite": "worker-transport", "synthetic_decisions": True, "source_sha": args.source_sha, "package_sha256": h.package_receipt["sha256"], "receipts": h.receipts}))

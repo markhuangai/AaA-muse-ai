@@ -29,7 +29,14 @@ export class Subscriber {
       input.idle_ack = { job_id: ack.job_id, generation: ack.generation, lease_id: ack.lease_id };
       acknowledged = ack;
     }
-    const result = await transport.request('/api/v1/worker/heartbeat', 'POST', encode(input), { worker_id: this.worker.config.worker_id, operation_id: this.active!.connection_id, connection_id: this.active!.connection_id, connection_generation: this.active!.connection_generation });
+    let result;
+    try {
+      result = await transport.request('/api/v1/worker/heartbeat', 'POST', encode(input), { worker_id: this.worker.config.worker_id, operation_id: this.active!.connection_id, connection_id: this.active!.connection_id, connection_generation: this.active!.connection_generation });
+    } catch (error) {
+      if (error instanceof Failure && error.code === 'broker_rejected' && error.fields.http_status === 409 &&
+          (error.fields.reason === 'stale_connection' || error.fields.reason === 'unknown_or_expired_challenge')) error.retryable = true;
+      throw error;
+    }
     await this.worker.state.write('connection.json', encode({ ...this.active, last_event_id: this.lastEvent, last_heartbeat_at: new Date(this.worker.state.sys.now()).toISOString(), status: result.data.connection_status }));
     if (acknowledged) {
       acknowledged.state = 'confirmed';

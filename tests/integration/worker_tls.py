@@ -1,9 +1,11 @@
 import http.client
 import http.server
+import json
 import socket
 import ssl
 import subprocess
 import threading
+import time
 import urllib.parse
 
 
@@ -15,6 +17,8 @@ class TLSFixture:
         self.lock = threading.Lock()
         self.drop_decision = False
         self.dropped = 0
+        self.expire_heartbeat = False
+        self.delayed_heartbeat = None
         self.events = []
         self.cert = harness.root.resolve() / "tls-cert.pem"
         key = harness.root.resolve() / "tls-key.pem"
@@ -39,6 +43,16 @@ class TLSFixture:
                     fixture.connections.append(connection)
                 try:
                     body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                    if self.path == "/api/v1/worker/heartbeat":
+                        identity = json.loads(body)["connection_id"]
+                        with fixture.lock:
+                            if fixture.expire_heartbeat:
+                                fixture.expire_heartbeat = False
+                                fixture.delayed_heartbeat = (identity, time.monotonic() + 25)
+                            delayed = fixture.delayed_heartbeat
+                        if delayed and delayed[0] == identity:
+                            # Expire liveness while leaving time for the final HTTP attempt to receive the broker's refusal.
+                            time.sleep(max(0, delayed[1] - time.monotonic()))
                     headers = {key: self.headers[key] for key in ("Authorization", "Content-Type", "X-Request-Id") if key in self.headers}
                     connection.request(self.command, self.path, body=body or None, headers=headers)
                     response = connection.getresponse()

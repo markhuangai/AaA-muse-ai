@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Subscriber } from '../dist/subscriber.js';
+import { Worker } from '../dist/worker.js';
 import { encode, parse, integer } from '../dist/json.js';
 import { fixture, enrolled, until, ID, JOB, CONN, KEY, claimed } from './helpers.mjs';
 
@@ -108,4 +109,91 @@ test('invalid UTF-8 is a terminal protocol failure and never reconnects', async 
   await assert.rejects(new Subscriber(f.worker).run(new AbortController().signal), error => error.code === 'invalid_utf8' && !error.retryable);
   assert.equal(f.broker.calls.filter(c => c.path.endsWith('/events')).length, 1);
   assert(!f.output.map(JSON.parse).some(e => e.msg === 'worker.stream_retrying'));
+});
+
+test('expired heartbeat connections reopen SSE and confirm queued idle only on a fresh accepted challenge', async t => {
+  for (const reason of ['stale_connection', 'unknown_or_expired_challenge']) {
+    const f = await fixture(t); await enrolled(f);
+    f.broker.jobs.set(JOB, claimed({ state: 'interrupted' }));
+    await f.worker.ack(JOB);
+    const acks = await f.state.child('acks');
+    const queued = await acks.read(JOB + '.json');
+    const stop = new AbortController(); let streams = 0, heartbeats = 0;
+    f.broker.override = async call => {
+      if (call.path.endsWith('/events')) {
+        if (++streams === 2) {
+          assert.equal(await acks.read(JOB + '.json'), queued);
+          assert.equal(f.broker.jobs.get(JOB).held, true);
+        }
+        const c = { ...opened, connection_id: CONN.slice(0, -1) + streams, connection_generation: streams };
+        const frames = [['connection.opened', c], ['health.challenge', { ...c, challenge_id: 'fresh-' + streams }]].map(([type, data], i) => `id: ${streams}-${i}\nevent: ${type}\ndata: ${encode(data)}\n\n`).join('');
+        return new Response(new ReadableStream({ start(controller) { controller.enqueue(Buffer.from(frames)); } }), { headers: { 'content-type': 'text/event-stream' } });
+      }
+      if (call.path.endsWith('/heartbeat')) {
+        assert.equal(call.input.idle_ack.job_id, JOB);
+        assert.equal(integer(call.input.idle_ack.generation), 1);
+        assert.equal(call.input.idle_ack.lease_id, 'f'.repeat(32));
+        if (++heartbeats === 1) return new Response(encode({ error: reason }), { status: 409, headers: { 'x-request-id': 'expired-heartbeat' } });
+        stop.abort();
+      }
+    };
+    await new Subscriber(f.worker).run(stop.signal);
+    assert.equal(streams, 2); assert.equal(heartbeats, 2);
+    const calls = f.broker.calls.filter(c => c.path.endsWith('/heartbeat'));
+    assert.equal(integer(calls[0].input.connection_generation), 1);
+    assert.equal(integer(calls[1].input.connection_generation), 2);
+    assert.notEqual(calls[0].input.challenge_id, calls[1].input.challenge_id);
+    assert.equal(parse(await acks.read(JOB + '.json')).state, 'confirmed');
+    assert.equal(f.broker.jobs.get(JOB).held, false);
+    assert.equal(parse(await f.state.read('pending.json')).jobs.length, 0);
+    const warnings = f.output.map(JSON.parse).filter(e => e.msg === 'worker.stream_retrying');
+    assert.equal(warnings.length, 1); assert.equal(warnings[0].reason, reason);
+    assert.equal(warnings[0].request_id, 'expired-heartbeat'); assert.equal(warnings[0].delay_ms, 1000);
+    const exported = await f.logger.capture.export({}, true);
+    assert.equal(JSON.parse(exported.split('\n')[0]).complete, true);
+    assert(!exported.includes(KEY)); assert(!f.output.join('').includes(KEY));
+    assert(!f.broker.calls.some(c => c.path.endsWith('/decisions')));
+  }
+});
+
+test('heartbeat authorization, protocol and idle-acknowledgement failures remain terminal', async t => {
+  for (const [status, body, expected] of [
+    [401, '{"error":"unauthorized"}', 'worker_unauthorized'],
+    [200, 'not-json', 'invalid_json'],
+    [409, '{"error":"idle_ack_mismatch"}', 'broker_rejected'],
+    [409, '{"error":"challenge_reply_conflict"}', 'broker_rejected'],
+    [400, '{"error":"unsupported_protocol_version"}', 'broker_rejected'],
+  ]) {
+    const f = await fixture(t); await enrolled(f);
+    const frames = [['connection.opened', opened], ['health.challenge', health('terminal')]].map(([type, data], i) => `id: ${i}\nevent: ${type}\ndata: ${encode(data)}\n\n`).join('');
+    f.broker.override = async call => {
+      if (call.path.endsWith('/events')) return new Response(new ReadableStream({ start(c) { c.enqueue(Buffer.from(frames)); } }), { headers: { 'content-type': 'text/event-stream' } });
+      if (call.path.endsWith('/heartbeat')) return new Response(body, { status });
+    };
+    await assert.rejects(new Subscriber(f.worker).run(new AbortController().signal), e => e.code === expected && !e.retryable);
+    assert.equal(f.broker.calls.filter(c => c.path.endsWith('/events')).length, 1);
+    assert.equal(f.broker.calls.filter(c => c.path.endsWith('/heartbeat')).length, 1);
+    assert(!f.output.map(JSON.parse).some(e => e.msg === 'worker.stream_retrying'));
+  }
+});
+
+test('startup reconciliation preserves a held claimed cue through shutdown before subscription', async t => {
+  const f = await fixture(t); const transport = await enrolled(f);
+  await f.worker.claim(transport, JOB, opened);
+  const before = parse(await f.state.read('pending.json')).jobs[0];
+  const stop = new AbortController();
+  f.broker.override = async call => { if (call.path.endsWith('/status')) stop.abort(); };
+  await new Subscriber(new Worker(f.state, f.logger, f.net)).run(stop.signal);
+  const after = parse(await f.state.read('pending.json')).jobs;
+  assert.equal(after.length, 1); assert.equal(after[0].state, 'pending'); assert.equal(after[0].needs_attention, true);
+  for (const key of ['job_id', 'worker_id', 'conversation_id', 'context_receipt_id', 'deadline_at']) assert.equal(after[0][key], before[key]);
+  assert.equal(integer(after[0].generation), 1); assert.equal(after[0].progress, 'reconciled_existing_assignment');
+  assert.equal(f.broker.jobs.get(JOB).state, 'claimed'); assert.equal(f.broker.jobs.get(JOB).held, true);
+  assert.equal(f.broker.calls.filter(c => c.path.endsWith('/claim')).length, 1);
+  assert(!f.broker.calls.some(c => c.path.endsWith('/events') || c.path.endsWith('/decisions')));
+  assert.equal((await f.state.read('credential.key')).trim(), KEY);
+  assert(!encode(after).includes('lease_id')); assert(!encode(after).includes('client-only request'));
+  const events = (await f.logger.capture.export({}, true)).trimEnd().split('\n').map(JSON.parse);
+  assert.equal(events[0].complete, true);
+  assert(events.some(e => e.msg === 'worker.job_progress' && e.progress === 'reconciled_existing_assignment' && e.state === 'pending'));
 });
