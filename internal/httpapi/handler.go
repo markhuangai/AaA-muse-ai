@@ -25,6 +25,7 @@ type Exporter interface {
 type Handler struct {
 	Service   *service.Service
 	Workers   *service.Workers
+	Setup     *service.Setup
 	Broker    *service.Broker
 	Authority *auth.Authority
 	Exporter  Exporter
@@ -182,6 +183,8 @@ func (h *Handler) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, h.Service.Status(r.Context(), logger))
 	case "/api/v1/admin/diagnostics/export":
 		h.export(w, r, logger)
+	case "/api/v1/admin/setup-prompts":
+		h.setupRequest(w, r, logger, body)
 	default:
 		if strings.Contains(route, "/experiments") || route == "/api/v1/worker/events" || route == "/api/v1/worker/heartbeat" || strings.HasPrefix(route, "/api/v1/worker/jobs/") {
 			h.inferenceRequest(w, r, logger, route, requestedWorker, identity, body)

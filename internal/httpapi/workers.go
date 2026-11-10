@@ -13,6 +13,7 @@ import (
 
 	"github.com/markhuangai/AaA-muse-ai/internal/diagnostics"
 	"github.com/markhuangai/AaA-muse-ai/internal/inference"
+	"github.com/markhuangai/AaA-muse-ai/internal/service"
 	"github.com/markhuangai/AaA-muse-ai/internal/worker"
 )
 
@@ -20,7 +21,7 @@ var workerIDPattern = regexp.MustCompile(`^[0-9a-f]{32}$`)
 
 func routeFor(path string) (string, string) {
 	switch path {
-	case "/healthz", "/readyz", "/api/v1/admin/status", "/api/v1/admin/diagnostics/export", "/api/v1/admin/enrollments", "/api/v1/worker/enroll", "/api/v1/admin/workers", "/api/v1/worker/status":
+	case "/healthz", "/readyz", "/api/v1/admin/status", "/api/v1/admin/diagnostics/export", "/api/v1/admin/enrollments", "/api/v1/admin/setup-prompts", "/api/v1/worker/enroll", "/api/v1/admin/workers", "/api/v1/worker/status":
 		return path, ""
 	}
 	if strings.HasPrefix(path, "/api/v1/admin/workers/") {
@@ -39,7 +40,7 @@ func routeFor(path string) (string, string) {
 
 func routeMethod(route string) string {
 	switch route {
-	case "/api/v1/admin/enrollments", "/api/v1/worker/enroll", "/api/v1/admin/workers/{id}/revoke":
+	case "/api/v1/admin/enrollments", "/api/v1/admin/setup-prompts", "/api/v1/worker/enroll", "/api/v1/admin/workers/{id}/revoke":
 		return http.MethodPost
 	case "/api/v1/admin/workers/{id}":
 		return http.MethodPatch
@@ -48,6 +49,29 @@ func routeMethod(route string) string {
 	default:
 		return http.MethodGet
 	}
+}
+
+func (h *Handler) setupRequest(w *response, r *http.Request, logger *slog.Logger, body []byte) {
+	if _, err := decodeWorkerInput(body, ""); err != nil {
+		logger.Warn("request.rejected", "reason", err.Error(), "omitted_body_bytes", len(body))
+		writeJSON(w, 400, map[string]any{"error": err.Error()})
+		return
+	}
+	if h.Setup == nil {
+		writeJSON(w, 503, map[string]any{"error": "service_unavailable"})
+		return
+	}
+	result, err := h.Setup.Create(r.Context(), logger)
+	w.enrollmentID = result.EnrollmentID
+	if errors.Is(err, service.ErrWorkerPackageUnconfigured) {
+		writeJSON(w, 503, map[string]any{"error": err.Error()})
+		return
+	}
+	if err != nil {
+		workerError(w, err)
+		return
+	}
+	writeJSON(w, 201, result)
 }
 
 type workerView struct {

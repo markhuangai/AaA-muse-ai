@@ -1,8 +1,8 @@
 # Muse worker CLI
 
-The worker receives broker assignments and carries structured decisions. It answers transport-health challenges; it never invents a model answer, answers an inference-readiness challenge automatically, or executes client tools. Native Muse wake/setup assets belong to issue #6 and live qualification to issue #7.
+The worker receives broker assignments and carries structured decisions. It answers transport-health challenges; it never invents a model answer, answers an inference-readiness challenge automatically, or executes client tools. Issue #6 supplies installation and candidate hook/recovery assets; live Muse qualification belongs to issue #7.
 
-Build with Node 24.22.2 and TypeScript 7.0.2. Compiled JavaScript targets Node 22.12.0 or newer on a POSIX filesystem. The actual Muse runtime remains unverified. The package is `@markhuangai/aaa-muse-worker`, version `0.1.0-dev.0`; no package or Release asset is published by issue #5.
+Build with Node 24.22.2 and TypeScript 7.0.2. Compiled JavaScript targets Node 22.12.0 or newer on a POSIX filesystem. The actual Muse runtime remains unverified. The package is `@markhuangai/aaa-muse-worker`, version `0.1.0-dev.0`; development builds keep this version. Post-merge issue #6 publication stamps matching package/CLI versions as `0.1.0-rc.N`; no worker publication is qualified before its live workflow receipt.
 
 From the repository root:
 
@@ -13,6 +13,7 @@ npm run check --workspace worker
 npm test --workspace worker
 make worker-package
 make test-worker-transport
+make test-worker-setup
 ```
 
 The last check requires Docker, Python 3, and OpenSSL. It runs the packed CLI in pinned Node containers through a private trusted TLS fixture to the real Go/PostgreSQL broker. Decisions are supplied by the test driver. Its client fixture is absent from worker containers. These are software checks, not Muse inference evidence.
@@ -23,6 +24,8 @@ Invoke `node worker/dist/main.js` from a source build, or `aaa-muse-worker` from
 
 | Command | Behavior |
 | --- | --- |
+| `setup --origin HTTPS_ORIGIN --code-stdin --install-dir ABSOLUTE_PATH --setup-id ID` | Verified installer entry: preserve enrollment, install scoped assets and start one subscriber |
+| `hook-check` | Internal managed-hook check and guarded recovery; never a model answer |
 | `configure --origin https://muse.example.com` | Save an HTTPS origin, with no credentials, path, query, or fragment |
 | `enroll --code-stdin` | Read the single-use code from stdin; save the returned worker key without printing it |
 | `run` | Hold one authenticated SSE subscription, answer health challenges, claim jobs, and publish cues |
@@ -80,3 +83,19 @@ Also available: `--request-id`, `--since`, and `--until` with RFC3339 times. Che
 `worker.state_unsafe` reports expected/observed permissions, ownership/type, and the stopped operation. Repair the identified private state before restarting. If the directory cannot safely open, stderr records that protected capture is unavailable. A required capture-write failure emits `worker.capture_failed` and stops the operation; repair its storage cause before restarting. Exports record their outcome without recapturing their own response.
 
 Unit coverage receipts under `.artifacts/unit/worker` list every production module and raw covered/total statements; the ratio must be strictly above 90%. Broker/image integration receipts stay separate. Packed archives and source/runtime/digest receipts are under `.artifacts/worker-package`; isolated integration resources and cleanup receipts use the existing unique test-owner labels. None of these private artifacts belongs in Git or a public handoff.
+
+## Installation, detector and recovery
+
+Use the broker's management-authenticated setup-prompt endpoint after configuring the exact published version and digest. Paste its complete result into Muse and approve only the actual permissions it requests. The bootstrap verifies the archive before executing package code; Node fallback verifies the pinned Linux x64 archive before executing that runtime. An unavailable platform, tool or permission stops setup explicitly. No npm registry credentials enter the VM.
+
+The installer returns exact launcher, hook and skill paths. Register one no-argument managed hook with five-second checks after listing enabled and disabled hooks. Reuse an existing exact enabled registration. Disabled/conflicting registrations or unsupported cadence require an operator report rather than another hook. The generated skill is discoverable in later conversations and limits authority to authenticated model decisions; the client executes its tools. End setup before an independent readiness challenge.
+
+Previous bundles and private credentials/journals remain intact. One daemon owns the state directory. Managed checks may restart only a provably absent subscriber, preserving the worker's identity. A terminal `run-stop.json`, ambiguous ownership, revoked key, unsafe state, or uncertain enrollment blocks recovery and needs operator diagnosis. Do not delete journals or silently re-enroll. Running-version changes and automatic upgrades are outside this installation path. Full wipes, account resets and live refresh persistence remain outside the software receipt.
+
+Unchanged actionable cues emit one wake per assignment/state change. Native emission failure leaves the cue eligible; successful emission does not prove inference started. Inspect the deadline, last emitted cue, subsequent job progress and broker outcome when work stalls. No model retry or stopped-assignment acknowledgement is invented by the detector. Managed dry runs stop before worker state access, network, filesystem writes or subscriber launch.
+
+Before verified Node is available, bootstrap records contain only bounded nonsecret metadata in a private `0700` temporary directory and `0600` receipt. Preserve that directory on failure. Successful setup imports the receipt into the existing protected capture. Installer failures include stage, expected/observed artifact digest or capability, setup correlation and execution status. Required evidence-write failure stops installation. Background stderr is a private bounded 64 KiB emergency sink; the existing diagnostic capture retains complete redacted events and explicitly reports retention omissions.
+
+Collect a setup timeline with `diagnostics-export --decode`, check the first export record's completeness/omissions, and filter events by `setup_id`. Use worker/operation/request IDs to join recovered processes and broker exports. `setup.digest_mismatch`, `setup.runtime_unsupported`, `setup.recovery_blocked`, `setup.cue_observed` and `setup.wake_emitted` distinguish artifact refusal, capability refusal, ownership/authorization stops and emitted but unconfirmed work. Setup and transport health always retain `inference_readiness: unverified` until independent live qualification.
+
+Automatic publication after human merge uses immutable `worker-v0.1.0-rc.N` tags. It packs one archive, tests it on the build and minimum runtimes, and compares registry and anonymous public Release bytes. `worker-release.json` provides source/version/digest pins. Existing-byte conflicts fail; publication does not overwrite tags or assets. Its first live receipt, actual Muse permissions, native wake and supported-refresh recovery must be observed separately before issue #7 passes.

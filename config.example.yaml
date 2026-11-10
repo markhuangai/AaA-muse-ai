@@ -8,6 +8,9 @@ management:
 control-portal:
   password: "${MUSE_PORTAL_PASSWORD}"
 client-keys: {}
+worker-package:
+  version: ""
+  sha256: ""
 limits:
   max-jobs: 1
   in-flight-per-worker: 1

@@ -144,6 +144,7 @@ func Run(ctx context.Context, args []string, build service.Build, d Dependencies
 	serveCtx, cancelServe := context.WithCancel(ctx)
 	defer cancelServe()
 	handler := &httpapi.Handler{Service: svc, Workers: service.NewWorkers(repo, authority, d.Random, d.Now), Broker: broker, Authority: authority, Exporter: store, Logger: logger, Random: d.Random, Now: d.Now, Failed: failed}
+	handler.Setup = service.NewSetup(handler.Workers, c.Server.PublicURL, c.WorkerPackage)
 	server := &http.Server{Handler: handler, BaseContext: func(net.Listener) context.Context { return serveCtx }, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 * 1024, ErrorLog: slog.NewLogLogger(logger.Handler(), slog.LevelError)}
 	brokerDone := make(chan struct{})
 	go func() { defer close(brokerDone); broker.Run(serveCtx, logger) }()

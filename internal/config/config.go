@@ -39,8 +39,9 @@ type Config struct {
 	Portal struct {
 		Password Secret `yaml:"password" json:"password"`
 	} `yaml:"control-portal" json:"control_portal"`
-	ClientKeys map[string]Secret `yaml:"client-keys" json:"client_keys"`
-	Limits     struct {
+	ClientKeys    map[string]Secret `yaml:"client-keys" json:"client_keys"`
+	WorkerPackage WorkerPackage     `yaml:"worker-package" json:"worker_package"`
+	Limits        struct {
 		MaxJobs  int `yaml:"max-jobs" json:"max_jobs"`
 		InFlight int `yaml:"in-flight-per-worker" json:"in_flight_per_worker"`
 	} `yaml:"limits" json:"limits"`
@@ -51,6 +52,14 @@ type Config struct {
 		MaxBytes      int64  `yaml:"max-bytes" json:"max_bytes"`
 	} `yaml:"diagnostics" json:"diagnostics"`
 }
+
+type WorkerPackage struct {
+	Version string `yaml:"version" json:"version"`
+	SHA256  string `yaml:"sha256" json:"sha256"`
+}
+
+var packageVersion = regexp.MustCompile(`^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(dev|rc)\.(0|[1-9][0-9]*))?$`)
+var packageDigest = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
 type Error struct {
 	Field, Reason string
@@ -222,6 +231,14 @@ func resolve(n *yaml.Node, lookup func(string) (string, bool)) error {
 
 func (c Config) Validate() error {
 	bad := func(field, reason string) error { return &Error{Field: field, Reason: reason} }
+	if c.WorkerPackage.Version != "" || c.WorkerPackage.SHA256 != "" {
+		if !packageVersion.MatchString(c.WorkerPackage.Version) {
+			return bad("worker-package.version", "canonical_version_required")
+		}
+		if !packageDigest.MatchString(c.WorkerPackage.SHA256) {
+			return bad("worker-package.sha256", "sha256_required")
+		}
+	}
 	_, port, err := net.SplitHostPort(c.Server.Listen)
 	p, portErr := strconv.Atoi(port)
 	if err != nil || portErr != nil || p < 1 || p > 65535 {
