@@ -11,6 +11,35 @@ permissions:
   contents: read
 
 jobs:
+  qualification:
+    name: CI / qualification
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24.22.2
+      - name: Verify exact source
+        env:
+          SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+      - name: Install locked helper dependencies
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Build existing diagnostic helpers
+        run: npm run build --workspace worker
+      - name: Exercise collector, evidence integrity, verdicts and CLI fixtures
+        run: node --test tools/qualification.test.mjs
+      - name: Validate explicit synthetic receipts without qualifying Muse
+        run: |
+          set -euo pipefail
+          fixture_dir="${RUNNER_TEMP}/aaa-muse-qualification-synthetic"
+          node tools/qualification-fixtures.mjs "$fixture_dir"
+          node tools/qualify.mjs validate-report --report "$fixture_dir/report.json" --synthetic
+
   workflow-policy:
     name: CI / workflow-policy
     runs-on: ubuntu-latest
