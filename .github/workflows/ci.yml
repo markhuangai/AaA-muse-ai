@@ -126,11 +126,13 @@ jobs:
         run: npm ci --ignore-scripts --no-audit --no-fund
       - name: Build and verify Node 24 archive
         run: make worker-package
+      - name: Shipped installer, hook, recovery and protected diagnostics
+        run: make test-worker-setup
       - uses: actions/setup-node@v7
         with:
           node-version: 22.12.0
       - name: Verify the same compiled package on the minimum runtime
-        run: npm run test:package --workspace worker
+        run: npm run test:package --workspace worker -- --verify-receipt .artifacts/worker-package/latest.json
       - name: Exercise production worker logic on the minimum runtime
         working-directory: worker
         run: node --test test/*.test.mjs

@@ -1,0 +1,96 @@
+name: Publish worker prerelease
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  actions: read
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: worker-release
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    if: github.event.workflow_run.event == 'push' && github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      source_sha: ${{ steps.resolve.outputs.source_sha }}
+      version: ${{ steps.resolve.outputs.version }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      should_publish: ${{ steps.resolve.outputs.should_publish }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - name: Verify merged source and classify shipped changes
+        id: resolve
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const { prepareRelease, reportReleaseFailure } = await import(`${process.env.GITHUB_WORKSPACE}/.github/scripts/worker-release.mjs`);
+            try {
+              const prepared = await prepareRelease({ github, context });
+              for (const [name, value] of Object.entries(prepared)) core.setOutput(name, value);
+            } catch (error) { reportReleaseFailure(core, error); }
+  publish:
+    needs: resolve
+    if: needs.resolve.outputs.should_publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      actions: read
+      contents: write
+      packages: write
+      pull-requests: read
+    env:
+      SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
+      WORKER_RELEASE_VERSION: ${{ needs.resolve.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: trusted
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          path: source
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24.22.2
+          registry-url: https://npm.pkg.github.com
+      - name: Pack one exact-source release archive
+        working-directory: source
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          npm ci --ignore-scripts --no-audit --no-fund
+          make worker-package
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22.12.0
+      - name: Validate identical bytes on the minimum runtime
+        working-directory: source
+        run: npm run test:package --workspace worker -- --verify-receipt .artifacts/worker-package/latest.json
+      - name: Publish and independently verify both destinations
+        uses: actions/github-script@v9
+        env:
+          NODE_AUTH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
+        with:
+          script: |
+            const { readFileSync } = await import('node:fs');
+            const { publishRelease, reportReleaseFailure } = await import(`${process.env.GITHUB_WORKSPACE}/trusted/.github/scripts/worker-release.mjs`);
+            const prepared = { source_sha: process.env.SOURCE_SHA, version: process.env.WORKER_RELEASE_VERSION, tag: process.env.RELEASE_TAG, should_publish: true };
+            try {
+              const receipt = JSON.parse(readFileSync('source/.artifacts/worker-package/latest.json', 'utf8'));
+              await publishRelease({ github, context, prepared, receipt, archive: readFileSync(receipt.archive), token: process.env.NODE_AUTH_TOKEN });
+            } catch (error) { reportReleaseFailure(core, error, prepared); }

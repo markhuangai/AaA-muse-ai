@@ -38,34 +38,34 @@ export class State {
     await this.io.mkdir(this.root, { recursive: true, mode: 0o700 });
     await this.check(this.root, true);
   }
-  async check(path: string, directory = false): Promise<void> {
+  async check(path: string, directory = false, fileMode: 0o600 | 0o700 = 0o600): Promise<void> {
     const info = await this.io.lstat(path);
-    const mode = directory ? 0o700 : 0o600;
+    const mode = directory ? 0o700 : fileMode;
     // An atomic replacement can unlink a private inode after lookup while its snapshot remains valid.
     requireValue((directory ? info.isDirectory() : info.isFile()) && !info.isSymbolicLink() && info.uid === this.sys.uid && (info.mode & 0o7777) === mode && (directory || info.nlink <= 1), 'state_unsafe', {
       path_kind: directory ? 'state_directory' : 'state_file', entry: path === this.root ? '.' : path.slice(this.root.length + 1), expected_mode: mode.toString(8), observed_mode: (info.mode & 0o7777).toString(8), expected_uid: this.sys.uid, observed_uid: info.uid, observed_links: info.nlink, observed_type: info.isSymbolicLink() ? 'symlink' : info.isDirectory() ? 'directory' : info.isFile() ? 'file' : 'other',
     });
   }
-  async read(name: string): Promise<string | undefined> {
+  async read(name: string, mode: 0o600 | 0o700 = 0o600): Promise<string | undefined> {
     await this.check(this.root, true);
     const path = this.path(name);
     try {
-      await this.check(path);
+      await this.check(path, false, mode);
       const f = await this.io.open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
       try {
         const info = await f.stat();
-        requireValue(info.isFile() && info.uid === this.sys.uid && (info.mode & 0o7777) === 0o600 && info.nlink <= 1, 'state_unsafe', { entry: name, expected_mode: '600', observed_mode: (info.mode & 0o7777).toString(8), expected_uid: this.sys.uid, observed_uid: info.uid, observed_links: info.nlink });
+        requireValue(info.isFile() && info.uid === this.sys.uid && (info.mode & 0o7777) === mode && info.nlink <= 1, 'state_unsafe', { entry: name, expected_mode: mode.toString(8), observed_mode: (info.mode & 0o7777).toString(8), expected_uid: this.sys.uid, observed_uid: info.uid, observed_links: info.nlink });
         requireValue(info.size <= 16 * 1024 * 1024, 'state_file_too_large');
         return await f.readFile('utf8');
       } finally { await f.close(); }
     } catch (error) { if (cause(error) === 'ENOENT') return undefined; throw error; }
   }
-  async write(name: string, value: string): Promise<void> {
+  async write(name: string, value: string, mode: 0o600 | 0o700 = 0o600): Promise<void> {
     await this.check(this.root, true);
     const target = this.path(name);
-    try { await this.check(target); } catch (error) { if (cause(error) !== 'ENOENT') throw error; }
+    try { await this.check(target, false, mode); } catch (error) { if (cause(error) !== 'ENOENT') throw error; }
     const tmp = this.path(`.${name}.${this.sys.uuid()}.tmp`);
-    const f = await this.io.open(tmp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+    const f = await this.io.open(tmp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, mode);
     try { await f.writeFile(value); await f.sync(); } finally { await f.close(); }
     await this.io.rename(tmp, target);
     const directory = await this.io.open(this.root, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
