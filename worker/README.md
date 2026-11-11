@@ -63,6 +63,8 @@ The subscriber retries transient stream failures with delays capped at 30 second
 
 Cancellation, a deadline, or disconnect fences late results but does not prove that Muse stopped. The broker retains the busy hold. Send `--ack-idle` only after that exact assignment has finished/stopped. The CLI queues its job/generation/lease tuple for a fresh health challenge; output distinguishes `queued` from `confirmed`. Ordinary heartbeats and restarts never supply this acknowledgement automatically.
 
+The acknowledgment record confirms broker acceptance before the local cue and `pending.json` refresh finishes. `worker.idle_confirmed` is emitted after that publication; callers observing files must wait for both confirmation and the reconciled pending state.
+
 Startup reconciles the broker's current assignment and persisted actionable cues, including when the broker is idle. This repairs interrupted cue publication after an accepted decision. A delayed context read cannot revive an exact assignment with an accepted decision or confirmed explicit idle acknowledgement; other assignments and uncertain stopped work retain their cues.
 
 ## Protected state and diagnostics

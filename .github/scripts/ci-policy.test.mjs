@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { parse } from 'yaml';
-import { checkDirectory, checkWorkflow } from './ci-policy.mjs';
+import { checkDirectory, checkWorkflow, main, workflowProblems } from './ci-policy.mjs';
 
 const workflow = (runner = 'ubuntu-latest', budget = '30') => `
 name: fixture
@@ -78,6 +78,28 @@ test('directory scanner checks both YAML extensions and refuses an empty workflo
   } finally {
     rmSync(directory, { recursive: true });
   }
+});
+
+test('budget rejection logs identify the actual runner, job, workflow, and allowed timeout', () => {
+  const events = [], emit = (_core, level, event, fields) => events.push({ level, event, ...fields });
+  const directory = mkdtempSync(join(tmpdir(), 'aaa-muse-ci-diagnostics-test-'));
+  try {
+    writeFileSync(join(directory, 'bad.yml'), workflow('self-hosted', '31'));
+    assert.equal(main(directory, emit), 1);
+    const rejected = events.filter(event => event.event === 'ci.budget_rejected');
+    assert.equal(rejected.length, 2);
+    assert(rejected.every(event => event.level === 'error' && event.workflow === 'bad.yml' && event.job === 'check' && event.runner === 'self-hosted' && event.timeout === 31 && event.maximum === 30));
+    const captured = [], previous = console.log;
+    console.log = line => captured.push(line);
+    try { assert.equal(main(directory), 1); } finally { console.log = previous; }
+    assert(captured.filter(line => line.startsWith('::error::')).map(line => JSON.parse(line.slice(9))).some(event => event.level === 'ERROR' && event.event === 'ci.budget_rejected' && event.workflow === 'bad.yml' && event.job === 'check' && event.runner === 'self-hosted' && event.timeout === 31 && event.maximum === 30));
+    writeFileSync(join(directory, 'bad.yml'), workflow());
+    assert.equal(main(directory, emit), 0);
+    assert.equal(events.at(-1).outcome, 'passed');
+    assert.equal(main(join(directory, 'missing'), emit), 1);
+    assert.equal(events.at(-1).cause, 'ENOENT');
+    for (const value of ['[]', 'false', 'invalid']) assert.equal(workflowProblems(`jobs:\n  job: ${value}`)[0].cause, 'invalid_job');
+  } finally { rmSync(directory, { recursive: true }); }
 });
 
 test('actual pre-checkout workflow gate admits only trusted direct or successful completion events', async () => {

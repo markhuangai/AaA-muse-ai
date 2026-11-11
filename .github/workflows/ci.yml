@@ -10,7 +10,110 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.repository }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+
 jobs:
+  standards:
+    name: CI / standards
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      components: ${{ steps.components.outputs.components }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          ref: ${{ env.SOURCE_SHA }}
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24.22.2
+      - name: Verify exact source
+        run: test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+      - name: Enforce maintained-file inventory and line limits
+        run: make check-file-sizes
+      - name: Select every implemented unit component
+        id: components
+        run: |
+          set -euo pipefail
+          components=$(node tools/unit-runner.mjs list)
+          printf 'components=%s\n' "$components" >> "$GITHUB_OUTPUT"
+
+  unit:
+    name: CI / unit (${{ matrix.component }})
+    needs: standards
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        component: ${{ fromJSON(needs.standards.outputs.components) }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          ref: ${{ env.SOURCE_SHA }}
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24.22.2
+      - name: Verify exact source
+        run: test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+      - name: Install locked unit dependencies
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund
+          npm ci --prefix .github/scripts --ignore-scripts --no-audit --no-fund
+      - name: Build existing diagnostic modules
+        run: npm run build --workspace worker
+      - name: Run the selected real-logic unit suite and coverage policy
+        env:
+          UNIT_COMPONENT: ${{ matrix.component }}
+        run: node tools/unit-runner.mjs "$UNIT_COMPONENT"
+      - name: Retain complete safe unit evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: unit-${{ env.SOURCE_SHA }}-${{ matrix.component }}-${{ github.run_attempt }}
+          path: .artifacts/ci/unit/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+
+  coverage:
+    name: CI / coverage
+    needs: [standards, unit]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          ref: ${{ env.SOURCE_SHA }}
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24.22.2
+      - name: Verify exact source
+        run: test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+      - name: Download unit reports for this source and run
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: unit-${{ env.SOURCE_SHA }}-*
+          path: .artifacts/downloaded-unit
+      - name: Require every expected unit shard and raw report
+        if: always()
+        env:
+          STANDARDS_RESULT: ${{ needs.standards.result }}
+          UNIT_RESULT: ${{ needs.unit.result }}
+        run: |
+          set -euo pipefail
+          node tools/coverage-policy.mjs aggregate .artifacts/downloaded-unit
+          test "$STANDARDS_RESULT" = success
+          test "$UNIT_RESULT" = success
+
   qualification:
     name: CI / qualification
     runs-on: ubuntu-latest
@@ -31,8 +134,6 @@ jobs:
         run: npm ci --ignore-scripts --no-audit --no-fund
       - name: Build existing diagnostic helpers
         run: npm run build --workspace worker
-      - name: Exercise collector, evidence integrity, verdicts and CLI fixtures
-        run: node --test tools/qualification.test.mjs
       - name: Validate explicit synthetic receipts without qualifying Muse
         run: |
           set -euo pipefail
@@ -67,8 +168,6 @@ jobs:
           printf '%s  %s\n' "${ACTIONLINT_SHA256}" "${tool_dir}/actionlint.tar.gz" | sha256sum --check -
           tar -xzf "${tool_dir}/actionlint.tar.gz" -C "${tool_dir}" actionlint
           printf '%s\n' "${tool_dir}" >> "${GITHUB_PATH}"
-      - name: Test production policies
-        run: node --test .github/scripts/*.test.mjs
       - name: Enforce runner and timeout policy
         run: make check-ci-policy
       - name: Lint workflows
@@ -89,8 +188,6 @@ jobs:
         run: test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
       - name: Check service
         run: make check-service
-      - name: Unit statements and race checks
-        run: make test-service-unit
       - name: Real HTTP and PostgreSQL integration
         run: make test-service
       - name: Worker enrollment, revocation, and diagnosis
@@ -130,8 +227,6 @@ jobs:
         run: npm ci --ignore-scripts --no-audit --no-fund
       - name: Check worker types
         run: npm run check --workspace worker
-      - name: Worker unit statement coverage
-        run: npm test --workspace worker
       - name: Packed CLI with real HTTPS, SSE and PostgreSQL
         run: make test-worker-transport
 

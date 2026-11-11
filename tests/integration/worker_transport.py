@@ -303,8 +303,7 @@ class WorkerTransport(Inference):
             self.command(worker, 'decision-submit', '--job-id', job_id, '--ack-idle')
             self.proxy.interrupt()
             ack = worker['state'] / 'acks' / (job_id + '.json')
-            self.until(lambda: json.loads(ack.read_text())['state'] == 'confirmed', 'fresh challenge did not confirm idle', timeout=6)
-            require(not json.loads((worker['state'] / 'pending.json').read_text())['jobs'], 'confirmation left pending work')
+            self.until(lambda: json.loads(ack.read_text())['state'] == 'confirmed' and not json.loads((worker['state'] / 'pending.json').read_text())['jobs'], 'confirmed idle did not complete pending-state reconciliation', timeout=6)
         finally:
             self.proxy.release_context.set()
         self.until(lambda: not self.inspect(showing)['State']['Running'], 'old claimed response did not finish')
