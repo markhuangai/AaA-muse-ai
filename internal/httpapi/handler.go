@@ -37,13 +37,15 @@ type Handler struct {
 
 type response struct {
 	http.ResponseWriter
-	code                   int
-	body                   bytes.Buffer
-	capture                bool
-	stream                 bool
-	attempted, written     int
-	writeErr               error
-	workerID, enrollmentID string
+	code                                       int
+	body                                       bytes.Buffer
+	capture                                    bool
+	stream                                     bool
+	attempted, written                         int
+	writeErr                                   error
+	workerID, enrollmentID                     string
+	conversationID, sessionID, requestRecordID string
+	boundaryFailed                             bool
 }
 
 func (w *response) WriteHeader(code int) {
@@ -82,10 +84,19 @@ func (h *Handler) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 	route, requestedWorker := routeFor(r.URL.Path)
 	logger := h.Logger.With("request_id", id, "route", route)
 	w := &response{ResponseWriter: out, capture: route != "/api/v1/admin/diagnostics/export"}
-	role := h.Authority.Role(r.Header.Get("Authorization"))
+	role, clientID := h.Authority.Identity(r.Header.Get("Authorization"))
+	if clientID != "" {
+		logger = logger.With("client_id", clientID)
+	}
 	defer func() {
 		logger = logger.With("worker_id", w.workerID, "enrollment_id", w.enrollmentID)
+		if w.requestRecordID != "" {
+			logger = logger.With("operation_id", w.requestRecordID, "request_record_id", w.requestRecordID, "conversation_id", w.conversationID, "session_id", w.sessionID)
+		}
 		outcome, detail := "completed", ""
+		if w.boundaryFailed {
+			outcome = "uncertain"
+		}
 		if w.writeErr != nil {
 			outcome, detail = "interrupted", w.writeErr.Error()
 			logger.Warn("request.write_failed", "cause", "client_write_failed", "attempted_bytes", w.attempted, "written_bytes", w.written)
@@ -107,6 +118,8 @@ func (h *Handler) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 	expectedRole := ""
 	if strings.HasPrefix(route, "/api/v1/admin/") {
 		expectedRole = "management"
+	} else if strings.HasPrefix(route, "/api/v1/requests") {
+		expectedRole = "client"
 	} else if strings.HasPrefix(route, "/api/v1/worker/") && route != "/api/v1/worker/enroll" {
 		expectedRole = "worker"
 	}
@@ -158,7 +171,7 @@ func (h *Handler) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]any{"error": "get_body_unsupported"})
 		return
 	}
-	if route != "/api/v1/admin/diagnostics/export" && len(r.URL.Query()) != 0 {
+	if route != "/api/v1/admin/diagnostics/export" && !adminHistoryRoute(route) && r.URL.RawQuery != "" {
 		writeJSON(w, 400, map[string]any{"error": "unsupported_query"})
 		return
 	}
@@ -186,7 +199,9 @@ func (h *Handler) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 	case "/api/v1/admin/setup-prompts":
 		h.setupRequest(w, r, logger, body)
 	default:
-		if strings.Contains(route, "/experiments") || route == "/api/v1/worker/events" || route == "/api/v1/worker/heartbeat" || strings.HasPrefix(route, "/api/v1/worker/jobs/") {
+		if adminHistoryRoute(route) || strings.HasPrefix(route, "/api/v1/requests") {
+			h.historyRequest(w, r, logger, route, requestedWorker, clientID, body)
+		} else if strings.Contains(route, "/experiments") || route == "/api/v1/worker/events" || route == "/api/v1/worker/heartbeat" || strings.HasPrefix(route, "/api/v1/worker/jobs/") {
 			h.inferenceRequest(w, r, logger, route, requestedWorker, identity, body)
 		} else {
 			h.workerRequest(w, r, logger, route, requestedWorker, identity, body)

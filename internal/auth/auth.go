@@ -33,36 +33,41 @@ func ID(random io.Reader) (string, error) {
 
 type Authority struct {
 	management, portal []byte
-	clients            [][]byte
+	clients            map[string][]byte
 }
 
 func New(c config.Config) *Authority {
-	a := &Authority{management: []byte(c.Management.Key), portal: []byte(c.Portal.Password)}
-	for _, key := range c.ClientKeys {
-		a.clients = append(a.clients, []byte(key))
+	a := &Authority{management: []byte(c.Management.Key), portal: []byte(c.Portal.Password), clients: map[string][]byte{}}
+	for name, key := range c.ClientKeys {
+		a.clients[name] = []byte(key)
 	}
 	return a
 }
 
 func (a *Authority) Role(header string) string {
+	role, _ := a.Identity(header)
+	return role
+}
+
+func (a *Authority) Identity(header string) (string, string) {
 	if !strings.HasPrefix(header, "Bearer ") {
-		return "unauthenticated"
+		return "unauthenticated", ""
 	}
 	value := strings.TrimPrefix(header, "Bearer ")
 	if value == "" || strings.ContainsAny(value, " \t\r\n") {
-		return "unauthenticated"
+		return "unauthenticated", ""
 	}
 	credential := []byte(value)
 	if subtle.ConstantTimeCompare(credential, a.management) == 1 {
-		return "management"
+		return "management", ""
 	}
 	if subtle.ConstantTimeCompare(credential, a.portal) == 1 {
-		return "portal"
+		return "portal", ""
 	}
-	for _, client := range a.clients {
+	for name, client := range a.clients {
 		if subtle.ConstantTimeCompare(credential, client) == 1 {
-			return "client"
+			return "client", name
 		}
 	}
-	return "unauthenticated"
+	return "unauthenticated", ""
 }

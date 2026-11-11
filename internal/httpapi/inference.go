@@ -134,6 +134,17 @@ func (h *Handler) inferenceRequest(w *response, r *http.Request, logger *slog.Lo
 		return
 	}
 	writeJSON(w, code, result)
+	if route == "/api/v1/worker/jobs/{id}" || route == "/api/v1/worker/jobs/{id}/claim" {
+		cleanup, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 5*time.Second)
+		defer cancel()
+		cause := ""
+		if w.writeErr != nil {
+			cause = w.writeErr.Error()
+		}
+		if err := h.Broker.DeliveryFinished(cleanup, logger, identity.ID, id, w.attempted, w.written, cause); err != nil {
+			w.boundaryFailed = true
+		}
+	}
 }
 
 func (w *response) Unwrap() http.ResponseWriter { return w.ResponseWriter }

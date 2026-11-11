@@ -41,6 +41,9 @@ func event(events *[]inferenceEvent, level slog.Level, name string, s *inference
 	attrs := []any{"worker_id", s.WorkerID, "connection_id", s.Connection.ID, "connection_generation", s.Connection.Generation}
 	if j != nil {
 		attrs = append(attrs, "operation_id", j.ExperimentID, "experiment_id", j.ExperimentID, "conversation_id", j.ConversationID, "job_id", j.ID, "generation", j.Generation, "state", j.State, "lease_expires_at", j.LeaseExpiresAt, "deadline_at", j.DeadlineAt, "claimed_at", j.ClaimedAt)
+		if r := s.Requests[j.ExperimentID]; r != nil {
+			attrs = append(attrs, "client_id", r.ClientID, "session_id", r.SessionID, "request_record_id", r.ID)
+		}
 	} else {
 		attrs = append(attrs, "operation_id", s.Connection.ID)
 	}
@@ -57,7 +60,7 @@ func heldJob(s *inference.State) *inference.Job {
 }
 
 func project(s *inference.State) inference.Projection {
-	p := inference.Projection{ConnectionStatus: s.Connection.Status(s.Now), WorkStatus: "unknown", LastHeartbeatAt: s.Connection.LastAckAt}
+	p := inference.Projection{ConnectionStatus: s.Connection.Status(s.Now), WorkStatus: "unknown", LastHeartbeatAt: s.Connection.LastAckAt, WaitingForTool: s.PendingTools}
 	if p.ConnectionStatus == "online" {
 		p.WorkStatus = "idle"
 	}
@@ -154,6 +157,9 @@ func (b *Broker) run(ctx context.Context, logger *slog.Logger, ref inference.Ref
 		}
 	}
 	logger = logger.With("operation", operation, "protocol_version", inference.Version, "schema_version", postgres.SchemaVersion, "health_interval_seconds", 10, "health_window_seconds", 30, "max_context_bytes", inference.MaxContextBytes, "max_jobs", b.maxJobs)
+	if ref.ClientID != "" {
+		logger = logger.With("client_id", ref.ClientID, "requested_session_id", ref.SessionID)
+	}
 	hash, err := inference.Hash(struct {
 		Operation, Experiment, Job string
 		Input                      any
@@ -179,6 +185,9 @@ func (b *Broker) run(ctx context.Context, logger *slog.Logger, ref inference.Ref
 		if e := s.Experiments[expID]; e != nil {
 			observed["conversation_id"] = e.ConversationID
 		}
+		if r := s.Requests[expID]; r != nil {
+			observed["client_id"], observed["session_id"], observed["request_record_id"] = r.ClientID, r.SessionID, r.ID
+		}
 		if j := s.Jobs[ref.JobID]; j != nil {
 			observed["job_id"] = j.ID
 			observed["generation"] = j.Generation
@@ -202,6 +211,15 @@ func (b *Broker) run(ctx context.Context, logger *slog.Logger, ref inference.Ref
 				observed["conversation_id"] = identity.ConversationID
 				observed["job_id"] = identity.JobID
 			}
+			if operation == "request_create" {
+				var view inference.RequestView
+				if err := json.Unmarshal(result, &view); err != nil {
+					return err
+				}
+				observed["operation_id"], observed["experiment_id"], observed["request_record_id"] = view.ID, view.ID, view.ID
+				observed["conversation_id"], observed["session_id"] = view.ConversationID, view.SessionID
+				events = append(events, inferenceEvent{"history.reconciled", slog.LevelInfo, []any{"operation_id", view.ID, "request_record_id", view.ID, "conversation_id", view.ConversationID, "client_id", ref.ClientID, "session_id", view.SessionID, "matched_from", 0, "matched_to", ref.HistoryInputCount, "appended_from", ref.HistoryInputCount, "appended_to", ref.HistoryInputCount, "reason", "submission_replay"}})
+			}
 			return nil
 		}
 		expire(s, &events)
@@ -217,6 +235,15 @@ func (b *Broker) run(ctx context.Context, logger *slog.Logger, ref inference.Ref
 			expID = v.ExperimentID
 			observed["conversation_id"] = v.ConversationID
 			observed["job_id"] = v.ID
+		case inference.RequestView:
+			expID = v.ID
+			observed["conversation_id"], observed["session_id"], observed["request_record_id"] = v.ConversationID, v.SessionID, v.ID
+		}
+		if r := s.Requests[expID]; r != nil {
+			observed["client_id"], observed["session_id"], observed["request_record_id"] = r.ClientID, r.SessionID, r.ID
+		}
+		if err := syncHistory(s, events); err != nil {
+			return err
 		}
 		observed["connection_id"] = s.Connection.ID
 		if expID != "" {
@@ -246,11 +273,17 @@ func (b *Broker) run(ctx context.Context, logger *slog.Logger, ref inference.Ref
 	if observed != nil {
 		attrs := []any{}
 		for key, value := range observed {
+			if key == "operation_id" && value == "" {
+				continue
+			}
 			attrs = append(attrs, key, value)
 		}
 		logger = logger.With(attrs...)
 	} else {
-		logger = logger.With("operation_id", ref.ExperimentID, "experiment_id", ref.ExperimentID, "job_id", ref.JobID, "worker_id", ref.WorkerID, "authenticated_principal", ref.Principal)
+		logger = logger.With("experiment_id", ref.ExperimentID, "job_id", ref.JobID, "worker_id", ref.WorkerID, "authenticated_principal", ref.Principal)
+		if ref.ExperimentID != "" {
+			logger = logger.With("operation_id", ref.ExperimentID)
+		}
 	}
 	if operation != "poll" && operation != "sweep" && operation != "projection" {
 		logger.Debug("inference.exchange", "correlation", observed, "input", input, "output", result, "requested_experiment_id", ref.ExperimentID, "requested_job_id", ref.JobID)
@@ -259,10 +292,21 @@ func (b *Broker) run(ctx context.Context, logger *slog.Logger, ref inference.Ref
 		var rejection *inference.Rejection
 		if errors.As(err, &rejection) {
 			name := "lease.rejected"
+			if ref.ClientID != "" {
+				name = "history.conflict"
+			}
+			if rejection.Reason == "history_owner_denied" {
+				name = "history.owner_denied"
+			}
 			if operation == "decision" && rejection.Code == 400 {
 				name = "decision.rejected"
 			}
-			logger.Warn(name, "requested_experiment_id", ref.ExperimentID, "requested_job_id", ref.JobID, "reason", rejection.Reason, "evidence", rejection.Fields, "observed", observed, "duration_ms", b.now().Sub(started).Milliseconds())
+			evidence := rejection.Fields
+			if name == "history.conflict" || (observed != nil && observed["client_id"] != nil && name != "history.owner_denied") {
+				logger.Debug("history.conflict_detail", "reason", rejection.Reason, "evidence", evidence, "observed", observed)
+				evidence = safeHistoryConflict(evidence)
+			}
+			logger.Warn(name, "requested_experiment_id", ref.ExperimentID, "requested_job_id", ref.JobID, "reason", rejection.Reason, "evidence", evidence, "observed", observed, "duration_ms", b.now().Sub(started).Milliseconds())
 		} else {
 			failure := postgres.Classify(err)
 			logger.Debug("inference.storage_exchange", "cause", failure.Reason, "detail", failure.Detail(), "sqlstate", failure.SQLState, "transaction_outcome", failure.Outcome, "attempt", 1)
@@ -277,7 +321,7 @@ func (b *Broker) run(ctx context.Context, logger *slog.Logger, ref inference.Ref
 }
 
 func (b *Broker) Projection(ctx context.Context, logger *slog.Logger, id string, workerAuth bool) (inference.Projection, error) {
-	ref := inference.Ref{WorkerID: id, Principal: "management"}
+	ref := inference.Ref{WorkerID: id, Principal: "management", CountPendingTools: true}
 	if workerAuth {
 		ref.WorkerAuth = id
 		ref.Principal = "worker:" + id
@@ -415,7 +459,7 @@ func (b *Broker) Poll(ctx context.Context, logger *slog.Logger, workerID, id str
 }
 
 func (b *Broker) Heartbeat(ctx context.Context, logger *slog.Logger, workerID string, h inference.Heartbeat) (json.RawMessage, error) {
-	return b.run(ctx, logger, inference.Ref{WorkerID: workerID, WorkerAuth: workerID}, "heartbeat", h, func(s *inference.State, events *[]inferenceEvent) (any, error) {
+	return b.run(ctx, logger, inference.Ref{WorkerID: workerID, WorkerAuth: workerID, CountPendingTools: true}, "heartbeat", h, func(s *inference.State, events *[]inferenceEvent) (any, error) {
 		if h.Version != 1 {
 			return nil, inference.Reject("unsupported_protocol_version", 400)
 		}

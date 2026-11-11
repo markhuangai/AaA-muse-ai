@@ -35,6 +35,9 @@ func routeFor(path string) (string, string) {
 			}
 		}
 	}
+	if route, id := historyRoute(path); route != "unmatched" {
+		return route, id
+	}
 	return inferenceRoute(path)
 }
 
@@ -44,7 +47,7 @@ func routeMethod(route string) string {
 		return http.MethodPost
 	case "/api/v1/admin/workers/{id}":
 		return http.MethodPatch
-	case "/api/v1/admin/experiments", "/api/v1/admin/experiments/{id}/cancel", "/api/v1/admin/experiments/{id}/tool-results", "/api/v1/worker/heartbeat", "/api/v1/worker/jobs/{id}/claim", "/api/v1/worker/jobs/{id}/decisions":
+	case "/api/v1/requests", "/api/v1/requests/{id}/cancel", "/api/v1/admin/experiments", "/api/v1/admin/experiments/{id}/cancel", "/api/v1/admin/experiments/{id}/tool-results", "/api/v1/worker/heartbeat", "/api/v1/worker/jobs/{id}/claim", "/api/v1/worker/jobs/{id}/decisions":
 		return http.MethodPost
 	default:
 		return http.MethodGet
