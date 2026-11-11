@@ -123,6 +123,14 @@ test('artifact selection uses each latest attempt without reviving an older succ
   assert.deepEqual(aggregateCoverage({ ...options, artifactNames: [name + '1'] }).problems, []);
 });
 
+test('worker and worker-scripts select their own exact component artifacts', () => {
+  const sha = 'a'.repeat(40), worker = `unit-${sha}-worker-`, scripts = `unit-${sha}-worker-scripts-`;
+  const names = [worker + '1', scripts + '1', scripts + '2'];
+  assert.deepEqual(selectShard('worker', sha, names, 2), { name: worker + '1', attempt: 1 });
+  assert.deepEqual(selectShard('worker-scripts', sha, names, 2), { name: scripts + '2', attempt: 2 });
+  assert.throws(() => selectShard('worker', sha, [scripts + '1'], 2), /missing_or_invalid_shard_attempt/);
+});
+
 test('CLI writes checked receipts and emits actionable ERROR evidence through the existing logger', t => {
   const f = fixture(t); receiptFor(f);
   const options = { source: f.inspect(), env: {} };

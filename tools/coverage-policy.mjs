@@ -77,7 +77,7 @@ export function collectCoverage(component, { root = rootDirectory, source = insp
 
 export function selectShard(component, sha, names, attempt) {
   const prefix = `unit-${sha}-${component}-`;
-  const matches = names.filter(name => name.startsWith(prefix)).map(name => ({ name, attempt: Number(name.slice(prefix.length)) }));
+  const matches = names.filter(name => name.startsWith(prefix) && /^\d+$/.test(name.slice(prefix.length))).map(name => ({ name, attempt: Number(name.slice(prefix.length)) }));
   requireThat(matches.length && matches.every(item => Number.isSafeInteger(item.attempt) && item.attempt >= 1 && item.attempt <= attempt), 'missing_or_invalid_shard_attempt');
   const latest = Math.max(...matches.map(item => item.attempt));
   const selected = matches.filter(item => item.attempt === latest);
