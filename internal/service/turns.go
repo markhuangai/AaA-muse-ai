@@ -162,6 +162,14 @@ func (b *Broker) Job(ctx context.Context, logger *slog.Logger, workerID, id stri
 		if j == nil {
 			return nil, inference.Reject("inference_not_found", 404)
 		}
+		if j.Reason == "rerouted_before_delivery" {
+			return nil, inference.Reject("stale_assignment", 409)
+		}
+		if j.State == "queued" {
+			if err := nativeEligibility(s, j); err != nil {
+				return nil, err
+			}
+		}
 		startContextDelivery(s, j, events)
 		return j, nil
 	})
@@ -181,6 +189,9 @@ func (b *Broker) Claim(ctx context.Context, logger *slog.Logger, workerID, id st
 		j := s.Jobs[id]
 		if j == nil {
 			return nil, inference.Reject("inference_not_found", 404)
+		}
+		if err := nativeEligibility(s, j); err != nil {
+			return nil, err
 		}
 		if held := heldJob(s); held != nil {
 			return nil, inference.Reject("worker_busy", 409, "held_job_id", held.ID, "held_generation", held.Generation)

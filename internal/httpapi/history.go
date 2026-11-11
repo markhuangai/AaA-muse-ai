@@ -120,7 +120,7 @@ func (h *Handler) historyRequest(w *response, r *http.Request, logger *slog.Logg
 	switch route {
 	case "/api/v1/requests":
 		var input inference.RequestInput
-		err = decodeInferenceInput(body, &input, "protocol_version", "submission_id", "worker_id", "messages", "tools")
+		err = decodeInferenceInput(body, &input, "protocol_version", "submission_id", "messages", "tools")
 		if err == nil {
 			result, err = h.Broker.SubmitRequest(r.Context(), logger, client, session, input)
 		}

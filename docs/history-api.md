@@ -1,6 +1,6 @@
 # Native requests and canonical history
 
-This API exercises the broker's normalized text/tool contract. It is not an OpenAI adapter or a live Muse qualification receipt. The November 11, 2026 issue #8 approval permits this engineering work with live testing deferred; release qualification remains inconclusive.
+This API exercises the broker's normalized text/tool contract. It is not an OpenAI adapter or a live Muse qualification receipt. The November 11, 2026 issue #8 and #9 approvals permit canonical history and capability-routing engineering with controlled software tests and live testing deferred; release qualification remains inconclusive.
 
 ## Submit and continue
 
@@ -12,7 +12,6 @@ Authenticate with a configured `client-keys` bearer credential. Its YAML entry n
 {
   "protocol_version": 1,
   "submission_id": "caller-retry-identity",
-  "worker_id": "opaque-worker-id",
   "messages": [{"type": "message", "role": "user", "text": "A question"}],
   "tools": [],
   "timeout_seconds": 300
@@ -21,11 +20,13 @@ Authenticate with a configured `client-keys` bearer credential. Its YAML entry n
 
 Send `X-Muse-Session-Id` to continue an identified session. Session IDs are 1–100 ASCII letters, digits, underscores or hyphens; empty, repeated and malformed headers fail. The same string under different client owners identifies independent conversations. Without a session header or an owned `previous_response_id`, every new submission creates an independent session. The response returns the effective session in the same header.
 
-Admission returns HTTP 202 with `id`, `conversation_id`, `session_id`, `worker_id`, `response_id`, `state`, and `created_at`. It contains no model output. Poll `GET /api/v1/requests/{id}` for the state and accepted `output`. Each request completes with one `final` or `tool_call` decision. A tool proposal leaves the conversation awaiting that exact call's client result; the caller applies its permissions and executes the tool locally.
+Omit `worker_id` for automatic selection. An optional explicit worker is a selection constraint and must be eligible; it cannot bypass an existing healthy session pin.
+
+Admission returns HTTP 202 with `id`, `conversation_id`, `session_id`, `worker_id`, `response_id`, `state`, and `created_at`. It contains no model output. An unassigned new session returns `worker_id: ""` and has no inference job until dispatch; a queued established session retains its known target worker. Queue deadlines start at admission, including capacity wait. Read and cancel work through the same native request endpoints before assignment. Poll `GET /api/v1/requests/{id}` for the state and accepted `output`. Each request completes with one `final` or `tool_call` decision. A tool proposal leaves the conversation awaiting that exact call's client result; the caller applies its permissions and executes the tool locally.
 
 Submit the next complete history, including the observed assistant message or tool call and the matching `tool_result`, using a fresh submission ID. Message items have `type`, `role` (`system`, `developer`, `user`, or `assistant`), and exact `text`; tool calls have `type`, `call_id`, `name`, and object `arguments`; tool results have `type`, `call_id`, and exact string `output`. Tool definitions use `name`, optional `description`, and JSON Schema object `parameters`. A final decision becomes an assistant message in canonical history. Text, line endings, numeric argument values and call IDs are preserved.
 
-An optional `previous_response_id` resolves an owned, completed decision to its session. If a session header is also present, both must agree. This reference does not enable delta input: native requests always supply full history. Historical calls retain their original tool definitions; later requests may change their current tool set. Worker IDs remain pinned across completed requests, and a different explicit worker produces a conflict. Automatic selection and failover belong to later tickets.
+An optional `previous_response_id` resolves an owned, completed decision to its session. If a session header is also present, both must agree. This reference does not enable delta input: native requests always supply full history. Historical calls retain their original tool definitions; later requests may change their current tool set. Worker IDs remain pinned across completed requests, and a different explicit worker produces a conflict. A healthy busy pin waits rather than moving to another idle worker. After confirmed offline status, automatic routing may move only a safe next turn following a final answer, with no unresolved tool outcome, before claim or context delivery. It fences the old queued assignment and replays full canonical history. Interrupted, uncertain and tool-wait reassignment remains outside this ticket and belongs to #21.
 
 `POST /api/v1/requests/{id}/cancel` accepts `protocol_version` and `submission_id`, cancels unfinished work, and retains history. A supplied session must match before cancellation. Cancellation of claimed inference retains the worker's busy hold until its matching idle acknowledgement; it does not prove remote inference stopped. Completed requests cannot be cancelled.
 
@@ -33,7 +34,7 @@ An optional `previous_response_id` resolves an owned, completed decision to its 
 
 Exact retries use the same submission ID and original correlation fields. Changing those inputs under the same ID returns 409. An identified request whose normalized input exactly matches an admitted request returns that existing request without appending history or creating work. Uncorrelated requests with different submission IDs stay independent.
 
-Other shortened/conflicting prefixes, unmatched/reused tool calls or results, and simultaneous new turns in the same session fail explicitly. Native requests do not queue overlapping session turns. Foreign and unknown request/response identifiers both return 404. Invalid/unsupported input returns 400, context/body overflow returns 413, capacity exhaustion returns 429, and storage unavailability returns 503. Online transport does not establish model readiness.
+Other shortened/conflicting prefixes, unmatched/reused tool calls or results, and simultaneous new turns in the same session fail explicitly. Native requests do not queue overlapping session turns. Foreign and unknown request/response identifiers both return 404. Invalid/unsupported input returns 400, context/body overflow returns 413, `queue_full` capacity exhaustion returns 429, `no_ready_worker` returns 503 when no permitted qualified online target exists, and storage unavailability returns 503. Online transport does not establish model readiness.
 
 Bodies and complete delivered contexts remain bounded at 1 MiB. Reaching that bound fails instead of trimming history. Canonical history, request snapshots and events have no automatic expiry or deletion API; storage grows with accepted work and operators must plan database capacity. Diagnostic retention is separate.
 
@@ -66,6 +67,34 @@ Collect `/api/v1/admin/diagnostics/export?request_id=HTTP_REQUEST_ID` with a pro
 | `job.deadline_exceeded` ERROR | The correlated last boundary and deadline show the stall; an unanswered job is not proof of its internal Muse cause. |
 | `request.context_delivery_*` / `request.output_*` | Start markers precede writes; completion means the server wrote the complete response, not that the client received it. Interrupted writes or failed boundary persistence retain uncertainty. Never infer that an exposed tool call can safely be regenerated. |
 
-Schema 4 is additive and preserves migrations 1–3 and legacy records. An older binary rejects schema 4. Recover through a forward fix that retains the schema and history; do not drop tables or run a destructive downgrade.
+Schema 5 preserves migrations 1–4 and their checksums, existing identities, history and delivery snapshots. It adds durable qualification/dispatch metadata and permits a native request or conversation to await its first worker. Existing workers start unqualified. An older binary rejects schema 5. Recover through a forward fix that retains the schema and history; do not drop tables or run a destructive downgrade.
 
 `make test-history` runs the real service/PostgreSQL/SSE software scenarios with controlled worker decisions, including log-only diagnosis and cleanup. Those results do not qualify live Muse wake, reasoning, account-memory isolation, refresh recovery, or client compatibility.
+
+## Qualification and dispatch
+
+Management-only `POST /api/v1/admin/workers/{id}/qualifications` records idempotent commands. Approval uses:
+
+```json
+{
+  "protocol_version": 1,
+  "submission_id": "approval-retry-identity",
+  "action": "approve",
+  "evidence_kind": "controlled",
+  "evidence_reference": "Exact protected trial receipt or observation reference",
+  "readiness_experiment_id": "completed-management-readiness-experiment",
+  "tool_experiment_id": "completed-management-client-tool-experiment"
+}
+```
+
+The reference is nonempty and at most 1,024 UTF-8 bytes. `evidence_kind` is `controlled` or `live`; it describes the operator's evidence, not a broker-certified live PoC verdict. The broker checks accepted authenticated worker decisions, ownership, current connection generation, an exact challenge echo, and an optional complete client-tool call/result/final chain. Omit the tool experiment for text-only capability. Management attests independent unattended conditions and semantic correctness; the broker cannot independently observe those external facts. Heartbeats, aliases and worker self-report never establish inference readiness or vendor identity.
+
+A withdrawal supplies `protocol_version`, `submission_id`, `action: "withdraw"` and `evidence_reference`. It stops new native dispatch/offers/claims while preserving qualification history, existing assignment snapshots, and any already-claimed outcome. It does not cancel remote inference or revoke the worker credential. Worker/client/portal credentials cannot approve or withdraw qualification. Management experiments retain explicit-worker access to establish evidence and still obey health, admission, lease and single-held-turn rules.
+
+Worker management/status records separately expose connection status, work status, waiting client-tool count, `inference_readiness` (`unverified`, `verified`, `stale` or `withdrawn`), latest `qualification`, and `qualification_history`. `verified` means evidence was approved for this connection generation; inspect its provenance. Every reconnection invalidates previous readiness and requires new trials/approval. Historical evidence is retained.
+
+Dispatch orders queued requests by creation time and stable ID, skips blocked pins, and selects available eligible workers by least recent dispatch with stable worker-ID ties. Text is always required; supplied tools or historical tool items also require `function_tools`. One worker holds at most one inference turn. `limits.max-jobs` bounds all nonterminal work globally and defaults to 1; raise it to permit multiple workers or queued requests. `timeout_seconds` defaults to 300 and accepts 1–3600 seconds. Same-session overlaps still return `409 session_busy`; callers continue after the current decision using full canonical history.
+
+Use the existing protected export route first with `?request_id=HTTP_REQUEST_ID`, then with `?operation_id=NATIVE_REQUEST_ID`. Reconstruct through `decodeExport` from `tools/qualification-evidence.mjs`; require complete metadata and validated chunks/digests. Filter by owner, conversation, job and connection generation across broker exports. `dispatch.queued` and `dispatch.assigned` INFO include queue timing, candidates, selection reasons and qualification provenance. `dispatch.rejected` WARN distinguishes eligibility from capacity; record fresh matching verification for readiness/capability failures, or reduce admitted work/raise the documented bound for capacity failures. `dispatch.pin_conflict` WARN identifies conflicting selections; use the owned session and its pinned worker. `dispatch.reassigned` INFO records the old/new identities and safe pre-claim/pre-context boundary. Existing deadline/outcome and causal storage events identify stalls and rollback. No business-table query or process attachment is needed for diagnosis.
+
+`make test-routing` exercises competing real HTTP/PostgreSQL/SSE software paths through two broker processes, qualification provenance, queue limits, owner/session isolation, pinning and safe/unsafe offline boundaries, with protected diagnostic reconstruction and resource-cleanup receipts. Controlled peers never qualify live Muse behavior. No live probe scheduler or PoC/release configuration selector is provided.

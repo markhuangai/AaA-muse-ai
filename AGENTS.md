@@ -27,6 +27,8 @@
 - Component checks begin with their implementing tickets. The November 11 user decision permits the shared engineering CI/coverage gate after the completed live PoC investigation; its inconclusive verdict is retained and a passing live receipt still gates release features. Use standard free GitHub-hosted Linux runners, with an explicit timeout of at most 30 minutes for every job except `ai-pr-review.yml`'s `review` job: the November 9 user decision permits its 40-minute reviewer step within a 45-minute job, retaining time for final status and cleanup. Split slow checks into bounded jobs; timeout or missing evidence is a failure.
 - The November 11 issue #8 approval additionally permits canonical-history engineering and controlled software validation before further live tests. It does not qualify Muse, waive the passing live release gate, or authorize downstream features. Native history is retained without automatic deletion; named client-key configuration entries are durable owner identities.
 
+- The November 11 issue #9 approval permits capability-routing engineering and controlled software validation now. It retains the inconclusive live qualification result and passing-live release gate, permits no live Muse trial, and authorizes no other downstream feature. Readiness requires management-approved authenticated trial evidence for the current connection generation; controlled provenance is not live inference proof.
+
 ## Contributor CI checks
 
 - Install locked dependencies with `npm ci --ignore-scripts --no-audit --no-fund` and `npm ci --prefix .github/scripts --ignore-scripts --no-audit --no-fund`. Docker supplies the pinned Go toolchain. `make check-workflows` requires verified actionlint 1.7.12.

@@ -11,7 +11,7 @@ const MaxTimelineBytes = 2 * 1024 * 1024
 type RequestInput struct {
 	Version            int    `json:"protocol_version"`
 	SubmissionID       string `json:"submission_id"`
-	WorkerID           string `json:"worker_id"`
+	WorkerID           string `json:"worker_id,omitempty"`
 	Messages           []Item `json:"messages"`
 	Tools              []Tool `json:"tools"`
 	TimeoutSeconds     int    `json:"timeout_seconds,omitempty"`
@@ -71,6 +71,7 @@ type Request struct {
 	DecisionAcceptedAt     *time.Time   `json:"decision_accepted_at,omitempty"`
 	OutputStartedAt        *time.Time   `json:"output_started_at,omitempty"`
 	OutputCompletedAt      *time.Time   `json:"output_completed_at,omitempty"`
+	ReassignAllowed        bool         `json:"reassign_allowed"`
 }
 
 type RequestView struct {

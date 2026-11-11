@@ -73,7 +73,7 @@ func httpHistoryScope(states map[string]*inference.State, ref *inference.Ref) er
 	if c == nil {
 		return nil
 	}
-	if ref.WorkerID != "" && ref.WorkerID != c.WorkerID {
+	if c.WorkerID != "" && ref.WorkerID != "" && ref.WorkerID != c.WorkerID {
 		return inference.Reject("session_worker_conflict", 409)
 	}
 	ref.WorkerID, ref.ConversationID = c.WorkerID, c.ID
@@ -134,7 +134,7 @@ func nativeHTTPDecision(t *testing.T, h *Handler, m *httpInferenceStore, c infer
 
 func TestNativeHTTPProductionFlowAndDisclosure(t *testing.T) {
 	h, m, w, key := inferenceHTTPFixture(t)
-	c := onlineHTTP(t, h, w.ID)
+	c := onlineNativeHTTP(t, h, m, w.ID)
 	input := nativeHTTPInput(w.ID)
 	v, response := nativeHTTP(t, h, "POST", "/api/v1/requests", "session-http", input, 202)
 	if response.Header().Get("X-Muse-Session-Id") != "session-http" || v.Output != nil {
@@ -174,7 +174,7 @@ func TestNativeHTTPProductionFlowAndDisclosure(t *testing.T) {
 
 func TestHistoryConflictContentStaysInProtectedCapture(t *testing.T) {
 	h, m, w, key := inferenceHTTPFixture(t)
-	c := onlineHTTP(t, h, w.ID)
+	c := onlineNativeHTTP(t, h, m, w.ID)
 	input := nativeHTTPInput(w.ID)
 	input.Messages[0].Text = "distinctive-private-history-marker\n"
 	v, _ := nativeHTTP(t, h, "POST", "/api/v1/requests", "protected-session", input, 202)
@@ -229,7 +229,7 @@ func TestNativeOutputPartialWriteAndBoundaryFailure(t *testing.T) {
 	for _, storageFailure := range []bool{false, true} {
 		t.Run(fmt.Sprint(storageFailure), func(t *testing.T) {
 			h, m, w, key := inferenceHTTPFixture(t)
-			c := onlineHTTP(t, h, w.ID)
+			c := onlineNativeHTTP(t, h, m, w.ID)
 			v, _ := nativeHTTP(t, h, "POST", "/api/v1/requests", "session", nativeHTTPInput(w.ID), 202)
 			nativeHTTPDecision(t, h, m, c, key, v)
 			r := httptest.NewRequest("GET", "/api/v1/requests/"+v.ID, nil)
@@ -249,7 +249,7 @@ func TestNativeOutputPartialWriteAndBoundaryFailure(t *testing.T) {
 
 func TestNativeHTTPStrictBoundariesAndHistoryQueries(t *testing.T) {
 	h, m, w, key := inferenceHTTPFixture(t)
-	onlineHTTP(t, h, w.ID)
+	onlineNativeHTTP(t, h, m, w.ID)
 	for _, path := range []string{"/api/v1/requests", "/api/v1/requests/abc", "/api/v1/requests/abc/cancel"} {
 		method := "GET"
 		if path == "/api/v1/requests" || strings.HasSuffix(path, "cancel") {
@@ -312,4 +312,10 @@ func TestNativeHTTPStrictBoundariesAndHistoryQueries(t *testing.T) {
 	apiJSON(t, h, "GET", "/api/v1/admin/requests", "admin-private-sentinel", nil, 503)
 	h.Broker = nil
 	nativeHTTP(t, h, "POST", "/api/v1/requests", "", nativeHTTPInput(w.ID), 503)
+}
+
+func onlineNativeHTTP(t *testing.T, h *Handler, m *httpInferenceStore, id string) inference.Connection {
+	c := onlineHTTP(t, h, id)
+	m.states[id].Routing.Qualifications = []inference.Qualification{{ID: "fixture-qualification", WorkerID: id, ConnectionID: c.ID, ConnectionGeneration: c.Generation, Capabilities: []string{"text", "function_tools"}, Input: inference.QualificationInput{Action: "approve", EvidenceKind: "controlled"}}}
+	return c
 }

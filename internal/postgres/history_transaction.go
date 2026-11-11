@@ -60,7 +60,7 @@ func ownedHistory(ctx context.Context, tx pgx.Tx, ref *inference.Ref) error {
 	if c.ID == "" {
 		return nil
 	}
-	if ref.WorkerID != "" && ref.WorkerID != c.WorkerID {
+	if c.WorkerID != "" && ref.WorkerID != "" && ref.WorkerID != c.WorkerID {
 		return inference.Reject("session_worker_conflict", 409, "expected_worker_id", c.WorkerID, "observed_worker_id", ref.WorkerID)
 	}
 	ref.WorkerID, ref.ConversationID = c.WorkerID, c.ID
@@ -195,7 +195,7 @@ func saveHistory(ctx context.Context, tx pgx.Tx, s *inference.State, before hist
 		}
 		if !bytes.Equal(data, before.conversations[id]) {
 			if _, err = tx.Exec(ctx, `INSERT INTO aaa_conversations(id,client_id,session_id,worker_id,created_at,pending_call_id,data) VALUES($1,$2,$3,$4,$5,$6,$7)
-				ON CONFLICT(id) DO UPDATE SET pending_call_id=EXCLUDED.pending_call_id,data=EXCLUDED.data`, id, c.ClientID, c.SessionID, c.WorkerID, c.CreatedAt, c.PendingCallID, data); err != nil {
+				ON CONFLICT(id) DO UPDATE SET worker_id=EXCLUDED.worker_id,pending_call_id=EXCLUDED.pending_call_id,data=EXCLUDED.data`, id, c.ClientID, c.SessionID, nullableWorker(c.WorkerID), c.CreatedAt, c.PendingCallID, data); err != nil {
 				return err
 			}
 		}

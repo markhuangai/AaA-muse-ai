@@ -23,6 +23,35 @@ class History(Inference):
         config["limits"] = {"max-jobs": 16, "in-flight-per-worker": 1}
         return config
 
+    def peer(self, worker, reply=True, qualify=True):
+        peer = super().peer(worker, reply)
+        if reply and qualify:
+            self.qualify_worker(worker, peer)
+        return peer
+
+    def qualify_worker(self, worker, peer, tools=True):
+        challenge = "ready-" + secrets.token_hex(24)
+        ready = self.create(worker, challenge, tools=False, messages=[{"type": "message", "role": "user", "text": challenge}])
+        job, _, _ = self.claim(worker, peer, ready)
+        self.decision(worker, peer, job, {"type": "final", "text": challenge})
+        body = {"protocol_version": 1, "submission_id": secrets.token_hex(12), "action": "approve", "evidence_kind": "controlled",
+                "evidence_reference": "controlled authenticated software peer; not a live Muse qualification", "readiness_experiment_id": ready["id"]}
+        if tools:
+            contents = "client-only-" + secrets.token_hex(24) + "\r\nexact\n"
+            fixture = self.private("qualification-client-" + secrets.token_hex(6) + ".txt", contents)
+            trial = self.create(worker, "Read the client-only fixture")
+            job, _, _ = self.claim(worker, peer, trial)
+            call_id = "call-" + secrets.token_hex(12)
+            self.decision(worker, peer, job, {"type": "tool_call", "call_id": call_id, "name": "read_file", "arguments": {"path": str(fixture)}})
+            continuation, _ = self.checked("/api/v1/admin/experiments/" + trial["id"] + "/tool-results", self.admin, "POST",
+                                           {"protocol_version": 1, "submission_id": secrets.token_hex(12), "call_id": call_id, "output": fixture.read_bytes().decode()}, want=202)
+            job, _, _ = self.claim(worker, peer, continuation)
+            self.decision(worker, peer, job, {"type": "final", "text": contents})
+            body["tool_experiment_id"] = trial["id"]
+        approval, _ = self.checked("/api/v1/admin/workers/" + worker["worker"]["id"] + "/qualifications", self.admin, "POST", body)
+        require(approval["evidence"]["evidence_kind"] == "controlled" and approval["connection_generation"] == peer.opened["connection_generation"], "qualification provenance or generation lost")
+        return approval, body
+
     def retained_export(self, filter_name, identity):
         status, _, raw = self.api("/api/v1/admin/diagnostics/export?" + filter_name + "=" + identity, self.admin)
         require(status == 200, "diagnostic export unavailable")

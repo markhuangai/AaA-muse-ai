@@ -8,7 +8,7 @@ import (
 )
 
 func nativeRef(client, id string) inference.Ref {
-	return inference.Ref{ExperimentID: id, ClientID: client, Principal: "client:" + client, Full: true}
+	return inference.Ref{ExperimentID: id, ClientID: client, Principal: "client:" + client, Full: true, Routing: true}
 }
 
 func (b *Broker) ReadRequest(ctx context.Context, logger *slog.Logger, client, id, session string) (inference.RequestView, error) {
