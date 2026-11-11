@@ -4,11 +4,82 @@ import * as fs from 'node:fs/promises';
 import { State } from '../dist/state.js';
 import { Subscriber } from '../dist/subscriber.js';
 import { Worker } from '../dist/worker.js';
+import { execute } from '../dist/cli.js';
 import { encode, parse, integer } from '../dist/json.js';
 import { fixture, enrolled, until, ID, JOB, CONN, KEY, claimed } from './helpers.mjs';
 
 const opened = { protocol_version: 1, connection_id: CONN, connection_generation: 1 };
 const health = id => ({ ...opened, challenge_id: id });
+
+test('confirmed idle precedes pending publication and is not its completion signal', { timeout: 10_000 }, async t => {
+  const f = await fixture(t); const transport = await enrolled(f);
+  f.broker.jobs.set(JOB, claimed({ state: 'cancelled' }));
+  await f.worker.ack(JOB);
+  await f.worker.publish(f.broker.jobs.get(JOB), 'cancelled', 'awaiting_explicit_idle_acknowledgement');
+  let release, reached;
+  const gate = new Promise(done => { release = done; });
+  const entered = new Promise(done => { reached = done; });
+  f.broker.override = async call => {
+    if (call.path.endsWith('/' + JOB) && f.broker.jobs.get(JOB).held === false) { reached(); await gate; }
+  };
+  const subscriber = new Subscriber(f.worker); subscriber.active = opened;
+  const completing = subscriber.heartbeat(transport, health('idle-publication-barrier'));
+  try {
+    await entered;
+    assert.equal(parse(await (await f.state.child('acks')).read(JOB + '.json')).state, 'confirmed');
+    assert.equal(parse(await f.state.read('pending.json')).jobs.length, 1);
+    assert(!f.output.map(JSON.parse).some(event => event.msg === 'worker.idle_confirmed'));
+  } finally { release(); }
+  await completing;
+  assert.equal(parse(await f.state.read('pending.json')).jobs.length, 0);
+  await f.worker.publish(claimed(), 'pending', 'delayed_claimed_context');
+  assert.equal(parse(await f.state.read('pending.json')).jobs.length, 0);
+  const exported = await f.logger.capture.export({}, true);
+  const events = exported.trimEnd().split('\n').map(JSON.parse);
+  assert.equal(events[0].complete, true);
+  assert(events.some(event => event.msg === 'worker.idle_confirmed' && event.request_id));
+  assert(events.some(event => event.msg === 'worker.job_progress' && event.observed_state === 'claimed' && event.state === 'ack_confirmed' && event.progress === 'broker_already_confirmed_idle'));
+  assert(!exported.includes(KEY));
+});
+
+test('publication failure after confirmed idle fails the real run command and remains diagnosable', { timeout: 10_000 }, async t => {
+  for (const boundary of ['cue', 'index']) {
+    const f = await fixture(t); await enrolled(f);
+    f.broker.jobs.set(JOB, claimed({ state: 'cancelled' }));
+    await f.worker.ack(JOB);
+    await f.worker.publish(f.broker.jobs.get(JOB), 'cancelled', 'awaiting_explicit_idle_acknowledgement');
+    let fail = false;
+    const files = { ...fs, open: async (path, ...args) => {
+      if (fail && ((boundary === 'cue' && path.includes('/cues/.' + JOB + '.json.')) || (boundary === 'index' && path.includes('/.pending.json.')))) throw Object.assign(new Error('controlled publication outage'), { code: 'ENOSPC' });
+      return await fs.open(path, ...args);
+    } };
+    f.broker.override = async call => {
+      if (call.path.endsWith('/heartbeat')) fail = true;
+      if (call.path.endsWith('/events')) {
+        const frames = [['connection.opened', opened], ['health.challenge', health('publication-failure')]];
+        return new Response(new ReadableStream({ start(c) { c.enqueue(Buffer.from(frames.map(([type, data], i) => `id: failure-${i}\nevent: ${type}\ndata: ${encode(data)}\n\n`).join(''))); } }), { headers: { 'content-type': 'text/event-stream' } });
+      }
+    };
+    const io = { files, system: f.state.sys, network: f.net, env: {}, home: () => f.state.root, nodeVersion: process.version, input: async () => '', stdout() {}, stderr: line => f.output.push(line), signal: new AbortController().signal, metadata: async () => ({ source_sha: 'unit', source_dirty: true }) };
+    assert.equal(await execute(['run', '--state-dir', f.state.root], io), 1);
+    assert.equal(parse(await (await f.state.child('acks')).read(JOB + '.json')).state, 'confirmed');
+    assert.equal(parse(await f.state.read('pending.json')).jobs.length, 1);
+    assert.equal(f.broker.jobs.get(JOB).held, false);
+    const exported = await f.logger.capture.export({}, true);
+    const events = exported.trimEnd().split('\n').map(JSON.parse);
+    assert.equal(events[0].complete, true);
+    assert(events.some(event => event.msg === 'worker.command_failed' && event.cause === 'ENOSPC' && event.stopped_operation === 'run' && event.command_id && event.instance_id));
+    assert(events.some(event => event.msg === 'worker.http_exchange' && event.route.endsWith('/heartbeat') && event.http_status === 200 && event.input.idle_ack.job_id === JOB));
+    assert(!events.some(event => event.msg === 'worker.idle_confirmed'));
+    assert(!f.output.some(line => JSON.parse(line).level === 'DEBUG')); assert(!exported.includes(KEY));
+    fail = false;
+    const stopped = new AbortController(); stopped.abort();
+    assert.equal(await execute(['run', '--state-dir', f.state.root], { ...io, signal: stopped.signal }), 0);
+    assert.equal(parse(await f.state.read('pending.json')).jobs.length, 0);
+    assert.equal(f.broker.calls.filter(call => call.input?.idle_ack).length, 1);
+  }
+});
+
 test('subscriber leaves model work pending, rejects duplicate consumers, and requires explicit stopped-work acknowledgement', async t => {
   const f = await fixture(t); await enrolled(f);
   let push, close;

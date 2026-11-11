@@ -10,6 +10,8 @@ One-account testing demonstrated background wake, authenticated replies, six bas
 
 The experiment API and worker exist. The management portal and OpenAI-compatible client endpoints are planned. Decision and evidence history is maintained in project memory.
 
+The November 11, 2026 CI decision accepts the completed PoC investigation as the prerequisite for engineering gates in [#20](https://github.com/markhuangai/AaA-muse-ai/issues/20), while retaining the inconclusive qualification result. [Contributor checks](AGENTS.md#contributor-ci-checks) cover independent unit coverage, source-file limits, workflow budgets, and packaged integrations.
+
 ## Run the service
 
 Requires Docker and Docker Compose. Copy the [example configuration](config.example.yaml):
