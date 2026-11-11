@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/markhuangai/AaA-muse-ai/internal/diagnostics"
 	"github.com/markhuangai/AaA-muse-ai/internal/inference"
 	"github.com/markhuangai/AaA-muse-ai/internal/service"
 )
@@ -22,12 +23,17 @@ type httpInferenceStore struct {
 	states   map[string]*inference.State
 	receipts map[string]*inference.Receipt
 	fail     error
+	output   *bytes.Buffer
+	capture  *diagnostics.Store
 }
 
 func (m *httpInferenceStore) InferenceWorkers(context.Context) ([]string, error) { return nil, m.fail }
 func (m *httpInferenceStore) WithinInference(_ context.Context, ref inference.Ref, fn func(*inference.State) error) error {
 	if m.fail != nil {
 		return m.fail
+	}
+	if err := httpHistoryScope(m.states, &ref); err != nil {
+		return err
 	}
 	wid := ref.WorkerID
 	if ref.ExperimentID != "" || ref.JobID != "" {
@@ -58,8 +64,22 @@ func (m *httpInferenceStore) WithinInference(_ context.Context, ref inference.Re
 		return err
 	}
 	s.Now = time.Now()
+	s.HistoryConversationID = ref.ConversationID
+	s.PendingTools = 0
+	for _, c := range s.Conversations {
+		c.Events = nil
+		if c.PendingCallID != "" {
+			s.PendingTools++
+		}
+	}
+	for id, request := range s.Requests {
+		if e := s.Experiments[id]; e != nil {
+			e.Messages = inference.Messages(s.Conversations[request.ConversationID], request.CanonicalEnd)
+		}
+	}
 	s.Revoked = m.workers.records[wid].RevokedAt != nil
 	s.Receipt = m.receipts[ref.Principal+":"+ref.SubmissionID]
+	s.ActiveCount = 0
 	for _, state := range m.states {
 		for _, e := range state.Experiments {
 			if !e.Terminal() {
@@ -74,14 +94,17 @@ func (m *httpInferenceStore) WithinInference(_ context.Context, ref inference.Re
 		m.receipts[ref.Principal+":"+ref.SubmissionID] = s.Receipt
 	}
 	s.Receipt = nil
+	for _, c := range s.Conversations {
+		c.Events = nil
+	}
 	m.states[wid] = &s
 	return nil
 }
 
 func inferenceHTTPFixture(t *testing.T) (*Handler, *httpInferenceStore, workerView, string) {
-	h, workers, _, _ := workerHTTPFixture(t)
+	h, workers, output, capture := workerHTTPFixture(t)
 	w, key := enrollHTTP(t, h, issueHTTP(t, h))
-	m := &httpInferenceStore{workers: workers, states: map[string]*inference.State{}, receipts: map[string]*inference.Receipt{}}
+	m := &httpInferenceStore{workers: workers, states: map[string]*inference.State{}, receipts: map[string]*inference.Receipt{}, output: output, capture: capture}
 	h.Broker = service.NewBroker(m, rand.Reader, time.Now, func(context.Context, time.Duration) error { return context.Canceled }, 2)
 	return h, m, w, key
 }

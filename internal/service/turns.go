@@ -157,11 +157,12 @@ func workerRef(workerID, jobID, submission string, full bool) inference.Ref {
 }
 
 func (b *Broker) Job(ctx context.Context, logger *slog.Logger, workerID, id string) (json.RawMessage, error) {
-	return b.run(ctx, logger, workerRef(workerID, id, "", true), "job_read", nil, func(s *inference.State, _ *[]inferenceEvent) (any, error) {
+	return b.run(ctx, logger, workerRef(workerID, id, "", true), "job_read", nil, func(s *inference.State, events *[]inferenceEvent) (any, error) {
 		j := s.Jobs[id]
 		if j == nil {
 			return nil, inference.Reject("inference_not_found", 404)
 		}
+		startContextDelivery(s, j, events)
 		return j, nil
 	})
 }
@@ -200,6 +201,7 @@ func (b *Broker) Claim(ctx context.Context, logger *slog.Logger, workerID, id st
 		j.ConnectionID, j.ConnectionGeneration = s.Connection.ID, s.Connection.Generation
 		j.ClaimedAt, j.LeaseExpiresAt = &s.Now, &until
 		s.Experiments[j.ExperimentID].State = "inference"
+		startContextDelivery(s, j, events)
 		event(events, slog.LevelInfo, "job.claimed", s, j, "context_receipt_id", j.Context.ReceiptID)
 		return j, nil
 	})
@@ -238,6 +240,9 @@ func (b *Broker) Decide(ctx context.Context, logger *slog.Logger, workerID, id s
 			e.FinalText = d.Decision.Text
 		}
 		if err := inference.CheckContext(e.Messages, e.Tools); err != nil {
+			return nil, err
+		}
+		if err := b.acceptHistory(s, e, d.Decision); err != nil {
 			return nil, err
 		}
 		j.State, j.Held = "accepted", false

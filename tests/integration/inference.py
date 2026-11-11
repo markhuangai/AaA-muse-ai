@@ -485,6 +485,8 @@ def main():
         peer = h.peer(a)
         h.tool_loop(a, peer)
         h.concurrency_and_scope(a, b, peer, second_origin)
+        h.docker("stop", "--time", "5", secondary)
+        require(not h.inspect(secondary)["State"]["Running"], "secondary broker still emits asynchronous diagnostics")
         h.cancellation_and_deadline(a, peer)
         opened_at = next(event["at"] for event in peer.events if event["type"] == "connection.opened")
         h.until(lambda: any(event["type"] == "health.challenge" and event["at"] - opened_at > 30 for event in peer.events), "no SSE frame observed after the global write deadline", timeout=45)

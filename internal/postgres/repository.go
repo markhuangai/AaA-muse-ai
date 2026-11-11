@@ -17,7 +17,7 @@ import (
 //go:embed migrations/*.sql
 var migrations embed.FS
 
-const SchemaVersion = 3
+const SchemaVersion = 4
 const migrationLock int64 = 0x4141414d555345
 
 type Pool interface {
@@ -95,7 +95,7 @@ func (r *Repository) Bootstrap(ctx context.Context) error {
 	}
 	var scripts [SchemaVersion][]byte
 	var checksums [SchemaVersion]string
-	for i, path := range []string{"migrations/001_initial.sql", "migrations/002_worker_identities.sql", "migrations/003_inference.sql"} {
+	for i, path := range []string{"migrations/001_initial.sql", "migrations/002_worker_identities.sql", "migrations/003_inference.sql", "migrations/004_canonical_history.sql"} {
 		scripts[i], err = migrations.ReadFile(path)
 		if err != nil {
 			return err

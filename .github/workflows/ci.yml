@@ -186,6 +186,11 @@ jobs:
         env:
           SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24.22.2
+      - name: Install locked diagnostic decoder dependencies
+        run: npm ci --ignore-scripts --no-audit --no-fund
       - name: Check service
         run: make check-service
       - name: Real HTTP and PostgreSQL integration
@@ -194,6 +199,8 @@ jobs:
         run: make test-worker-auth
       - name: Inference turns, SSE health, and client-tool continuation
         run: make test-inference
+      - name: Owned canonical history, request timelines and diagnostics
+        run: make test-history
 
   image:
     name: CI / image

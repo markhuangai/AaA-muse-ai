@@ -188,17 +188,25 @@ type Ref struct {
 	WorkerAuth                               string
 	Admission, Full                          bool
 	Correlation                              map[string]any
+	ClientID, SessionID, ResponseID          string
+	ConversationID, ReplayHash               string
+	CountPendingTools                        bool
+	HistoryInputCount                        int
 }
 
 type State struct {
-	WorkerID    string
-	Revoked     bool
-	Now         time.Time
-	Connection  Connection
-	Experiments map[string]*Experiment
-	Jobs        map[string]*Job
-	Receipt     *Receipt
-	ActiveCount int
+	WorkerID              string
+	Revoked               bool
+	Now                   time.Time
+	Connection            Connection
+	Experiments           map[string]*Experiment
+	Jobs                  map[string]*Job
+	Receipt               *Receipt
+	ActiveCount           int
+	Conversations         map[string]*Conversation
+	Requests              map[string]*Request
+	PendingTools          int
+	HistoryConversationID string
 }
 
 type Rejection struct {

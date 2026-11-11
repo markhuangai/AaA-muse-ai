@@ -82,6 +82,9 @@ func (r *Repository) WithinInference(ctx context.Context, ref inference.Ref, app
 				return err
 			}
 		}
+		if err := ownedHistory(ctx, tx, &ref); err != nil {
+			return err
+		}
 		if err := resolveInference(ctx, tx, &ref); err != nil {
 			return err
 		}
@@ -113,6 +116,9 @@ func (r *Repository) WithinInference(ctx context.Context, ref inference.Ref, app
 		if err = loadInference(ctx, tx, ref, s); err != nil {
 			return err
 		}
+		if err = loadHistory(ctx, tx, ref, s); err != nil {
+			return err
+		}
 		if ref.Admission {
 			if err = tx.QueryRow(ctx, "SELECT count(*) FROM aaa_experiments WHERE state NOT IN ('completed','cancelled','interrupted')").Scan(&s.ActiveCount); err != nil {
 				return err
@@ -133,10 +139,17 @@ func (r *Repository) WithinInference(ctx context.Context, ref inference.Ref, app
 		if err != nil {
 			return err
 		}
+		history, err := historySnapshot(s)
+		if err != nil {
+			return err
+		}
 		if err = apply(s); err != nil {
 			return err
 		}
-		return saveInference(ctx, tx, ref, s, before)
+		if err = saveInference(ctx, tx, ref, s, before); err != nil {
+			return err
+		}
+		return saveHistory(ctx, tx, s, history)
 	})
 }
 
@@ -192,7 +205,8 @@ func loadInference(ctx context.Context, tx pgx.Tx, ref inference.Ref, s *inferen
 		}
 	}
 	rows, err = tx.Query(ctx, `SELECT data, CASE WHEN $4 THEN context ELSE NULL END FROM aaa_inference_jobs
-		WHERE worker_id=$1 AND (state IN ('queued','claimed') OR held OR id=$2 OR id=$3) ORDER BY id`, ref.WorkerID, ref.JobID, ref.BaseJobID, ref.Full)
+		WHERE worker_id=$1 AND (state IN ('queued','claimed') OR held OR id=$2 OR id=$3 OR
+		id=(SELECT data->>'current_job_id' FROM aaa_experiments WHERE id=$5)) ORDER BY id`, ref.WorkerID, ref.JobID, ref.BaseJobID, ref.Full, ref.ExperimentID)
 	if err != nil {
 		return err
 	}
@@ -282,7 +296,7 @@ func saveInference(ctx context.Context, tx pgx.Tx, ref inference.Ref, s *inferen
 				return err
 			}
 		}
-		if ref.Full || b.experiments[id] == nil {
+		if s.Requests[id] == nil && (ref.Full || b.experiments[id] == nil) {
 			for i := b.history[id]; i < len(e.Messages); i++ {
 				data, err = json.Marshal(e.Messages[i])
 				if err != nil {

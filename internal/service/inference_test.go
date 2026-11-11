@@ -21,6 +21,7 @@ type inferenceMemory struct {
 	receipts    map[string]*inference.Receipt
 	fail        error
 	persistFail error
+	timeline    map[string][]inference.TimelineEvent
 }
 
 func (m *inferenceMemory) InferenceWorkers(context.Context) ([]string, error) {
@@ -38,6 +39,9 @@ func (m *inferenceMemory) WithinInference(_ context.Context, ref inference.Ref, 
 	defer m.mu.Unlock()
 	if m.fail != nil {
 		return m.fail
+	}
+	if err := memoryHistoryScope(m.states, &ref); err != nil {
+		return err
 	}
 	wid := ref.WorkerID
 	if ref.ExperimentID != "" || ref.JobID != "" {
@@ -69,6 +73,19 @@ func (m *inferenceMemory) WithinInference(_ context.Context, ref inference.Ref, 
 		return err
 	}
 	s.Now = m.now
+	s.HistoryConversationID = ref.ConversationID
+	s.PendingTools = 0
+	for _, c := range s.Conversations {
+		c.Events = nil
+		if c.PendingCallID != "" {
+			s.PendingTools++
+		}
+	}
+	for id, r := range s.Requests {
+		if e := s.Experiments[id]; e != nil {
+			e.Messages = inference.Messages(s.Conversations[r.ConversationID], r.CanonicalEnd)
+		}
+	}
 	s.Receipt = m.receipts[ref.Principal+":"+ref.SubmissionID]
 	s.ActiveCount = 0
 	for _, state := range m.states {
@@ -88,6 +105,13 @@ func (m *inferenceMemory) WithinInference(_ context.Context, ref inference.Ref, 
 		m.receipts[ref.Principal+":"+ref.SubmissionID] = s.Receipt
 	}
 	s.Receipt = nil
+	if m.timeline == nil {
+		m.timeline = map[string][]inference.TimelineEvent{}
+	}
+	for _, c := range s.Conversations {
+		m.timeline[c.ID] = append(m.timeline[c.ID], c.Events...)
+		c.Events = nil
+	}
 	m.states[wid] = &s
 	return nil
 }
