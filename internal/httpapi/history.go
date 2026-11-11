@@ -40,7 +40,7 @@ func historyRoute(path string) (string, string) {
 }
 
 func readSessionHeader(r *http.Request) (string, error) {
-	values := r.Header.Values("X-Muse-Session-Id")
+	values := r.Header["X-Muse-Session-Id"]
 	if len(values) > 1 || (len(values) == 1 && !inference.Identifier.MatchString(values[0])) {
 		return "", inference.Reject("invalid_session_header", 400)
 	}

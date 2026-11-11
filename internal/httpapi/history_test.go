@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -13,6 +14,30 @@ import (
 
 	"github.com/markhuangai/AaA-muse-ai/internal/inference"
 )
+
+func TestSessionHeaderFromHTTPWire(t *testing.T) {
+	for _, tc := range []struct {
+		name, headers, session string
+		invalid                bool
+	}{
+		{name: "absent"},
+		{name: "mixed case", headers: "x-MUsE-sESSION-iD: exact-session\r\n", session: "exact-session"},
+		{name: "upper case", headers: "X-MUSE-SESSION-ID: exact-session\r\n", session: "exact-session"},
+		{name: "duplicates", headers: "X-Muse-Session-Id: first\r\nx-muse-session-id: second\r\n", invalid: true},
+		{name: "empty", headers: "X-Muse-Session-Id:\r\n", invalid: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, err := http.ReadRequest(bufio.NewReader(strings.NewReader("GET /api/v1/requests/id HTTP/1.1\r\nHost: example.test\r\n" + tc.headers + "\r\n")))
+			if err != nil {
+				t.Fatal(err)
+			}
+			session, err := readSessionHeader(r)
+			if (err != nil) != tc.invalid || session != tc.session {
+				t.Fatal("wire header correlation or duplicate validation changed", session, err)
+			}
+		})
+	}
+}
 
 func httpHistoryScope(states map[string]*inference.State, ref *inference.Ref) error {
 	if ref.ClientID == "" {
