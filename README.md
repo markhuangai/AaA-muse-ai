@@ -18,6 +18,8 @@ The November 11 [#9 approval](https://github.com/markhuangai/AaA-muse-ai/issues/
 
 The November 12 [#10 approval](https://github.com/markhuangai/AaA-muse-ai/issues/10) permits broker-recovery engineering and controlled validation. Startup reconciles PostgreSQL work before serving, preserves accepted decisions and tool waits, and retains uncertain claimed work under the existing 30-second health leases. A healthy sibling broker is preserved. The [recovery contract](docs/history-api.md#broker-restart-recovery) distinguishes receipt replay from renewed claim authority. This engineering exception grants no live Muse trial or release qualification.
 
+The November 12 [#11 decision](https://github.com/markhuangai/AaA-muse-ai/issues/11) reaffirms the durable worker credentials approved in [#3 on November 9](https://github.com/markhuangai/AaA-muse-ai/issues/3), already implemented at source revision `c798f48dd2adabe704294cf2ceb929486feeac69`. It replaces #11's proposed credential expiry and renewal with documentation and controlled validation of the existing lifecycle, independently of #21. Live qualification and release requirements remain unchanged.
+
 ## Run the service
 
 Requires Docker and Docker Compose. Copy the [example configuration](config.example.yaml):
@@ -55,6 +57,12 @@ docker compose up --build -d
 Compose mounts `config.yaml` read-only. The service runs as UID/GID `10001:10001`, so that user must be able to read the mount. Put your own Traefik, Nginx or other HTTPS reverse proxy in front of the single HTTP port; configure `MUSE_PUBLIC_URL` as its HTTPS origin. No bundled proxy or TLS management is provided.
 
 If `management.key` is empty, startup prints an automatically generated management key once. Keep it local in a protected header file containing `Authorization: Bearer <management-key>` under a `0700` directory, with file mode `0600`. Never send that key to Muse. Liveness is `GET /healthz`; readiness is `GET /readyz`.
+
+## Worker registration
+
+A registration code expires after fifteen minutes and can be used once. Successful enrollment exchanges it for the worker's own credential, which has no automatic expiry. The worker reuses its protected credential and identity across reconnects and worker, service, or database restarts; it does not need a fresh setup code each time.
+
+Management can revoke a registration through `POST /api/v1/admin/workers/{id}/revoke`. Revocation rejects every copy of that credential while retaining registration and history records. Removing local worker state only loses that installation's copy; the server cannot recover it from its stored hash. See [reconnect and removal](worker/README.md#registration-reconnect-and-removal) before replacing or retiring an installation. Registration and connection health remain separate from independently verified inference readiness.
 
 ## One-message Muse setup
 
