@@ -29,6 +29,8 @@
 
 - The November 11 issue #9 approval permits capability-routing engineering and controlled software validation now. It retains the inconclusive live qualification result and passing-live release gate, permits no live Muse trial, and authorizes no other downstream feature. Readiness requires management-approved authenticated trial evidence for the current connection generation; controlled provenance is not live inference proof.
 
+- The November 12 issue #10 approval permits broker-recovery engineering and controlled HTTP/PostgreSQL validation with the existing 30-second health leases. Recovery preserves healthy sibling brokers, durable history/receipts/pins/tool linkage and unresolved busy holds; it introduces no automatic worker replacement. The inconclusive live result and passing-live release gate remain, and no live Muse trial or release publication is authorized.
+
 ## Contributor CI checks
 
 - Install locked dependencies with `npm ci --ignore-scripts --no-audit --no-fund` and `npm ci --prefix .github/scripts --ignore-scripts --no-audit --no-fund`. Docker supplies the pinned Go toolchain. `make check-workflows` requires verified actionlint 1.7.12.

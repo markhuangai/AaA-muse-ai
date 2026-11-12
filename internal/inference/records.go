@@ -192,6 +192,7 @@ type Ref struct {
 	WorkerAuth                               string
 	Admission, Full                          bool
 	Routing                                  bool
+	Recovery                                 bool
 	EvidenceIDs                              []string
 	Correlation                              map[string]any
 	ClientID, SessionID, ResponseID          string
@@ -215,6 +216,12 @@ type State struct {
 	HistoryConversationID string
 	Routing               WorkerRouting
 	Pool                  map[string]*State
+	Recovery              RecoverySummary
+}
+
+type RecoverySummary struct {
+	Receipts      int `json:"durable_receipts"`
+	Conversations int `json:"durable_conversations"`
 }
 
 type Rejection struct {

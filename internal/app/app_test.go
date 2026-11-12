@@ -19,6 +19,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/markhuangai/AaA-muse-ai/internal/config"
 	"github.com/markhuangai/AaA-muse-ai/internal/diagnostics"
+	"github.com/markhuangai/AaA-muse-ai/internal/inference"
 	"github.com/markhuangai/AaA-muse-ai/internal/postgres"
 	"github.com/markhuangai/AaA-muse-ai/internal/service"
 )
@@ -26,14 +27,25 @@ import (
 type fakeRepository struct {
 	service.WorkerRepository
 	service.InferenceRepository
-	bootErr error
-	closed  atomic.Bool
+	bootErr     error
+	recoveryErr error
+	recovered   atomic.Bool
+	closed      atomic.Bool
 }
 
 func (r *fakeRepository) Bootstrap(context.Context) error                    { return r.bootErr }
 func (r *fakeRepository) Ping(context.Context) error                         { return nil }
 func (r *fakeRepository) Close()                                             { r.closed.Store(true) }
 func (r *fakeRepository) InferenceWorkers(context.Context) ([]string, error) { return nil, nil }
+func (r *fakeRepository) WithinInference(_ context.Context, ref inference.Ref, apply func(*inference.State) error) error {
+	if ref.Recovery {
+		if r.recoveryErr != nil {
+			return r.recoveryErr
+		}
+		r.recovered.Store(true)
+	}
+	return apply(&inference.State{Now: time.Now(), Pool: map[string]*inference.State{}, Experiments: map[string]*inference.Experiment{}, Jobs: map[string]*inference.Job{}, Requests: map[string]*inference.Request{}, Conversations: map[string]*inference.Conversation{}})
+}
 
 func fixtureDependencies(t *testing.T, generated bool) (Dependencies, *bytes.Buffer, *bytes.Buffer, *fakeRepository) {
 	t.Helper()

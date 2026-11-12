@@ -16,6 +16,8 @@ The separate November 11 [#8 approval](https://github.com/markhuangai/AaA-muse-a
 
 The November 11 [#9 approval](https://github.com/markhuangai/AaA-muse-ai/issues/9) separately permits automatic capability routing and controlled software validation. Native requests can omit the worker ID, wait in a bounded queue, and retain a healthy session pin across answers. Management records authenticated qualification trials with explicit controlled/live provenance; reconnecting requires fresh evidence and approval. These software mechanisms do not resolve the failed interleaving or incomplete refresh qualification, and no live trial is authorized by this engineering change. See the [native API contract](docs/history-api.md).
 
+The November 12 [#10 approval](https://github.com/markhuangai/AaA-muse-ai/issues/10) permits broker-recovery engineering and controlled validation. Startup reconciles PostgreSQL work before serving, preserves accepted decisions and tool waits, and retains uncertain claimed work under the existing 30-second health leases. A healthy sibling broker is preserved. The [recovery contract](docs/history-api.md#broker-restart-recovery) distinguishes receipt replay from renewed claim authority. This engineering exception grants no live Muse trial or release qualification.
+
 ## Run the service
 
 Requires Docker and Docker Compose. Copy the [example configuration](config.example.yaml):

@@ -121,6 +121,11 @@ func (r *Repository) withinRouting(ctx context.Context, ref inference.Ref, apply
 		if err != nil {
 			return err
 		}
+		if ref.Recovery {
+			if err = tx.QueryRow(ctx, "SELECT (SELECT count(*) FROM aaa_inference_receipts), (SELECT count(*) FROM aaa_conversations)").Scan(&s.Recovery.Receipts, &s.Recovery.Conversations); err != nil {
+				return err
+			}
+		}
 		if ref.WorkerID != "" {
 			w := s.Pool[ref.WorkerID]
 			if w == nil {

@@ -203,6 +203,8 @@ jobs:
         run: make test-history
       - name: Capability routing, concurrency, affinity and log-only diagnosis
         run: make test-routing
+      - name: Broker restart reconciliation, durable receipts and uncertainty
+        run: make test-broker-recovery
 
   image:
     name: CI / image

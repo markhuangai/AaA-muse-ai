@@ -174,7 +174,7 @@ class WorkerTransport(Inference):
         require(retries[-1]["previous_submission_id"] == failed[0]["submission_id"] and accepted[-1]["submission_id"] != failed[0]["submission_id"], "fresh claim did not follow definitive rejection of its original journal")
         broker = self.export_operation(e["id"])
         require(len([v for v in broker if v["msg"] == "job.claimed"]) == 1, "claim recovery acquired more than one assignment")
-        self.diagnose(refusal[-1]["request_id"], "lease.rejected", "stale_connection")
+        self.diagnose(refusal[-1]["request_id"], "lease.fenced", "stale_connection")
         self.submit_cli(worker, e["current_job_id"], {"type": "final", "text": "claimed once"})
         self.receipt("worker.unsent_claim_rejected_then_replaced", request_id=refusal[-1]["request_id"], unsent_attempts=3, accepted_assignments=1, log_only_diagnosis=True)
 
@@ -377,7 +377,7 @@ class WorkerTransport(Inference):
         require(retry and retry[-1]["last_event_id"] and retry[-1]["delay_ms"] <= 30000, "stale heartbeat lacks correlated reconnect evidence")
         healthy = [e for e in events if e["msg"] == "worker.http_exchange" and e["route"].endswith("/heartbeat") and e["http_status"] == 200 and e["input"]["connection_generation"] > prior["connection_generation"]]
         require(healthy, "fresh connection never answered an authenticated health challenge")
-        self.diagnose(failure["request_id"], "lease.rejected", "stale_connection")
+        self.diagnose(failure["request_id"], "lease.fenced", "stale_connection")
         require((worker["state"] / "credential.key").read_text().strip() == worker["credential"], "heartbeat recovery replaced worker identity")
         self.receipt("worker.expired_heartbeat_reconnect", request_id=failure["request_id"], old_generation=prior["connection_generation"], new_generation=healthy[-1]["input"]["connection_generation"], log_only_diagnosis=True, identity_preserved=True)
 

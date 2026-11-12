@@ -24,6 +24,11 @@ func (tx *routingTx) QueryRow(_ context.Context, q string, args ...any) pgx.Row 
 		return workerRow{err: err}
 	}
 	switch {
+	case strings.Contains(q, "SELECT (SELECT count(*) FROM aaa_inference_receipts)"):
+		if tx.mode == "recovery-summary-error" {
+			return workerRow{err: errors.New("recovery summary unavailable")}
+		}
+		return workerRow{values: []any{7, 4}}
 	case strings.Contains(q, "clock_timestamp"):
 		return workerRow{values: []any{tx.now}}
 	case strings.Contains(q, "count(*)"):
