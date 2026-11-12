@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"sort"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -24,7 +25,7 @@ func (r *Repository) InferenceWorkers(ctx context.Context) (ids []string, err er
 		rows, err := tx.Query(ctx, `SELECT DISTINCT worker_id FROM (
 			SELECT worker_id FROM aaa_worker_connections WHERE (data->>'connected')::boolean
 			UNION SELECT worker_id FROM aaa_experiments WHERE state NOT IN ('completed','cancelled','interrupted')
-			UNION SELECT worker_id FROM aaa_inference_jobs WHERE held) AS active ORDER BY worker_id`)
+			UNION SELECT worker_id FROM aaa_inference_jobs WHERE held) AS active WHERE worker_id IS NOT NULL ORDER BY worker_id`)
 		if err != nil {
 			return err
 		}
@@ -71,6 +72,9 @@ func resolveInference(ctx context.Context, tx pgx.Tx, ref *inference.Ref) error 
 }
 
 func (r *Repository) WithinInference(ctx context.Context, ref inference.Ref, apply func(*inference.State) error) error {
+	if ref.Routing {
+		return r.withinRouting(ctx, ref, apply)
+	}
 	return r.workerTransaction(ctx, func(tx pgx.Tx) error {
 		if ref.Admission {
 			if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", inferenceAdmissionLock); err != nil {
@@ -116,6 +120,9 @@ func (r *Repository) WithinInference(ctx context.Context, ref inference.Ref, app
 		if err = loadInference(ctx, tx, ref, s); err != nil {
 			return err
 		}
+		if err = loadRouting(ctx, tx, s); err != nil {
+			return err
+		}
 		if err = loadHistory(ctx, tx, ref, s); err != nil {
 			return err
 		}
@@ -154,9 +161,9 @@ func (r *Repository) WithinInference(ctx context.Context, ref inference.Ref, app
 }
 
 func loadInference(ctx context.Context, tx pgx.Tx, ref inference.Ref, s *inference.State) error {
-	rows, err := tx.Query(ctx, `SELECT data FROM aaa_experiments WHERE worker_id=$1 AND
+	rows, err := tx.Query(ctx, `SELECT data FROM aaa_experiments WHERE (worker_id=$1 OR (worker_id IS NULL AND $1='')) AND
 		(state NOT IN ('completed','cancelled','interrupted') OR id=$2 OR id IN
-		(SELECT experiment_id FROM aaa_inference_jobs WHERE id=$3 OR held)) ORDER BY id`, ref.WorkerID, ref.ExperimentID, ref.BaseJobID)
+		(SELECT experiment_id FROM aaa_inference_jobs WHERE id=$3 OR held) OR id=ANY($4::text[])) ORDER BY id`, s.WorkerID, ref.ExperimentID, ref.BaseJobID, ref.EvidenceIDs)
 	if err != nil {
 		return err
 	}
@@ -206,7 +213,7 @@ func loadInference(ctx context.Context, tx pgx.Tx, ref inference.Ref, s *inferen
 	}
 	rows, err = tx.Query(ctx, `SELECT data, CASE WHEN $4 THEN context ELSE NULL END FROM aaa_inference_jobs
 		WHERE worker_id=$1 AND (state IN ('queued','claimed') OR held OR id=$2 OR id=$3 OR
-		id=(SELECT data->>'current_job_id' FROM aaa_experiments WHERE id=$5)) ORDER BY id`, ref.WorkerID, ref.JobID, ref.BaseJobID, ref.Full, ref.ExperimentID)
+		id=(SELECT data->>'current_job_id' FROM aaa_experiments WHERE id=$5) OR experiment_id=ANY($6::text[])) ORDER BY id`, s.WorkerID, ref.JobID, ref.BaseJobID, ref.Full, ref.ExperimentID, ref.EvidenceIDs)
 	if err != nil {
 		return err
 	}
@@ -280,7 +287,7 @@ func saveInference(ctx context.Context, tx pgx.Tx, ref inference.Ref, s *inferen
 	if err != nil {
 		return err
 	}
-	if !bytes.Equal(data, b.connection) {
+	if s.Pool == nil && !bytes.Equal(data, b.connection) {
 		if _, err = tx.Exec(ctx, "INSERT INTO aaa_worker_connections(worker_id,data) VALUES($1,$2) ON CONFLICT(worker_id) DO UPDATE SET data=EXCLUDED.data", s.WorkerID, data); err != nil {
 			return err
 		}
@@ -292,7 +299,7 @@ func saveInference(ctx context.Context, tx pgx.Tx, ref inference.Ref, s *inferen
 		}
 		if !bytes.Equal(data, b.experiments[id]) {
 			if _, err = tx.Exec(ctx, `INSERT INTO aaa_experiments(id,worker_id,state,deadline_at,data) VALUES($1,$2,$3,$4,$5)
-				ON CONFLICT(id) DO UPDATE SET state=EXCLUDED.state,data=EXCLUDED.data`, id, e.WorkerID, e.State, e.DeadlineAt, data); err != nil {
+				ON CONFLICT(id) DO UPDATE SET worker_id=EXCLUDED.worker_id,state=EXCLUDED.state,data=EXCLUDED.data`, id, nullableWorker(e.WorkerID), e.State, e.DeadlineAt, data); err != nil {
 				return err
 			}
 		}
@@ -308,7 +315,20 @@ func saveInference(ctx context.Context, tx pgx.Tx, ref inference.Ref, s *inferen
 			}
 		}
 	}
-	for id, j := range s.Jobs {
+	// Existing fences must reach PostgreSQL before replacements hit immediate unique indexes.
+	jobIDs := make([]string, 0, len(s.Jobs))
+	for id := range s.Jobs {
+		jobIDs = append(jobIDs, id)
+	}
+	sort.Slice(jobIDs, func(i, j int) bool {
+		existingI, existingJ := b.jobs[jobIDs[i]] != nil, b.jobs[jobIDs[j]] != nil
+		if existingI != existingJ {
+			return existingI
+		}
+		return jobIDs[i] < jobIDs[j]
+	})
+	for _, id := range jobIDs {
+		j := s.Jobs[id]
 		data, err = jobHeader(j)
 		if err != nil {
 			return err

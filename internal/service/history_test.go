@@ -51,7 +51,7 @@ func memoryHistoryScope(states map[string]*inference.State, ref *inference.Ref) 
 	if c == nil {
 		return nil
 	}
-	if ref.WorkerID != "" && ref.WorkerID != c.WorkerID {
+	if c.WorkerID != "" && ref.WorkerID != "" && ref.WorkerID != c.WorkerID {
 		return inference.Reject("session_worker_conflict", 409)
 	}
 	ref.WorkerID, ref.ConversationID = c.WorkerID, c.ID
@@ -98,7 +98,7 @@ func nativeDecide(t *testing.T, b *Broker, m *inferenceMemory, c inference.Conne
 func TestNativeCanonicalToolLoopReplayAndSnapshots(t *testing.T) {
 	b, m, logger, logs := inferenceFixture()
 	ctx := context.Background()
-	c := connectInference(t, b, m, logger, "worker-a")
+	c := connectNative(t, b, m, logger, "worker-a")
 	input := requestInput("first")
 	v := admitted(t, b, "alice", "session-a", input)
 	if v.SessionID != "session-a" || v.Output != nil {
@@ -192,7 +192,7 @@ func TestNativeOwnershipIdentityAndBoundaryPersistence(t *testing.T) {
 	b, m, logger, logs := inferenceFixture()
 	ctx := context.Background()
 	b.maxJobs = 16
-	c := connectInference(t, b, m, logger, "worker-a")
+	c := connectNative(t, b, m, logger, "worker-a")
 	input := requestInput("owned")
 	v := admitted(t, b, "alice", "shared-name", input)
 	other := admitted(t, b, "bob", "shared-name", requestInput("other"))
@@ -259,7 +259,8 @@ func TestNativeOwnershipIdentityAndBoundaryPersistence(t *testing.T) {
 	}
 	_, err = b.CancelRequest(ctx, logger, "alice", a.ID, "wrong-session", inference.Cancel{Version: 1, SubmissionID: "wrong-cancel"})
 	requireInferenceReason(t, err, "session_reference_conflict")
-	if m.states["worker-a"].Requests[a.ID].State != "queued" {
+	current, readErr := b.ReadRequest(ctx, logger, "alice", a.ID, "")
+	if readErr != nil || current.State != "queued" {
 		t.Fatal("wrong-header cancellation mutated request")
 	}
 	cancelInput := inference.Cancel{Version: 1, SubmissionID: "same-cancel"}
@@ -273,7 +274,7 @@ func TestNativeOwnershipIdentityAndBoundaryPersistence(t *testing.T) {
 func TestNativeConflictsAtomicFailureAndConcurrency(t *testing.T) {
 	b, m, logger, _ := inferenceFixture()
 	ctx := context.Background()
-	c := connectInference(t, b, m, logger, "worker-a")
+	c := connectNative(t, b, m, logger, "worker-a")
 	v := admitted(t, b, "alice", "race", requestInput("initial"))
 	nativeDecide(t, b, m, c, v, inference.Item{Type: "final", Text: "answer\n"})
 	base := inference.Messages(m.states["worker-a"].Conversations[v.ConversationID], 3)
@@ -366,11 +367,13 @@ func TestNativeValidationAndDependencyErrors(t *testing.T) {
 		}
 	}
 	_, err := b.SubmitRequest(ctx, logger, "alice", "offline", requestInput("offline"))
-	requireInferenceReason(t, err, "worker_offline")
-	connectInference(t, b, m, logger, "worker-a")
+	requireInferenceReason(t, err, "no_ready_worker")
+	requireCandidateReason(t, err, "worker-a", "worker_offline")
+	connectNative(t, b, m, logger, "worker-a")
 	m.states["worker-a"].Revoked = true
 	_, err = b.SubmitRequest(ctx, logger, "alice", "revoked", requestInput("revoked"))
-	requireInferenceReason(t, err, "worker_revoked")
+	requireInferenceReason(t, err, "no_ready_worker")
+	requireCandidateReason(t, err, "worker-a", "worker_revoked")
 	m.states["worker-a"].Revoked = false
 	for n := 0; n < 6; n++ {
 		b.random = bytes.NewReader(make([]byte, n*16))
@@ -398,7 +401,7 @@ func TestNativeValidationAndDependencyErrors(t *testing.T) {
 
 func TestNativeDecisionIdentifierFailureRemainsRetryable(t *testing.T) {
 	b, m, logger, _ := inferenceFixture()
-	c := connectInference(t, b, m, logger, "worker-a")
+	c := connectNative(t, b, m, logger, "worker-a")
 	v := admitted(t, b, "alice", "session", requestInput("first"))
 	job := nativeJob(t, b, m, c, v)
 	body := submission(job, c, "decision", inference.Item{Type: "final", Text: "result"})
@@ -449,4 +452,10 @@ func TestReconciliationRejectsUnsupportedAndConflictingItems(t *testing.T) {
 	if err := reconcileHistory(c, input); err == nil {
 		t.Fatal("invalid result fields accepted")
 	}
+}
+
+func connectNative(t *testing.T, b *Broker, m *inferenceMemory, logger *slog.Logger, id string) inference.Connection {
+	c := connectInference(t, b, m, logger, id)
+	m.states[id].Routing.Qualifications = []inference.Qualification{{ID: "fixture-qualification", WorkerID: id, ConnectionID: c.ID, ConnectionGeneration: c.Generation, Capabilities: []string{"text", "function_tools"}, Input: inference.QualificationInput{Action: "approve", EvidenceKind: "controlled"}}}
+	return c
 }

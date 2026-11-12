@@ -116,23 +116,24 @@ type Delivery struct {
 }
 
 type Job struct {
-	Version              int        `json:"protocol_version"`
-	ID                   string     `json:"id"`
-	ExperimentID         string     `json:"experiment_id"`
-	ConversationID       string     `json:"conversation_id"`
-	WorkerID             string     `json:"worker_id"`
-	State                string     `json:"state"`
-	CreatedAt            time.Time  `json:"created_at"`
-	DeadlineAt           time.Time  `json:"deadline_at"`
-	ClaimedAt            *time.Time `json:"claimed_at"`
-	LeaseExpiresAt       *time.Time `json:"lease_expires_at"`
-	Generation           int64      `json:"generation"`
-	LeaseID              string     `json:"lease_id"`
-	Held                 bool       `json:"held"`
-	ConnectionID         string     `json:"connection_id"`
-	ConnectionGeneration int64      `json:"connection_generation"`
-	Context              Delivery   `json:"context"`
-	Reason               string     `json:"reason,omitempty"`
+	Version              int            `json:"protocol_version"`
+	ID                   string         `json:"id"`
+	ExperimentID         string         `json:"experiment_id"`
+	ConversationID       string         `json:"conversation_id"`
+	WorkerID             string         `json:"worker_id"`
+	State                string         `json:"state"`
+	CreatedAt            time.Time      `json:"created_at"`
+	DeadlineAt           time.Time      `json:"deadline_at"`
+	ClaimedAt            *time.Time     `json:"claimed_at"`
+	LeaseExpiresAt       *time.Time     `json:"lease_expires_at"`
+	Generation           int64          `json:"generation"`
+	LeaseID              string         `json:"lease_id"`
+	Held                 bool           `json:"held"`
+	ConnectionID         string         `json:"connection_id"`
+	ConnectionGeneration int64          `json:"connection_generation"`
+	Context              Delivery       `json:"context"`
+	Reason               string         `json:"reason,omitempty"`
+	Qualification        *Qualification `json:"qualification,omitempty"`
 }
 
 type Challenge struct {
@@ -168,11 +169,14 @@ func (c Connection) Status(now time.Time) string {
 }
 
 type Projection struct {
-	ConnectionStatus string      `json:"connection_status"`
-	WorkStatus       string      `json:"work_status"`
-	CurrentJob       *Assignment `json:"current_job"`
-	WaitingForTool   int         `json:"waiting_for_client_tool"`
-	LastHeartbeatAt  *time.Time  `json:"last_heartbeat_at"`
+	ConnectionStatus     string          `json:"connection_status"`
+	WorkStatus           string          `json:"work_status"`
+	CurrentJob           *Assignment     `json:"current_job"`
+	WaitingForTool       int             `json:"waiting_for_client_tool"`
+	LastHeartbeatAt      *time.Time      `json:"last_heartbeat_at"`
+	InferenceReadiness   string          `json:"inference_readiness"`
+	Qualification        *Qualification  `json:"qualification,omitempty"`
+	QualificationHistory []Qualification `json:"qualification_history"`
 }
 
 type Receipt struct {
@@ -187,6 +191,8 @@ type Ref struct {
 	Principal, SubmissionID                  string
 	WorkerAuth                               string
 	Admission, Full                          bool
+	Routing                                  bool
+	EvidenceIDs                              []string
 	Correlation                              map[string]any
 	ClientID, SessionID, ResponseID          string
 	ConversationID, ReplayHash               string
@@ -207,6 +213,8 @@ type State struct {
 	Requests              map[string]*Request
 	PendingTools          int
 	HistoryConversationID string
+	Routing               WorkerRouting
+	Pool                  map[string]*State
 }
 
 type Rejection struct {

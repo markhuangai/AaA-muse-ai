@@ -75,8 +75,8 @@ func baselineChecksum() string {
 }
 
 func TestBootstrapTransaction(t *testing.T) {
-	for _, existing := range []int{0, 1, 2, 3, 4} {
-		t.Run([]string{"fresh", "upgrade-v1", "upgrade-v2", "upgrade-v3", "current"}[existing], func(t *testing.T) {
+	for _, existing := range []int{0, 1, 2, 3, 4, 5} {
+		t.Run([]string{"fresh", "upgrade-v1", "upgrade-v2", "upgrade-v3", "upgrade-v4", "current"}[existing], func(t *testing.T) {
 			r := &rows{}
 			if existing >= 1 {
 				r.versions = []int{1}
@@ -94,10 +94,16 @@ func TestBootstrapTransaction(t *testing.T) {
 				r.versions = append(r.versions, 3)
 				r.checksums = append(r.checksums, hex.EncodeToString(hash[:]))
 			}
-			if existing == 4 {
+			if existing >= 4 {
 				ddl, _ := migrations.ReadFile("migrations/004_canonical_history.sql")
 				hash := sha256.Sum256(ddl)
 				r.versions = append(r.versions, 4)
+				r.checksums = append(r.checksums, hex.EncodeToString(hash[:]))
+			}
+			if existing == 5 {
+				ddl, _ := migrations.ReadFile("migrations/005_routing.sql")
+				hash := sha256.Sum256(ddl)
+				r.versions = append(r.versions, 5)
 				r.checksums = append(r.checksums, hex.EncodeToString(hash[:]))
 			}
 			tx := &transaction{rows: r}
@@ -112,7 +118,7 @@ func TestBootstrapTransaction(t *testing.T) {
 			if tx.arguments[0][0] != migrationLock {
 				t.Fatal("wrong lock ownership")
 			}
-			want := []int{9, 8, 6, 4, 2}[existing]
+			want := []int{11, 10, 8, 6, 4, 2}[existing]
 			if len(tx.commands) != want {
 				t.Fatal("unexpected migration execution")
 			}
@@ -153,7 +159,7 @@ func TestBootstrapFailures(t *testing.T) {
 			case "rows":
 				tx.rows.endErr = failure
 			case "newer":
-				tx.rows.versions = []int{5}
+				tx.rows.versions = []int{6}
 				tx.rows.checksums = []string{"x"}
 			case "older":
 				tx.rows.versions = []int{0}

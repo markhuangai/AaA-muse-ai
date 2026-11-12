@@ -107,7 +107,7 @@ export async function execute(args: string[], io: Adapters): Promise<number> {
         const transport = await worker.load();
         const record = await worker.identity(transport);
         const pending = await state.read('pending.json');
-        result = { worker: record, pending_work: pending ? parse(pending) : null, inference_readiness: 'unverified', ...(command === 'doctor' ? { state_permissions: 'verified', runtime: io.nodeVersion, transport: 'authenticated_https', muse_runtime: 'unverified', wake: 'unverified', recovery: 'unverified' } : {}) };
+        result = { worker: record, pending_work: pending ? parse(pending) : null, inference_readiness: record.inference_readiness, ...(command === 'doctor' ? { state_permissions: 'verified', runtime: io.nodeVersion, transport: 'authenticated_https', muse_runtime: 'unverified', wake: 'unverified', recovery: 'unverified' } : {}) };
         break;
       }
       case 'job-show':

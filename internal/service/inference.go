@@ -38,7 +38,23 @@ type inferenceEvent struct {
 }
 
 func event(events *[]inferenceEvent, level slog.Level, name string, s *inference.State, j *inference.Job, extra ...any) {
-	attrs := []any{"worker_id", s.WorkerID, "connection_id", s.Connection.ID, "connection_generation", s.Connection.Generation}
+	w := s
+	workerID := s.WorkerID
+	connection := s.Connection
+	if j != nil {
+		if j.WorkerID != "" {
+			workerID = j.WorkerID
+		} else if r := s.Requests[j.ExperimentID]; r != nil {
+			workerID = r.WorkerID
+		}
+		if found := poolWorker(s, workerID); found != nil {
+			w = found
+			connection = w.Connection
+		} else if workerID == "" {
+			connection = inference.Connection{}
+		}
+	}
+	attrs := []any{"worker_id", workerID, "connection_id", connection.ID, "connection_generation", connection.Generation}
 	if j != nil {
 		attrs = append(attrs, "operation_id", j.ExperimentID, "experiment_id", j.ExperimentID, "conversation_id", j.ConversationID, "job_id", j.ID, "generation", j.Generation, "state", j.State, "lease_expires_at", j.LeaseExpiresAt, "deadline_at", j.DeadlineAt, "claimed_at", j.ClaimedAt)
 		if r := s.Requests[j.ExperimentID]; r != nil {
@@ -52,7 +68,7 @@ func event(events *[]inferenceEvent, level slog.Level, name string, s *inference
 
 func heldJob(s *inference.State) *inference.Job {
 	for _, j := range s.Jobs {
-		if j.Held {
+		if j.Held && j.WorkerID == s.WorkerID {
 			return j
 		}
 	}
@@ -60,7 +76,7 @@ func heldJob(s *inference.State) *inference.Job {
 }
 
 func project(s *inference.State) inference.Projection {
-	p := inference.Projection{ConnectionStatus: s.Connection.Status(s.Now), WorkStatus: "unknown", LastHeartbeatAt: s.Connection.LastAckAt, WaitingForTool: s.PendingTools}
+	p := inference.Projection{InferenceReadiness: readiness(s), Qualification: s.Routing.Latest(), QualificationHistory: append([]inference.Qualification{}, s.Routing.Qualifications...), ConnectionStatus: s.Connection.Status(s.Now), WorkStatus: "unknown", LastHeartbeatAt: s.Connection.LastAckAt, WaitingForTool: s.PendingTools}
 	if p.ConnectionStatus == "online" {
 		p.WorkStatus = "idle"
 	}
@@ -79,6 +95,10 @@ func project(s *inference.State) inference.Projection {
 func finish(s *inference.State, e *inference.Experiment, state, reason string, events *[]inferenceEvent) {
 	if e.Terminal() {
 		return
+	}
+	previousBoundary := "client_tool_wait"
+	if e.State == "queued" && e.CurrentJobID == "" {
+		previousBoundary = "dispatch_queue"
 	}
 	e.State, e.Reason, e.RemoteOutcome = state, reason, "not_started"
 	emitted := false
@@ -108,12 +128,27 @@ func finish(s *inference.State, e *inference.Experiment, state, reason string, e
 		if reason == "operator_cancelled" {
 			level, name = slog.LevelInfo, "experiment.cancelled"
 		}
-		event(events, level, name, s, &inference.Job{ID: e.CurrentJobID, ExperimentID: e.ID, ConversationID: e.ConversationID, State: state, DeadlineAt: e.DeadlineAt}, "reason", reason, "remote_outcome", e.RemoteOutcome, "previous_boundary", "client_tool_wait")
+		event(events, level, name, s, &inference.Job{ID: e.CurrentJobID, ExperimentID: e.ID, ConversationID: e.ConversationID, State: state, DeadlineAt: e.DeadlineAt}, "reason", reason, "remote_outcome", e.RemoteOutcome, "previous_boundary", previousBoundary, "queue_wait_ms", s.Now.Sub(e.CreatedAt).Milliseconds(), "created_at", e.CreatedAt)
 	}
 	*events = append(*events, inferenceEvent{"experiment.outcome", slog.LevelInfo, []any{"operation_id", e.ID, "experiment_id", e.ID, "conversation_id", e.ConversationID, "worker_id", e.WorkerID, "state", e.State, "reason", reason, "remote_outcome", e.RemoteOutcome}})
 }
 
 func expire(s *inference.State, events *[]inferenceEvent) {
+	if s.Pool != nil {
+		for _, w := range s.Pool {
+			expire(w, events)
+		}
+		s.ActiveCount = 0
+		for _, e := range s.Experiments {
+			if e.WorkerID == "" && !e.Terminal() && !s.Now.Before(e.DeadlineAt) {
+				finish(s, e, "interrupted", "deadline_exceeded", events)
+			}
+			if !e.Terminal() {
+				s.ActiveCount++
+			}
+		}
+		return
+	}
 	if s.Connection.Connected && (s.Revoked || s.Connection.Status(s.Now) == "offline") {
 		s.Connection.Connected = false
 		reason := "health_reply_expired"
@@ -237,7 +272,7 @@ func (b *Broker) run(ctx context.Context, logger *slog.Logger, ref inference.Ref
 			observed["job_id"] = v.ID
 		case inference.RequestView:
 			expID = v.ID
-			observed["conversation_id"], observed["session_id"], observed["request_record_id"] = v.ConversationID, v.SessionID, v.ID
+			observed["conversation_id"], observed["session_id"], observed["request_record_id"], observed["worker_id"] = v.ConversationID, v.SessionID, v.ID, v.WorkerID
 		}
 		if r := s.Requests[expID]; r != nil {
 			observed["client_id"], observed["session_id"], observed["request_record_id"] = r.ClientID, r.SessionID, r.ID
@@ -285,7 +320,7 @@ func (b *Broker) run(ctx context.Context, logger *slog.Logger, ref inference.Ref
 			logger = logger.With("operation_id", ref.ExperimentID)
 		}
 	}
-	if operation != "poll" && operation != "sweep" && operation != "projection" {
+	if operation != "poll" && operation != "sweep" && operation != "projection" && operation != "dispatch" {
 		logger.Debug("inference.exchange", "correlation", observed, "input", input, "output", result, "requested_experiment_id", ref.ExperimentID, "requested_job_id", ref.JobID)
 	}
 	if err != nil {
@@ -294,6 +329,12 @@ func (b *Broker) run(ctx context.Context, logger *slog.Logger, ref inference.Ref
 			name := "lease.rejected"
 			if ref.ClientID != "" {
 				name = "history.conflict"
+			}
+			if rejection.Reason == "no_ready_worker" || rejection.Reason == "queue_full" {
+				name = "dispatch.rejected"
+			}
+			if rejection.Reason == "session_worker_conflict" {
+				name = "dispatch.pin_conflict"
 			}
 			if rejection.Reason == "history_owner_denied" {
 				name = "history.owner_denied"
@@ -347,7 +388,7 @@ func (b *Broker) Sweep(ctx context.Context, logger *slog.Logger) error {
 			return err
 		}
 	}
-	return nil
+	return b.Dispatch(ctx, logger)
 }
 
 func (b *Broker) Run(ctx context.Context, logger *slog.Logger) {
@@ -438,7 +479,7 @@ func (b *Broker) Poll(ctx context.Context, logger *slog.Logger, workerID, id str
 		if project(s).WorkStatus == "idle" {
 			jobs := []*inference.Job{}
 			for _, j := range s.Jobs {
-				if j.State == "queued" {
+				if j.State == "queued" && nativeEligibility(s, j) == nil {
 					jobs = append(jobs, j)
 				}
 			}

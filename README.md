@@ -14,6 +14,8 @@ The November 11, 2026 CI decision accepts the completed PoC investigation as the
 
 The separate November 11 [#8 approval](https://github.com/markhuangai/AaA-muse-ai/issues/8) permits canonical-history logic and controlled HTTP/PostgreSQL tests now, with live testing deferred. Existing qualification remains inconclusive; this exception does not establish live session isolation or release readiness.
 
+The November 11 [#9 approval](https://github.com/markhuangai/AaA-muse-ai/issues/9) separately permits automatic capability routing and controlled software validation. Native requests can omit the worker ID, wait in a bounded queue, and retain a healthy session pin across answers. Management records authenticated qualification trials with explicit controlled/live provenance; reconnecting requires fresh evidence and approval. These software mechanisms do not resolve the failed interleaving or incomplete refresh qualification, and no live trial is authorized by this engineering change. See the [native API contract](docs/history-api.md).
+
 ## Run the service
 
 Requires Docker and Docker Compose. Copy the [example configuration](config.example.yaml):

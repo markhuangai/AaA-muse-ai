@@ -25,7 +25,11 @@ func (b *Broker) SubmitRequest(ctx context.Context, logger *slog.Logger, client,
 	if client == "" {
 		return view, inference.Reject("model_client_required", 401)
 	}
-	settings := inference.Create{Version: input.Version, SubmissionID: input.SubmissionID, WorkerID: input.WorkerID, Messages: []inference.Item{{Type: "message", Role: "user"}}, Tools: input.Tools, TimeoutSeconds: input.TimeoutSeconds}
+	validationWorker := input.WorkerID
+	if validationWorker == "" {
+		validationWorker = "automatic"
+	}
+	settings := inference.Create{Version: input.Version, SubmissionID: input.SubmissionID, WorkerID: validationWorker, Messages: []inference.Item{{Type: "message", Role: "user"}}, Tools: input.Tools, TimeoutSeconds: input.TimeoutSeconds}
 	if err := inference.ValidateCreate(&settings); err != nil {
 		logger.Warn("history.conflict", "client_id", client, "reason", err.Error())
 		return view, err
@@ -43,7 +47,7 @@ func (b *Broker) SubmitRequest(ctx context.Context, logger *slog.Logger, client,
 	if err != nil {
 		return view, err
 	}
-	ref := inference.Ref{WorkerID: input.WorkerID, ClientID: client, SessionID: session, ResponseID: input.PreviousResponseID, ReplayHash: replay, HistoryInputCount: len(input.Messages), Principal: "client:" + client, SubmissionID: input.SubmissionID, Admission: true, Full: true}
+	ref := inference.Ref{WorkerID: input.WorkerID, ClientID: client, SessionID: session, ResponseID: input.PreviousResponseID, ReplayHash: replay, HistoryInputCount: len(input.Messages), Principal: "client:" + client, SubmissionID: input.SubmissionID, Admission: true, Full: true, Routing: true}
 	data, err := b.run(ctx, logger, ref, "request_create", struct {
 		Session string                 `json:"session_id"`
 		Input   inference.RequestInput `json:"input"`
@@ -72,15 +76,21 @@ func (b *Broker) SubmitRequest(ctx context.Context, logger *slog.Logger, client,
 		if err := reconcileHistory(c, input); err != nil {
 			return nil, err
 		}
-		if s.Revoked {
-			return nil, inference.Reject("worker_revoked", 409)
+		priorDecision := "none"
+		if c != nil {
+			if previous := s.Requests[c.CurrentRequestID]; previous != nil && previous.Output != nil {
+				priorDecision = previous.Output.Type
+			}
 		}
-		if s.Connection.Status(s.Now) != "online" {
-			return nil, inference.Reject("worker_offline", 409)
+		movable := movableConversation(s, c)
+		allowed, evidence := candidates(s, c, input, movable, "")
+		if len(allowed) == 0 {
+			return nil, inference.Reject("no_ready_worker", 503, "candidates", evidence, "required_capabilities", inference.RequiredCapabilities(input.Messages, input.Tools), "max_jobs", b.maxJobs)
 		}
 		if s.ActiveCount >= b.maxJobs {
-			return nil, inference.Reject("queue_full", 429, "active_experiments", s.ActiveCount, "max_jobs", b.maxJobs)
+			return nil, inference.Reject("queue_full", 429, "active_experiments", s.ActiveCount, "max_jobs", b.maxJobs, "candidates", evidence)
 		}
+
 		id, err := auth.ID(b.random)
 		if err != nil {
 			return nil, err
@@ -100,7 +110,7 @@ func (b *Broker) SubmitRequest(ctx context.Context, logger *slog.Logger, client,
 					return nil, err
 				}
 			}
-			c = &inference.Conversation{ID: cid, ClientID: client, SessionID: session, WorkerID: input.WorkerID, CreatedAt: s.Now}
+			c = &inference.Conversation{ID: cid, ClientID: client, SessionID: session, CreatedAt: s.Now}
 			if s.Conversations == nil {
 				s.Conversations = map[string]*inference.Conversation{}
 			}
@@ -109,7 +119,7 @@ func (b *Broker) SubmitRequest(ctx context.Context, logger *slog.Logger, client,
 		if s.Requests == nil {
 			s.Requests = map[string]*inference.Request{}
 		}
-		r := &inference.Request{ID: id, ConversationID: c.ID, ClientID: client, SessionID: c.SessionID, WorkerID: c.WorkerID, ResponseID: "resp_" + response, CreatedAt: s.Now, State: "queued", ReplayHash: replay, Input: input, RequestedSession: ref.SessionID, InputCount: len(input.Messages), CanonicalEnd: len(input.Messages)}
+		r := &inference.Request{ID: id, ConversationID: c.ID, ClientID: client, SessionID: c.SessionID, WorkerID: c.WorkerID, ResponseID: "resp_" + response, CreatedAt: s.Now, State: "queued", ReassignAllowed: movable, ReplayHash: replay, Input: input, RequestedSession: ref.SessionID, InputCount: len(input.Messages), CanonicalEnd: len(input.Messages)}
 		s.Requests[id] = r
 		for _, item := range input.Messages[matched:] {
 			if err = b.appendHistory(s, c, r.ID, "client_provided", item); err != nil {
@@ -119,16 +129,16 @@ func (b *Broker) SubmitRequest(ctx context.Context, logger *slog.Logger, client,
 		c.CurrentRequestID, c.PendingCallID = id, ""
 		e := &inference.Experiment{ID: id, ConversationID: c.ID, WorkerID: c.WorkerID, State: "queued", CreatedAt: s.Now, DeadlineAt: s.Now.Add(time.Duration(input.TimeoutSeconds) * time.Second), Messages: inference.Messages(c, c.ItemCount), Tools: input.Tools, RemoteOutcome: "not_started"}
 		s.Experiments[id] = e
-		j, err := b.newJob(s, e, nil)
-		if err != nil {
-			return nil, err
-		}
+
 		if err = addTimeline(c, s.Now, id, "history.tools", "INFO", map[string]any{"tools": input.Tools}); err != nil {
 			return nil, err
 		}
-		event(events, slog.LevelInfo, "history.reconciled", s, j, "client_id", client, "session_id", c.SessionID, "request_record_id", id, "matched_from", 0, "matched_to", matched, "appended_from", matched, "appended_to", c.ItemCount, "reason", "new_suffix", "tool_count", len(input.Tools))
-		event(events, slog.LevelInfo, "job.queued", s, j, "context_kind", "full", "context_receipt_id", j.Context.ReceiptID)
-		event(events, slog.LevelDebug, "inference.context", s, j, "context", j.Context, "canonical_messages", e.Messages)
+		event(events, slog.LevelInfo, "history.reconciled", s, &inference.Job{ExperimentID: id, ConversationID: c.ID}, "client_id", client, "session_id", c.SessionID, "request_record_id", id, "matched_from", 0, "matched_to", matched, "appended_from", matched, "appended_to", c.ItemCount, "reason", "new_suffix", "tool_count", len(input.Tools))
+		event(events, slog.LevelInfo, "dispatch.queued", s, &inference.Job{ExperimentID: id, ConversationID: c.ID, DeadlineAt: e.DeadlineAt}, "candidates", evidence, "active_experiments", s.ActiveCount+1, "max_jobs", b.maxJobs, "timeout_seconds", input.TimeoutSeconds, "worker_selection_constraint", input.WorkerID, "reassign_allowed", movable, "prior_decision_type", priorDecision, "required_capabilities", inference.RequiredCapabilities(input.Messages, input.Tools))
+		if err = b.dispatch(s, events); err != nil {
+			return nil, err
+		}
+
 		return r.View(false), nil
 	})
 	if err == nil {

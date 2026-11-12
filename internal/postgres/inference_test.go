@@ -32,6 +32,9 @@ func (tx *inferenceTx) QueryRow(_ context.Context, q string, args ...any) pgx.Ro
 	if err := tx.fault(); err != nil {
 		return workerRow{err: err}
 	}
+	if strings.Contains(q, "FROM aaa_worker_routing") {
+		return workerRow{err: pgx.ErrNoRows}
+	}
 	if len(tx.rows) == 0 {
 		return workerRow{err: pgx.ErrNoRows}
 	}

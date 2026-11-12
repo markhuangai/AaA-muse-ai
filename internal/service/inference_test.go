@@ -29,7 +29,9 @@ func (m *inferenceMemory) InferenceWorkers(context.Context) ([]string, error) {
 	defer m.mu.Unlock()
 	ids := []string{}
 	for id := range m.states {
-		ids = append(ids, id)
+		if id != "" {
+			ids = append(ids, id)
+		}
 	}
 	return ids, m.fail
 }
@@ -39,6 +41,9 @@ func (m *inferenceMemory) WithinInference(_ context.Context, ref inference.Ref, 
 	defer m.mu.Unlock()
 	if m.fail != nil {
 		return m.fail
+	}
+	if ref.Routing {
+		return m.withinRouting(ref, fn)
 	}
 	if err := memoryHistoryScope(m.states, &ref); err != nil {
 		return err
@@ -81,6 +86,30 @@ func (m *inferenceMemory) WithinInference(_ context.Context, ref inference.Ref, 
 			s.PendingTools++
 		}
 	}
+	for _, request := range s.Requests {
+		if s.Conversations == nil {
+			s.Conversations = map[string]*inference.Conversation{}
+		}
+		if s.Conversations[request.ConversationID] != nil {
+			continue
+		}
+		for _, other := range m.states {
+			if c := other.Conversations[request.ConversationID]; c != nil {
+				data, err := json.Marshal(c)
+				if err != nil {
+					return err
+				}
+				var copied inference.Conversation
+				decoder := json.NewDecoder(bytes.NewReader(data))
+				decoder.UseNumber()
+				if err = decoder.Decode(&copied); err != nil {
+					return err
+				}
+				s.Conversations[c.ID] = &copied
+				break
+			}
+		}
+	}
 	for id, r := range s.Requests {
 		if e := s.Experiments[id]; e != nil {
 			e.Messages = inference.Messages(s.Conversations[r.ConversationID], r.CanonicalEnd)
@@ -111,6 +140,15 @@ func (m *inferenceMemory) WithinInference(_ context.Context, ref inference.Ref, 
 	for _, c := range s.Conversations {
 		m.timeline[c.ID] = append(m.timeline[c.ID], c.Events...)
 		c.Events = nil
+	}
+	for id, c := range s.Conversations {
+		if c.WorkerID != wid && m.states[c.WorkerID] != nil {
+			if m.states[c.WorkerID].Conversations == nil {
+				m.states[c.WorkerID].Conversations = map[string]*inference.Conversation{}
+			}
+			m.states[c.WorkerID].Conversations[id] = c
+			delete(s.Conversations, id)
+		}
 	}
 	m.states[wid] = &s
 	return nil

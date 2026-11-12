@@ -31,6 +31,12 @@ test('CLI runs configure, enrollment, context, decision, status, doctor and expo
   assert.equal(await run('enroll', '--code-stdin'), 0);
   assert.equal(await run('status'), 0); assert.equal(await run('doctor'), 0);
   assert.equal(JSON.parse(f.stdout.at(-1)).muse_runtime, 'unverified');
+  assert.equal(JSON.parse(f.stdout.at(-1)).inference_readiness, JSON.parse(f.stdout.at(-1)).worker.inference_readiness);
+  f.broker.override = call => call.path.endsWith('/status') ? new Response(JSON.stringify({ id: 'a'.repeat(32), inference_readiness: 'verified', qualification: { evidence: { evidence_kind: 'controlled' } } }), { status: 200 }) : undefined;
+  assert.equal(await run('status'), 0);
+  assert.equal(JSON.parse(f.stdout.at(-1)).inference_readiness, 'verified');
+  assert.equal(JSON.parse(f.stdout.at(-1)).worker.qualification.evidence.evidence_kind, 'controlled');
+  f.broker.override = undefined;
   f.broker.jobs.set(JOB, claimed());
   f.broker.jobs.get(JOB).context.tools[0].parameters = { type: 'object', properties: { token: { type: 'string' } } };
   assert.equal(await run('job-show', '--job-id', JOB), 0);

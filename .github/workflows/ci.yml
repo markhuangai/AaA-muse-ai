@@ -201,6 +201,8 @@ jobs:
         run: make test-inference
       - name: Owned canonical history, request timelines and diagnostics
         run: make test-history
+      - name: Capability routing, concurrency, affinity and log-only diagnosis
+        run: make test-routing
 
   image:
     name: CI / image

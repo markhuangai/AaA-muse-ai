@@ -115,7 +115,7 @@ func TestCanonicalOwnedLookupAndReferenceConsistency(t *testing.T) {
 	now := time.Now().UTC()
 	c := inference.Conversation{ID: "conversation", ClientID: "alice", SessionID: "session", WorkerID: "worker", CreatedAt: now}
 	r := inference.Request{ID: "request", ClientID: "alice", ConversationID: c.ID, Output: &inference.Item{Type: "final", Text: "observed"}}
-	for _, kind := range []string{"none", "unknown", "query-error", "request-json", "unfinished", "reference", "header-conflict", "worker-conflict", "session", "missing-session", "session-json", "session-error", "replay", "replay-error", "conversation-error"} {
+	for _, kind := range []string{"none", "unknown", "query-error", "request-json", "unfinished", "reference", "header-conflict", "worker-conflict", "session", "missing-session", "session-json", "session-error", "replay", "replay-error", "conversation-error", "unassigned"} {
 		t.Run(kind, func(t *testing.T) {
 			ref := inference.Ref{ClientID: "alice", ResponseID: "response", SessionID: "session", WorkerID: "worker"}
 			tx := &inferenceTx{workerTransaction: workerTransaction{rows: []workerRow{{values: []any{encoded(t, r)}}, {values: []any{encoded(t, c)}}}}}
@@ -142,6 +142,10 @@ func TestCanonicalOwnedLookupAndReferenceConsistency(t *testing.T) {
 			case "header-conflict":
 				ref.SessionID = "foreign"
 				wantError = true
+			case "unassigned":
+				unassigned := c
+				unassigned.WorkerID = ""
+				tx.rows[1].values = []any{encoded(t, unassigned)}
 			case "worker-conflict":
 				ref.WorkerID = "other"
 				wantError = true

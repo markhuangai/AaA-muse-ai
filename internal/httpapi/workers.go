@@ -30,6 +30,9 @@ func routeFor(path string) (string, string) {
 			if len(parts) == 1 {
 				return "/api/v1/admin/workers/{id}", parts[0]
 			}
+			if len(parts) == 2 && parts[1] == "qualifications" {
+				return "/api/v1/admin/workers/{id}/qualifications", parts[0]
+			}
 			if len(parts) == 2 && parts[1] == "revoke" {
 				return "/api/v1/admin/workers/{id}/revoke", parts[0]
 			}
@@ -43,7 +46,7 @@ func routeFor(path string) (string, string) {
 
 func routeMethod(route string) string {
 	switch route {
-	case "/api/v1/admin/enrollments", "/api/v1/admin/setup-prompts", "/api/v1/worker/enroll", "/api/v1/admin/workers/{id}/revoke":
+	case "/api/v1/admin/workers/{id}/qualifications", "/api/v1/admin/enrollments", "/api/v1/admin/setup-prompts", "/api/v1/worker/enroll", "/api/v1/admin/workers/{id}/revoke":
 		return http.MethodPost
 	case "/api/v1/admin/workers/{id}":
 		return http.MethodPatch
@@ -80,12 +83,11 @@ func (h *Handler) setupRequest(w *response, r *http.Request, logger *slog.Logger
 type workerView struct {
 	worker.Record
 	inference.Projection
-	InferenceReadiness string `json:"inference_readiness"`
 }
 
 func viewWorker(w worker.Record) workerView {
 	w.Name = diagnostics.RedactWorkerSecrets(w.Name)
-	return workerView{Record: w, Projection: inference.Projection{ConnectionStatus: "not_observed", WorkStatus: "unknown"}, InferenceReadiness: "unverified"}
+	return workerView{Record: w, Projection: inference.Projection{ConnectionStatus: "not_observed", WorkStatus: "unknown", InferenceReadiness: "unverified", QualificationHistory: []inference.Qualification{}}}
 }
 
 func (h *Handler) projectedWorker(r *http.Request, logger *slog.Logger, record worker.Record, own bool) (workerView, error) {
@@ -170,6 +172,28 @@ func decodeWorkerInput(body []byte, field string) (map[string]any, error) {
 func (h *Handler) workerRequest(w *response, r *http.Request, logger *slog.Logger, route, id string, identity workerView, body []byte) {
 	if h.Workers == nil {
 		writeJSON(w, 503, map[string]any{"error": "service_unavailable"})
+		return
+	}
+	if route == "/api/v1/admin/workers/{id}/qualifications" {
+		var input inference.QualificationInput
+		err := decodeInferenceInput(body, &input, "protocol_version", "submission_id", "action", "evidence_reference")
+		if err != nil {
+			inferenceError(w, err)
+			return
+		}
+		if h.Broker == nil {
+			inferenceError(w, errors.New("broker_unavailable"))
+			return
+		}
+		data, err := h.Broker.Qualify(r.Context(), logger, id, input)
+		if err != nil {
+			inferenceError(w, err)
+			return
+		}
+		w.workerID = id
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		_, _ = w.Write(append(data, '\n'))
 		return
 	}
 	field := ""
