@@ -14,6 +14,13 @@ import (
 
 const inferenceAdmissionLock int64 = 0x414141494e46
 
+const recoveryRequests = `SELECT m.id FROM aaa_model_requests m
+ JOIN aaa_conversations c ON c.id=m.conversation_id
+ WHERE (c.pending_call_id<>'' AND m.id=c.data->>'current_request_id')
+ OR (m.data->>'output' IS NOT NULL AND m.data->>'output_completed_at' IS NULL)
+ OR (m.data->>'context_delivery_started_at' IS NOT NULL
+ AND m.data->>'context_delivery_written_at' IS NULL)`
+
 func decodeInference(data []byte, out any) error {
 	d := json.NewDecoder(bytes.NewReader(data))
 	d.UseNumber()
@@ -163,7 +170,8 @@ func (r *Repository) WithinInference(ctx context.Context, ref inference.Ref, app
 func loadInference(ctx context.Context, tx pgx.Tx, ref inference.Ref, s *inference.State) error {
 	rows, err := tx.Query(ctx, `SELECT data FROM aaa_experiments WHERE (worker_id=$1 OR (worker_id IS NULL AND $1='')) AND
 		(state NOT IN ('completed','cancelled','interrupted') OR id=$2 OR id IN
-		(SELECT experiment_id FROM aaa_inference_jobs WHERE id=$3 OR held) OR id=ANY($4::text[])) ORDER BY id`, s.WorkerID, ref.ExperimentID, ref.BaseJobID, ref.EvidenceIDs)
+		(SELECT experiment_id FROM aaa_inference_jobs WHERE id=$3 OR held) OR id=ANY($4::text[])
+		OR ($5 AND id IN (`+recoveryRequests+`))) ORDER BY id`, s.WorkerID, ref.ExperimentID, ref.BaseJobID, ref.EvidenceIDs, ref.Recovery)
 	if err != nil {
 		return err
 	}
@@ -211,9 +219,16 @@ func loadInference(ctx context.Context, tx pgx.Tx, ref inference.Ref, s *inferen
 			}
 		}
 	}
+	ids := make([]string, 0, len(s.Experiments))
+	if ref.Recovery {
+		for id := range s.Experiments {
+			ids = append(ids, id)
+		}
+	}
 	rows, err = tx.Query(ctx, `SELECT data, CASE WHEN $4 THEN context ELSE NULL END FROM aaa_inference_jobs
 		WHERE worker_id=$1 AND (state IN ('queued','claimed') OR held OR id=$2 OR id=$3 OR
-		id=(SELECT data->>'current_job_id' FROM aaa_experiments WHERE id=$5) OR experiment_id=ANY($6::text[])) ORDER BY id`, s.WorkerID, ref.JobID, ref.BaseJobID, ref.Full, ref.ExperimentID, ref.EvidenceIDs)
+		id=(SELECT data->>'current_job_id' FROM aaa_experiments WHERE id=$5) OR experiment_id=ANY($6::text[])
+		OR experiment_id=ANY($7::text[])) ORDER BY id`, s.WorkerID, ref.JobID, ref.BaseJobID, ref.Full, ref.ExperimentID, ref.EvidenceIDs, ids)
 	if err != nil {
 		return err
 	}

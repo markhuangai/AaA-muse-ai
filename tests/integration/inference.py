@@ -243,7 +243,7 @@ class Inference(WorkerAuth):
         require(len(foreign) >= 2 and all(event["conversation_id"] == job["conversation_id"] and event["job_id"] == job["id"] and event["generation"] == job["generation"] for event in foreign), "experiment export omitted foreign assignment evidence")
         self.checked("/api/v1/worker/heartbeat", other["credential"], "POST", {"protocol_version": 1, "connection_id": peer.opened["connection_id"], "connection_generation": peer.opened["connection_generation"], "challenge_id": "foreign"}, want=409)
         _, headers, _ = self.decision(worker, peer, job, {"type": "final", "text": "stale"}, want=409, changes={"generation": job["generation"] + 1})
-        evidence, _ = self.diagnose(headers["X-Request-Id"], "lease.rejected", "stale_assignment")
+        evidence, _ = self.diagnose(headers["X-Request-Id"], "lease.fenced", "stale_assignment")
         require(evidence["evidence"]["expected_generation"] == job["generation"], "stale generation diagnosis missing")
         self.decision(worker, peer, job, {"type": "final", "text": "one accepted result"})
         self.receipt("inference.atomic_claim_and_scope", attempts=8, accepted=1, other_worker_denied=True)
@@ -491,12 +491,15 @@ def main():
         opened_at = next(event["at"] for event in peer.events if event["type"] == "connection.opened")
         h.until(lambda: any(event["type"] == "health.challenge" and event["at"] - opened_at > 30 for event in peer.events), "no SSE frame observed after the global write deadline", timeout=45)
         h.until(lambda: len(peer.replies) >= 4, "health replies missing", timeout=15)
-        require(peer.replies[3]["at"] - peer.replies[0]["at"] >= 28 and not peer.errors, "health challenges did not use ten-second cadence")
-        intervals = [peer.replies[i + 1]["at"] - peer.replies[i]["at"] for i in range(3)]
+        from datetime import datetime
+        issued = [datetime.fromisoformat(event["data"]["issued_at"].replace("Z", "+00:00")).timestamp() for event in peer.events if event["type"] == "health.challenge"]
+        require(issued[3] - issued[0] >= 28 and not peer.errors, "health challenges did not use ten-second cadence")
+        intervals = [issued[i + 1] - issued[i] for i in range(3)]
+        reply_intervals = [peer.replies[i + 1]["at"] - peer.replies[i]["at"] for i in range(3)]
         require(all(9 <= interval <= 15 for interval in intervals), "observed health cadence differs from ten seconds")
         require(h.status(a)["connection_status"] == "online", "long-lived stream disconnected")
         late_frame = next(event for event in peer.events if event["type"] == "health.challenge" and event["at"] - opened_at > 30)
-        h.receipt("inference.long_stream", replies=len(peer.replies), observed_seconds=late_frame["at"] - opened_at, intervals_seconds=intervals)
+        h.receipt("inference.long_stream", replies=len(peer.replies), observed_seconds=late_frame["at"] - opened_at, intervals_seconds=intervals, reply_completion_intervals_seconds=reply_intervals)
         from datetime import datetime
         retry_worker, retry_job, retry_body, retry_experiment = h.accepted_retry
         expiry = datetime.fromisoformat(retry_job["lease_expires_at"].replace("Z", "+00:00")).timestamp()

@@ -223,15 +223,15 @@ func (b *Broker) Decide(ctx context.Context, logger *slog.Logger, workerID, id s
 		if err := inference.VersionAndID(d.Version, d.SubmissionID); err != nil {
 			return nil, err
 		}
-		if err := connectionMatches(s, d.ConnectionID, d.ConnectionGeneration); err != nil {
-			return nil, err
-		}
 		j := s.Jobs[id]
 		if j == nil {
 			return nil, inference.Reject("inference_not_found", 404)
 		}
+		if err := assignmentConnection(s, j, d.ConnectionID, d.ConnectionGeneration, d.Generation); err != nil {
+			return nil, err
+		}
 		if j.State != "claimed" || !j.Held || j.Generation != d.Generation || j.LeaseID != d.LeaseID || j.ConnectionID != d.ConnectionID || j.ConnectionGeneration != d.ConnectionGeneration || j.ConversationID != d.ConversationID || j.Context.ReceiptID != d.ContextReceiptID {
-			return nil, inference.Reject("stale_assignment", 409, "expected_generation", j.Generation, "observed_generation", d.Generation, "expected_state", j.State, "observed_context_receipt", d.ContextReceiptID, "expected_context_receipt", j.Context.ReceiptID)
+			return nil, inference.Reject("stale_assignment", 409, "expected_generation", j.Generation, "observed_generation", d.Generation, "expected_state", j.State, "expected_connection_generation", s.Connection.Generation, "observed_connection_generation", d.ConnectionGeneration, "observed_context_receipt", d.ContextReceiptID, "expected_context_receipt", j.Context.ReceiptID)
 		}
 		e := s.Experiments[j.ExperimentID]
 		if err := inference.ValidateDecision(d.Decision, e.Tools); err != nil {

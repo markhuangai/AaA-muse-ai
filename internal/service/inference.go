@@ -119,6 +119,9 @@ func finish(s *inference.State, e *inference.Experiment, state, reason string, e
 			level, name = slog.LevelInfo, "experiment.cancelled"
 		}
 		event(events, level, name, s, j, "reason", reason, "remote_outcome", e.RemoteOutcome, "busy_hold", j.Held, "last_heartbeat_at", s.Connection.LastAckAt, "created_at", j.CreatedAt)
+		if j.Held {
+			uncertain(events, s, j, "claimed_inference", reason)
+		}
 	}
 	if !emitted {
 		level, name := slog.LevelError, "job.interrupted"
@@ -231,7 +234,13 @@ func (b *Broker) run(ctx context.Context, logger *slog.Logger, ref inference.Ref
 			if s.Receipt.InputHash != hash {
 				return inference.Reject("submission_conflict", 409)
 			}
+			if operation == "claim" {
+				if err := validateClaimReplay(s, s.Receipt.Result); err != nil {
+					return err
+				}
+			}
 			result = append(json.RawMessage{}, s.Receipt.Result...)
+			events = append(events, inferenceEvent{"receipt.replayed", slog.LevelInfo, []any{"submission_id", ref.SubmissionID, "receipt_principal", ref.Principal, "reason", "identical_committed_submission", "job_id", ref.JobID}})
 			if operation == "create" {
 				var identity struct {
 					ID             string `json:"id"`
@@ -257,7 +266,9 @@ func (b *Broker) run(ctx context.Context, logger *slog.Logger, ref inference.Ref
 			}
 			return nil
 		}
-		expire(s, &events)
+		if !ref.Recovery {
+			expire(s, &events)
+		}
 		value, err := action(s, &events)
 		if err != nil {
 			return err
@@ -342,16 +353,23 @@ func (b *Broker) run(ctx context.Context, logger *slog.Logger, ref inference.Ref
 			if operation == "decision" && rejection.Code == 400 {
 				name = "decision.rejected"
 			}
+			if rejection.Reason == "stale_connection" || rejection.Reason == "stale_assignment" {
+				name = "lease.fenced"
+			}
 			evidence := rejection.Fields
 			if name == "history.conflict" || (observed != nil && observed["client_id"] != nil && name != "history.owner_denied") {
 				logger.Debug("history.conflict_detail", "reason", rejection.Reason, "evidence", evidence, "observed", observed)
 				evidence = safeHistoryConflict(evidence)
 			}
-			logger.Warn(name, "requested_experiment_id", ref.ExperimentID, "requested_job_id", ref.JobID, "reason", rejection.Reason, "evidence", evidence, "observed", observed, "duration_ms", b.now().Sub(started).Milliseconds())
+			logger.Warn(name, "requested_experiment_id", ref.ExperimentID, "requested_job_id", ref.JobID, "reason", rejection.Reason, "evidence", evidence, "observed", observed, "outcome", "rejected", "duration_ms", b.now().Sub(started).Milliseconds())
 		} else {
 			failure := postgres.Classify(err)
 			logger.Debug("inference.storage_exchange", "cause", failure.Reason, "detail", failure.Detail(), "sqlstate", failure.SQLState, "transaction_outcome", failure.Outcome, "attempt", 1)
-			logger.Error("inference.operation_failed", "cause", failure.Reason, "sqlstate", failure.SQLState, "transaction_outcome", failure.Outcome, "attempt", 1, "duration_ms", b.now().Sub(started).Milliseconds())
+			name := "inference.operation_failed"
+			if ref.Recovery {
+				name = "recovery.failed"
+			}
+			logger.Error(name, "cause", failure.Reason, "sqlstate", failure.SQLState, "transaction_outcome", failure.Outcome, "attempt", 1, "duration_ms", b.now().Sub(started).Milliseconds(), "outcome", "operation_stopped")
 		}
 		return nil, err
 	}

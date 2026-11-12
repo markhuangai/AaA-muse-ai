@@ -121,6 +121,15 @@ func Run(ctx context.Context, args []string, build service.Build, d Dependencies
 		return 1
 	}
 	defer repo.Close()
+	broker := service.NewBroker(repo, d.Random, d.Now, d.Wait, c.Limits.MaxJobs)
+	if err = broker.Recover(ctx, startup); err != nil {
+		return 1
+	}
+	select {
+	case <-failed:
+		return 1
+	default:
+	}
 	listener, err := d.Listen("tcp", c.Server.Listen)
 	if err != nil {
 		startup.Error("server.listen_failed", "cause", "listen_failed", "listen", c.Server.Listen)
@@ -140,7 +149,6 @@ func Run(ctx context.Context, args []string, build service.Build, d Dependencies
 	}
 	svc := service.New(repo, c, build, instance, d.Now, logger)
 	authority := auth.New(c)
-	broker := service.NewBroker(repo, d.Random, d.Now, d.Wait, c.Limits.MaxJobs)
 	serveCtx, cancelServe := context.WithCancel(ctx)
 	defer cancelServe()
 	handler := &httpapi.Handler{Service: svc, Workers: service.NewWorkers(repo, authority, d.Random, d.Now), Broker: broker, Authority: authority, Exporter: store, Logger: logger, Random: d.Random, Now: d.Now, Failed: failed}

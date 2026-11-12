@@ -45,6 +45,9 @@ func (m *inferenceMemory) withinRouting(ref inference.Ref, apply func(*inference
 		w.Requests = s.Requests
 		w.Conversations = s.Conversations
 	}
+	if ref.Recovery {
+		s.Recovery = inference.RecoverySummary{Receipts: len(m.receipts), Conversations: len(s.Conversations)}
+	}
 	for id, r := range s.Requests {
 		if e := s.Experiments[id]; e != nil {
 			e.Messages = inference.Messages(s.Conversations[r.ConversationID], r.CanonicalEnd)
