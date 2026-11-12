@@ -46,18 +46,25 @@ export class Subscriber {
       await this.worker.logger.log('INFO', 'worker.idle_confirmed', { ...correlation(current), request_id: result.requestId });
     }
   }
-  async run(signal: AbortSignal): Promise<void> {
+  async run(signal: AbortSignal, background = false): Promise<void> {
     const { worker } = this;
-    const transport = await worker.load();
     const release = await worker.state.lock('daemon', false);
     try {
-      const status = await worker.identity(transport);
-      await worker.reconcile(transport, status);
+      if (background) requireValue(!(await worker.state.read('run-stop.json')), 'subscriber_terminal_stop');
+      const transport = await worker.load();
       let attempt = 0;
+      await worker.logger.log('INFO', 'worker.supervision_started', { worker_id: worker.config.worker_id, pid: worker.state.sys.pid, lock: 'daemon', outcome: 'exclusive_owner', background });
       await worker.logger.log('INFO', 'worker.started', { worker_id: worker.config.worker_id, endpoint: worker.config.origin, inference_readiness: 'unverified' });
       while (!signal.aborted) {
         this.active = undefined;
+        let phase = 'authentication';
+        const started = worker.state.sys.now();
         try {
+          const status = await worker.identity(transport);
+          phase = 'reconciliation';
+          await worker.reconcile(transport, status);
+          if (signal.aborted) break;
+          phase = 'subscription';
           for await (const event of transport.events(signal)) {
             this.lastEvent = event.id;
             if (event.type === 'connection.opened') {
@@ -87,12 +94,21 @@ export class Subscriber {
           if (signal.aborted) break;
           if (!(error instanceof Failure && error.retryable)) throw error;
           const delay = Math.min(30_000, 1000 * 2 ** Math.min(attempt++, 5));
-          await worker.logger.log('WARN', 'worker.stream_retrying', { worker_id: worker.config.worker_id, endpoint: worker.config.origin, ...this.active, cause: cause(error), ...error.fields, attempt, delay_ms: delay, last_event_id: this.lastEvent });
+          await worker.logger.log('WARN', 'worker.stream_retrying', { worker_id: worker.config.worker_id, endpoint: worker.config.origin, ...this.active, cause: cause(error), ...error.fields, phase, attempt, delay_ms: delay, duration_ms: worker.state.sys.now() - started, last_event_id: this.lastEvent });
           await worker.state.write('connection.json', encode({ ...(this.active ?? {}), status: 'offline', last_event_id: this.lastEvent }));
           for (let elapsed = 0; elapsed < delay && !signal.aborted; elapsed += 100) await worker.state.sys.wait(Math.min(100, delay - elapsed));
         }
       }
       await worker.logger.log('INFO', 'worker.stopped', { worker_id: worker.config.worker_id, last_event_id: this.lastEvent });
+    } catch (error) {
+      if (background) {
+        try {
+          if (!(await worker.state.read('run-stop.json'))) await worker.state.write('run-stop.json', encode({ cause: cause(error), pid: worker.state.sys.pid, stopped_at: worker.state.sys.now(), requires_operator_action: true }));
+        } catch (markerError) {
+          worker.logger.stderr(encode({ level: 'ERROR', msg: 'setup.recovery_marker_failed', cause: cause(markerError), pid: worker.state.sys.pid }) + '\n');
+        }
+      }
+      throw error;
     } finally { await release(); }
   }
 }

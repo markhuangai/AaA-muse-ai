@@ -53,10 +53,10 @@ export class Transport {
       const started = this.sys.now();
       const controller = new AbortController();
       const timer = this.net.setTimer(() => controller.abort(), 10_000);
-      let requestId = '';
+      let requestId = this.sys.uuid();
       try {
-        const response = await this.net.fetch(this.endpoint + route, { method, body: input, redirect: 'manual', signal: controller.signal, headers: { ...(this.credential ? { Authorization: 'Bearer ' + this.credential } : {}), Accept: 'application/json', ...(input === undefined ? {} : { 'Content-Type': 'application/json' }), 'X-Request-Id': this.sys.uuid() } });
-        requestId = response.headers.get('x-request-id') ?? '';
+        const response = await this.net.fetch(this.endpoint + route, { method, body: input, redirect: 'manual', signal: controller.signal, headers: { ...(this.credential ? { Authorization: 'Bearer ' + this.credential } : {}), Accept: 'application/json', ...(input === undefined ? {} : { 'Content-Type': 'application/json' }), 'X-Request-Id': requestId } });
+        requestId = response.headers.get('x-request-id') || requestId;
         requireValue(response.status < 300 || response.status >= 400, 'redirect_forbidden');
         const raw = await this.body(response);
         let data: ObjectValue = {};

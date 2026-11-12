@@ -73,7 +73,8 @@ test('publication failure after confirmed idle fails the real run command and re
     assert(!events.some(event => event.msg === 'worker.idle_confirmed'));
     assert(!f.output.some(line => JSON.parse(line).level === 'DEBUG')); assert(!exported.includes(KEY));
     fail = false;
-    const stopped = new AbortController(); stopped.abort();
+    const stopped = new AbortController();
+    f.broker.override = async call => { if (call.path.endsWith('/status')) stopped.abort(); };
     assert.equal(await execute(['run', '--state-dir', f.state.root], { ...io, signal: stopped.signal }), 0);
     assert.equal(parse(await f.state.read('pending.json')).jobs.length, 0);
     assert.equal(f.broker.calls.filter(call => call.input?.idle_ack).length, 1);

@@ -20,6 +20,8 @@ The November 12 [#10 approval](https://github.com/markhuangai/AaA-muse-ai/issues
 
 The November 12 [#11 decision](https://github.com/markhuangai/AaA-muse-ai/issues/11) reaffirms the durable worker credentials approved in [#3 on November 9](https://github.com/markhuangai/AaA-muse-ai/issues/3), already implemented at source revision `c798f48dd2adabe704294cf2ceb929486feeac69`. It replaces #11's proposed credential expiry and renewal with documentation and controlled validation of the existing lifecycle, independently of #21. Live qualification and release requirements remain unchanged.
 
+The November 12 [#12 approval](https://github.com/markhuangai/AaA-muse-ai/issues/12), based on `18e9317b76c506e5f33a31dc1e7a93b42c77123d`, permits worker-recovery engineering and controlled software validation. The development worker retries temporary startup and reconnect failures, reconciles existing evidence before resubscribing, and limits terminal-stop recording to the daemon owner. A healthy installation needs no repair or reinstall. No repair command, automatic inference retry, live trial, or publication is authorized; the published prerelease pin and inconclusive live qualification remain unchanged. See the [worker recovery contract](worker/README.md#installation-detector-and-recovery).
+
 ## Run the service
 
 Requires Docker and Docker Compose. Copy the [example configuration](config.example.yaml):

@@ -17,6 +17,8 @@ The owner's setup delegates model answers and structured client-tool proposals f
 
 The no-argument managed hook requests five-second checks and repairs only a provably absent subscriber using preserved private state. Its recovery launcher refuses ambiguous ownership, unsafe files, terminal authorization failures and revoked credentials. Missing scripts/runtime/credentials or unsupported refresh persistence require an explicit operator report; full wipes and account resets are not supported.
 
+A healthy installation needs no repair or reinstall. Temporary broker outages retry with the existing subscriber; recovery preserves uncertain native work and never acknowledges it automatically. On a terminal stop, retain its evidence and diagnose the cause. Replacing damaged program files through the verified installer must preserve credentials, journals and prior bundles; do not delete state to force startup or regain revoked authority.
+
 Retain the exact registered hook ID, script path and observed interval. Inspect `hooks.list` with `include_disabled:true` before registering anything; reuse the single enabled exact script and never create duplicates. A refusal, disabled/conflicting hook or unsupported five-second interval stops setup. Only the owner's actual permission cards can grant permissions.
 
 End the installation turn before reading or answering an inference-readiness challenge. A later independent wake must fetch and answer it through authenticated context. Live Muse wake, credential handling and refresh survival remain unverified until issue #7 records observations. Never put enrollment codes or worker credentials in this skill, hook bodies, tasks, URLs or logs.
