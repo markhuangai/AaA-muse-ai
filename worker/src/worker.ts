@@ -9,12 +9,26 @@ export class Worker {
   config: ObjectValue = {};
   credential = '';
   constructor(readonly state: State, readonly logger: Logger, readonly net?: Network) {}
+  async readRecord(state: State, name: string, validate?: (record: ObjectValue) => void): Promise<ObjectValue | undefined> {
+    let raw: string | undefined;
+    try {
+      raw = await state.read(name);
+      if (raw === undefined) return undefined;
+      const record = object(parse(raw));
+      validate?.(record);
+      return record;
+    } catch (error) {
+      if (error instanceof Failure && ['state_unsafe', 'diagnostics_unavailable'].includes(error.code)) throw error;
+      const entry = state === this.state ? name : state.root.slice(this.state.root.length + 1) + '/' + name;
+      await this.logger.log('ERROR', 'worker.local_state_invalid', { entry, cause: cause(error), ...(error instanceof Failure ? error.fields : {}), input_omitted: true, omitted_input_bytes: raw === undefined ? null : Buffer.byteLength(raw), corrective_action: 'preserve the original state and diagnose its format or storage failure before restarting' });
+      throw new Failure('invalid_local_state', { entry, cause: cause(error), diagnostic_recorded: true });
+    }
+  }
   async load(enrolled = true): Promise<Transport> {
-    const raw = await this.state.read('config.json');
-    requireValue(raw, 'worker_not_configured');
-    this.config = object(parse(raw));
-    version(this.config.protocol_version);
-    const endpoint = origin(text(this.config.origin));
+    const config = await this.readRecord(this.state, 'config.json', value => { version(value.protocol_version); origin(text(value.origin)); });
+    requireValue(config, 'worker_not_configured');
+    this.config = config;
+    const endpoint = origin(text(config.origin));
     this.credential = (await this.state.read('credential.key'))?.trim() ?? '';
     this.logger.redactor.add(this.credential);
     if (enrolled) requireValue(/^muse_worker_[A-Za-z0-9_-]{43}$/.test(this.credential), 'worker_not_enrolled');
@@ -114,23 +128,49 @@ export class Worker {
     await this.logger.log(phase === 'cancelled' || phase === 'interrupted' ? 'WARN' : 'INFO', 'worker.job_progress', { ...correlation(j), state: phase, progress, observed_state: j.state, observed_held: j.held, reason: j.reason ?? '', acknowledgement_required: phase !== 'ack_confirmed' && j.held === true && j.state !== 'claimed', elapsed_ms: j.claimed_at ? this.state.sys.now() - Date.parse(text(j.claimed_at)) : 0 });
   }
   async reconcile(transport: Transport, status: ObjectValue): Promise<void> {
+    const started = this.state.sys.now();
     const ids = new Set<string>();
     if (status.current_job) ids.add(identifier(object(status.current_job).job_id));
     const cues = await this.state.child('cues');
     for (const name of (await cues.list()).filter(n => /^[A-Za-z0-9_-]+\.json$/.test(n))) {
-      const cue = object(parse((await cues.read(name))!));
+      const cue = (await this.readRecord(cues, name, value => { identifier(value.job_id); requireValue(value.worker_id === this.config.worker_id, 'pending_worker_mismatch'); }))!;
       if (cue.needs_attention === true) ids.add(identifier(cue.job_id));
     }
-    const saved = await this.state.read('pending.json');
-    if (saved) {
-      const pending = object(parse(saved));
-      requireValue(pending.worker_id === this.config.worker_id && Array.isArray(pending.jobs), 'invalid_pending_cues');
+    const pending = await this.readRecord(this.state, 'pending.json', value => requireValue(value.worker_id === this.config.worker_id && Array.isArray(value.jobs), 'invalid_pending_cues'));
+    if (pending) {
       for (const cue of pending.jobs as Value[]) ids.add(identifier(object(cue).job_id));
     }
+    const journals = await this.state.child('journals');
     for (const id of ids) {
       const current = await this.getJob(transport, id);
+      const operations: ObjectValue[] = [];
+      for (const kind of ['claim', 'decision']) {
+        const pointer = await this.readRecord(journals, `${kind}-${id}.json`, value => { identifier(value.submission_id); });
+        if (!pointer) continue;
+        const saved = await this.readRecord(journals, `operation-${text(pointer.submission_id)}.json`, value => {
+          requireValue(value.kind === kind && value.submission_id === pointer.submission_id && value.origin === this.config.origin && value.worker_id === this.config.worker_id && value.job_id === id && value.conversation_id === current.conversation_id && ['pending', 'accepted', 'rejected', 'uncertain'].includes(text(value.state)), 'invalid_operation_journal');
+          const body = object(parse(text(value.body)));
+          version(body.protocol_version);
+          requireValue(body.submission_id === pointer.submission_id, 'journal_submission_mismatch');
+          if (value.state === 'accepted') object(value.result);
+          if (value.decision_input) object(parse(text(value.decision_input)));
+        });
+        if (!saved) {
+          await this.logger.log('ERROR', 'worker.local_state_invalid', { ...correlation(current), entry: `journals/operation-${text(pointer.submission_id)}.json`, cause: 'journal_operation_missing', submission_id: pointer.submission_id, corrective_action: 'preserve the pointer and recover its original operation evidence; do not create a replacement submission' });
+          throw new Failure('invalid_local_state', { diagnostic_recorded: true });
+        }
+        operations.push(saved);
+      }
+      const receipt = operations.find(op => op.kind === 'decision') ?? operations[0];
+      const body = receipt ? object(parse(text(receipt.body))) : undefined;
+      const assignment = receipt?.kind === 'claim' && receipt.state === 'accepted' ? object(receipt.result) : body;
+      const uncertain = current.held === true || operations.some(op => op.state === 'pending' || op.state === 'uncertain');
+      const disposition = current.state === 'accepted' ? 'broker_accepted' : current.held === true ? 'preserve_busy_hold' : current.state === 'queued' ? 'await_fresh_offer' : 'preserve_stopped_outcome';
+      await this.logger.log('DEBUG', 'worker.recovery_detail', { ...correlation(current), status, pending: pending ?? null, current, saved_operations: operations.map(op => ({ ...op, body: parse(text(op.body)), decision_input: op.decision_input ? parse(text(op.decision_input)) : null })) });
       await this.publish(current, text(current.state), 'reconciled_existing_assignment');
+      await this.logger.log(uncertain ? 'WARN' : 'INFO', 'worker.recovery_reconciled', { ...correlation(current), submission_id: receipt?.submission_id, receipt_request_id: receipt?.request_id, local_state: receipt?.state ?? 'no_saved_operation', broker_state: current.state, busy_hold: current.held, saved_generation: assignment?.generation, saved_connection_id: assignment?.connection_id, saved_connection_generation: assignment?.connection_generation, lease_matches: assignment ? assignment.lease_id === current.lease_id : null, context_receipt_matches: assignment ? (assignment.context_receipt_id ?? (assignment.context ? object(assignment.context).receipt_id : undefined)) === object(current.context).receipt_id : null, disposition, automatic_submission: false, automatic_idle_ack: false, corrective_action: current.held === true ? 'preserve this assignment; acknowledge idle only after the exact native work actually finished or stopped' : uncertain ? 'inspect the original submission; retry only that same ID and body if its receipt remains uncertain' : 'retain existing receipts and await a fresh broker offer', duration_ms: this.state.sys.now() - started });
     }
+    if (!ids.size) await this.logger.log('INFO', 'worker.recovery_reconciled', { worker_id: this.config.worker_id, broker_state: status.work_status, disposition: 'no_actionable_work', automatic_submission: false, automatic_idle_ack: false, duration_ms: this.state.sys.now() - started });
   }
   async operation(kind: string, j: ObjectValue, build: (submission: string) => ObjectValue, decisionInput = ''): Promise<ObjectValue> {
     const journals = await this.state.child('journals');

@@ -50,7 +50,6 @@ export function argumentsFor(args: string[]): { command: string; flags: Record<s
 export async function execute(args: string[], io: Adapters): Promise<number> {
   let logger: Logger | undefined;
   let command = 'parse';
-  let runState: State | undefined;
   try {
     const parsed = argumentsFor(args);
     command = parsed.command;
@@ -98,8 +97,7 @@ export async function execute(args: string[], io: Adapters): Promise<number> {
         result = await worker.enroll((await io.input('-')).trim());
         break;
       case 'run':
-        if (flags.background) runState = state;
-        await new Subscriber(worker).run(io.signal);
+        await new Subscriber(worker).run(io.signal, flags.background === true);
         result = { stopped: true };
         break;
       case 'status':
@@ -131,10 +129,6 @@ export async function execute(args: string[], io: Adapters): Promise<number> {
     return 0;
   } catch (error) {
     const code = cause(error);
-    if (runState) {
-      try { await runState.write('run-stop.json', encode({ cause: code, pid: io.system.pid, stopped_at: io.system.now(), requires_operator_action: true })); }
-      catch (markerError) { io.stderr(encode({ level: 'ERROR', msg: 'setup.recovery_marker_failed', cause: cause(markerError) }) + '\n'); }
-    }
     const event = { stopped_operation: command, cause: code, ...(error instanceof Failure ? error.fields : {}) };
     if (logger && code !== 'diagnostics_unavailable' && !(error instanceof Failure && error.fields.diagnostic_recorded)) {
       try { await logger.log('ERROR', code === 'state_unsafe' ? 'worker.state_unsafe' : 'worker.command_failed', event); }

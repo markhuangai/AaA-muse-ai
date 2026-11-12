@@ -4,7 +4,7 @@ SERVICE_IMAGE ?= aaa-muse-ai-service:local
 SOURCE_SHA ?= $(shell git rev-parse HEAD)
 SOURCE_DIRTY ?= $(shell test -z "$$(git --no-optional-locks status --porcelain --untracked-files=all)" && echo false || echo true)
 
-.PHONY: check-ci-policy check-file-sizes test-unit-coverage check-workflows check-service test-service-unit test-service test-worker-auth test-inference test-history test-routing test-broker-recovery smoke-image image worker-package test-worker-transport test-worker-setup
+.PHONY: check-ci-policy check-file-sizes test-unit-coverage check-workflows check-service test-service-unit test-service test-worker-auth test-inference test-history test-routing test-broker-recovery smoke-image image worker-package test-worker-transport test-worker-setup test-worker-recovery
 
 check-ci-policy:
 	node .github/scripts/ci-policy.mjs
@@ -61,3 +61,6 @@ test-worker-transport: image worker-package
 
 test-worker-setup: image worker-package
 	python3 -B tests/integration/worker_setup.py --image $(SERVICE_IMAGE) --source-sha $(SOURCE_SHA) --source-dirty $(SOURCE_DIRTY) --package-receipt .artifacts/worker-package/latest.json
+
+test-worker-recovery: image worker-package
+	python3 -B tests/integration/worker_recovery.py --image $(SERVICE_IMAGE) --source-sha $(SOURCE_SHA) --source-dirty $(SOURCE_DIRTY) --package-receipt .artifacts/worker-package/latest.json

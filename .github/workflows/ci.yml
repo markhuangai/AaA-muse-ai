@@ -240,6 +240,8 @@ jobs:
         run: npm run check --workspace worker
       - name: Packed CLI with real HTTPS, SSE and PostgreSQL
         run: make test-worker-transport
+      - name: Worker startup outages, abrupt crashes, receipt replay and uncertainty
+        run: make test-worker-recovery
 
   worker-package:
     name: CI / worker-package

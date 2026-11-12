@@ -85,7 +85,7 @@ class WorkerSetup(Inference):
     def environment(self, name):
         home = self.root.resolve() / ("home-" + name)
         home.mkdir(mode=0o700)
-        identity = self.remember("containers", self.docker("run", "-d", "--read-only", "--label", LABEL + "=" + self.owner,
+        identity = self.remember("containers", self.docker("run", "-d", "--init", "--read-only", "--label", LABEL + "=" + self.owner,
             "--network", "host", "--user", str(os.getuid()) + ":" + str(os.getgid()),
             "--mount", "type=bind,source=" + str(home) + ",target=/home/worker",
             "--mount", "type=bind,source=" + str(self.assets.public.resolve()) + ",target=/fixture,readonly",
@@ -229,7 +229,7 @@ class WorkerSetup(Inference):
         self.receipt("setup.revocation_boundary", no_reenrollment=True)
 
 
-def main():
+def run(harness_type=WorkerSetup, suite="worker-setup"):
     parser = argparse.ArgumentParser()
     parser.add_argument("--image", required=True)
     parser.add_argument("--source-sha", required=True)
@@ -237,7 +237,7 @@ def main():
     parser.add_argument("--package-receipt", required=True)
     args = parser.parse_args()
     os.umask(0o077)
-    h = WorkerSetup(args)
+    h = harness_type(args)
     proxy = assets = None
     try:
         h.baseline()
@@ -247,18 +247,19 @@ def main():
         config["server"]["public-url"] = proxy.origin
         config["worker-package"] = {"version": h.package["version"], "sha256": h.package["sha256"]}
         config["limits"] = {"max-jobs": 8, "in-flight-per-worker": 1}
-        _, h.origin_url, _ = h.launch(config)
+        h.broker, h.origin_url, _ = h.launch(config)
         proxy.target = urllib.parse.urlsplit(h.origin_url)
         h.ready(h.resources["containers"][-1], h.origin_url)
         assets = h.assets = Assets(h, h.package["archive"])
         h.docker("build", "--label", LABEL + "=" + h.owner, "-f", "tests/integration/worker-setup.Dockerfile", "-t", h.fixture_image, ".", timeout=240)
         h.fixture_image_created = True
         h.exercise()
-        h.private("results.json", json.dumps({"suite": "worker-setup", "source_sha": args.source_sha, "package_sha256": h.package["sha256"], "muse_qualified": False, "receipts": h.receipts}))
+        h.private("results.json", json.dumps({"suite": suite, "source_sha": args.source_sha, "package_sha256": h.package["sha256"], "muse_qualified": False, "receipts": h.receipts}))
     finally:
         if assets:
             assets.close()
         if proxy:
+            proxy.release_decision.set()
             proxy.close()
         h.cleanup()
         if h.fixture_image_created:
@@ -270,4 +271,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    run()

@@ -21,6 +21,11 @@ class TLSFixture:
         self.delayed_heartbeat = None
         self.fail_claims = 0
         self.failed_claims = []
+        self.allow_statuses = 0
+        self.fail_statuses = 0
+        self.pause_decision = False
+        self.decision_captured = threading.Event()
+        self.release_decision = threading.Event()
         self.delay_context_job = None
         self.context_captured = threading.Event()
         self.release_context = threading.Event()
@@ -57,11 +62,20 @@ class TLSFixture:
                         if reject:
                             fixture.fail_claims -= 1
                             fixture.failed_claims.append(json.loads(body))
+                        if self.path == "/api/v1/worker/status":
+                            if fixture.allow_statuses:
+                                fixture.allow_statuses -= 1
+                            elif fixture.fail_statuses:
+                                fixture.fail_statuses -= 1
+                                reject = True
                     if reject:
+                        with fixture.lock:
+                            fixture.events.append({"event": "fixture.request_rejected", "route": self.path, "request_id": self.headers.get("X-Request-Id", "fixture-unavailable"), "status": 503, "forwarded": False})
                         payload = b'{"error":"fixture_unavailable"}'
                         self.send_response(503)
                         self.send_header("Content-Type", "application/json")
                         self.send_header("Content-Length", str(len(payload)))
+                        self.send_header("X-Request-Id", self.headers.get("X-Request-Id", "fixture-unavailable"))
                         self.end_headers()
                         self.wfile.write(payload)
                         return
@@ -87,6 +101,9 @@ class TLSFixture:
                                 fixture.pause_claim = False
                             if self.path.endswith('/decisions') and response.status == 200:
                                 fixture.decision_sizes.append(len(payload))
+                            paused_decision = fixture.pause_decision and self.path.endswith('/decisions') and response.status == 200
+                            if paused_decision:
+                                fixture.pause_decision = False
                             delayed_context = self.command == "GET" and fixture.delay_context_job is not None and self.path == "/api/v1/worker/jobs/" + fixture.delay_context_job
                             if delayed_context:
                                 fixture.delay_context_job = None
@@ -100,6 +117,10 @@ class TLSFixture:
                         if paused_claim:
                             fixture.claim_captured.set()
                             fixture.release_claim.wait(timeout=8)
+                        if paused_decision:
+                            fixture.harness.private("paused-decision-request.json", body.decode())
+                            fixture.decision_captured.set()
+                            fixture.release_decision.wait(timeout=30)
                         if drop:
                             fixture.harness.private("lost-decision-request.json", body.decode())
                             self.connection.shutdown(socket.SHUT_RDWR)
