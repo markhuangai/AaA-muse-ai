@@ -39,6 +39,16 @@ Pass bootstrap authority through stdin from an approved private input source. Do
 
 An enrollment response can be lost after its single-use code is consumed. A pending enrollment record without a saved key is an explicit uncertain outcome. Use management records/request IDs to find and revoke any orphaned identity before starting a new enrollment with a fresh code and separate state directory. The CLI does not recover plaintext credentials or silently redeem again.
 
+## Registration, reconnect and removal
+
+An enrollment code expires after fifteen minutes and can be used once. Successful enrollment returns a separate 256-bit worker credential with no automatic expiry or renewal schedule. Keep `credential.key` in the protected state directory (`0700`, with a `0600` key file). Network reconnects and worker, service, or database restarts reuse that credential and the same worker ID. Preserve the complete state, including operation journals and receipts, when replacing a package.
+
+To revoke a registration, management uses `POST /api/v1/admin/workers/{id}/revoke`. The broker rejects the credential and every copy of it while retaining registration, revocation, and history records. Revocation does not prove that an already-running remote Muse inference stopped. The subscriber stops on authorization denial; managed recovery and repeated setup cannot restore revoked authority or silently enroll another identity.
+
+Before removing a local installation, stop its managed hook and subscriber so neither continues using the saved or in-memory credential. Preserve needed journals and receipts before removing local state. Local removal does not revoke the server registration or credentials copied elsewhere; use server-side revocation to retire that authority. There is no worker unregister command or server hard-delete endpoint.
+
+The server stores a credential hash and cannot return a lost key. Loss of local credential state requires explicit replacement enrollment with a fresh single-use code; retain and inspect uncertain enrollment records, and revoke any orphaned registration first. A VM wipe cannot recover the original identity from the broker. Registration, transport health, and controlled software checks do not establish live Muse inference or wipe/refresh recovery.
+
 ## Context and decisions
 
 `pending.json` contains protocol version, worker/conversation/job identity, assignment generation, context receipt/kind/base, deadline, and progress for work needing attention. It contains no key, lease, or context text. Per-job cues remain in `cues/`; accepted tool decisions leave the inference slot free while the client supplies its tool result. Distinct conversations are never combined in an implicit global context.
