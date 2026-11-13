@@ -361,6 +361,8 @@ class Responses(Chat):
             if bot.peer.thread.is_alive():
                 bot.peer.stop()
         self.docker("restart", self.main_service)
+        self.origin_url = self.origin(self.main_service)
+        self.origins[0] = self.origin_url
         self.ready(self.main_service, self.origin_url)
         self.new_bot()
         next_result = self.response(self.body("aaa-chat:echo:after-restart", instructions="after-restart-only", previous_response_id=self.last["id"]))
