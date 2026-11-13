@@ -238,6 +238,37 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  portal:
+    name: CI / portal
+    needs: unit
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          ref: ${{ env.SOURCE_SHA }}
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24.22.2
+      - name: Verify exact source
+        run: test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+      - name: Install locked browser dependencies
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Install the pinned Chromium runtime
+        run: npx --no-install playwright install --with-deps chromium
+      - name: Built-image desktop, tablet, phone, authentication and log-only diagnosis
+        run: make test-portal-shell
+      - name: Retain only safe browser and cleanup evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: portal-${{ env.SOURCE_SHA }}-${{ github.run_attempt }}
+          path: .artifacts/ci/portal/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+
   image:
     name: CI / image
     runs-on: ubuntu-latest

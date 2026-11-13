@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
@@ -32,12 +33,14 @@ func ID(random io.Reader) (string, error) {
 }
 
 type Authority struct {
-	management, portal []byte
-	clients            map[string][]byte
+	management    []byte
+	portal        [32]byte
+	portalEnabled bool
+	clients       map[string][]byte
 }
 
 func New(c config.Config) *Authority {
-	a := &Authority{management: []byte(c.Management.Key), portal: []byte(c.Portal.Password), clients: map[string][]byte{}}
+	a := &Authority{management: []byte(c.Management.Key), portal: sha256.Sum256([]byte(c.Portal.Password)), portalEnabled: c.Portal.Password != "", clients: map[string][]byte{}}
 	for name, key := range c.ClientKeys {
 		a.clients[name] = []byte(key)
 	}
@@ -61,13 +64,19 @@ func (a *Authority) Identity(header string) (string, string) {
 	if subtle.ConstantTimeCompare(credential, a.management) == 1 {
 		return "management", ""
 	}
-	if subtle.ConstantTimeCompare(credential, a.portal) == 1 {
-		return "portal", ""
-	}
 	for name, client := range a.clients {
 		if subtle.ConstantTimeCompare(credential, client) == 1 {
 			return "client", name
 		}
 	}
 	return "unauthenticated", ""
+}
+
+func (a *Authority) PortalPassword(password string) bool {
+	digest := sha256.Sum256([]byte(password))
+	return subtle.ConstantTimeCompare(digest[:], a.portal[:]) == 1 && a.portalEnabled
+}
+
+func (a *Authority) Reserved(credential string) bool {
+	return a.PortalPassword(credential) || a.Role("Bearer "+credential) != "unauthenticated"
 }

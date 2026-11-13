@@ -17,7 +17,7 @@ export function unitCommand(component, source, root) {
 }
 
 export function safeLog(raw, env = process.env) {
-  let result = raw.replace(/muse_(?:worker|enroll)_[A-Za-z0-9_-]{43}/g, '[REDACTED]').replace(/(Bearer\s+)[^\s"']+/gi, '$1[REDACTED]');
+  let result = raw.replace(/muse_(?:worker|enroll|portal)_[A-Za-z0-9_-]{43}/g, '[REDACTED]').replace(/(Bearer\s+)[^\s"']+/gi, '$1[REDACTED]');
   for (const [key, value] of Object.entries(env)) if (/TOKEN|PASSWORD|SECRET|AUTH|KEY/i.test(key) && value) result = result.split(value).join('[REDACTED]');
   return result;
 }

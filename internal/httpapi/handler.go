@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -27,6 +28,8 @@ type Handler struct {
 	Workers   *service.Workers
 	Setup     *service.Setup
 	Broker    *service.Broker
+	Portal    *service.Portal
+	Assets    fs.FS
 	Authority *auth.Authority
 	Exporter  Exporter
 	Logger    *slog.Logger
@@ -46,6 +49,7 @@ type response struct {
 	workerID, enrollmentID                     string
 	conversationID, sessionID, requestRecordID string
 	boundaryFailed                             bool
+	captureReason                              string
 	openAI                                     bool
 	now                                        func() time.Time
 }
@@ -106,7 +110,10 @@ func (h *Handler) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 	out.Header().Set("Cache-Control", "no-store")
 	route, requestedWorker := routeFor(r.URL.Path)
 	logger := h.Logger.With("request_id", id, "route", route)
-	w := &response{ResponseWriter: out, capture: route != "/api/v1/admin/diagnostics/export", openAI: chatRoute(route), now: h.Now}
+	w := &response{ResponseWriter: out, capture: route != "/api/v1/admin/diagnostics/export" && route != "/api/v1/portal/login", openAI: chatRoute(route), now: h.Now}
+	if route == "/api/v1/portal/login" {
+		w.captureReason = "credentials_omitted"
+	}
 	role, clientID := h.Authority.Identity(r.Header.Get("Authorization"))
 	if clientID != "" {
 		logger = logger.With("client_id", clientID)
@@ -131,16 +138,31 @@ func (h *Handler) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 		if w.stream {
 			captureKind = "per_event"
 		}
+		if w.captureReason != "" {
+			captureKind = w.captureReason
+		}
 		logger.Debug("request.exchange", "method", r.Method, "role", role, "status", w.code, "response", w.body.String(), "response_capture", captureKind, "outcome", outcome, "write_error", detail, "attempted_bytes", w.attempted, "written_bytes", w.written)
 		logger.Info("request.completed", "method", r.Method, "role", role, "status", w.code, "outcome", outcome, "duration_ms", h.Now().Sub(started).Milliseconds())
 	}()
+	if operation := r.Header.Get("X-Portal-Operation-Id"); operation != "" {
+		if !opaqueID.MatchString(operation) {
+			writeJSON(w, 400, map[string]any{"error": "invalid_operation_id"})
+			return
+		}
+		logger = logger.With("operation_id", operation)
+	}
 	if route == "unmatched" {
+		if h.portalAsset(w, r, logger) {
+			return
+		}
 		writeJSON(w, 404, map[string]any{"error": "not_found"})
 		return
 	}
 	expectedRole := ""
 	if strings.HasPrefix(route, "/api/v1/admin/") {
 		expectedRole = "management"
+	} else if strings.HasPrefix(route, "/api/v1/portal/") && route != "/api/v1/portal/login" {
+		expectedRole = "portal_session"
 	} else if strings.HasPrefix(route, "/api/v1/requests") || chatRoute(route) {
 		expectedRole = "client"
 	} else if strings.HasPrefix(route, "/api/v1/worker/") && route != "/api/v1/worker/enroll" {
@@ -149,6 +171,16 @@ func (h *Handler) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 	var identity workerView
 	if expectedRole != "" {
 		credential := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		if role == "unauthenticated" && strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") && strings.HasPrefix(credential, auth.PortalPrefix) && h.Portal != nil {
+			identity, err := h.Portal.Authenticate(logger, credential)
+			if err != nil {
+				logger.Warn("portal.auth_failed", "component", "shell", "cause", err.Error(), "expected_state", "authenticated", "observed_state", "unauthenticated", "outcome", "rejected")
+				portalError(w, err)
+				return
+			}
+			role = "portal_session"
+			logger = logger.With("portal_session_id", identity.ID)
+		}
 		if role == "unauthenticated" && strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") && strings.HasPrefix(credential, auth.WorkerPrefix) && h.Workers != nil {
 			record, err := h.Workers.Authenticate(r.Context(), logger, credential)
 			w.workerID = record.ID
@@ -158,7 +190,7 @@ func (h *Handler) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 			}
 			role, identity = "worker", viewWorker(record)
 		}
-		if role != expectedRole {
+		if role != expectedRole && !(expectedRole == "management" && role == "portal_session") {
 			event := "auth.denied"
 			if strings.HasPrefix(route, "/api/v1/worker/") || route == "/api/v1/admin/enrollments" || strings.HasPrefix(route, "/api/v1/admin/workers") {
 				event = "worker.auth_denied"
@@ -207,6 +239,8 @@ func (h *Handler) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 	default:
 	}
 	switch route {
+	case "/api/v1/portal/login", "/api/v1/portal/logout", "/api/v1/portal/settings", "/api/v1/portal/events":
+		h.portalRequest(w, r, logger, route, body)
 	case "/healthz":
 		writeJSON(w, 200, map[string]any{"status": "alive"})
 	case "/readyz":

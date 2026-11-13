@@ -17,5 +17,10 @@ case "${1:-}" in
       sh -ec 'go version > .artifacts/unit/service/go-version.txt; go test -race -covermode=atomic -coverpkg="$(go list ./... | paste -sd, -)" -coverprofile=.artifacts/unit/service/service.cover ./...'
     node "$task_root/tools/coverage-policy.mjs" collect service
     ;;
-  *) echo 'Expected check or unit' >&2; exit 1 ;;
+  portal)
+    docker run --rm --user "$(id -u):$(id -g)" -v "$task_root:/src" -v "$task_root/.artifacts/go-mod:/module-cache" -w /src \
+      -e GOCACHE=/src/.artifacts/go-cache -e GOMODCACHE=/module-cache "$tools_image" \
+      go test -race -v -count=1 ./internal/httpapi ./internal/service -run '^TestPortal'
+    ;;
+  *) echo 'Expected check, unit or portal' >&2; exit 1 ;;
 esac

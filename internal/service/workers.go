@@ -73,7 +73,7 @@ func (s *Workers) identity(prefix string) (id, token string, err error) {
 	if err == nil {
 		token, err = auth.Token(prefix, s.random)
 	}
-	if err == nil && s.authority.Role("Bearer "+token) != "unauthenticated" {
+	if err == nil && s.authority.Reserved(token) {
 		err = errors.New("generated_worker_authority_collision")
 	}
 	return
