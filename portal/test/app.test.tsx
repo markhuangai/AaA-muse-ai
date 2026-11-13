@@ -70,7 +70,7 @@ test('the actual error boundary reports the failure and offers reload', async ()
   let reloads = 0;
   function Failure(): never { throw new Error('controlled-render-failure'); }
   render(<RenderBoundary controller={controller} reload={() => { reloads++; }}><Failure /></RenderBoundary>);
-  expect(screen.getByRole('heading', { name: 'Settings could not be rendered' })).toBeTruthy();
+  expect(screen.getByRole('heading', { name: 'Portal view could not be rendered' })).toBeTruthy();
   fireEvent.click(screen.getByRole('button', { name: 'Reload and sign in' })); await settle();
   expect(reloads).toBe(1); expect(api.reports.at(-1)?.cause).toBe('render_exception'); controller.dispose();
 });

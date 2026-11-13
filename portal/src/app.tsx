@@ -2,6 +2,7 @@ import { Component, useEffect, useState, useSyncExternalStore, type FormEvent, t
 import { BUILD } from './api';
 import { PortalController, type View } from './controller';
 import { Workers } from './workers';
+import { Requests } from './history';
 
 function Mark() {
   return <span className="wordmark"><svg aria-hidden="true" viewBox="0 0 28 28"><path d="M3 22 9 6l5 12L19 6l6 16M6 15h6m4 0h6" /></svg><span>AaA <span className="wordmark-detail">Muse</span></span></span>;
@@ -63,7 +64,7 @@ export class RenderBoundary extends Component<{ controller: PortalController; re
   static getDerivedStateFromError() { return { failed: true }; }
   componentDidCatch() { this.props.controller.renderFailed(); }
   render() {
-    if (this.state.failed) return <main className="render-error"><h1>Settings could not be rendered</h1><p>Reload the portal and sign in again. The client failure has been reported when the service is reachable.</p><button className="primary" onClick={this.props.reload}>Reload and sign in</button></main>;
+    if (this.state.failed) return <main className="render-error"><h1>Portal view could not be rendered</h1><p>Reload the portal and sign in again. The client failure has been reported when the service is reachable.</p><button className="primary" onClick={this.props.reload}>Reload and sign in</button></main>;
     return this.props.children;
   }
 }
@@ -71,7 +72,7 @@ export class RenderBoundary extends Component<{ controller: PortalController; re
 export function App({ controller, reload = () => location.reload() }: { controller: PortalController; reload?: () => void }) {
   const view = useSyncExternalStore(controller.subscribe, controller.snapshot);
   useEffect(() => {
-    const route = () => controller.navigate(location.pathname === '/workers' ? 'workers' : 'settings');
+    const route = () => controller.navigate(location.pathname === '/workers' ? 'workers' : location.pathname === '/requests' ? 'requests' : 'settings');
     route(); window.addEventListener('popstate', route);
     return () => window.removeEventListener('popstate', route);
   }, [controller]);
@@ -81,8 +82,8 @@ export function App({ controller, reload = () => location.reload() }: { controll
     window.addEventListener('unhandledrejection', report);
     return () => { window.removeEventListener('error', report); window.removeEventListener('unhandledrejection', report); };
   }, [controller]);
-  return <><header className="site-header"><div className="header-content"><Mark /><span className="header-label">Control portal</span>{view.phase === 'authenticated' && <><nav aria-label="Portal">{(['settings', 'workers'] as const).map(page => <a key={page} href={`/${page}`} aria-current={view.page === page ? 'page' : undefined} onClick={event => {
+  return <><header className="site-header"><div className="header-content"><Mark /><span className="header-label">Control portal</span>{view.phase === 'authenticated' && <><nav aria-label="Portal">{(['settings', 'workers', 'requests'] as const).map(page => <a key={page} href={`/${page}`} aria-current={view.page === page ? 'page' : undefined} onClick={event => {
     if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
     event.preventDefault(); history.pushState(null, '', `/${page}`); controller.navigate(page);
-  }}>{page === 'settings' ? 'Settings' : 'Workers'}</a>)}</nav><button className="sign-out" onClick={() => void controller.logout()}>Sign out</button></>}</div></header><RenderBoundary key={view.phase === 'authenticated' ? 'session' : 'login'} controller={controller} reload={reload}>{view.phase === 'authenticated' ? view.page === 'workers' ? <Workers controller={controller.workers} /> : <Configuration controller={controller} view={view} /> : <Login controller={controller} view={view} />}</RenderBoundary><footer className="site-footer"><span>AaA Muse · Operator console</span><span className="build-label">Portal build <code>{BUILD.slice(0, 8)}</code></span></footer></>;
+  }}>{page === 'settings' ? 'Settings' : page === 'workers' ? 'Workers' : 'Requests'}</a>)}</nav><button className="sign-out" onClick={() => void controller.logout()}>Sign out</button></>}</div></header><RenderBoundary key={view.phase === 'authenticated' ? 'session' : 'login'} controller={controller} reload={reload}>{view.phase === 'authenticated' ? view.page === 'workers' ? <Workers controller={controller.workers} /> : view.page === 'requests' ? <Requests controller={controller.history} /> : <Configuration controller={controller} view={view} /> : <Login controller={controller} view={view} />}</RenderBoundary><footer className="site-footer"><span>AaA Muse · Operator console</span><span className="build-label">Portal build <code>{BUILD.slice(0, 8)}</code></span></footer></>;
 }

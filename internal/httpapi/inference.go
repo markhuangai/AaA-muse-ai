@@ -129,6 +129,36 @@ func (h *Handler) inferenceRequest(w *response, r *http.Request, logger *slog.Lo
 		}
 	}
 	if err != nil {
+		if route == "/api/v1/admin/experiments/{id}/cancel" {
+			cause, state := "service_unavailable", "unknown"
+			outcome, remote := "unknown", "unknown"
+			var busy any = "unknown"
+			fields := []any{"operation_id", id}
+			var rejected *inference.Rejection
+			if errors.As(err, &rejected) {
+				cause = rejected.Reason
+				if observed, ok := rejected.Fields["observed_state"].(string); ok {
+					state = observed
+				}
+				if value, ok := rejected.Fields["transaction_outcome"].(string); ok {
+					outcome = value
+				}
+				if value, ok := rejected.Fields["remote_outcome"].(string); ok {
+					remote = value
+				}
+				if value, ok := rejected.Fields["busy_hold"].(bool); ok {
+					busy = value
+				}
+				for _, key := range []string{"conversation_id", "worker_id", "job_id"} {
+					if value, ok := rejected.Fields[key].(string); ok {
+						fields = append(fields, key, value)
+					}
+				}
+			}
+			fields = append(fields, "request_record_id", id, "requested_state", "cancelled", "observed_state", state, "cause", cause,
+				"transaction_outcome", outcome, "remote_outcome", remote, "busy_hold", busy, "outcome", "not_confirmed")
+			logger.Warn("portal.cancel_result", fields...)
+		}
 		logger.Warn("request.rejected", "reason", err.Error(), "admitted_body_bytes", len(body))
 		inferenceError(w, err)
 		return

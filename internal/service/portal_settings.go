@@ -69,23 +69,29 @@ func redactPortalYAML(node *yaml.Node, redactor *diagnostics.Redactor) {
 }
 
 type PortalReport struct {
-	Event             string     `json:"event"`
-	Build             string     `json:"build"`
-	Component         string     `json:"component"`
-	Cause             string     `json:"cause"`
-	RequestID         string     `json:"request_id"`
-	OperationID       string     `json:"operation_id"`
-	Expected          string     `json:"expected_state"`
-	Observed          string     `json:"observed_state"`
-	LastGoodAt        *time.Time `json:"last_good_at"`
-	DurationMS        int64      `json:"duration_ms"`
-	Attempt           int        `json:"attempt"`
-	OmittedReports    int        `json:"omitted_reports"`
-	WorkerID          string     `json:"worker_id,omitempty"`
-	RequestSequence   int64      `json:"request_sequence,omitempty"`
-	AcceptedSequence  int64      `json:"accepted_sequence,omitempty"`
-	LatestSequence    int64      `json:"latest_sequence,omitempty"`
-	SessionGeneration int64      `json:"session_generation,omitempty"`
+	Event               string     `json:"event"`
+	Build               string     `json:"build"`
+	Component           string     `json:"component"`
+	Cause               string     `json:"cause"`
+	RequestID           string     `json:"request_id"`
+	OperationID         string     `json:"operation_id"`
+	Expected            string     `json:"expected_state"`
+	Observed            string     `json:"observed_state"`
+	LastGoodAt          *time.Time `json:"last_good_at"`
+	DurationMS          int64      `json:"duration_ms"`
+	Attempt             int        `json:"attempt"`
+	OmittedReports      int        `json:"omitted_reports"`
+	WorkerID            string     `json:"worker_id,omitempty"`
+	RequestSequence     int64      `json:"request_sequence,omitempty"`
+	AcceptedSequence    int64      `json:"accepted_sequence,omitempty"`
+	LatestSequence      int64      `json:"latest_sequence,omitempty"`
+	SessionGeneration   int64      `json:"session_generation,omitempty"`
+	QueryGeneration     int64      `json:"query_generation,omitempty"`
+	SelectionGeneration int64      `json:"selection_generation,omitempty"`
+	QueryKind           string     `json:"query_kind,omitempty"`
+	Cursor              string     `json:"cursor,omitempty"`
+	ConversationID      string     `json:"conversation_id,omitempty"`
+	RequestRecordID     string     `json:"request_record_id,omitempty"`
 }
 
 var portalIdentifier = regexp.MustCompile(`^[A-Za-z0-9_-]{1,100}$`)
@@ -105,6 +111,12 @@ func (r PortalReport) valid() bool {
 		(r.RequestID == "" || portalIdentifier.MatchString(r.RequestID)) && portalIdentifier.MatchString(r.OperationID) &&
 		oneOf(r.Expected, "fresh", "rendered", "authenticated") && oneOf(r.Observed, "stale", "failed", "unauthenticated") &&
 		r.DurationMS >= 0 && r.DurationMS <= 86400000 && r.Attempt >= 1 && r.Attempt <= 1000000 && r.OmittedReports >= 0 && r.OmittedReports <= 1000000
+	if r.Component == "history" {
+		return common && r.validHistoryReport()
+	}
+	if r.QueryKind != "" || r.Cursor != "" || r.ConversationID != "" || r.RequestRecordID != "" || r.QueryGeneration != 0 || r.SelectionGeneration != 0 {
+		return false
+	}
 	if r.Event == "portal.worker_state_stale" {
 		return common && r.Component == "workers" && r.Expected == "fresh" && r.Observed == "stale" &&
 			oneOf(r.Cause, "request_failed", "request_timeout", "service_unavailable", "stale_data", "obsolete_response") &&
@@ -145,6 +157,11 @@ func (p *Portal) Report(logger *slog.Logger, credential string, input PortalRepo
 		"omitted_reports", input.OmittedReports, "outcome", "reported"}
 	if input.Event == "portal.worker_state_stale" {
 		fields = append(fields, "worker_id", input.WorkerID, "request_sequence", input.RequestSequence, "accepted_sequence", input.AcceptedSequence, "latest_sequence", input.LatestSequence, "session_generation", input.SessionGeneration)
+	}
+	if input.Component == "history" {
+		fields = append(fields, "query_kind", input.QueryKind, "cursor", input.Cursor, "conversation_id", input.ConversationID, "request_record_id", input.RequestRecordID,
+			"request_sequence", input.RequestSequence, "accepted_sequence", input.AcceptedSequence, "latest_sequence", input.LatestSequence, "session_generation", input.SessionGeneration,
+			"query_generation", input.QueryGeneration, "selection_generation", input.SelectionGeneration)
 	}
 	logger.Debug("portal.browser_report", "client_report", true, "report", input, "portal_session_id", record.ID)
 	if input.Event == "portal.render_failed" {

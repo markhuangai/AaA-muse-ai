@@ -61,7 +61,10 @@ func historyRequest(ctx context.Context, tx pgx.Tx, id string) (json.RawMessage,
 	 json_build_object('kind','native','request',m.data,'assignment',j.data,'delivery',j.context)
 	 ELSE json_build_object('kind','legacy','request',e.data,'provenance','unavailable',
 	 'history',(SELECT json_agg(h.data ORDER BY h.sequence) FROM aaa_inference_history h WHERE h.experiment_id=e.id),
-	 'assignment',j.data,'delivery',j.context) END FROM aaa_experiments e
+	 'assignment',j.data,'delivery',j.context) END::jsonb || jsonb_build_object('execution',jsonb_build_object(
+	 'id',e.id,'worker_id',e.worker_id,'state',e.state,'reason',e.data->'reason',
+	 'remote_outcome',e.data->'remote_outcome','created_at',e.data->'created_at',
+	 'deadline_at',e.data->'deadline_at','current_job_id',e.data->'current_job_id')) FROM aaa_experiments e
 	 LEFT JOIN aaa_model_requests m ON m.id=e.id LEFT JOIN aaa_inference_jobs j ON j.id=e.data->>'current_job_id' WHERE e.id=$1`, id)
 }
 

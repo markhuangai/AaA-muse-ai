@@ -1,3 +1,4 @@
+import { browserTransport } from './browser-transport.mjs';
 import { chromium, expect } from '@playwright/test';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -5,6 +6,7 @@ import { execFileSync } from 'node:child_process';
 import { inspectTaste } from './taste.mjs';
 
 const fixture = JSON.parse(readFileSync(process.argv[process.argv.indexOf('--fixture') + 1], 'utf8'));
+const transport = browserTransport(fixture.origin);
 const secrets = [];
 const receipt = { source_sha: fixture.source_sha, outcome: 'failed', cases: [], diagnostics: [], screenshots: [], design: [] };
 const save = (name, value) => writeFileSync(join(fixture.directory, name), JSON.stringify(value, null, 2), { mode: 0o600 });
@@ -22,7 +24,7 @@ async function control(path, { method = 'GET', key, body } = {}) {
 }
 
 async function login(page) {
-  await page.goto(`${fixture.origin}/workers`);
+  await page.goto(`${transport.origin}/workers`);
   await page.getByLabel('Portal password').fill(fixture.password);
   const pending = page.waitForResponse(response => new URL(response.url()).pathname === '/api/v1/portal/login' && response.status() === 200);
   await page.getByRole('button', { name: 'Sign in', exact: true }).click();
@@ -163,7 +165,7 @@ async function viewports() {
     const retained = await control('/api/v1/admin/workers', { key: session.session_token });
     expect(retained.data.workers.some(worker => worker.id === enrolled.data.worker.id && worker.revoked_at)).toBe(true);
     expect(telemetry.every(value => !secrets.some(secret => value.includes(secret)))).toBe(true);
-    expect([...origins]).toEqual([new URL(fixture.origin).origin]);
+    expect([...origins]).toEqual([new URL(transport.origin).origin]);
     passed('portal.workers_actions', { width, accepted_rename: true, identity_and_assignment_preserved: true, full_prompt: true, single_use: true, confirmed_revocation: true, keyboard: true, persistent_credentials: false });
     await context.close();
   }
@@ -173,14 +175,14 @@ async function orderingAndUncertainty() {
   const context = await browser.newContext({ viewport: { width: 1440, height: 900 }, serviceWorkers: 'block' }); const page = await context.newPage();
   const session = await login(page); await openWorker(page, fixture.workers.busy_id);
   let release, seen; const gate = new Promise(resolve => { release = resolve; }); const observed = new Promise(resolve => { seen = resolve; });
-  await page.route('**/api/v1/admin/workers', async route => { const response = await route.fetch(); seen(); await gate; await route.fulfill({ response }); });
+  await page.route('**/api/v1/admin/workers', async route => { const response = await transport.fetch(route); seen(); await gate; await route.fulfill({ response }); });
   await page.getByRole('button', { name: 'Refresh workers' }).click(); await observed;
   await page.getByLabel('Display name', { exact: true }).fill('Newest accepted name');
   await action(page, `/api/v1/admin/workers/${fixture.workers.busy_id}`, () => page.getByRole('button', { name: 'Save name', exact: true }).click());
   const stale = report(page, 'obsolete_response'); release(); await stale;
   await expect(page.getByRole('heading', { name: 'Newest accepted name', exact: true })).toBeVisible(); await page.unroute('**/api/v1/admin/workers');
   let committedRequestID = '';
-  await page.route(`**/api/v1/admin/workers/${fixture.workers.busy_id}`, async route => { const response = await route.fetch(); committedRequestID = response.headers()['x-request-id']; await route.abort('failed'); });
+  await page.route(`**/api/v1/admin/workers/${fixture.workers.busy_id}`, async route => { const response = await transport.fetch(route); committedRequestID = response.headers()['x-request-id']; await route.abort('failed'); });
   await page.getByLabel('Display name', { exact: true }).fill('Committed before response loss');
   const failure = report(page, 'request_failed'); await page.getByRole('button', { name: 'Save name', exact: true }).click(); await failure;
   receipt.diagnostics.push({ request_id: committedRequestID, event: 'worker.renamed', client_unconfirmed: true });
@@ -233,20 +235,20 @@ async function expiryAndLateLogout() {
   passed('portal.worker_browser_enrollment_expiry', { browser_clock_controlled: true, server_expiry_tested_separately: true }); await context.close();
   const second = await browser.newContext({ serviceWorkers: 'block' }); const delayed = await second.newPage(); await login(delayed);
   let release, seen, done; const gate = new Promise(resolve => { release = resolve; }); const observed = new Promise(resolve => { seen = resolve; }); const finished = new Promise(resolve => { done = resolve; });
-  await delayed.route('**/api/v1/admin/workers', async route => { const response = await route.fetch(); seen(); await gate; try { await route.fulfill({ response }); } catch (error) { if (!route.request().failure()) throw error; } finally { done(); } });
+  await delayed.route('**/api/v1/admin/workers', async route => { const response = await transport.fetch(route); seen(); await gate; try { await route.fulfill({ response }); } catch (error) { if (!route.request().failure()) throw error; } finally { done(); } });
   await delayed.getByRole('button', { name: 'Refresh workers' }).click(); await observed; await delayed.getByRole('button', { name: 'Sign out' }).click(); release(); await finished;
   await expect(delayed.getByRole('heading', { name: 'Service access' })).toBeVisible(); expect(await delayed.getByRole('region', { name: 'Registered workers' }).count()).toBe(0);
   passed('portal.worker_late_response_after_logout'); await second.close();
   const third = await browser.newContext({ serviceWorkers: 'block' }); const timed = await third.newPage(); await timed.clock.install(); await login(timed);
   let unblock, reached; const blocked = new Promise(resolve => { unblock = resolve; }); const requested = new Promise(resolve => { reached = resolve; });
-  await timed.route('**/api/v1/admin/workers', async route => { const response = await route.fetch(); reached(); await blocked; try { await route.fulfill({ response }); } catch (error) { if (!route.request().failure()) throw error; } });
+  await timed.route('**/api/v1/admin/workers', async route => { const response = await transport.fetch(route); reached(); await blocked; try { await route.fulfill({ response }); } catch (error) { if (!route.request().failure()) throw error; } });
   const deadlineReport = report(timed, 'request_timeout'); await timed.getByRole('button', { name: 'Refresh workers' }).click(); await requested;
   await timed.clock.fastForward(10_001); await deadlineReport; await expect(timed.getByText('Could not refresh workers. Check the connection and retry.')).toBeVisible();
   unblock(); await third.close(); passed('portal.worker_request_deadline', { deadline_ms: 10000 });
 }
 
 try {
-  browser = await chromium.launch({ headless: true, args: [`--unsafely-treat-insecure-origin-as-secure=${fixture.origin}`] });
+  browser = await chromium.launch({ headless: true, args: transport.args });
   if (fixture.phase === 'empty') await emptyViews();
   else { await viewports(); await orderingAndUncertainty(); await expiryAndLateLogout(); await outageAndDenial(); }
   receipt.outcome = 'passed';

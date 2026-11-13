@@ -89,14 +89,21 @@ func (h *Handler) historyRequest(w *response, r *http.Request, logger *slog.Logg
 		return
 	}
 	if adminHistoryRoute(route) {
+		logger.Debug("history.query_input", "raw_query", r.URL.RawQuery, "requested_id", id)
 		query, err := parseHistoryQuery(r, route, id)
 		if err != nil {
-			logger.Warn("history.query_rejected", "reason", err.Error())
+			logger.Warn("portal.history_load_failed", "cause", err.Error(), "query_kind", query.Kind, "requested_id", id, "outcome", "rejected")
 			inferenceError(w, err)
 			return
 		}
 		result, err := h.Broker.QueryHistory(r.Context(), logger, query)
 		if err != nil {
+			cause := "service_unavailable"
+			var rejected *inference.Rejection
+			if errors.As(err, &rejected) {
+				cause = rejected.Reason
+			}
+			logger.Warn("portal.history_load_failed", "cause", cause, "query_kind", query.Kind, "requested_id", id, "outcome", "failed")
 			inferenceError(w, err)
 			return
 		}

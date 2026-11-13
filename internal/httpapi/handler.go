@@ -158,7 +158,7 @@ func (h *Handler) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 			writeJSON(w, 400, map[string]any{"error": "invalid_operation_id"})
 			return
 		}
-		logger = logger.With("operation_id", operation)
+		logger = logger.With("operation_id", operation, "portal_operation_id", operation)
 	}
 	if route == "unmatched" {
 		if h.portalAsset(w, r, logger) {

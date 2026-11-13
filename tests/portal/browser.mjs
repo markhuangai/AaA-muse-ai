@@ -1,3 +1,4 @@
+import { browserTransport } from './browser-transport.mjs';
 import { chromium, expect } from '@playwright/test';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -5,6 +6,7 @@ import { execFileSync } from 'node:child_process';
 import { inspectTaste } from './taste.mjs';
 
 const fixture = JSON.parse(readFileSync(process.argv[process.argv.indexOf('--fixture') + 1], 'utf8'));
+const transport = browserTransport(fixture.origin);
 const secrets = [];
 const receipt = { source_sha: fixture.source_sha, outcome: 'failed', cases: [], diagnostics: [], screenshots: [], design: [] };
 const save = (name, value) => writeFileSync(join(fixture.directory, name), JSON.stringify(value, null, 2), { mode: 0o600 });
@@ -58,7 +60,7 @@ async function viewports() {
     const context = await browser.newContext({ viewport: { width, height: width === 1440 ? 900 : width === 768 ? 1024 : 844 }, serviceWorkers: 'block' });
     const page = await context.newPage();
     const origins = new Set(); page.on('request', request => origins.add(new URL(request.url()).origin));
-    await page.goto(fixture.origin);
+    await page.goto(transport.origin);
     await expect(page.getByRole('heading', { name: 'Service access' })).toBeVisible();
     await page.evaluate(() => document.fonts.ready);
     await screenshot(page, `login-${width}.png`);
@@ -87,7 +89,7 @@ async function viewports() {
     const render = reportResponse(page, 'portal.render_failed');
     await page.evaluate(message => window.dispatchEvent(new ErrorEvent('error', { message })), `private-browser-detail-${fixture.password}`);
     await render;
-    expect([...origins]).toEqual([new URL(fixture.origin).origin]);
+    expect([...origins]).toEqual([new URL(transport.origin).origin]);
     await page.getByRole('button', { name: 'Sign out' }).click();
     await expect(page.getByRole('heading', { name: 'Service access' })).toBeVisible();
     passed('portal.browser_viewport', { width, same_origin: true, unsafe_text_is_text: true, persistent_credentials: false });
@@ -98,14 +100,16 @@ async function viewports() {
 async function lifecycle() {
   const context = await browser.newContext({ viewport: { width: 1440, height: 900 }, serviceWorkers: 'block' });
   const page = await context.newPage();
-  await page.goto(`${fixture.origin}/settings`);
+  await page.goto(`${transport.origin}/settings`);
   const first = await login(page); await authenticated(page);
   await page.reload(); await expect(page.getByRole('heading', { name: 'Service access' })).toBeVisible();
   expect((await page.request.get(`${fixture.origin}/api/v1/portal/settings`)).status()).toBe(401);
   expect((await page.request.get(`${fixture.origin}/api/v1/portal/settings`, { headers: { Authorization: `Bearer ${first.session_token}` } })).status()).toBe(200);
   passed('portal.reload_forgets_browser_session');
   const loggedOut = await login(page); await authenticated(page);
+  const logout = page.waitForResponse(response => new URL(response.url()).pathname === '/api/v1/portal/logout' && response.status() === 204);
   await page.getByRole('button', { name: 'Sign out' }).click();
+  await logout;
   await expect(page.getByText('Signed out.', { exact: true })).toBeVisible();
   expect((await page.request.get(`${fixture.origin}/api/v1/portal/settings`, { headers: { Authorization: `Bearer ${loggedOut.session_token}` } })).status()).toBe(401);
   passed('portal.logout_invalidates_server_session');
@@ -123,7 +127,7 @@ async function lifecycle() {
   const seen = new Promise(resolve => { observed = resolve; });
   const done = new Promise(resolve => { finished = resolve; });
   await page.route('**/api/v1/portal/settings', async route => {
-    const response = await route.fetch(); observed(); await gate;
+    const response = await transport.fetch(route); observed(); await gate;
     try { await route.fulfill({ response }); }
     catch (error) { if (!route.request().failure()) throw error; }
     finally { finished(); }
@@ -162,13 +166,13 @@ async function lifecycle() {
 
 async function expiryAndDeadline() {
   const context = await browser.newContext({ serviceWorkers: 'block' }); const page = await context.newPage();
-  await page.clock.install(); await page.goto(fixture.origin); await login(page); await authenticated(page);
+  await page.clock.install(); await page.goto(transport.origin); await login(page); await authenticated(page);
   await page.clock.fastForward(1_800_001);
   await expect(page.getByText('Your session ended. Sign in again.')).toBeVisible();
   await emptyStorage(page, context); passed('portal.browser_absolute_expiry', { server_lifetime_seconds: 1800, browser_clock_controlled: true });
   await context.close();
   const second = await browser.newContext({ serviceWorkers: 'block' }); const delayed = await second.newPage();
-  await delayed.clock.install(); await delayed.goto(fixture.origin); await login(delayed); await authenticated(delayed);
+  await delayed.clock.install(); await delayed.goto(transport.origin); await login(delayed); await authenticated(delayed);
   let release; const gate = new Promise(resolve => { release = resolve; });
   await delayed.route('**/api/v1/portal/settings', async route => { await gate; try { await route.abort('failed'); } catch (error) { if (!route.request().failure()) throw error; } });
   const diagnostic = reportResponse(delayed, 'portal.state_stale');
@@ -179,7 +183,7 @@ async function expiryAndDeadline() {
 }
 
 try {
-  browser = await chromium.launch({ headless: true });
+  browser = await chromium.launch({ headless: true, args: transport.args });
   await viewports(); await lifecycle(); await expiryAndDeadline();
   receipt.outcome = 'passed';
   save('browser-receipt.json', receipt);
