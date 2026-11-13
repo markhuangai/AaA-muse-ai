@@ -128,6 +128,7 @@ async function viewports() {
     await open(page, data.native.continued.id); await expect(page.getByRole('region', { name: 'Request detail' })).toContainText('Client-only exact result');
     await open(page, data.native.response_request_id); await expect(page.getByText('Instructions only for this Responses request', { exact: false, selector: 'pre' }).first()).toBeVisible();
     await open(page, data.legacy); await expect(page.getByText(/Legacy request ·/)).toBeVisible(); await expect(page.getByText(/Native session identity/)).toBeVisible();
+    await expect(page.locator('pre').filter({ hasText: '1e200000' })).toHaveCount(1);
     const queued = data.cancellation.queued[index]; await open(page, queued.id); await expect(page.getByRole('button', { name: 'Cancel request', exact: true })).toBeEnabled();
     await page.getByRole('button', { name: 'Cancel request', exact: true }).click(); const dialog = page.getByRole('dialog'); await expect(dialog.getByRole('button', { name: 'Keep request' })).toBeFocused();
     await page.keyboard.press('Escape'); await expect(dialog).not.toBeVisible();
@@ -156,12 +157,37 @@ async function pagingAndOrdering() {
   await expect(page.getByText(/No recorded requests match/)).toBeVisible(); await page.unrouteAll({ behavior: 'wait' });
   await page.getByLabel('Conversation ID').fill(''); await page.getByRole('button', { name: 'Apply filter', exact: true }).click(); await expect(page.locator('tbody tr')).toHaveCount(50);
   const first = await page.locator('tbody .request-link').allTextContents();
+  const failPage = async pattern => {
+    await page.route(pattern, async route => { if (new URL(route.request().url()).searchParams.has('cursor')) { await transport.fetch(route); await route.abort('failed'); } else await route.continue(); });
+  };
+  await failPage('**/api/v1/admin/requests?*');
+  const failedPage = waitReport(page, 'portal.history_load_failed', 'request_failed', 'requests');
+  await page.getByRole('button', { name: 'Next requests page', exact: true }).click(); await failedPage;
+  expect(await page.locator('tbody .request-link').allTextContents()).toEqual(first);
+  await expect(page.getByLabel('Requests pagination')).toContainText('page 1');
+  await expect(page.getByRole('button', { name: 'Previous requests page', exact: true })).toBeDisabled();
+  await page.unrouteAll({ behavior: 'wait' });
   const next = page.waitForResponse(response => new URL(response.url()).pathname === '/api/v1/admin/requests' && new URL(response.url()).searchParams.has('cursor'));
   await page.getByRole('button', { name: 'Next requests page', exact: true }).click(); await next; await expect(page.getByText(/Older request page/)).toBeVisible();
   await expect(page.getByRole('region', { name: 'Recorded requests' })).toHaveAttribute('aria-busy', 'false');
   const older = await page.locator('tbody .request-link').allTextContents(); expect(older.every(id => !first.includes(id))).toBe(true);
+  await expect(page.getByLabel('Requests pagination')).toContainText('page 2');
+  await page.getByRole('button', { name: 'Previous requests page', exact: true }).click(); await expect(page.getByLabel('Requests pagination')).toContainText('page 1');
+  expect(await page.locator('tbody .request-link').allTextContents()).toEqual(first);
+  await page.getByRole('button', { name: 'Next requests page', exact: true }).click(); await expect(page.getByText(/Older request page/)).toBeVisible();
   const concurrent = concurrentLegacy(); await page.clock.fastForward(30_001); expect(await page.locator('tbody .request-link').allTextContents()).toEqual(older);
   await page.getByRole('button', { name: 'First requests page', exact: true }).click(); await expect(page.locator('tbody .request-link').first()).toHaveText(concurrent);
+  await open(page, fixture.fixtures.native.first.id);
+  const timeline = page.getByRole('region', { name: 'Conversation timeline' }), events = await timeline.locator('.timeline-events').innerText();
+  await failPage('**/api/v1/admin/conversations/*/timeline?*');
+  const failedEvents = waitReport(page, 'portal.history_load_failed', 'request_failed', 'timeline');
+  await page.getByRole('button', { name: 'Next timeline page', exact: true }).click(); await failedEvents;
+  expect(await timeline.locator('.timeline-events').innerText()).toBe(events); await expect(page.getByLabel('Timeline pagination')).toContainText('page 1');
+  await expect(page.getByRole('button', { name: 'Previous timeline page', exact: true })).toBeDisabled(); await page.unrouteAll({ behavior: 'wait' });
+  await nextTimeline(page); await expect(page.getByLabel('Timeline pagination')).toContainText('page 2');
+  await page.getByRole('button', { name: 'Previous timeline page', exact: true }).click(); await expect(page.getByLabel('Timeline pagination')).toContainText('page 1');
+  expect(await timeline.locator('.timeline-events').innerText()).toBe(events);
+  passed('portal.history_pagination_failure_recovery', { requests: true, timeline: true, retained_cursor_matches_records: true });
   passed('portal.history_pagination_and_concurrent_arrivals', { page_limit: 50, duplicate_ids: false, older_page_preserved: true, obsolete_response_discarded: true }); await context.close();
 }
 async function selectionAndCancellationOrdering() {

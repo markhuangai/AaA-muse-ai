@@ -48,6 +48,27 @@ test('timeline pages preserve linkage and refresh only the anchored page', async
   expect(f.controller.snapshot().selectedID).toBe(requestID); expect(f.controller.snapshot().timeline.cursor).toBe('');
   await f.controller.select(''); expect(f.controller.snapshot().detail.value).toBeNull(); await f.controller.page('timeline', 'first'); f.controller.reset();
 });
+test.each(['list', 'timeline'] as const)('failed %s navigation keeps its retained page and cursor history aligned', async resource => {
+  const f = await active(); let failing = false, blocked: Promise<void> | null = null;
+  const load = async () => { const gate = blocked; blocked = null; if (gate) await gate; if (failing) throw new APIError('request_failed'); };
+  f.api.requestsWork = async (_conversation, cursor) => { if (resource === 'list') await load(); return { value: { items: [{ ...summary(), id: cursor || requestID }], next_cursor: cursor ? 'third' : 'second' }, requestID: 'paged-list' }; };
+  f.api.timelineWork = async (_conversation, cursor) => { if (resource === 'timeline') await load(); return { value: { items: [entry(cursor ? 50 : 0)], next_cursor: cursor ? 'third' : 'second' }, requestID: 'paged-events' }; };
+  if (resource === 'timeline') await f.controller.select(requestID); else await f.controller.refresh();
+  const first = f.controller.snapshot()[resource].value;
+  failing = true; await f.controller.page(resource, 'next');
+  expect(f.controller.snapshot()[resource]).toMatchObject({ value: first, cursor: '', back: [], loading: false, stale: true });
+  expect(f.api.reports.at(-1)?.cursor).toBe('second');
+  failing = false; await f.controller.page(resource, 'next'); const second = f.controller.snapshot()[resource].value;
+  expect(f.controller.snapshot()[resource]).toMatchObject({ cursor: 'second', back: [''], loading: false, stale: false });
+  failing = true; await f.controller.page(resource, 'previous');
+  expect(f.controller.snapshot()[resource]).toMatchObject({ value: second, cursor: 'second', back: [''], loading: false, stale: true });
+  failing = false; await f.controller.refresh(); expect(f.controller.snapshot()[resource].cursor).toBe('second');
+  await f.controller.page(resource, 'previous'); expect(f.controller.snapshot()[resource]).toMatchObject({ value: first, cursor: '', back: [] });
+  const delayed = deferred<void>(); blocked = delayed.promise; const pending = f.controller.page(resource, 'next');
+  await f.controller.refresh(); delayed.resolve(); await pending;
+  expect(f.controller.snapshot()[resource]).toMatchObject({ value: first, cursor: '', back: [], loading: false });
+  expect(f.api.reports.at(-1)?.cause).toBe('obsolete_response'); f.controller.reset();
+});
 test('older list pages do not shift under polling and stale snapshots retain their data', async () => {
   const f = await active();
   f.api.requestsWork = async () => ({ value: { items: [summary()], next_cursor: 'older' }, requestID: 'list' });

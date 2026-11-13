@@ -62,7 +62,7 @@ class PortalHistory(Portal, Routing):
           json_build_object('id',md5('portal-history-page-'||g),'conversation_id',md5('portal-history-conversation-'||g),
           'worker_id','%s','state','completed','created_at','2026-11-13T00:00:00Z','deadline_at','2026-11-13T00:30:00Z',
           'current_job_id','','messages',json_build_array(json_build_object('type','message','role','user','text','Retained legacy fixture')),
-          'tools',json_build_array(),'final_text','Retained legacy answer','remote_outcome','decision_observed')
+          'tools',json_build_array(),'final_text','Retained legacy answer','remote_outcome','decision_observed','numeric_fixture','1e200000'::json)
           FROM generate_series(1,55) AS g;""" % (worker_id, worker_id))
         identity = self.sql("SELECT md5('portal-history-page-1');")
         self.sql("INSERT INTO aaa_inference_history(experiment_id,sequence,data) VALUES ('" + identity + "',0,'{\"type\":\"message\",\"role\":\"user\",\"text\":\"Retained legacy fixture\"}');")
@@ -74,7 +74,11 @@ class PortalHistory(Portal, Routing):
             if not cursor:
                 break
         require(len(seen) >= 55 and len(set(seen)) == len(seen), "equal-time keyset pages lost or duplicated history")
-        require(self.detail({"id": identity})["kind"] == "legacy", "legacy request fixture lost its provenance")
+        value, _ = self.checked("/api/v1/admin/requests/" + identity, self.admin)
+        require(value["kind"] == "legacy" and value["request"]["messages"][0]["text"] == "Retained legacy fixture", "legacy request fixture lost its provenance or JSON text")
+        status, _, raw = self.api("/api/v1/admin/requests/" + identity, self.admin)
+        require(status == 200 and b'1e200000' in raw, "request projection changed retained JSON numeric values")
+        self.receipt("portal.history_json_payload_fidelity", legacy_numeric_exponent_preserved=True)
         self.receipt("portal.history_equal_timestamp_database_pages", records=len(seen), imported_legacy_fixtures=55)
         return identity
 

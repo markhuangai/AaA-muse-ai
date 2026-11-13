@@ -11,6 +11,7 @@ export interface HistoryRead<T> {
 interface Values { list: HistoryPage<RequestSummary>; detail: RequestDetail; timeline: HistoryPage<TimelineEntry> }
 export type HistoryResource = keyof Values;
 type Resource = HistoryResource;
+type Position = Pick<HistoryRead<unknown>, 'cursor' | 'back'>;
 export interface HistoryView {
   list: HistoryRead<Values['list']>; detail: HistoryRead<Values['detail']>; timeline: HistoryRead<Values['timeline']>;
   conversation: string; selectedID: string; workers: Worker[] | null; namesStale: boolean;
@@ -105,10 +106,10 @@ export class HistoryController {
       request_sequence: Math.max(1, sequence), accepted_sequence: this.#accepted[source], latest_sequence: Math.max(1, sequence, this.#sequence), session_generation: this.#generation,
       query_generation: this.#queryGeneration, selection_generation: this.#selectionGeneration });
   }
-  private async read<K extends Resource>(resource: K, load: (operation: string, signal: AbortSignal) => Promise<{ value: Values[K]; requestID: string }>) {
+  private async read<K extends Resource>(resource: K, load: (operation: string, signal: AbortSignal) => Promise<{ value: Values[K]; requestID: string }>, position?: Position) {
     if (!this.available() || this.#view.pending) return;
     const generation = this.#generation, key = this.key(resource), sequence = ++this.#sequence, operation = this.system.id(), started = this.system.now();
-    const cursor = this.#view[resource].cursor, conversation = resource === 'list' ? this.#view.conversation : this.#view.detail.value?.request.conversation_id ?? '', id = this.#view.selectedID;
+    const cursor = position?.cursor ?? this.#view[resource].cursor, conversation = resource === 'list' ? this.#view.conversation : this.#view.detail.value?.request.conversation_id ?? '', id = this.#view.selectedID;
     this.#pendingReads.set(sequence, { resource, operation, started, cursor, conversation, id });
     this.#latest[resource] = sequence;
     this.changeRead(resource, { loading: true, operationID: operation });
@@ -118,7 +119,7 @@ export class HistoryController {
       if (generation !== this.#generation || !this.available()) return;
       if (!current()) { this.report('portal.history_load_failed', 'obsolete_response', resource, operation, result.requestID, sequence, this.system.now() - started, cursor, conversation, id); return; }
       this.#accepted[resource] = sequence;
-      this.changeRead(resource, { value: result.value, requestID: result.requestID, lastGood: this.system.now(), stale: false, message: '' });
+      this.changeRead(resource, { ...position, value: result.value, requestID: result.requestID, lastGood: this.system.now(), stale: false, loading: false, message: '' });
       if (resource === 'detail' && this.#view.unconfirmed) this.change({ actionMessage: `Current server state: ${this.#view.detail.value!.execution.state}. The previous cancellation response was unconfirmed.`, unconfirmed: false });
       this.freshness(); await this.reports.flush();
     } catch (error) {
@@ -132,11 +133,11 @@ export class HistoryController {
       this.report('portal.history_load_failed', failure.causeCode === 'request_timeout' ? 'request_timeout' : failure.causeCode === 'invalid_response' ? 'invalid_response' : failure.status >= 500 ? 'service_unavailable' : 'request_failed', resource, operation, failure.requestID, sequence, this.system.now() - started, cursor, conversation, id);
     } finally { this.#pendingReads.delete(sequence); if (generation === this.#generation && current()) this.changeRead(resource, { loading: false }); }
   }
-  private loadList() { return this.read('list', (op, signal) => this.api.requests(this.#view.conversation, this.#view.list.cursor, op, signal)); }
-  private loadTimeline() {
+  private loadList(position?: Position) { return this.read('list', (op, signal) => this.api.requests(this.#view.conversation, position?.cursor ?? this.#view.list.cursor, op, signal), position); }
+  private loadTimeline(position?: Position) {
     const conversation = this.#view.detail.value?.request.conversation_id;
     if (!conversation) return Promise.resolve();
-    return this.read('timeline', (op, signal) => this.api.timeline(conversation, this.#view.timeline.cursor, op, signal));
+    return this.read('timeline', (op, signal) => this.api.timeline(conversation, position?.cursor ?? this.#view.timeline.cursor, op, signal), position);
   }
   private async loadDetail(explicit: boolean) {
     const id = this.#view.selectedID;
@@ -191,8 +192,8 @@ export class HistoryController {
     else back.length = 0;
     this.#latest[resource] = ++this.#sequence;
     this.#queryGeneration++;
-    this.changeRead(resource, { cursor, back, message: '', stale: true });
-    await (resource === 'list' ? this.loadList() : this.loadTimeline());
+    this.changeRead(resource, { message: '', stale: true });
+    await (resource === 'list' ? this.loadList({ cursor, back }) : this.loadTimeline({ cursor, back }));
   }
   private invalidate() {
     for (const resource of ['list', 'detail', 'timeline'] as const) { this.#latest[resource] = ++this.#sequence; this.changeRead(resource, { loading: false }); }
