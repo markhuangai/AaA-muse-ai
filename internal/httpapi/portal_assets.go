@@ -15,7 +15,7 @@ import (
 const portalCSP = "default-src 'none'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'"
 
 func (h *Handler) portalAsset(w *response, r *http.Request, logger *slog.Logger) bool {
-	shell := r.URL.Path == "/" || r.URL.Path == "/settings"
+	shell := r.URL.Path == "/" || r.URL.Path == "/settings" || r.URL.Path == "/workers"
 	if !shell && !strings.HasPrefix(r.URL.Path, "/assets/") {
 		return false
 	}

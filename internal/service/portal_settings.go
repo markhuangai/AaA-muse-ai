@@ -69,18 +69,23 @@ func redactPortalYAML(node *yaml.Node, redactor *diagnostics.Redactor) {
 }
 
 type PortalReport struct {
-	Event          string     `json:"event"`
-	Build          string     `json:"build"`
-	Component      string     `json:"component"`
-	Cause          string     `json:"cause"`
-	RequestID      string     `json:"request_id"`
-	OperationID    string     `json:"operation_id"`
-	Expected       string     `json:"expected_state"`
-	Observed       string     `json:"observed_state"`
-	LastGoodAt     *time.Time `json:"last_good_at"`
-	DurationMS     int64      `json:"duration_ms"`
-	Attempt        int        `json:"attempt"`
-	OmittedReports int        `json:"omitted_reports"`
+	Event             string     `json:"event"`
+	Build             string     `json:"build"`
+	Component         string     `json:"component"`
+	Cause             string     `json:"cause"`
+	RequestID         string     `json:"request_id"`
+	OperationID       string     `json:"operation_id"`
+	Expected          string     `json:"expected_state"`
+	Observed          string     `json:"observed_state"`
+	LastGoodAt        *time.Time `json:"last_good_at"`
+	DurationMS        int64      `json:"duration_ms"`
+	Attempt           int        `json:"attempt"`
+	OmittedReports    int        `json:"omitted_reports"`
+	WorkerID          string     `json:"worker_id,omitempty"`
+	RequestSequence   int64      `json:"request_sequence,omitempty"`
+	AcceptedSequence  int64      `json:"accepted_sequence,omitempty"`
+	LatestSequence    int64      `json:"latest_sequence,omitempty"`
+	SessionGeneration int64      `json:"session_generation,omitempty"`
 }
 
 var portalIdentifier = regexp.MustCompile(`^[A-Za-z0-9_-]{1,100}$`)
@@ -96,13 +101,23 @@ func oneOf(value string, choices ...string) bool {
 }
 
 func (r PortalReport) valid() bool {
-	return oneOf(r.Event, "portal.state_stale", "portal.render_failed") && portalBuild.MatchString(r.Build) &&
-		oneOf(r.Component, "settings", "shell", "login") &&
-		oneOf(r.Cause, "request_failed", "request_timeout", "service_unavailable", "session_expired", "build_mismatch", "render_exception", "stale_data") &&
+	common := portalBuild.MatchString(r.Build) &&
 		(r.RequestID == "" || portalIdentifier.MatchString(r.RequestID)) && portalIdentifier.MatchString(r.OperationID) &&
 		oneOf(r.Expected, "fresh", "rendered", "authenticated") && oneOf(r.Observed, "stale", "failed", "unauthenticated") &&
 		r.DurationMS >= 0 && r.DurationMS <= 86400000 && r.Attempt >= 1 && r.Attempt <= 1000000 && r.OmittedReports >= 0 && r.OmittedReports <= 1000000
+	if r.Event == "portal.worker_state_stale" {
+		return common && r.Component == "workers" && r.Expected == "fresh" && r.Observed == "stale" &&
+			oneOf(r.Cause, "request_failed", "request_timeout", "service_unavailable", "stale_data", "obsolete_response") &&
+			(r.WorkerID == "" || portalWorkerID.MatchString(r.WorkerID)) && r.RequestSequence >= 1 && r.RequestSequence <= 9007199254740991 &&
+			r.AcceptedSequence >= 0 && r.AcceptedSequence <= 9007199254740991 && r.SessionGeneration >= 0 && r.SessionGeneration <= 9007199254740991 &&
+			r.LatestSequence >= r.RequestSequence && r.LatestSequence >= r.AcceptedSequence && r.LatestSequence <= 9007199254740991
+	}
+	return common && oneOf(r.Event, "portal.state_stale", "portal.render_failed") && oneOf(r.Component, "settings", "shell", "login") &&
+		oneOf(r.Cause, "request_failed", "request_timeout", "service_unavailable", "session_expired", "build_mismatch", "render_exception", "stale_data") &&
+		r.WorkerID == "" && r.RequestSequence == 0 && r.AcceptedSequence == 0 && r.LatestSequence == 0 && r.SessionGeneration == 0
 }
+
+var portalWorkerID = regexp.MustCompile(`^[a-f0-9]{32}$`)
 
 func (p *Portal) Report(logger *slog.Logger, credential string, input PortalReport) error {
 	if !input.valid() {
@@ -128,6 +143,9 @@ func (p *Portal) Report(logger *slog.Logger, credential string, input PortalRepo
 		"cause", input.Cause, "related_request_id", input.RequestID, "operation_id", input.OperationID, "expected_state", input.Expected,
 		"observed_state", input.Observed, "last_good_at", input.LastGoodAt, "duration_ms", input.DurationMS, "attempt", input.Attempt,
 		"omitted_reports", input.OmittedReports, "outcome", "reported"}
+	if input.Event == "portal.worker_state_stale" {
+		fields = append(fields, "worker_id", input.WorkerID, "request_sequence", input.RequestSequence, "accepted_sequence", input.AcceptedSequence, "latest_sequence", input.LatestSequence, "session_generation", input.SessionGeneration)
+	}
 	logger.Debug("portal.browser_report", "client_report", true, "report", input, "portal_session_id", record.ID)
 	if input.Event == "portal.render_failed" {
 		logger.Error(input.Event, fields...)
