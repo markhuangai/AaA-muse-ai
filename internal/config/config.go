@@ -24,6 +24,7 @@ type Secret string
 func (Secret) String() string               { return "[REDACTED]" }
 func (Secret) LogValue() slog.Value         { return slog.StringValue("[REDACTED]") }
 func (Secret) MarshalJSON() ([]byte, error) { return json.Marshal("[REDACTED]") }
+func (Secret) MarshalYAML() (any, error)    { return "[REDACTED]", nil }
 
 type Config struct {
 	Server struct {

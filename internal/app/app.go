@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net"
 	"net/http"
@@ -38,13 +39,14 @@ type Dependencies struct {
 	Sleep          func(context.Context, time.Duration) error
 	Wait           func(context.Context, time.Duration) error
 	Files          diagnostics.Files
+	PortalAssets   fs.FS
 	OpenDB         func(context.Context, string) (Repository, error)
 	Listen         func(string, string) (net.Listener, error)
 	Stdout, Stderr io.Writer
 }
 
 func Production(stdout, stderr io.Writer) Dependencies {
-	return Dependencies{ReadFile: os.ReadFile, LookupEnv: os.LookupEnv, Random: rand.Reader, Now: time.Now, Sleep: sleep, Wait: sleep, Files: diagnostics.OSFiles{}, OpenDB: func(ctx context.Context, u string) (Repository, error) {
+	return Dependencies{ReadFile: os.ReadFile, LookupEnv: os.LookupEnv, Random: rand.Reader, Now: time.Now, Sleep: sleep, Wait: sleep, Files: diagnostics.OSFiles{}, PortalAssets: os.DirFS("/usr/share/aaa-muse-ai/portal"), OpenDB: func(ctx context.Context, u string) (Repository, error) {
 		repo, err := postgres.Open(ctx, u)
 		if err != nil {
 			return nil, err
@@ -152,6 +154,9 @@ func Run(ctx context.Context, args []string, build service.Build, d Dependencies
 	serveCtx, cancelServe := context.WithCancel(ctx)
 	defer cancelServe()
 	handler := &httpapi.Handler{Service: svc, Workers: service.NewWorkers(repo, authority, d.Random, d.Now), Broker: broker, Authority: authority, Exporter: store, Logger: logger, Random: d.Random, Now: d.Now, Failed: failed}
+	handler.Portal = service.NewPortal(authority, d.Random, d.Now)
+	handler.Assets = d.PortalAssets
+	startup.Info("portal.configured", "effective_settings", service.PortalSettings(), "session_scope", "process_memory", "browser_storage", "none")
 	handler.Setup = service.NewSetup(handler.Workers, c.Server.PublicURL, c.WorkerPackage)
 	server := &http.Server{Handler: handler, BaseContext: func(net.Listener) context.Context { return serveCtx }, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 * 1024, ErrorLog: slog.NewLogLogger(logger.Handler(), slog.LevelError)}
 	brokerDone := make(chan struct{})

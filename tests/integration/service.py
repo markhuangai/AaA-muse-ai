@@ -111,14 +111,14 @@ class Harness:
                 "client-keys": {"fixture-client": self.client},
                 "diagnostics": {"level": "info", "directory": "/var/lib/aaa-muse-ai/diagnostics"}}
 
-    def launch(self, config=None, raw=None, diagnostic_volume=None, expect_startup=True):
+    def launch(self, config=None, raw=None, diagnostic_volume=None, expect_startup=True, port_binding="127.0.0.1::8080"):
         index = len(self.resources["containers"])
         path = self.private("config-" + str(index) + ".yaml", raw if raw is not None else json.dumps(config or self.configuration()))
         # The bind source is inside a private directory; the container needs read access to its mounted file.
         path.chmod(0o644)
         volume = diagnostic_volume or self.volume("diagnostics-" + str(index))
         identity = self.remember("containers", self.docker("run", "-d", "--label", LABEL + "=" + self.owner,
-                                  "--network", self.network, "-p", "127.0.0.1::8080",
+                                  "--network", self.network, "-p", port_binding,
                                   "--mount", "type=bind,source=" + str(path) + ",target=/etc/aaa-muse-ai/config.yaml,readonly",
                                   "-v", volume + ":/var/lib/aaa-muse-ai/diagnostics", self.args.image).stdout.strip())
         return identity, self.origin(identity) if expect_startup else None, volume

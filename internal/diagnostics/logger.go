@@ -19,7 +19,7 @@ import (
 
 type Redactor struct{ secrets []string }
 
-var workerSecrets = regexp.MustCompile(`muse_(?:enroll|worker)_[A-Za-z0-9_-]{43}`)
+var workerSecrets = regexp.MustCompile(`muse_(?:enroll|worker|portal)_[A-Za-z0-9_-]{43}`)
 
 func RedactWorkerSecrets(value string) string {
 	return (&Redactor{}).text(value)
@@ -37,6 +37,7 @@ func NewRedactor(secrets []string) *Redactor {
 	sort.Slice(values, func(i, j int) bool { return len(values[i]) > len(values[j]) })
 	return &Redactor{secrets: values}
 }
+func (r *Redactor) Text(value string) string { return r.text(value) }
 func (r *Redactor) text(value string) string {
 	var spans [][]int
 	for offset := 0; offset < len(value); {

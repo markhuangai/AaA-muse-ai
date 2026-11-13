@@ -17,6 +17,8 @@ test('unit commands preserve component boundaries and require real helper tests'
   assert.throws(() => unitCommand('unknown', f.inspect(), f.root), /unknown_component/);
   assert(safeLog('Bearer abc ' + 'muse_worker_' + 'a'.repeat(43) + ' secret-value', { API_SECRET: 'secret-value', EMPTY_KEY: '' }).includes('[REDACTED]'));
   assert(!safeLog('Bearer abc secret-value', { API_SECRET: 'secret-value' }).includes('secret-value'));
+  const browserSession = 'muse_portal_' + 'b'.repeat(43);
+  assert.equal(safeLog(JSON.stringify({ session_token: browserSession }), {}), '{"session_token":"[REDACTED]"}');
 });
 
 test('runner executes real coverage rules, binds actual evidence and publishes only safe allowlisted files', t => {

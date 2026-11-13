@@ -22,7 +22,7 @@ func authConfig() config.Config {
 func TestCredentialRoles(t *testing.T) {
 	c := authConfig()
 	a := New(c)
-	for header, want := range map[string]string{"": "unauthenticated", "Basic admin-fixture": "unauthenticated", "Bearer ": "unauthenticated", "Bearer wrong": "unauthenticated", "Bearer admin-fixture extra": "unauthenticated", "Bearer admin-fixture": "management", "Bearer portal-fixture": "portal", "Bearer client-fixture": "client"} {
+	for header, want := range map[string]string{"": "unauthenticated", "Basic admin-fixture": "unauthenticated", "Bearer ": "unauthenticated", "Bearer wrong": "unauthenticated", "Bearer admin-fixture extra": "unauthenticated", "Bearer admin-fixture": "management", "Bearer portal-fixture": "unauthenticated", "Bearer client-fixture": "client"} {
 		if got := a.Role(header); got != want {
 			t.Fatalf("expected role %s, got %s", want, got)
 		}
@@ -64,7 +64,7 @@ func TestCredentialComparisonRequiresExactValue(t *testing.T) {
 	c.ClientKeys = map[string]config.Secret{"first": "client", "second": "another-client-key"}
 	a := New(c)
 	for value, role := range map[string]string{
-		string(c.Management.Key): "management", string(c.Portal.Password): "portal",
+		string(c.Management.Key): "management", string(c.Portal.Password): "unauthenticated",
 		"client": "client", "another-client-key": "client",
 	} {
 		if a.Role("Bearer "+value) != role {
@@ -75,5 +75,25 @@ func TestCredentialComparisonRequiresExactValue(t *testing.T) {
 				t.Fatal("accepted a partial or changed credential")
 			}
 		}
+	}
+}
+
+func TestPortalPasswordIsLoginOnlyAndExact(t *testing.T) {
+	c := authConfig()
+	a := New(c)
+	if !a.PortalPassword(string(c.Portal.Password)) || a.Role("Bearer "+string(c.Portal.Password)) != "unauthenticated" {
+		t.Fatal("portal password crossed the bearer boundary")
+	}
+	for _, value := range []string{"", "portal", "portal-fixture-extra", string(c.Management.Key), string(c.ClientKeys["local"])} {
+		if a.PortalPassword(value) {
+			t.Fatal("non-password credential authenticated portal login")
+		}
+	}
+	c.Portal.Password = ""
+	if New(c).PortalPassword("") {
+		t.Fatal("empty portal password was enabled")
+	}
+	if !a.Reserved("portal-fixture") || !a.Reserved("admin-fixture") || !a.Reserved("client-fixture") || a.Reserved("unreserved") {
+		t.Fatal("credential collision reservation changed")
 	}
 }

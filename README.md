@@ -8,7 +8,7 @@ One-account testing demonstrated background wake, authenticated replies, six bas
 
 **Full qualification remains inconclusive:** interleaving failed in both runs, and the exact supported-refresh scope and formal recovery case remain incomplete. Full history is the baseline; the tested delta candidate is rejected. A passing live receipt still gates release work. Detailed [findings and receipts are in #7](https://github.com/markhuangai/AaA-muse-ai/issues/7#issuecomment-6784686856), with [reconnection](https://github.com/markhuangai/AaA-muse-ai/issues/7#issuecomment-6785064072) and [weather-demo](https://github.com/markhuangai/AaA-muse-ai/issues/7#issuecomment-6785270949) updates.
 
-The experiment API and worker exist. The [native request API](docs/history-api.md) adds named-client canonical conversations, one decision per request, and management timelines. The [OpenAI Chat Completions subset](docs/history-api.md#openai-chat-completions) and [Responses subset](docs/history-api.md#openai-responses) provide text and client function tools with JSON or buffered SSE responses. Responses adds typed items and linear owned response continuation. The management portal remains planned. Decisions and evidence are recorded in this repository and GitHub; project memory may supplement them.
+The experiment API and worker exist. The [native request API](docs/history-api.md) adds named-client canonical conversations, one decision per request, and management timelines. The [OpenAI Chat Completions subset](docs/history-api.md#openai-chat-completions) and [Responses subset](docs/history-api.md#openai-responses) provide text and client function tools with JSON or buffered SSE responses. Responses adds typed items and linear owned response continuation. The [control portal](docs/portal.md) adds password login and read-only service settings in the same image and origin. Decisions and evidence are recorded in this repository and GitHub; project memory may supplement them.
 
 The November 11, 2026 CI decision accepts the completed PoC investigation as the prerequisite for engineering gates in [#20](https://github.com/markhuangai/AaA-muse-ai/issues/20), while retaining the inconclusive qualification result. [Contributor checks](AGENTS.md#contributor-ci-checks) cover independent unit coverage, source-file limits, workflow budgets, and packaged integrations.
 
@@ -28,6 +28,10 @@ The November 13 [#14 approval](https://github.com/markhuangai/AaA-muse-ai/issues
 
 Responses validation passed at `2026-11-13T04:24:26Z` (54 receipts after refreshing the restart fixture). Earlier runs passed Chat (34 receipts) and the native inference, history, routing and broker-recovery regressions. Both protocol runners use OpenAI JS SDK 7.53.0. The local Docker port-forwarding path timed out during TCP connection setup; the passing runs used the existing direct-container-network harness option. Each suite verified removal of its three containers, three volumes and network. Hosted CI retains its normal transport and separate safe protocol receipts; these controlled results do not qualify live Muse.
 
+The November 13 [#15 approval](https://github.com/markhuangai/AaA-muse-ai/issues/15), based on `e2fb302c7846db8e8c424f33b8a7d00c2d22523b`, permits portal engineering and controlled browser/API/image validation before further live qualification. Portal sessions are limited to the service process, expire after thirty minutes without renewal, and are never persisted by the browser. This exception preserves the inconclusive live verdict and passing-live release gate; it grants no live trial, deployment, publication or merge. Codex, the configured AI reviewer, CI and CodeQL are required; CodeRabbit is excluded for this delivery. Controlled receipts do not qualify Muse inference.
+
+Controlled portal validation passed at `2026-11-13T13:58:01Z`: 24 receipts and nine login/settings/error screenshots at 1440, 768 and 390 pixels. The approved-base working-source digest was `346fe74085c332ff6793adc671877782256c22eb2defd1d7cc5ffbc3daddc5f8`; the tested combined image was `sha256:117224eaee903055849a13a4206771c02e293035fbb07ff1430c29aafef572e7`. Authentication boundaries, redaction, process-local invalidation and log-only diagnosis passed. The suite verified removal of its three containers, three volumes and network. See [validation limits and corrected failures](docs/portal.md#controlled-validation); hosted final-head review remains a separate delivery gate.
+
 ## Run the service
 
 Requires Docker and Docker Compose. Copy the [example configuration](config.example.yaml):
@@ -46,7 +50,7 @@ MUSE_DATABASE_URL=postgres://aaa_muse:<URL-encoded-database-password>@database:5
 MUSE_PORTAL_PASSWORD=<distinct-portal-password>
 ```
 
-The database passwords must match; URL-encode the one in `MUSE_DATABASE_URL`. The portal password is required configuration even though its UI is not implemented. Configure the worker package pin in `config.yaml`; this is the tested prerelease:
+The database passwords must match; URL-encode the one in `MUSE_DATABASE_URL`. Use the distinct portal password to sign in at your public origin. Configure the worker package pin in `config.yaml`; this is the tested prerelease:
 
 ```yaml
 worker-package:
@@ -74,7 +78,7 @@ Management can revoke a registration through `POST /api/v1/admin/workers/{id}/re
 
 ## One-message Muse setup
 
-`POST /api/v1/admin/setup-prompts` already generates the complete installation message: configured origin, pinned worker release, setup ID and a fresh enrollment code. A future portal can reuse this generator and offer the whole message to copy; no portal is implemented yet.
+`POST /api/v1/admin/setup-prompts` generates the complete installation message: configured origin, pinned worker release, setup ID and a fresh enrollment code. The current portal shows read-only settings; setup-prompt and worker-management controls remain planned.
 
 Set `ORIGIN` to your HTTPS service origin and `ADMIN_HEADER_FILE` to the protected header file. Generate a prompt into a private file:
 
@@ -160,6 +164,7 @@ Recovery starts only a provably absent subscriber using retained state. The subs
 ## Reference
 
 - [Worker CLI, state, permissions and diagnostics](worker/README.md)
+- [Portal sessions, settings and diagnostics](docs/portal.md)
 - [Qualification procedure](docs/qualification/README.md)
 - [Contributor instructions](AGENTS.md)
 

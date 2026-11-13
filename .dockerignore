@@ -7,3 +7,5 @@ config.yaml
 **/node_modules
 **/*_test.go
 tests
+portal/dist
+portal/test
