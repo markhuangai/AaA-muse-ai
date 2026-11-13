@@ -12,7 +12,7 @@ import (
 
 func safeHistoryConflict(fields map[string]any) map[string]any {
 	safe := map[string]any{}
-	for _, key := range []string{"position", "expected_count", "observed_count", "expected_call_id", "observed_call_id", "expected_session_id", "observed_session_id", "expected_worker_id", "observed_worker_id", "conversation_id", "current_request_id", "expected_state", "observed_state", "expected_generation", "observed_generation", "expected_connection_id", "observed_connection_id", "expected_connection_generation", "observed_connection_generation", "expected_context_receipt", "observed_context_receipt", "transaction_outcome", "active_experiments", "max_jobs", "context_bytes", "max_context_bytes"} {
+	for _, key := range []string{"position", "expected_count", "observed_count", "expected_call_id", "observed_call_id", "expected_session_id", "observed_session_id", "expected_worker_id", "observed_worker_id", "conversation_id", "current_request_id", "expected_state", "observed_state", "expected_generation", "observed_generation", "expected_connection_id", "observed_connection_id", "expected_connection_generation", "observed_connection_generation", "expected_context_receipt", "observed_context_receipt", "transaction_outcome", "active_experiments", "max_jobs", "context_bytes", "max_context_bytes", "observed_response_id", "requested_item_id", "item_id"} {
 		if value, ok := fields[key]; ok {
 			safe[key] = value
 		}
@@ -21,6 +21,10 @@ func safeHistoryConflict(fields map[string]any) map[string]any {
 }
 
 func (b *Broker) SubmitRequest(ctx context.Context, logger *slog.Logger, client, session string, input inference.RequestInput) (inference.RequestView, error) {
+	return b.submitRequest(ctx, logger, client, session, input, nil)
+}
+
+func (b *Broker) submitRequest(ctx context.Context, logger *slog.Logger, client, session string, input inference.RequestInput, response *inference.ResponseMetadata) (inference.RequestView, error) {
 	var view inference.RequestView
 	if client == "" {
 		return view, inference.Reject("model_client_required", 401)
@@ -43,15 +47,24 @@ func (b *Broker) SubmitRequest(ctx context.Context, logger *slog.Logger, client,
 	}
 	replayInput := input
 	replayInput.SubmissionID, replayInput.PreviousResponseID = "", ""
-	replay, err := inference.Hash(replayInput)
+	var replayValue any = replayInput
+	if response != nil {
+		replayValue = struct {
+			Input    inference.RequestInput
+			Response *inference.ResponseMetadata
+		}{replayInput, response}
+	}
+	replay, err := inference.Hash(replayValue)
 	if err != nil {
 		return view, err
 	}
 	ref := inference.Ref{WorkerID: input.WorkerID, ClientID: client, SessionID: session, ResponseID: input.PreviousResponseID, ReplayHash: replay, HistoryInputCount: len(input.Messages), Principal: "client:" + client, SubmissionID: input.SubmissionID, Admission: true, Full: true, Routing: true}
+	ref.Responses = response != nil
 	data, err := b.run(ctx, logger, ref, "request_create", struct {
-		Session string                 `json:"session_id"`
-		Input   inference.RequestInput `json:"input"`
-	}{session, input}, func(s *inference.State, events *[]inferenceEvent) (any, error) {
+		Session  string                      `json:"session_id"`
+		Input    inference.RequestInput      `json:"input"`
+		Response *inference.ResponseMetadata `json:"response_metadata,omitempty"`
+	}{session, input, response}, func(s *inference.State, events *[]inferenceEvent) (any, error) {
 		c := s.Conversations[s.HistoryConversationID]
 		if c != nil {
 			for _, r := range s.Requests {
@@ -67,6 +80,13 @@ func (b *Broker) SubmitRequest(ctx context.Context, logger *slog.Logger, client,
 			}
 			if r := s.Requests[c.CurrentRequestID]; r != nil && (r.State == "queued" || r.State == "inference") {
 				return nil, inference.Reject("session_busy", 409, "conversation_id", c.ID, "current_request_id", r.ID, "observed_state", r.State)
+			}
+		}
+		if response != nil {
+			var err error
+			input.Messages, err = responseHistory(c, s.Requests, input.Messages, response)
+			if err != nil {
+				return nil, err
 			}
 		}
 		matched := 0
@@ -95,7 +115,7 @@ func (b *Broker) SubmitRequest(ctx context.Context, logger *slog.Logger, client,
 		if err != nil {
 			return nil, err
 		}
-		response, err := auth.ID(b.random)
+		responseID, err := auth.ID(b.random)
 		if err != nil {
 			return nil, err
 		}
@@ -119,7 +139,7 @@ func (b *Broker) SubmitRequest(ctx context.Context, logger *slog.Logger, client,
 		if s.Requests == nil {
 			s.Requests = map[string]*inference.Request{}
 		}
-		r := &inference.Request{ID: id, ConversationID: c.ID, ClientID: client, SessionID: c.SessionID, WorkerID: c.WorkerID, ResponseID: "resp_" + response, CreatedAt: s.Now, State: "queued", ReassignAllowed: movable, ReplayHash: replay, Input: input, RequestedSession: ref.SessionID, InputCount: len(input.Messages), CanonicalEnd: len(input.Messages)}
+		r := &inference.Request{ID: id, ConversationID: c.ID, ClientID: client, SessionID: c.SessionID, WorkerID: c.WorkerID, ResponseID: "resp_" + responseID, CreatedAt: s.Now, State: "queued", ReassignAllowed: movable, ReplayHash: replay, Input: input, RequestedSession: ref.SessionID, InputCount: len(input.Messages), CanonicalEnd: len(input.Messages), Response: response}
 		s.Requests[id] = r
 		for _, item := range input.Messages[matched:] {
 			if err = b.appendHistory(s, c, r.ID, "client_provided", item); err != nil {
@@ -127,7 +147,10 @@ func (b *Broker) SubmitRequest(ctx context.Context, logger *slog.Logger, client,
 			}
 		}
 		c.CurrentRequestID, c.PendingCallID = id, ""
-		e := &inference.Experiment{ID: id, ConversationID: c.ID, WorkerID: c.WorkerID, State: "queued", CreatedAt: s.Now, DeadlineAt: s.Now.Add(time.Duration(input.TimeoutSeconds) * time.Second), Messages: inference.Messages(c, c.ItemCount), Tools: input.Tools, RemoteOutcome: "not_started"}
+		e := &inference.Experiment{ID: id, ConversationID: c.ID, WorkerID: c.WorkerID, State: "queued", CreatedAt: s.Now, DeadlineAt: s.Now.Add(time.Duration(input.TimeoutSeconds) * time.Second), Messages: inference.RequestMessages(c, r), Tools: input.Tools, RemoteOutcome: "not_started"}
+		if err = inference.CheckContext(e.Messages, e.Tools); err != nil {
+			return nil, err
+		}
 		s.Experiments[id] = e
 
 		if err = addTimeline(c, s.Now, id, "history.tools", "INFO", map[string]any{"tools": input.Tools}); err != nil {

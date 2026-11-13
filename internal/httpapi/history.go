@@ -147,7 +147,9 @@ func (h *Handler) historyRequest(w *response, r *http.Request, logger *slog.Logg
 			return
 		}
 	}
-	writeJSON(w, code, result)
+	clientView := result
+	clientView.Response = nil
+	writeJSON(w, code, clientView)
 	if result.Output != nil {
 		cleanup, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 5*time.Second)
 		defer cancel()

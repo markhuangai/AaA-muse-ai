@@ -169,9 +169,11 @@ export async function runConformance({ baseURL, key, fixturePath, read = readFil
 export async function main(args = process.argv.slice(2), env = process.env) {
   try {
     const options = {};
-    require(args.length === 6, 'runner_arguments_required');
-    for (let i = 0; i < args.length; i += 2) { require(['--base-url', '--fixture', '--receipt'].includes(args[i]) && !options[args[i]] && args[i + 1], 'invalid_runner_arguments'); options[args[i]] = args[i + 1]; }
-    const result = await runConformance({ baseURL: options['--base-url'], key: env.MUSE_CHAT_CLIENT_KEY, fixturePath: options['--fixture'], emit: receipt => process.stdout.write(JSON.stringify(receipt) + '\n') });
+    require(args.length === 6 || args.length === 8, 'runner_arguments_required');
+    for (let i = 0; i < args.length; i += 2) { require(['--base-url', '--fixture', '--receipt', '--protocol'].includes(args[i]) && !options[args[i]] && args[i + 1], 'invalid_runner_arguments'); options[args[i]] = args[i + 1]; }
+    require(['--base-url', '--fixture', '--receipt'].every(key => options[key]) && ['chat', 'responses'].includes(options['--protocol'] ?? 'chat'), 'invalid_runner_arguments');
+    const run = options['--protocol'] === 'responses' ? (await import('./responses-conformance.mjs')).runResponseConformance : runConformance;
+    const result = await run({ baseURL: options['--base-url'], key: env.MUSE_CHAT_CLIENT_KEY, fixturePath: options['--fixture'], emit: receipt => process.stdout.write(JSON.stringify(receipt) + '\n') });
     await writeFile(options['--receipt'], JSON.stringify(result, null, 2) + '\n', { mode: 0o600 });
     return 0;
   } catch (error) {
@@ -180,4 +182,4 @@ export async function main(args = process.argv.slice(2), env = process.env) {
   }
 }
 
-if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1])) process.exitCode = await main();
+if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1])) main().then(code => { process.exitCode = code; });

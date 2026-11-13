@@ -50,7 +50,7 @@ func (m *inferenceMemory) withinRouting(ref inference.Ref, apply func(*inference
 	}
 	for id, r := range s.Requests {
 		if e := s.Experiments[id]; e != nil {
-			e.Messages = inference.Messages(s.Conversations[r.ConversationID], r.CanonicalEnd)
+			e.Messages = inference.RequestMessages(s.Conversations[r.ConversationID], r)
 		}
 	}
 	if err = apply(s); err != nil {

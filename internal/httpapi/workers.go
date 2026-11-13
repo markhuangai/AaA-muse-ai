@@ -21,7 +21,7 @@ var workerIDPattern = regexp.MustCompile(`^[0-9a-f]{32}$`)
 
 func routeFor(path string) (string, string) {
 	switch path {
-	case "/v1/models", "/v1/chat/completions", "/healthz", "/readyz", "/api/v1/admin/status", "/api/v1/admin/diagnostics/export", "/api/v1/admin/enrollments", "/api/v1/admin/setup-prompts", "/api/v1/worker/enroll", "/api/v1/admin/workers", "/api/v1/worker/status":
+	case "/v1/models", "/v1/chat/completions", "/v1/responses", "/healthz", "/readyz", "/api/v1/admin/status", "/api/v1/admin/diagnostics/export", "/api/v1/admin/enrollments", "/api/v1/admin/setup-prompts", "/api/v1/worker/enroll", "/api/v1/admin/workers", "/api/v1/worker/status":
 		return path, ""
 	}
 	if strings.HasPrefix(path, "/api/v1/admin/workers/") {
@@ -46,7 +46,7 @@ func routeFor(path string) (string, string) {
 
 func routeMethod(route string) string {
 	switch route {
-	case "/v1/chat/completions", "/api/v1/admin/workers/{id}/qualifications", "/api/v1/admin/enrollments", "/api/v1/admin/setup-prompts", "/api/v1/worker/enroll", "/api/v1/admin/workers/{id}/revoke":
+	case "/v1/chat/completions", "/v1/responses", "/api/v1/admin/workers/{id}/qualifications", "/api/v1/admin/enrollments", "/api/v1/admin/setup-prompts", "/api/v1/worker/enroll", "/api/v1/admin/workers/{id}/revoke":
 		return http.MethodPost
 	case "/api/v1/admin/workers/{id}":
 		return http.MethodPatch

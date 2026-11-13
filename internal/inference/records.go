@@ -196,9 +196,11 @@ type Ref struct {
 	EvidenceIDs                              []string
 	Correlation                              map[string]any
 	ClientID, SessionID, ResponseID          string
+	ReferenceRequestID                       string
 	ConversationID, ReplayHash               string
 	CountPendingTools                        bool
 	HistoryInputCount                        int
+	Responses                                bool
 }
 
 type State struct {

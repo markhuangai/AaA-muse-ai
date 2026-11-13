@@ -87,7 +87,7 @@ class Chat(History):
     def chat_body(self, text, stream=False, **fields):
         return {"model": "muse-pool-text", "messages": [{"role": "user", "content": text}], "stream": stream, **fields}
 
-    def chat(self, body, session=None, key=None, origin=None, raw=None, timeout=45):
+    def chat(self, body, session=None, key=None, origin=None, raw=None, timeout=45, path="/v1/chat/completions"):
         target = urllib.parse.urlsplit(origin or self.origin_url)
         connection = http.client.HTTPConnection(target.hostname, target.port, timeout=timeout)
         headers = {"Content-Type": "application/json", "Authorization": "Bearer " + (self.client if key is None else key)}
@@ -95,7 +95,7 @@ class Chat(History):
             headers["X-Muse-Session-Id"] = session
         data = raw if raw is not None else json.dumps(body).encode()
         try:
-            connection.request("POST", "/v1/chat/completions", data, headers)
+            connection.request("POST", path, data, headers)
             response = connection.getresponse()
             return response.status, response.headers, response.read()
         finally:

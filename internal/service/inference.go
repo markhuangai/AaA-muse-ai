@@ -198,6 +198,9 @@ func (b *Broker) run(ctx context.Context, logger *slog.Logger, ref inference.Ref
 	if ref.ClientID != "" {
 		logger = logger.With("client_id", ref.ClientID, "requested_session_id", ref.SessionID)
 	}
+	if ref.Responses {
+		logger = logger.With("requested_response_id", ref.ResponseID)
+	}
 	hash, err := inference.Hash(struct {
 		Operation, Experiment, Job string
 		Input                      any
@@ -350,6 +353,14 @@ func (b *Broker) run(ctx context.Context, logger *slog.Logger, ref inference.Ref
 			if rejection.Reason == "history_owner_denied" {
 				name = "history.owner_denied"
 			}
+			if ref.Responses {
+				switch rejection.Reason {
+				case "history_owner_denied", "session_reference_conflict", "response_not_completed", "stale_response_reference", "response_item_not_owned":
+					name = "responses.reference_rejected"
+				case "response_item_conflict", "history_prefix_conflict", "history_shortened_or_no_new_input", "tool_result_linkage_conflict", "invalid_tool_linkage", "session_busy":
+					name = "responses.item_conflict"
+				}
+			}
 			if operation == "decision" && rejection.Code == 400 {
 				name = "decision.rejected"
 			}
@@ -357,7 +368,7 @@ func (b *Broker) run(ctx context.Context, logger *slog.Logger, ref inference.Ref
 				name = "lease.fenced"
 			}
 			evidence := rejection.Fields
-			if name == "history.conflict" || (observed != nil && observed["client_id"] != nil && name != "history.owner_denied") {
+			if ref.Responses || name == "history.conflict" || (observed != nil && observed["client_id"] != nil && name != "history.owner_denied") {
 				logger.Debug("history.conflict_detail", "reason", rejection.Reason, "evidence", evidence, "observed", observed)
 				evidence = safeHistoryConflict(evidence)
 			}
