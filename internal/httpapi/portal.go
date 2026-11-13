@@ -12,6 +12,21 @@ import (
 	"github.com/markhuangai/AaA-muse-ai/internal/service"
 )
 
+func portalWorkerAction(route string) (string, string) {
+	switch route {
+	case "/api/v1/admin/enrollments":
+		return "enrollment.issue", "enrollment"
+	case "/api/v1/admin/setup-prompts":
+		return "setup.create", "enrollment"
+	case "/api/v1/admin/workers/{id}":
+		return "worker.rename", "worker"
+	case "/api/v1/admin/workers/{id}/revoke":
+		return "worker.revoke", "worker"
+	default:
+		return "", ""
+	}
+}
+
 func portalError(w http.ResponseWriter, err error) {
 	code, reason := 503, "service_unavailable"
 	var rejected *service.PortalError

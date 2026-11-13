@@ -1,5 +1,6 @@
 import { APIError, BUILD, schedule, type API, type BrowserReport, type Schedule, type Settings } from './api';
 import { Reports } from './reports';
+import { WorkersController } from './worker-controller';
 
 export interface System {
   now(): number;
@@ -14,6 +15,7 @@ export const browserSystem: System = {
   watchVisibility: callback => { document.addEventListener('visibilitychange', callback); return () => document.removeEventListener('visibilitychange', callback); },
 };
 export interface View {
+  page: 'settings' | 'workers';
   phase: 'login' | 'signing_in' | 'authenticated';
   settings: Settings | null;
   loading: boolean;
@@ -24,7 +26,7 @@ export interface View {
   requestID: string;
   operationID: string;
 }
-const initial = (): View => ({ phase: 'login', settings: null, loading: false, stale: false, lastGood: null, expiresAt: null, message: '', requestID: '', operationID: '' });
+const initial = (page: View['page'] = 'settings'): View => ({ page, phase: 'login', settings: null, loading: false, stale: false, lastGood: null, expiresAt: null, message: '', requestID: '', operationID: '' });
 
 export class PortalController {
   #view = initial();
@@ -38,7 +40,15 @@ export class PortalController {
   #refreshing = false;
   #attempt = 0;
   readonly reports: Reports;
-  constructor(private api: API, private system: System = browserSystem) { this.reports = new Reports(api); }
+  readonly workers: WorkersController;
+  constructor(private api: API, private system: System = browserSystem) {
+    this.reports = new Reports(api);
+    this.workers = new WorkersController(api, system, this.reports, () => {
+      if (this.#view.phase !== 'authenticated') return false;
+      if (this.#view.expiresAt !== null && system.now() >= this.#view.expiresAt) { this.expire(); return false; }
+      return true;
+    }, () => this.expire());
+  }
   snapshot = () => this.#view;
   subscribe = (listener: () => void) => { this.#listeners.add(listener); return () => { this.#listeners.delete(listener); }; };
   private change(patch: Partial<View>) { this.#view = { ...this.#view, ...patch }; for (const listener of this.#listeners) listener(); }
@@ -49,6 +59,7 @@ export class PortalController {
     this.#expiry(); this.#refreshTimer(); this.#freshnessTimer(); this.#visibility();
     this.#refreshing = false;
     this.reports.clear();
+    this.workers.reset();
   }
   dispose() { this.cancel(); this.api.setSession(null); this.#listeners.clear(); }
 
@@ -57,7 +68,7 @@ export class PortalController {
     this.api.setSession(null);
     const generation = this.#generation;
     const operation = this.system.id();
-    this.#view = initial();
+    this.#view = initial(this.#view.page);
     this.change({ phase: 'signing_in', operationID: operation });
     try {
       const session = await this.api.login(password, operation, this.#abort.signal);
@@ -69,6 +80,7 @@ export class PortalController {
       this.#expiry = this.system.schedule(() => this.expire(), expiresAt - this.system.now());
       this.#visibility = this.system.watchVisibility(() => { if (this.system.visible()) void this.refresh(); });
       this.tick();
+      if (this.#view.page === 'workers') this.workers.activate();
       await this.refresh();
     } catch (error) {
       if (generation !== this.#generation) return;
@@ -81,8 +93,15 @@ export class PortalController {
   private expire() {
     this.cancel();
     this.api.setSession(null);
-    this.#view = initial();
+    this.#view = initial(this.#view.page);
     this.change({ message: 'Your session ended. Sign in again.' });
+  }
+
+  navigate(page: View['page']) {
+    if (page === this.#view.page) return;
+    this.workers.reset();
+    this.change({ page });
+    if (page === 'workers' && this.#view.phase === 'authenticated') this.workers.activate();
   }
 
   private tick() {
@@ -150,7 +169,7 @@ export class PortalController {
     const generation = this.#generation;
     const pending = this.api.logout(this.system.id(), this.#abort.signal);
     this.api.setSession(null);
-    this.#view = initial();
+    this.#view = initial(this.#view.page);
     this.change({ message: 'Signed out.' });
     try { await pending; }
     catch (error) {

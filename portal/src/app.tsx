@@ -1,6 +1,7 @@
 import { Component, useEffect, useState, useSyncExternalStore, type FormEvent, type ReactNode } from 'react';
 import { BUILD } from './api';
 import { PortalController, type View } from './controller';
+import { Workers } from './workers';
 
 function Mark() {
   return <span className="wordmark"><svg aria-hidden="true" viewBox="0 0 28 28"><path d="M3 22 9 6l5 12L19 6l6 16M6 15h6m4 0h6" /></svg><span>AaA <span className="wordmark-detail">Muse</span></span></span>;
@@ -15,7 +16,7 @@ export function Login({ controller, view }: { controller: PortalController; view
     void pending;
   }
   return <main className="login-page">
-    <div className="login-intro"><p className="product-purpose">Model clients. Your broker. Your control.</p><h1>Service access</h1><p>Sign in to inspect the service and its effective configuration.</p></div>
+    <div className="login-intro"><p className="product-purpose">Model clients. Your broker. Your control.</p><h1>Service access</h1><p>Sign in to manage workers and inspect service settings.</p></div>
     <section className="login-panel" aria-label="Sign in">
       <h2>Operator sign-in</h2>
       <form onSubmit={submit}>
@@ -26,7 +27,7 @@ export function Login({ controller, view }: { controller: PortalController; view
       <p className="field-note">Use the portal password from your service configuration.</p>
       {view.message && <div className="notice" role="status"><p>{view.message}</p><Correlation view={view} /></div>}
     </section>
-    <p className="login-scope">Read-only settings · Browser session expires after 30 minutes</p>
+    <p className="login-scope">Worker management and read-only settings · Session expires after 30 minutes</p>
   </main>;
 }
 
@@ -70,10 +71,18 @@ export class RenderBoundary extends Component<{ controller: PortalController; re
 export function App({ controller, reload = () => location.reload() }: { controller: PortalController; reload?: () => void }) {
   const view = useSyncExternalStore(controller.subscribe, controller.snapshot);
   useEffect(() => {
+    const route = () => controller.navigate(location.pathname === '/workers' ? 'workers' : 'settings');
+    route(); window.addEventListener('popstate', route);
+    return () => window.removeEventListener('popstate', route);
+  }, [controller]);
+  useEffect(() => {
     const report = () => controller.renderFailed();
     window.addEventListener('error', report);
     window.addEventListener('unhandledrejection', report);
     return () => { window.removeEventListener('error', report); window.removeEventListener('unhandledrejection', report); };
   }, [controller]);
-  return <><header className="site-header"><div className="header-content"><Mark /><span className="header-label">Control portal</span>{view.phase === 'authenticated' && <button className="sign-out" onClick={() => void controller.logout()}>Sign out</button>}</div></header><RenderBoundary key={view.phase === 'authenticated' ? 'session' : 'login'} controller={controller} reload={reload}>{view.phase === 'authenticated' ? <Configuration controller={controller} view={view} /> : <Login controller={controller} view={view} />}</RenderBoundary><footer className="site-footer"><span>AaA Muse · Operator console</span><span className="build-label">Portal build <code>{BUILD.slice(0, 8)}</code></span></footer></>;
+  return <><header className="site-header"><div className="header-content"><Mark /><span className="header-label">Control portal</span>{view.phase === 'authenticated' && <><nav aria-label="Portal">{(['settings', 'workers'] as const).map(page => <a key={page} href={`/${page}`} aria-current={view.page === page ? 'page' : undefined} onClick={event => {
+    if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+    event.preventDefault(); history.pushState(null, '', `/${page}`); controller.navigate(page);
+  }}>{page === 'settings' ? 'Settings' : 'Workers'}</a>)}</nav><button className="sign-out" onClick={() => void controller.logout()}>Sign out</button></>}</div></header><RenderBoundary key={view.phase === 'authenticated' ? 'session' : 'login'} controller={controller} reload={reload}>{view.phase === 'authenticated' ? view.page === 'workers' ? <Workers controller={controller.workers} /> : <Configuration controller={controller} view={view} /> : <Login controller={controller} view={view} />}</RenderBoundary><footer className="site-footer"><span>AaA Muse · Operator console</span><span className="build-label">Portal build <code>{BUILD.slice(0, 8)}</code></span></footer></>;
 }

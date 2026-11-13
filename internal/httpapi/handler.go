@@ -115,6 +115,7 @@ func (h *Handler) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 		w.captureReason = "credentials_omitted"
 	}
 	role, clientID := h.Authority.Identity(r.Header.Get("Authorization"))
+	portalSessionID := ""
 	if clientID != "" {
 		logger = logger.With("client_id", clientID)
 	}
@@ -143,6 +144,14 @@ func (h *Handler) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 		}
 		logger.Debug("request.exchange", "method", r.Method, "role", role, "status", w.code, "response", w.body.String(), "response_capture", captureKind, "outcome", outcome, "write_error", detail, "attempted_bytes", w.attempted, "written_bytes", w.written)
 		logger.Info("request.completed", "method", r.Method, "role", role, "status", w.code, "outcome", outcome, "duration_ms", h.Now().Sub(started).Milliseconds())
+		if action, resource := portalWorkerAction(route); portalSessionID != "" && action != "" {
+			resourceID := w.enrollmentID
+			if resource == "worker" {
+				resourceID = requestedWorker
+			}
+			logger.Info("portal.worker_action", "component", "workers", "action", action, "resource", resource, "resource_id", resourceID,
+				"portal_session_id", portalSessionID, "status", w.code, "outcome", outcome, "attempt", 1, "duration_ms", h.Now().Sub(started).Milliseconds())
+		}
 	}()
 	if operation := r.Header.Get("X-Portal-Operation-Id"); operation != "" {
 		if !opaqueID.MatchString(operation) {
@@ -179,6 +188,7 @@ func (h *Handler) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 				return
 			}
 			role = "portal_session"
+			portalSessionID = identity.ID
 			logger = logger.With("portal_session_id", identity.ID)
 		}
 		if role == "unauthenticated" && strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") && strings.HasPrefix(credential, auth.WorkerPrefix) && h.Workers != nil {

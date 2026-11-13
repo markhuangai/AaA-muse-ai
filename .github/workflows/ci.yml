@@ -259,6 +259,8 @@ jobs:
         run: npx --no-install playwright install --with-deps chromium
       - name: Built-image desktop, tablet, phone, authentication and log-only diagnosis
         run: make test-portal-shell
+      - name: Worker management, enrollment, activity, ordering and log-only diagnosis
+        run: make test-portal-workers
       - name: Retain only safe browser and cleanup evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
