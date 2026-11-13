@@ -51,45 +51,52 @@ type Conversation struct {
 }
 
 type Request struct {
-	ID                     string       `json:"id"`
-	ConversationID         string       `json:"conversation_id"`
-	ClientID               string       `json:"client_id"`
-	SessionID              string       `json:"session_id"`
-	WorkerID               string       `json:"worker_id"`
-	ResponseID             string       `json:"response_id"`
-	CreatedAt              time.Time    `json:"created_at"`
-	State                  string       `json:"state"`
-	Reason                 string       `json:"reason,omitempty"`
-	ReplayHash             string       `json:"replay_hash"`
-	Input                  RequestInput `json:"input"`
-	RequestedSession       string       `json:"requested_session"`
-	InputCount             int          `json:"input_count"`
-	CanonicalEnd           int          `json:"canonical_end"`
-	Output                 *Item        `json:"output,omitempty"`
-	ContextDeliveryStarted *time.Time   `json:"context_delivery_started_at,omitempty"`
-	ContextDeliveryWritten *time.Time   `json:"context_delivery_written_at,omitempty"`
-	DecisionAcceptedAt     *time.Time   `json:"decision_accepted_at,omitempty"`
-	OutputStartedAt        *time.Time   `json:"output_started_at,omitempty"`
-	OutputCompletedAt      *time.Time   `json:"output_completed_at,omitempty"`
-	ReassignAllowed        bool         `json:"reassign_allowed"`
+	ID                     string            `json:"id"`
+	ConversationID         string            `json:"conversation_id"`
+	ClientID               string            `json:"client_id"`
+	SessionID              string            `json:"session_id"`
+	WorkerID               string            `json:"worker_id"`
+	ResponseID             string            `json:"response_id"`
+	CreatedAt              time.Time         `json:"created_at"`
+	State                  string            `json:"state"`
+	Reason                 string            `json:"reason,omitempty"`
+	ReplayHash             string            `json:"replay_hash"`
+	Input                  RequestInput      `json:"input"`
+	RequestedSession       string            `json:"requested_session"`
+	InputCount             int               `json:"input_count"`
+	CanonicalEnd           int               `json:"canonical_end"`
+	Output                 *Item             `json:"output,omitempty"`
+	ContextDeliveryStarted *time.Time        `json:"context_delivery_started_at,omitempty"`
+	ContextDeliveryWritten *time.Time        `json:"context_delivery_written_at,omitempty"`
+	DecisionAcceptedAt     *time.Time        `json:"decision_accepted_at,omitempty"`
+	OutputStartedAt        *time.Time        `json:"output_started_at,omitempty"`
+	OutputCompletedAt      *time.Time        `json:"output_completed_at,omitempty"`
+	ReassignAllowed        bool              `json:"reassign_allowed"`
+	Response               *ResponseMetadata `json:"response_metadata,omitempty"`
 }
 
 type RequestView struct {
-	ID             string    `json:"id"`
-	ConversationID string    `json:"conversation_id"`
-	SessionID      string    `json:"session_id"`
-	WorkerID       string    `json:"worker_id"`
-	ResponseID     string    `json:"response_id"`
-	State          string    `json:"state"`
-	Reason         string    `json:"reason,omitempty"`
-	Output         *Item     `json:"output,omitempty"`
-	CreatedAt      time.Time `json:"created_at"`
+	ID             string            `json:"id"`
+	ConversationID string            `json:"conversation_id"`
+	SessionID      string            `json:"session_id"`
+	WorkerID       string            `json:"worker_id"`
+	ResponseID     string            `json:"response_id"`
+	State          string            `json:"state"`
+	Reason         string            `json:"reason,omitempty"`
+	Output         *Item             `json:"output,omitempty"`
+	CreatedAt      time.Time         `json:"created_at"`
+	Response       *ResponseMetadata `json:"response_metadata,omitempty"`
 }
 
 func (r *Request) View(output bool) RequestView {
 	v := RequestView{ID: r.ID, ConversationID: r.ConversationID, SessionID: r.SessionID, WorkerID: r.WorkerID, ResponseID: r.ResponseID, State: r.State, Reason: r.Reason, CreatedAt: r.CreatedAt}
 	if output {
 		v.Output = r.Output
+		if r.Response != nil && (r.Output != nil || r.State == "interrupted" || r.State == "cancelled") {
+			metadata := *r.Response
+			metadata.Input, metadata.ItemIDs = nil, nil
+			v.Response = &metadata
+		}
 	}
 	return v
 }

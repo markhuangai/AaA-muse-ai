@@ -224,12 +224,16 @@ jobs:
         run: npm ci --ignore-scripts --no-audit --no-fund
       - name: SDK, raw SSE, canonical tools, isolation and log-only diagnosis
         run: make test-chat
+      - name: Responses typed items, owned chaining, lifecycle events and diagnosis
+        run: make test-responses
       - name: Retain safe protocol and cleanup receipts
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: openai-${{ env.SOURCE_SHA }}-${{ github.run_attempt }}
-          path: .artifacts/ci/openai/receipt.json
+          path: |
+            .artifacts/ci/openai/receipt.json
+            .artifacts/ci/openai/responses-receipt.json
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 7

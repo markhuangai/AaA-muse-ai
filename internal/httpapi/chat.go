@@ -12,7 +12,9 @@ import (
 	"github.com/markhuangai/AaA-muse-ai/internal/openai"
 )
 
-func chatRoute(path string) bool { return path == "/v1/models" || path == "/v1/chat/completions" }
+func chatRoute(path string) bool {
+	return path == "/v1/models" || path == "/v1/chat/completions" || path == "/v1/responses"
+}
 
 func chatErrorValue(status int, reason, param string) any {
 	kind := "invalid_request_error"

@@ -36,6 +36,9 @@ func ownedHistory(ctx context.Context, tx pgx.Tx, ref *inference.Ref) error {
 			return inference.Reject("response_not_completed", 409)
 		}
 		ref.ConversationID = request.ConversationID
+		if ref.ResponseID != "" {
+			ref.ReferenceRequestID = request.ID
+		}
 	}
 	if ref.ConversationID != "" {
 		if err := tx.QueryRow(ctx, "SELECT data FROM aaa_conversations WHERE id=$1 AND client_id=$2", ref.ConversationID, ref.ClientID).Scan(&data); err != nil {
@@ -79,6 +82,9 @@ func loadHistory(ctx context.Context, tx pgx.Tx, ref inference.Ref, s *inference
 	ids := []string{}
 	for id := range s.Experiments {
 		ids = append(ids, id)
+	}
+	if ref.ReferenceRequestID != "" {
+		ids = append(ids, ref.ReferenceRequestID)
 	}
 	rows, err := tx.Query(ctx, `SELECT data FROM aaa_model_requests WHERE id=ANY($1::text[])
 		OR (conversation_id=$2 AND (replay_hash=$3 OR id=(SELECT data->>'current_request_id' FROM aaa_conversations WHERE id=$2)))`, ids, ref.ConversationID, ref.ReplayHash)
@@ -133,7 +139,7 @@ func loadHistory(ctx context.Context, tx pgx.Tx, ref inference.Ref, s *inference
 		}
 		for id, request := range s.Requests {
 			if e := s.Experiments[id]; e != nil {
-				e.Messages = inference.Messages(s.Conversations[request.ConversationID], request.CanonicalEnd)
+				e.Messages = inference.RequestMessages(s.Conversations[request.ConversationID], request)
 			}
 		}
 	}

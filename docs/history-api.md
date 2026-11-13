@@ -173,3 +173,60 @@ DEBUG records retain admitted Chat input, normalized input, accepted decisions a
 Collect `/api/v1/admin/diagnostics/export?request_id=HTTP_REQUEST_ID` with a protected management header file, reconstruct using `decodeExport` from `tools/qualification-evidence.mjs`, and require complete metadata and valid chunks/digests. Then export each linked `operation_id`, filtering by client, session, conversation, worker/job and generation across broker instances. Unsupported input requires correcting the named parameter; conflicts require restoring exact owned history/tool linkage; uncertain inference requires retaining its hold; a failed storage boundary requires repairing its recorded cause and reading/replaying the accepted output. No business-table query or process attachment is needed for diagnosis.
 
 `CI / openai` retains only safe source/image identity, case, SDK and cleanup summaries for seven days. Private fixture directories and model payloads are not uploaded. These integration receipts do not contribute to unit statement coverage.
+
+## OpenAI Responses
+
+Use the same `/v1` base URL, named model-client Bearer key and `muse-pool-text` alias as Chat. `POST /v1/responses` implements a text/function subset using Responses items and events. The [official function-calling guide](https://developers.openai.com/api/docs/guides/function-calling), [streaming guide](https://developers.openai.com/api/docs/guides/streaming-responses), and installed OpenAI JS SDK 7.53.0 are the protocol references inspected on November 13, 2026. This subset does not certify Codex, Claude Code, CLIProxyAPI or cc-switch.
+
+### Inputs and owned continuation
+
+| Field | Supported behavior |
+|---|---|
+| `model`, `input` | Exact alias required; input is a string or nonempty item array |
+| Message items | `type:"message"` or easy messages, roles `system`, `developer`, `user`, `assistant`; string content or ordered `input_text` parts; assistant replay also accepts `output_text` with empty annotations |
+| Function items | `function_call` with exact `call_id`, name and JSON-object arguments string; `function_call_output` with the exact call ID and string output |
+| `instructions`, `tools` | Request-scoped instructions, optional flattened function definitions (`type`, `name`, optional description, object parameters, optional `strict:false`); omitted tools mean no active definitions |
+| Controls | `stream:false` or `true`, `parallel_tool_calls:false`, `tool_choice:"auto"`; `"none"` only when tools are empty; optional owned `previous_response_id` |
+
+Top-level instructions are stored separately from canonical message items. Only the current request's instructions are prepended to its full worker context. Omitted/null instructions activate none from earlier requests; an explicit empty string remains empty. Explicit system/developer messages in input remain canonical history. Old requests keep their instruction and tool snapshots unchanged. Effective context, including active instructions and tools, must fit 1 MiB; HTTP bodies have the same bound. History is never trimmed to fit.
+
+Without a previous response reference, use `X-Muse-Session-Id` and resend the complete canonical item history with new input. Without either stable reference, each request is independent. For chaining, send an owned `previous_response_id` and new items, usually a function-call output or user message. The broker expands this into full canonical history before delivery; it does not introduce delta delivery to Muse. The service returns `X-Muse-Session-Id` and `X-Request-Id`. When the session header is also supplied it must agree with the response reference.
+
+New turns require the latest completed response of that owned session. There is no branching. Exact repeated requests are reconciled before stale-reference rejection and return their existing response and item IDs; changing JSON versus SSE does not create a new turn. Replayed server output IDs must belong to the canonical conversation and match their accepted contents. Unknown and foreign response references have the same `404` outcome. Conflicting session, stale new continuation, changed item or call/result linkage produces `409`. Concurrent turns serialize through the existing PostgreSQL transaction.
+
+Clients execute their own tools under their own permissions. The broker returns one proposed function call per decision and retains its `call_id` exactly. Accepted results are not re-executed during replacement or replay. Previously accepted calls keep their linkage when current tool definitions change.
+
+Unsupported fields and items are rejected explicitly, including reasoning items, media, custom/hosted tools, forced/required tool choices, parallel execution, strict-generation promises, sampling settings, and storage/state options such as `store`, `background` and `conversation`. Omission of a storage option does not disable the broker's durable history: its existing retention contract still applies. Completed output messages/function calls may be replayed with their IDs and `status:"completed"`; incomplete items and nonempty annotations are unsupported.
+
+### JSON, lifecycle events and delivery failures
+
+JSON output has `object:"response"`, the durable `resp_` ID, creation time, model alias, completed status and one output item. Text uses an assistant message containing `output_text`; a proposed function call uses separate item and call IDs with arguments encoded as a JSON string. Usage is `null` because the backend does not report measured token usage.
+
+SSE is buffered until the broker observes a terminal outcome. No lifecycle or model-output event is emitted while waiting. Each frame has matching `event:` and JSON `type`, with consecutive `sequence_number` values starting at zero:
+
+1. `response.created`, then `response.in_progress`.
+2. `response.output_item.added` with an in-progress item.
+3. For text: content-part added, output-text delta/done, content-part done. For a function: function-call-arguments delta/done.
+4. `response.output_item.done`, then `response.completed` carrying the complete response.
+
+An admitted terminal backend failure emits created/in-progress followed by `response.failed` with its causal error and no fabricated output. Pre-admission errors and failures before a safe lifecycle exposure boundary use OpenAI-shaped HTTP errors. Responses has no Chat `[DONE]` sentinel. A write interruption closes the stream without claiming successful completion or appending a JSON fallback. The logs record the last attempted and fully written sequence; a server write receipt does not prove client receipt.
+
+The 300-second native turn budget and five-second write bounds apply. Configure client/reverse-proxy waiting timeouts above 305 seconds plus margin. Client cancellation attempts owned cancellation while retaining already accepted decisions and uncertain remote busy holds.
+
+Healthy session pins persist through answers and tool waits. Existing eligible continuations may move from an offline worker only before claim and context delivery, after a completed final answer and without an unresolved tool outcome. Replacement receives full history with accepted call/result IDs. Claimed inference is not retried. An emitted stream is never automatically restarted; an explicit exact client retry may replay its accepted decision.
+
+Responses metadata is additive in existing request JSON. Existing records without it retain native behavior; no SQL migration or worker protocol change is required. A route rollback must retain the metadata reader/context projector and canonical records. An older writer is not certified to preserve newly introduced metadata; do not erase records or run a destructive downgrade.
+
+### Verification and log-only diagnosis
+
+`make test-responses` reuses the broker/PostgreSQL/SSE harness and `tools/openai-conformance.mjs --protocol responses`. The existing Chat invocation remains unchanged. The runner still takes `--base-url`, `--fixture`, and `--receipt`, and obtains its model-client credential only from `MUSE_CHAT_CLIENT_KEY`. SDK/raw HTTP and JSON/SSE cases execute only the exact permitted local `read_file` fixture and check its exact result, full replay, chained continuation, and retry identity.
+
+The controlled integration target covers reference ownership, serialization, instruction replacement/omission, restart persistence, healthy pinning, eligible replacement, tool conflicts, deadlines, cancellation, claimed-worker failure, storage boundaries and interrupted delivery. These are software checks, not live inference qualification. Unit tests exercise actual normalizers, services, encoders, handlers and stream consumers separately from integration coverage.
+
+At the normal INFO runtime setting, `responses.request_admitted` identifies effective wait/write settings and operation correlation. Admission emits `responses.reference_rejected` WARN for reference/ownership failures and `responses.item_conflict` WARN for history/linkage conflicts. Protected `history.conflict_detail` retains the corresponding expected/observed items. `responses.request_rejected` WARN identifies unsupported fields and schema paths. `responses.stream_terminated` or `responses.request_terminated` records state, cause, output acceptance, last attempted/completed sequence, bytes, timing, attempt and final disposition. Completion and cancellation use INFO; failed required operations and uncertain delivery use ERROR. Existing job/dispatch/storage records provide generations, fences, busy holds, decisions and causal dependency evidence.
+
+DEBUG captures admitted and normalized input, active instruction/tool metadata, accepted decisions, delivered worker context and each attempted encoded frame privately after credential redaction. INFO stdout excludes these payloads. Existing 6-KiB reconstructable chunks, seven-day/128-MiB retention and explicit omission reporting apply.
+
+Collect each participating broker's `/api/v1/admin/diagnostics/export?request_id=HTTP_REQUEST_ID` using the protected management header file. Decode using `decodeExport` from `tools/qualification-evidence.mjs`; require complete metadata and valid chunks/digests. Export linked `operation_id` values and filter by authenticated owner, conversation/session, worker/job, generation and revision. Reference failures require the latest owned ID and agreeing session; item conflicts require restoring exact accepted history/results. Retain uncertain holds after claimed loss, and repair the recorded storage cause before replaying accepted output. This procedure needs no business-table query or runtime attachment.
+
+`CI / openai` runs both protocol matrices on the exact source head. It retains `.artifacts/ci/openai/receipt.json` for Chat and `responses-receipt.json` for Responses, containing only safe source/image identity, SDK/case results, diagnostic conclusions and resource-cleanup proof for seven days. Private fixtures, raw captures and credentials are not uploaded, and integration receipts never contribute to unit coverage.

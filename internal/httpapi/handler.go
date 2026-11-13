@@ -174,6 +174,7 @@ func (h *Handler) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 	}
 	method := routeMethod(route)
 	if r.Method != method {
+		logger.Warn("request.rejected", "reason", "method_not_allowed", "expected_method", method, "observed_method", r.Method)
 		w.Header().Set("Allow", method)
 		writeJSON(w, 405, map[string]any{"error": "method_not_allowed"})
 		return
@@ -223,6 +224,8 @@ func (h *Handler) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 		h.setupRequest(w, r, logger, body)
 	case "/v1/models", "/v1/chat/completions":
 		h.chatRequest(w, r, logger, clientID, body)
+	case "/v1/responses":
+		h.responsesRequest(w, r, logger, clientID, body)
 	default:
 		if adminHistoryRoute(route) || strings.HasPrefix(route, "/api/v1/requests") {
 			h.historyRequest(w, r, logger, route, requestedWorker, clientID, body)

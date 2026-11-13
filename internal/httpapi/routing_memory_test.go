@@ -52,7 +52,7 @@ func (m *httpInferenceStore) withinRouting(ref inference.Ref, apply func(*infere
 	}
 	for id, r := range s.Requests {
 		if e := s.Experiments[id]; e != nil {
-			e.Messages = inference.Messages(s.Conversations[r.ConversationID], r.CanonicalEnd)
+			e.Messages = inference.RequestMessages(s.Conversations[r.ConversationID], r)
 		}
 	}
 	if err = apply(s); err != nil {

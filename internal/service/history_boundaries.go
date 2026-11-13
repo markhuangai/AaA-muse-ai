@@ -90,7 +90,8 @@ func (b *Broker) OutputBoundary(ctx context.Context, logger *slog.Logger, client
 		if r == nil || r.ClientID != client {
 			return nil, inference.Reject("history_owner_denied", 404, "requested_id", id)
 		}
-		if r.Output == nil {
+		failedResponse := r.Response != nil && (r.State == "interrupted" || r.State == "cancelled")
+		if r.Output == nil && !failedResponse {
 			return nil, inference.Reject("output_not_available", 409)
 		}
 		e := s.Experiments[id]
@@ -101,7 +102,14 @@ func (b *Broker) OutputBoundary(ctx context.Context, logger *slog.Logger, client
 		if !completed {
 			if r.OutputStartedAt == nil {
 				r.OutputStartedAt = &s.Now
-				event(events, slog.LevelInfo, "request.output_started", s, j, "boundary", "before_model_output_write", "decision_type", r.Output.Type)
+				kind, boundary := "", "before_model_output_write"
+				if r.Output != nil {
+					kind = r.Output.Type
+				}
+				if r.Response != nil {
+					boundary = "before_response_lifecycle_write"
+				}
+				event(events, slog.LevelInfo, "request.output_started", s, j, "boundary", boundary, "decision_type", kind, "output_accepted", r.Output != nil)
 			}
 		} else if cause != "" || attempted != written {
 			event(events, slog.LevelWarn, "request.output_interrupted", s, j, "attempted_bytes", attempted, "written_bytes", written, "cause", cause, "outcome", "uncertain")
