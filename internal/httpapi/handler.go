@@ -46,6 +46,15 @@ type response struct {
 	workerID, enrollmentID                     string
 	conversationID, sessionID, requestRecordID string
 	boundaryFailed                             bool
+	openAI                                     bool
+	now                                        func() time.Time
+}
+
+func (w *response) shortDeadline() error {
+	if !w.openAI {
+		return nil
+	}
+	return http.NewResponseController(w.ResponseWriter).SetWriteDeadline(w.now().Add(5 * time.Second))
 }
 
 func (w *response) WriteHeader(code int) {
@@ -53,13 +62,27 @@ func (w *response) WriteHeader(code int) {
 		return
 	}
 	w.code = code
+	if err := w.shortDeadline(); err != nil {
+		w.writeErr = err
+		return
+	}
 	w.ResponseWriter.WriteHeader(code)
 }
 func (w *response) Write(b []byte) (int, error) {
 	if w.code == 0 {
 		w.WriteHeader(200)
 	}
-	n, err := w.ResponseWriter.Write(b)
+	var n int
+	var err error
+	if w.openAI {
+		err = w.writeErr
+		if err == nil {
+			err = w.shortDeadline()
+		}
+	}
+	if err == nil {
+		n, err = w.ResponseWriter.Write(b)
+	}
 	w.attempted += len(b)
 	w.written += n
 	if err != nil {
@@ -76,14 +99,14 @@ func (h *Handler) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 	id, err := auth.ID(h.Random)
 	if err != nil {
 		h.Logger.Error("request.rejected", "cause", "identifier_generation_failed")
-		writeJSON(out, 503, map[string]any{"error": "service_unavailable"})
+		writeJSON(&response{ResponseWriter: out, openAI: chatRoute(r.URL.Path), now: h.Now}, 503, map[string]any{"error": "service_unavailable"})
 		return
 	}
 	out.Header().Set("X-Request-Id", id)
 	out.Header().Set("Cache-Control", "no-store")
 	route, requestedWorker := routeFor(r.URL.Path)
 	logger := h.Logger.With("request_id", id, "route", route)
-	w := &response{ResponseWriter: out, capture: route != "/api/v1/admin/diagnostics/export"}
+	w := &response{ResponseWriter: out, capture: route != "/api/v1/admin/diagnostics/export", openAI: chatRoute(route), now: h.Now}
 	role, clientID := h.Authority.Identity(r.Header.Get("Authorization"))
 	if clientID != "" {
 		logger = logger.With("client_id", clientID)
@@ -118,7 +141,7 @@ func (h *Handler) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 	expectedRole := ""
 	if strings.HasPrefix(route, "/api/v1/admin/") {
 		expectedRole = "management"
-	} else if strings.HasPrefix(route, "/api/v1/requests") {
+	} else if strings.HasPrefix(route, "/api/v1/requests") || chatRoute(route) {
 		expectedRole = "client"
 	} else if strings.HasPrefix(route, "/api/v1/worker/") && route != "/api/v1/worker/enroll" {
 		expectedRole = "worker"
@@ -198,6 +221,8 @@ func (h *Handler) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 		h.export(w, r, logger)
 	case "/api/v1/admin/setup-prompts":
 		h.setupRequest(w, r, logger, body)
+	case "/v1/models", "/v1/chat/completions":
+		h.chatRequest(w, r, logger, clientID, body)
 	default:
 		if adminHistoryRoute(route) || strings.HasPrefix(route, "/api/v1/requests") {
 			h.historyRequest(w, r, logger, route, requestedWorker, clientID, body)
@@ -210,6 +235,13 @@ func (h *Handler) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 }
 
 func writeJSON(w http.ResponseWriter, code int, value any) {
+	if boundary, ok := w.(*response); ok && boundary.openAI && code >= 400 {
+		if object, ok := value.(map[string]any); ok {
+			if reason, ok := object["error"].(string); ok {
+				value = chatErrorValue(code, reason, "")
+			}
+		}
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(value)

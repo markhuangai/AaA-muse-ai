@@ -1,5 +1,7 @@
 # Native requests and canonical history
 
+The [OpenAI Chat Completions subset](#openai-chat-completions) below adapts this canonical contract for general clients. Native endpoints retain their existing wire format.
+
 This API exercises the broker's normalized text/tool contract. It is not an OpenAI adapter or a live Muse qualification receipt. The November 11, 2026 issue #8 and #9 approvals permit canonical history and capability-routing engineering with controlled software tests and live testing deferred; release qualification remains inconclusive.
 
 ## Broker restart recovery
@@ -116,3 +118,58 @@ Dispatch orders queued requests by creation time and stable ID, skips blocked pi
 Use the existing protected export route first with `?request_id=HTTP_REQUEST_ID`, then with `?operation_id=NATIVE_REQUEST_ID`. Reconstruct through `decodeExport` from `tools/qualification-evidence.mjs`; require complete metadata and validated chunks/digests. Filter by owner, conversation, job and connection generation across broker exports. `dispatch.queued` and `dispatch.assigned` INFO include queue timing, candidates, selection reasons and qualification provenance. `dispatch.rejected` WARN distinguishes eligibility from capacity; record fresh matching verification for readiness/capability failures, or reduce admitted work/raise the documented bound for capacity failures. `dispatch.pin_conflict` WARN identifies conflicting selections; use the owned session and its pinned worker. `dispatch.reassigned` INFO records the old/new identities and safe pre-claim/pre-context boundary. Existing deadline/outcome and causal storage events identify stalls and rollback. No business-table query or process attachment is needed for diagnosis.
 
 `make test-routing` exercises competing real HTTP/PostgreSQL/SSE software paths through two broker processes, qualification provenance, queue limits, owner/session isolation, pinning and safe/unsafe offline boundaries, with protected diagnostic reconstruction and resource-cleanup receipts. Controlled peers never qualify live Muse behavior. No live probe scheduler or PoC/release configuration selector is provided.
+
+## OpenAI Chat Completions
+
+The November 12, 2026 issue #13 engineering approval permits this adapter and controlled software validation. Live Muse qualification remains inconclusive. The implementation follows the [official Chat Completions contract](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create) and the OpenAI JS SDK 7.53.0 types inspected on November 12, 2026; it supports the subset below.
+
+### Connection and ownership
+
+Configure the client with base URL `https://YOUR_PUBLIC_ORIGIN/v1`, bearer authentication using a distinct named `client-keys` entry, and model `muse-pool-text`. Environment references in YAML must exist inside the service container; arbitrary variables from the operator's `.env` are not automatically forwarded by Compose. Management keys, portal passwords and worker credentials cannot authenticate these endpoints.
+
+`GET /v1/models` returns that one alias, owned by `aaa-muse-ai`. Listing the alias makes no inference-readiness claim and does not identify another vendor's model. `POST /v1/chat/completions` waits for one canonical broker decision. Responses include `X-Request-Id` and, after admission, `X-Muse-Session-Id`.
+
+Supply a stable `X-Muse-Session-Id` and resend full history, including returned assistant messages and exact client-tool results, for continuation. The broker owns observed history, retains it without automatic deletion, rejects conflicting prefixes, serializes turns and preserves healthy worker pins. The same session string belongs to different conversations under different named client keys. Without correlation, each HTTP submission is independent; similar text does not establish identity. Exact full-history replays within an identified session return the previously accepted decision and completion ID. No additional client idempotency header is supported.
+
+CLIProxyAPI and cc-switch are prospective gateway consumers. A gateway must preserve the stable session header for cross-request affinity. Neither gateway nor Codex/Claude Code is certified by these controlled protocol tests. A separate forwarding SDK is not required.
+
+### Supported request subset
+
+| Input | Support |
+|---|---|
+| `model`, `messages` | Required; exact model alias and nonempty text history |
+| Message roles | `system`, `developer`, `user`, `assistant`, `tool`; strings or nonempty arrays of `{type:"text",text:STRING}` content, joined in order |
+| `tools` | Optional function definitions with name, optional description, object `parameters` schema, and optional `strict:false`; multiple definitions are allowed |
+| Assistant `tool_calls` | One function call per assistant message, with ID, function name, and a JSON-object arguments string; assistant text accompanying a call is preserved |
+| Tool results | `role:"tool"`, exact `tool_call_id`, text content; the client enforces permission and executes the tool locally |
+| Default controls | `stream:false` or `true`, `n:1`, `parallel_tool_calls:false`, `tool_choice:"auto"`; `"none"` is accepted only with no tools |
+
+Assistant call content may be absent, null or empty. Plain assistant messages require text. Returned `refusal:null` may be replayed; non-null refusals are unsupported. Function names, identifiers, object schemas, local references and argument validation follow the native contract. External schema resources are forbidden. Previously accepted calls retain their linkage even when the current tool-definition snapshot changes.
+
+Unknown fields, participant names, media, custom/hosted tools, legacy function fields, strict generation, forced/required tool choice, parallel calls, multiple choices, generation parameters, storage parameters and streaming usage options are rejected. Fields are never silently discarded. HTTP bodies and normalized canonical context each have a 1-MiB limit. The client decides its own tool permissions; neither the broker nor Muse executes proposed client tools.
+
+### JSON, buffered SSE and failures
+
+Non-streaming completions use `object:"chat.completion"`, one choice at index zero, an assistant message and finish reason `stop` or `tool_calls`. Function arguments remain a JSON string. Unknown usage is omitted; token counts are not estimated.
+
+With `stream:true`, the service buffers until the broker accepts a decision, then emits `data:` frames containing `chat.completion.chunk` objects: assistant role, content or indexed function-call delta, an empty delta with the finish reason, and `data: [DONE]`. IDs, creation time and model stay constant across frames. This is buffered protocol streaming; it exposes no incremental Muse tokens or private reasoning. No model-output frame is sent while waiting.
+
+The native turn budget is 300 seconds. Chat adjusts its response deadline independently of other routes' 30-second default and applies a five-second deadline to response writes. Set client and reverse-proxy waiting timeouts above 305 seconds plus network margin. There is no Chat body parameter to extend the turn deadline.
+
+Before response headers, errors use `{error:{message,type,param,code}}`: `400` invalid/unsupported input, `401` incorrect credential authority, `404` unknown model, `409` history/linkage/session conflict, `429` queue capacity, `503` unavailable or interrupted work, and `504` native deadline. Wrong methods return `405`, oversized bodies `413`. Errors identify the applicable parameter where available. An interrupted write after headers closes the response; it does not emit a successful finish or `[DONE]`.
+
+Cancellation attempts the existing owned cancellation under a bounded cleanup context. An already accepted decision remains accepted. Claimed work retains an uncertain busy hold until its exact idle acknowledgement. Existing eligible session continuations may reroute only before claim and context delivery, using full history. This adapter adds no retry of claimed inference or accepted tool effects. A server-write completion receipt is not proof that the client received the response.
+
+### Verification and diagnosis
+
+`make test-chat` runs real HTTP/PostgreSQL/broker paths with authenticated controlled peers, the pinned OpenAI JS SDK and raw SSE assertions. It includes client-only fixture tools, owner/session isolation, strict errors, delayed output, cancellation, deadlines, recovery boundaries and protected log reconstruction. Deadline tests advance only disposable fixture records; there is no production test-mode flag. Unit checks separately exercise failed writes/flushes against real handler/broker logic and protected captures.
+
+The reusable `tools/openai-conformance.mjs` accepts `--base-url`, `--fixture`, and `--receipt`; its model-client key comes only from `MUSE_CHAT_CLIENT_KEY`. It runs text/tool cycles in JSON and SSE through both SDK and raw HTTP. It executes only `read_file` for the exact permitted local fixture, checks the exact returned result, and fails on malformed streams, wrong outputs or missing required cases. Run it against an explicitly authorized backend; `make test-chat` supplies an isolated controlled backend automatically. Its receipt never qualifies live Muse.
+
+At the normal INFO level, `chat.request_admitted` records effective waiting/write settings and correlation. `chat.request_rejected` WARN records unsupported parameter/schema paths; `chat.history_conflict` WARN records linkage failures. `chat.stream_terminated` or `chat.request_terminated` records the last event, cause, last observed job disposition, output acceptance, byte counts, timing and outcome. Completion and context cancellation are INFO; required-operation failures and uncertain delivery are ERROR. Existing dispatch, deadline and storage events supply assignment generations, busy holds and causal dependency evidence.
+
+DEBUG records retain admitted Chat input, normalized input, accepted decisions and actual attempted encoded frames privately after redaction. INFO stdout excludes these payloads. Capture remains bounded to seven days or 128 MiB, with records no larger than 6 KiB and explicit omissions.
+
+Collect `/api/v1/admin/diagnostics/export?request_id=HTTP_REQUEST_ID` with a protected management header file, reconstruct using `decodeExport` from `tools/qualification-evidence.mjs`, and require complete metadata and valid chunks/digests. Then export each linked `operation_id`, filtering by client, session, conversation, worker/job and generation across broker instances. Unsupported input requires correcting the named parameter; conflicts require restoring exact owned history/tool linkage; uncertain inference requires retaining its hold; a failed storage boundary requires repairing its recorded cause and reading/replaying the accepted output. No business-table query or process attachment is needed for diagnosis.
+
+`CI / openai` retains only safe source/image identity, case, SDK and cleanup summaries for seven days. Private fixture directories and model payloads are not uploaded. These integration receipts do not contribute to unit statement coverage.

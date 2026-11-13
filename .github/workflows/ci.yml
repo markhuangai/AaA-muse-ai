@@ -206,6 +206,34 @@ jobs:
       - name: Broker restart reconciliation, durable receipts and uncertainty
         run: make test-broker-recovery
 
+  openai:
+    name: CI / openai
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          ref: ${{ env.SOURCE_SHA }}
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24.22.2
+      - name: Verify exact source
+        run: test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+      - name: Install locked protocol dependencies
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: SDK, raw SSE, canonical tools, isolation and log-only diagnosis
+        run: make test-chat
+      - name: Retain safe protocol and cleanup receipts
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: openai-${{ env.SOURCE_SHA }}-${{ github.run_attempt }}
+          path: .artifacts/ci/openai/receipt.json
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+
   image:
     name: CI / image
     runs-on: ubuntu-latest
