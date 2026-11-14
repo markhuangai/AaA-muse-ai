@@ -76,6 +76,8 @@ Portal sessions can read these management projections through [Requests](portal.
 
 Existing experiments remain available through their original API and appear as `legacy` management records. Their retained item/job snapshots are read-only, have `provenance: unavailable`, and use unknown event times where original evidence does not establish them. They are never assigned to a model client or silently imported into a client session.
 
+Admitted text may contain NUL. Management lists, request/conversation detail and timelines retain that content, distinguish it from a literal `\u0000`, and preserve existing numeric JSON values. PostgreSQL metadata accessors use a temporary NUL-neutralized parsing copy only for backend-generated or validated metadata and recovery presence checks. Messages, tools, decisions, client results, event details and delivery snapshots come from the original JSON. Native timeline events are projected in Go with raw JSON payloads; legacy rows are assembled directly without re-parsing their content through PostgreSQL accessors. This changes no admission rule, schema, public shape, cursor or recovery authority, and does not rewrite stored records.
+
 ## Diagnostics and recovery
 
 The existing logger emits INFO operational boundaries and WARN/ERROR failures, with DEBUG exchanges always captured privately after credential redaction. Capture retention remains seven days or 128 MiB, with reconstructable records no larger than 6 KiB. Missing, expired or pruned captures are explicit.
@@ -87,6 +89,8 @@ Collect `/api/v1/admin/diagnostics/export?request_id=HTTP_REQUEST_ID` with a pro
 | `history.reconciled` INFO | Matched/appended ranges, owner/session and replay reason identify exactly what was admitted. |
 | `history.conflict` WARN plus protected input/exchange | Compare the identified mismatch or call linkage; resend the owned full history rather than guessing a prefix. |
 | `history.owner_denied` WARN | Requested identity is absent or outside the authenticated owner; use the correct client credential without probing another owner's records. |
+| `history.query_completed` INFO plus `history.query_exchange` / `request.exchange` DEBUG | Reconstruct the exact query and original NUL-containing output, including tool linkage and literal escapes, from the protected export. |
+| `history.operation_failed` ERROR plus `history.storage_exchange` DEBUG | `history_projection_invalid` identifies malformed native event metadata; causal detail identifies its field. PostgreSQL failures retain SQLSTATE when available. Inspect revision, query, duration, attempt and transaction outcome; correct the projection or restore the dependency, then retry reading while preserving original records. |
 | `inference.storage_exchange` DEBUG and `inference.operation_failed` ERROR | Read SQLSTATE, causal detail, transaction outcome, attempt and duration; repair the write failure before retrying the same submission. |
 | `job.deadline_exceeded` ERROR | The correlated last boundary and deadline show the stall; an unanswered job is not proof of its internal Muse cause. |
 | `request.context_delivery_*` / `request.output_*` | Start markers precede writes; completion means the server wrote the complete response, not that the client received it. Interrupted writes or failed boundary persistence retain uncertainty. Never infer that an exposed tool call can safely be regenerated. |

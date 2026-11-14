@@ -129,6 +129,14 @@ async function viewports() {
     await open(page, data.native.response_request_id); await expect(page.getByText('Instructions only for this Responses request', { exact: false, selector: 'pre' }).first()).toBeVisible();
     await open(page, data.legacy); await expect(page.getByText(/Legacy request ·/)).toBeVisible(); await expect(page.getByText(/Native session identity/)).toBeVisible();
     await expect(page.locator('pre').filter({ hasText: '1e200000' })).toHaveCount(1);
+    for (const id of [data.nul.native, data.nul.legacy]) {
+      const response = await open(page, id); const value = await response.json();
+      const snapshot = await page.getByRole('region', { name: 'Request detail' }).innerText();
+      expect(snapshot).toContain('nul-history-value\\u0000'); expect(snapshot).toContain('literal\\\\u0000');
+      expect(value.kind === 'native' ? value.request.input.messages[0].text : value.history[0].text).toContain('nul-history-value\u0000');
+      const retained = await timelineText(page); expect(retained).toContain('nul-history-value\\u0000'); expect(retained).toContain(data.nul.call_id);
+    }
+    passed('portal.history_nul_native_and_legacy', { width, escaped_nul_preserved: true, literal_escape_distinct: true, timeline_readable: true });
     const queued = data.cancellation.queued[index]; await open(page, queued.id); await expect(page.getByRole('button', { name: 'Cancel request', exact: true })).toBeEnabled();
     await page.getByRole('button', { name: 'Cancel request', exact: true }).click(); const dialog = page.getByRole('dialog'); await expect(dialog.getByRole('button', { name: 'Keep request' })).toBeFocused();
     await page.keyboard.press('Escape'); await expect(dialog).not.toBeVisible();

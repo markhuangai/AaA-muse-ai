@@ -332,3 +332,70 @@ func TestHistoryQueryPaginationAndLegacyProjection(t *testing.T) {
 		})
 	}
 }
+
+func TestTimelineProjectionPreservesOriginalPayloads(t *testing.T) {
+	input := json.RawMessage(`{"event":{"sequence":7,"time":"2026-11-14T01:02:03Z","kind":"history.tools","level":"INFO","request_id":"request","details":{"text":"NUL\u0000literal\\u0000 SOH\u0001 quote\" slash\\\r\n","number":1e200000,"integer":9007199254740993}},"item":{"item":{"type":"message","role":"user","text":"item\u0000"}}}`)
+	data, err := projectTimeline(input, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var projected struct {
+		inference.TimelineEvent
+		Item json.RawMessage `json:"item"`
+	}
+	if json.Unmarshal(data, &projected) != nil || projected.Sequence != 7 || projected.Kind != "history.tools" || projected.Time == nil {
+		t.Fatal("timeline metadata changed", string(data))
+	}
+	var details struct {
+		Text string `json:"text"`
+	}
+	if json.Unmarshal(projected.Details, &details) != nil || details.Text != "NUL\x00literal\\u0000 SOH\x01 quote\" slash\\\r\n" {
+		t.Fatal("payload was taken from metadata parsing copy")
+	}
+	for _, original := range []string{`1e200000`, `9007199254740993`, `item\u0000`} {
+		if !strings.Contains(string(data), original) {
+			t.Fatal("raw JSON value changed", original)
+		}
+	}
+	legacy := json.RawMessage(`{"sequence":7,"kind":"legacy_item","item":{"text":"\u0000\\u0000","number":1e200000}}`)
+	data, err = projectTimeline(legacy, 7)
+	if err != nil || string(data) != string(legacy) {
+		t.Fatal("legacy payload changed", err)
+	}
+	for _, invalid := range []string{`{`, `{"event":1}`, `{"event":null}`, `{"event":{"sequence":8,"kind":"history.item"}}`, `{"event":{"sequence":7}}`, `{"event":{"sequence":7,"kind":4}}`} {
+		_, err = projectTimeline(json.RawMessage(invalid), 7)
+		if err == nil || Classify(err).Reason != "history_projection_invalid" || Classify(err).Detail() == "" {
+			t.Fatal("unsupported projection did not retain its explicit cause", invalid, err)
+		}
+	}
+}
+
+func TestNativeTimelinePaginationCountsProjectedBytes(t *testing.T) {
+	for _, size := range []int{1048000, inference.MaxTimelineBytes} {
+		tx := &inferenceTx{workerTransaction: workerTransaction{rows: []workerRow{{values: []any{json.RawMessage(`{"kind":"native"}`)}}}}}
+		rows := []workerRow{}
+		for sequence := 0; sequence < 2; sequence++ {
+			event := inference.TimelineEvent{Sequence: sequence, Kind: "history.tools", Details: json.RawMessage(`{"text":"` + strings.Repeat("x", size) + `\u0000"}`)}
+			data := encoded(t, map[string]any{"event": event, "item": nil})
+			rows = append(rows, workerRow{values: []any{"conversation", (*time.Time)(nil), sequence, data}})
+		}
+		tx.rowsets = []*workerRows{{records: rows}}
+		q := inference.HistoryQuery{Kind: "timeline", ID: "conversation", Limit: 100}
+		data, err := New(inferencePool{tx: tx}).QueryHistory(context.Background(), q)
+		if size == inference.MaxTimelineBytes {
+			var rejected *inference.Rejection
+			if !errors.As(err, &rejected) || rejected.Reason != "timeline_entry_too_large" {
+				t.Fatal("oversized assembled timeline was accepted", err)
+			}
+			continue
+		}
+		var page inference.HistoryPage
+		if err != nil || json.Unmarshal(data, &page) != nil || len(page.Items) != 1 || page.NextCursor == "" || len(data) > inference.MaxTimelineBytes || strings.Contains(string(page.Items[0]), `"event":`) {
+			t.Fatal("assembled page bound or public shape changed", err)
+		}
+		cursor, err := inference.DecodeCursor(page.NextCursor, q)
+		if err != nil || cursor.Sequence != 0 || cursor.ID != "conversation" {
+			t.Fatal("timeline cursor skipped the unreturned event", err)
+		}
+	}
+}

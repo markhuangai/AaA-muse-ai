@@ -291,9 +291,10 @@ def main():
         h.browser("empty", {})
         native = h.native_timeline()
         legacy = h.seed_legacy_pages(native["worker_id"])
+        nul = h.nul_histories()
         boundaries = h.routing_fixtures()
         cancellation = h.cancellation_fixtures()
-        h.browser("history", {"native": native, "legacy": legacy, "boundaries": boundaries, "cancellation": cancellation})
+        h.browser("history", {"native": native, "legacy": legacy, "nul": nul, "boundaries": boundaries, "cancellation": cancellation})
         h.final_evidence()
         require(source_identity() == identity, "source changed during history validation")
         outcome = "passed"
