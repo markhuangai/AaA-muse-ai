@@ -1,6 +1,7 @@
 import { APIError, BUILD, schedule, type API, type BrowserReport, type Schedule, type Settings } from './api';
 import { Reports } from './reports';
 import { WorkersController } from './worker-controller';
+import { HistoryController } from './history-controller';
 
 export interface System {
   now(): number;
@@ -15,7 +16,7 @@ export const browserSystem: System = {
   watchVisibility: callback => { document.addEventListener('visibilitychange', callback); return () => document.removeEventListener('visibilitychange', callback); },
 };
 export interface View {
-  page: 'settings' | 'workers';
+  page: 'settings' | 'workers' | 'requests';
   phase: 'login' | 'signing_in' | 'authenticated';
   settings: Settings | null;
   loading: boolean;
@@ -39,11 +40,18 @@ export class PortalController {
   #visibility = () => {};
   #refreshing = false;
   #attempt = 0;
+  #loggingOut = false;
   readonly reports: Reports;
   readonly workers: WorkersController;
+  readonly history: HistoryController;
   constructor(private api: API, private system: System = browserSystem) {
     this.reports = new Reports(api);
     this.workers = new WorkersController(api, system, this.reports, () => {
+      if (this.#view.phase !== 'authenticated') return false;
+      if (this.#view.expiresAt !== null && system.now() >= this.#view.expiresAt) { this.expire(); return false; }
+      return true;
+    }, () => this.expire());
+    this.history = new HistoryController(api, system, this.reports, () => {
       if (this.#view.phase !== 'authenticated') return false;
       if (this.#view.expiresAt !== null && system.now() >= this.#view.expiresAt) { this.expire(); return false; }
       return true;
@@ -60,6 +68,7 @@ export class PortalController {
     this.#refreshing = false;
     this.reports.clear();
     this.workers.reset();
+    this.history.reset();
   }
   dispose() { this.cancel(); this.api.setSession(null); this.#listeners.clear(); }
 
@@ -81,6 +90,7 @@ export class PortalController {
       this.#visibility = this.system.watchVisibility(() => { if (this.system.visible()) void this.refresh(); });
       this.tick();
       if (this.#view.page === 'workers') this.workers.activate();
+      if (this.#view.page === 'requests') this.history.activate();
       await this.refresh();
     } catch (error) {
       if (generation !== this.#generation) return;
@@ -100,8 +110,10 @@ export class PortalController {
   navigate(page: View['page']) {
     if (page === this.#view.page) return;
     this.workers.reset();
+    this.history.reset();
     this.change({ page });
     if (page === 'workers' && this.#view.phase === 'authenticated') this.workers.activate();
+    if (page === 'requests' && this.#view.phase === 'authenticated') this.history.activate();
   }
 
   private tick() {
@@ -160,11 +172,18 @@ export class PortalController {
 
   renderFailed() {
     if (this.#view.phase !== 'authenticated') return;
+    if (this.#view.page === 'requests') { this.history.renderFailed(); return; }
     this.reports.add({ event: 'portal.render_failed', component: 'shell', cause: 'render_exception', request_id: this.#view.requestID,
       operation_id: this.system.id(), expected_state: 'rendered', observed_state: 'failed', last_good_at: this.#view.lastGood === null ? null : new Date(this.#view.lastGood).toISOString(), duration_ms: 0, attempt: 1 });
   }
 
   async logout() {
+    if (this.#loggingOut) return;
+    this.#loggingOut = true;
+    const previous = this.#generation;
+    if (this.history.hasPendingReads()) await this.history.abandon();
+    this.#loggingOut = false;
+    if (previous !== this.#generation) return;
     this.cancel();
     const generation = this.#generation;
     const pending = this.api.logout(this.system.id(), this.#abort.signal);

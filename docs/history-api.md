@@ -70,6 +70,10 @@ Lists and timelines return `items` and optional `next_cursor`. Use `limit` (defa
 
 Request detail includes immutable admitted input, response correlation, current assignment and its exact delivered context, observed output, and boundary timestamps. Canonical items have stable IDs and `client_provided` or `server_observed` provenance. Timelines retain instructions/messages, tool definitions, assignments, generations, decisions, client-tool linkage and errors.
 
+Request detail retains `kind`, `request`, `assignment`, `delivery` and legacy history/provenance, and adds `execution`: `id`, `worker_id`, `state`, `reason`, `remote_outcome`, `created_at`, `deadline_at` and `current_job_id`. Execution reflects the durable experiment state, including an unassigned request with no current job. Assignment and delivery remain recorded snapshots, not proof of remote consumption. Current display names are resolved separately by immutable worker ID.
+
+Portal sessions can read these management projections through [Requests](portal.md#request-history-and-cancellation). The portal uses fifty-row/event pages, the existing conversation filter and exact request lookup. `POST /api/v1/admin/experiments/{id}/cancel` accepts `protocol_version: 1` and a fresh `submission_id` for assigned or unassigned work. It retains accepted receipts, tool linkage and uncertain busy holds; completed work is rejected. No new cancellation endpoint or replay authority is introduced.
+
 Existing experiments remain available through their original API and appear as `legacy` management records. Their retained item/job snapshots are read-only, have `provenance: unavailable`, and use unknown event times where original evidence does not establish them. They are never assigned to a model client or silently imported into a client session.
 
 ## Diagnostics and recovery

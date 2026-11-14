@@ -4,11 +4,14 @@ export class Reports {
   #queue: BrowserReport[] = [];
   #omitted = 0;
   #sending = false;
+  #waiters = new Set<() => void>();
   #generation = 0;
   #abort = new AbortController();
   constructor(private api: API) {}
 
   clear() {
+    for (const resolve of this.#waiters) resolve();
+    this.#waiters = new Set();
     this.#generation++;
     this.#abort.abort();
     this.#abort = new AbortController();
@@ -23,10 +26,15 @@ export class Reports {
     void this.flush();
   }
 
+  async drain() {
+    await this.flush();
+    if (this.#sending) await new Promise<void>(resolve => this.#waiters.add(resolve));
+  }
+
   async flush() {
     if (this.#sending) return;
     this.#sending = true;
-    const generation = this.#generation;
+    const generation = this.#generation, waiters = this.#waiters;
     try {
       while (this.#queue.length && generation === this.#generation) {
         const omitted = this.#omitted;
@@ -41,6 +49,6 @@ export class Reports {
         this.#omitted -= omitted;
         this.#queue.shift();
       }
-    } finally { if (generation === this.#generation) this.#sending = false; }
+    } finally { if (generation === this.#generation) this.#sending = false; for (const resolve of waiters) resolve(); waiters.clear(); }
   }
 }

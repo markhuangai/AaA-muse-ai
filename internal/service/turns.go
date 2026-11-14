@@ -108,7 +108,7 @@ func (b *Broker) Read(ctx context.Context, logger *slog.Logger, id string) (json
 }
 
 func (b *Broker) Cancel(ctx context.Context, logger *slog.Logger, id string, c inference.Cancel) (json.RawMessage, error) {
-	return b.run(ctx, logger, inference.Ref{ExperimentID: id, Principal: "management", SubmissionID: c.SubmissionID, Full: true}, "cancel", c, func(s *inference.State, events *[]inferenceEvent) (any, error) {
+	return b.run(ctx, logger, inference.Ref{ExperimentID: id, Principal: "management", SubmissionID: c.SubmissionID, Full: true, Routing: true}, "cancel", c, func(s *inference.State, events *[]inferenceEvent) (any, error) {
 		if err := inference.VersionAndID(c.Version, c.SubmissionID); err != nil {
 			return nil, err
 		}
@@ -117,9 +117,18 @@ func (b *Broker) Cancel(ctx context.Context, logger *slog.Logger, id string, c i
 			return nil, inference.Reject("inference_not_found", 404)
 		}
 		if e.State == "completed" {
-			return nil, inference.Reject("experiment_already_completed", 409)
+			job := s.Jobs[e.CurrentJobID]
+			return nil, inference.Reject("experiment_already_completed", 409, "observed_state", e.State,
+				"remote_outcome", e.RemoteOutcome, "busy_hold", job != nil && job.Held, "transaction_outcome", "rolled_back",
+				"conversation_id", e.ConversationID, "worker_id", e.WorkerID, "job_id", e.CurrentJobID)
 		}
+		previous := e.State
 		finish(s, e, "cancelled", "operator_cancelled", events)
+		job := s.Jobs[e.CurrentJobID]
+		if job == nil {
+			job = &inference.Job{ExperimentID: e.ID, ConversationID: e.ConversationID, WorkerID: e.WorkerID, State: e.State, DeadlineAt: e.DeadlineAt}
+		}
+		event(events, slog.LevelInfo, "portal.cancel_result", s, job, "requested_state", "cancelled", "previous_state", previous, "observed_state", e.State, "remote_outcome", e.RemoteOutcome, "busy_hold", job.Held, "reason", e.Reason, "outcome", "recorded")
 		return e, nil
 	})
 }

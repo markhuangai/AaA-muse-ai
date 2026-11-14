@@ -272,6 +272,14 @@ func TestHistoryQueryPaginationAndLegacyProjection(t *testing.T) {
 				if !strings.Contains(string(data), "native") {
 					t.Fatal("single result lost")
 				}
+				if kind == "request" {
+					query := strings.Join(tx.queriesSeen, "\n")
+					for _, field := range []string{"'execution'", "'remote_outcome'", "'deadline_at'", "'current_job_id'", "'assignment'", "'delivery'"} {
+						if !strings.Contains(query, field) {
+							t.Fatal("request projection lost observed execution or existing context", field)
+						}
+					}
+				}
 				return
 			}
 			var page inference.HistoryPage

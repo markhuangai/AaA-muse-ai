@@ -1,6 +1,8 @@
 import type { API, BrowserReport, Session, Settings } from '../src/api';
 import type { System } from '../src/controller';
 import type { Worker, Enrollment, EnrollmentKind } from '../src/worker-api';
+import type { Execution, HistoryPage, RequestDetail, RequestSummary, TimelineEntry } from '../src/history-api';
+import { detail, entry, execution, summary } from './history-fixtures';
 
 export const token = 'muse_portal_' + 'a'.repeat(43);
 export const settings = (): Settings => ({ build: { revision: 'development', dirty: false }, instance_id: 'instance-1', public_origin: 'https://muse.example.test', ready: true, database: 'available', schema_version: 5, effective_yaml: 'control-portal:\n  password: "[REDACTED]"\n', capabilities: ['Native requests', 'Buffered SSE lifecycle events'] });
@@ -61,6 +63,11 @@ export class TestAPI implements API {
   renameWork: (id: string, name: string) => Promise<{ value: Worker; requestID: string }> = async (id, name) => ({ value: worker(id, name.trim()), requestID: 'rename-request' });
   revokeWork: (id: string) => Promise<{ value: Worker; requestID: string }> = async id => ({ value: { ...worker(id), revoked_at: '2026-11-13T00:01:00Z' }, requestID: 'revoke-request' });
   enrollmentWork: (kind: EnrollmentKind) => Promise<{ value: Enrollment; requestID: string }> = async kind => ({ value: enrollment(kind), requestID: 'enrollment-request' });
+  historyCalls = { list: 0, detail: 0, timeline: 0, cancel: 0 };
+  requestsWork: (conversation: string, cursor: string) => Promise<{ value: HistoryPage<RequestSummary>; requestID: string }> = async () => ({ value: { items: [summary()] }, requestID: 'history-list' });
+  detailWork: (id: string) => Promise<{ value: RequestDetail; requestID: string }> = async () => ({ value: detail(), requestID: 'history-detail' });
+  timelineWork: (conversation: string, cursor: string) => Promise<{ value: HistoryPage<TimelineEntry>; requestID: string }> = async () => ({ value: { items: [entry()] }, requestID: 'history-timeline' });
+  cancelWork: (id: string, submission: string) => Promise<{ value: Execution; requestID: string }> = async () => ({ value: execution('cancelled'), requestID: 'history-cancel' });
   constructor(public system: TestSystem) { this.loginWork = async () => ({ session_token: token, expires_at: new Date(system.time + 1_800_000).toISOString() }); }
   setSession(value: string | null) { this.credential = value; }
   async login() { this.loginCalls++; return this.loginWork(); }
@@ -71,4 +78,8 @@ export class TestAPI implements API {
   async renameWorker(id: string, name: string) { return this.renameWork(id, name); }
   async revokeWorker(id: string) { return this.revokeWork(id); }
   async enrollment(kind: EnrollmentKind) { return this.enrollmentWork(kind); }
+  async requests(conversation: string, cursor: string) { this.historyCalls.list++; return this.requestsWork(conversation, cursor); }
+  async requestDetail(id: string) { this.historyCalls.detail++; return this.detailWork(id); }
+  async timeline(conversation: string, cursor: string) { this.historyCalls.timeline++; return this.timelineWork(conversation, cursor); }
+  async cancelRequest(id: string, submission: string) { this.historyCalls.cancel++; return this.cancelWork(id, submission); }
 }
