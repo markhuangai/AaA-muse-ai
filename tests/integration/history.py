@@ -8,7 +8,7 @@ import subprocess
 import urllib.parse
 
 from inference import Inference
-from service import require
+from service import Harness, require
 
 
 class History(Inference):
@@ -62,7 +62,7 @@ class History(Inference):
         if decoded.returncode:
             self.private(label + "-decoder-error.txt", decoded.stderr)
         require(decoded.returncode == 0 and json.loads(decoded.stdout)["complete"], "production decodeExport rejected diagnostic capture")
-        metadata, events = self.decode_export(raw)
+        metadata, events = Harness.decode_export(self, raw)
         require(metadata["complete"] and events, "diagnostic evidence incomplete")
         require(all(event.get(filter_name) == identity for event in events), "diagnostic export crossed its filter")
         self.assert_private(json.dumps(events))
@@ -291,7 +291,7 @@ class History(Inference):
         canonical = []
         for i in range(3):
             canonical.append({"type": "message", "role": "user", "text": "large tools " + str(i)})
-            tools = [{"name": "read_file", "description": "x" * 710000, "parameters": {"type": "object"}}]
+            tools = [{"name": "read_file", "description": "x" * 710000 + "\x00 literal\\u0000", "parameters": {"type": "object"}}]
             request, _ = self.submit(self.input(worker, canonical, tools), "large-tool-snapshots")
             self.deliver(worker, peer, request, {"type": "final", "text": "ok"})
             canonical.append({"type": "message", "role": "assistant", "text": "ok"})
@@ -300,6 +300,92 @@ class History(Inference):
         all_events = self.timeline(request["conversation_id"])
         require(sum(e["kind"] == "history.tools" for e in all_events) == 3, "byte pagination omitted snapshots")
         self.receipt("history.pagination_legacy_and_byte_bounds", conversations=len(seen), timeline_limit_bytes=2097152, provenance_unknown_explicit=True)
+
+    def nul_histories(self):
+        worker = self.new_worker()
+        peer = self.peer(worker)
+        text = 'nul-history-value\x00 literal\\u0000 SOH\x01 quote" slash\\ unicode雪\r\n'
+        messages = [{"type": "message", "role": "system", "text": text}, {"type": "message", "role": "user", "text": text}]
+        tools = [{"name": "read_file", "description": text, "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "marker": {"type": "string", "description": text}, "number": {"type": "integer"}}, "required": ["path", "marker"]}}]
+        initial = self.input(worker, messages=messages, tools=tools)
+        first, _ = self.submit(initial, "nul-history-native")
+        call = {"type": "tool_call", "call_id": "nul-call-" + secrets.token_hex(8), "name": "read_file", "arguments": {"path": "client-only.txt", "marker": text, "number": 9007199254740993}}
+        self.deliver(worker, peer, first, call)
+        require(self.read_native(first)[0]["output"] == call, "NUL tool arguments changed during native readback")
+        result = {"type": "tool_result", "call_id": call["call_id"], "output": text}
+        continued_input = self.input(worker, messages=messages + [call, result], tools=tools, previous=first["response_id"])
+        continued, _ = self.submit(continued_input)
+        self.deliver(worker, peer, continued, {"type": "final", "text": text})
+        require(self.read_native(continued)[0]["output"]["text"] == text, "NUL final output changed during current-job lookup")
+        native_items = continued_input["messages"] + [{"type": "message", "role": "assistant", "text": text}]
+        legacy_input = {key: value for key, value in self.input(worker, messages=messages, tools=tools).items() if key != "previous_response_id"}
+        legacy, _ = self.checked("/api/v1/admin/experiments", self.admin, "POST", legacy_input, want=201)
+        job, _, _ = self.claim(worker, peer, legacy)
+        self.decision(worker, peer, job, call)
+        legacy_next, _ = self.checked("/api/v1/admin/experiments/" + legacy["id"] + "/tool-results", self.admin, "POST", {"protocol_version": 1, "submission_id": secrets.token_hex(12), "call_id": call["call_id"], "output": text}, want=202)
+        job, _, _ = self.claim(worker, peer, legacy_next)
+        self.decision(worker, peer, job, {"type": "final", "text": text})
+        ids = "','".join([first["id"], continued["id"], legacy["id"]])
+        retained = """SELECT string_agg(kind||':'||identity||':'||md5(payload),',' ORDER BY kind,identity) FROM (
+          SELECT 'experiment' AS kind,id AS identity,data::text AS payload FROM aaa_experiments WHERE id IN ('%s')
+          UNION ALL SELECT 'request',id,data::text FROM aaa_model_requests WHERE id IN ('%s')
+          UNION ALL SELECT 'job',id,data::text||context::text FROM aaa_inference_jobs WHERE experiment_id IN ('%s')
+          UNION ALL SELECT 'legacy',experiment_id||':'||sequence,data::text FROM aaa_inference_history WHERE experiment_id IN ('%s')
+          UNION ALL SELECT 'item',id,data::text FROM aaa_conversation_items WHERE request_id IN ('%s')
+          UNION ALL SELECT 'event',conversation_id||':'||sequence,data::text FROM aaa_conversation_events WHERE conversation_id='%s'
+          ) stored;""" % (ids, ids, ids, ids, ids, first["conversation_id"])
+        before = self.sql(retained)
+        for request, kind in ((first, "native"), (continued, "native"), (legacy, "legacy")):
+            detail, headers = self.checked("/api/v1/admin/requests/" + request["id"], self.admin)
+            require(detail["kind"] == kind and detail["execution"]["id"] == request["id"] and detail["execution"]["state"] == "completed", "NUL history metadata or immutable ID changed")
+            require(detail["delivery"]["tools"] == tools and detail["delivery"]["messages"] == (continued_input["messages"] if request["id"] == continued["id"] or kind == "legacy" else messages), "original delivery was replaced by metadata copy")
+            if request["id"] == continued["id"]:
+                require(detail["request"]["input"] == continued_input and detail["request"]["output"]["text"] == text, "NUL request snapshot changed")
+            if kind == "legacy":
+                require(detail["request"]["final_text"] == text and detail["history"] == native_items, "retained legacy content changed")
+            page, _ = self.checked("/api/v1/admin/requests?limit=1&conversation_id=" + request["conversation_id"], self.admin)
+            require(page["items"] and page["items"][0]["conversation_id"] == request["conversation_id"], "NUL filtered list unavailable")
+            conversation, _ = self.checked("/api/v1/admin/conversations/" + request["conversation_id"], self.admin)
+            require(conversation["kind"] == kind and conversation["id"] == request["conversation_id"], "NUL conversation detail unavailable")
+            events = self.timeline(request["conversation_id"], 1)
+            actual = [event["item"]["item"] if kind == "native" else event["item"] for event in events if event.get("item") is not None]
+            require(actual == native_items, "paginated NUL timeline lost or substituted content")
+            if kind == "native":
+                require(any(event["kind"] == "history.tools" and event["details"]["tools"] == tools for event in events), "original NUL event details changed")
+            else:
+                require(all(event["time"] is None and event["provenance"] == "unavailable" for event in events), "legacy provenance changed")
+            evidence = self.retained_export("request_id", headers["X-Request-Id"])
+            exchange = next(event for event in evidence if event["msg"] == "history.query_exchange")
+            require(exchange["level"] == "DEBUG" and exchange["output"] == detail and any(event["msg"] == "history.query_completed" and event["level"] == "INFO" for event in evidence), "protected NUL output cannot be reconstructed")
+            require(json.loads(next(event["response"] for event in evidence if event["msg"] == "request.exchange")) == detail, "HTTP exchange lost original NUL output")
+        seen, cursor = set(), ""
+        while True:
+            page, _ = self.checked("/api/v1/admin/conversations?limit=1" + ("&cursor=" + cursor if cursor else ""), self.admin)
+            for item in page["items"]:
+                require(item["id"] not in seen, "NUL conversation paging duplicated an ID")
+                seen.add(item["id"])
+            cursor = page.get("next_cursor")
+            if not cursor:
+                break
+        require({first["conversation_id"], legacy["conversation_id"]} <= seen, "NUL histories missing from conversation list")
+        require(self.sql(retained) == before, "management reads rewrote retained JSON")
+        original = self.sql("SELECT data::text FROM aaa_conversation_events WHERE conversation_id='" + first["conversation_id"] + "' AND sequence=0;")
+        self.sql("UPDATE aaa_conversation_events SET data='{\"sequence\":0,\"kind\":7}' WHERE conversation_id='" + first["conversation_id"] + "' AND sequence=0;")
+        try:
+            _, headers = self.checked("/api/v1/admin/conversations/" + first["conversation_id"] + "/timeline", self.admin, want=503)
+            evidence = self.retained_export("request_id", headers["X-Request-Id"])
+            failure = next(event for event in evidence if event["msg"] == "history.operation_failed")
+            detail = next(event for event in evidence if event["msg"] == "history.storage_exchange")
+            require(failure["level"] == "ERROR" and failure["cause"] == "history_projection_invalid" and failure["transaction_outcome"] == "rolled_back" and failure["attempt"] == 1 and failure["duration_ms"] >= 0, "malformed projection failure lacks cause/outcome")
+            require(detail["level"] == "DEBUG" and "kind" in detail["detail"] and failure["revision"] == self.args.source_sha, "projection cause or source revision missing")
+        finally:
+            self.sql("UPDATE aaa_conversation_events SET data='" + original.replace("'", "''") + "' WHERE conversation_id='" + first["conversation_id"] + "' AND sequence=0;")
+        require(self.sql(retained) == before, "projection fault fixture did not restore original history")
+        require('nul-history-value' not in self.logs(self.main_service), "NUL payload escaped INFO filtering")
+        peer.stop()
+        self.receipt("history.nul_original_payloads", native=True, legacy=True, client_result=True, accepted_output=True, tools_and_arguments=True, details=True, literal_escape_distinct=True, management_read_only=True, paginated=True, diagnostic_reconstruction=True)
+        self.receipt("history.nul_projection_failure_diagnosis", cause="history_projection_invalid", transaction_outcome="rolled_back", corrective_action="Correct the timeline projection or unsupported metadata and retry reading; preserve original records.", business_table_queries=False)
+        return {"native": continued["id"], "legacy": legacy["id"], "call_id": call["call_id"]}
 
     def persistence_and_output_failures(self, worker, peer):
         request, _ = self.submit(self.input(worker, tools=[]), "boundary-fault")
@@ -390,6 +476,7 @@ def main():
         h.docker("stop", "--time", "5", secondary)
         require(not h.inspect(secondary)["State"]["Running"], "secondary broker still emits asynchronous diagnostics")
         h.pagination_and_legacy(worker, peer)
+        h.nul_histories()
         h.persistence_and_output_failures(worker, peer)
         h.deadline_and_restart(worker, peer, first, initial, canonical)
         h.private("results.json", json.dumps({"suite": "history", "source_sha": args.source_sha, "synthetic_peer": True, "receipts": h.receipts}))

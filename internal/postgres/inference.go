@@ -14,12 +14,12 @@ import (
 
 const inferenceAdmissionLock int64 = 0x414141494e46
 
-const recoveryRequests = `SELECT m.id FROM aaa_model_requests m
+const recoveryRequests = `SELECT m.id FROM (SELECT *, ` + metadataJSON + ` AS metadata FROM aaa_model_requests) m
  JOIN aaa_conversations c ON c.id=m.conversation_id
  WHERE (c.pending_call_id<>'' AND m.id=c.data->>'current_request_id')
- OR (m.data->>'output' IS NOT NULL AND m.data->>'output_completed_at' IS NULL)
- OR (m.data->>'context_delivery_started_at' IS NOT NULL
- AND m.data->>'context_delivery_written_at' IS NULL)`
+ OR (m.metadata->>'output' IS NOT NULL AND m.metadata->>'output_completed_at' IS NULL)
+ OR (m.metadata->>'context_delivery_started_at' IS NOT NULL
+ AND m.metadata->>'context_delivery_written_at' IS NULL)`
 
 func decodeInference(data []byte, out any) error {
 	d := json.NewDecoder(bytes.NewReader(data))
@@ -227,7 +227,7 @@ func loadInference(ctx context.Context, tx pgx.Tx, ref inference.Ref, s *inferen
 	}
 	rows, err = tx.Query(ctx, `SELECT data, CASE WHEN $4 THEN context ELSE NULL END FROM aaa_inference_jobs
 		WHERE worker_id=$1 AND (state IN ('queued','claimed') OR held OR id=$2 OR id=$3 OR
-		id=(SELECT data->>'current_job_id' FROM aaa_experiments WHERE id=$5) OR experiment_id=ANY($6::text[])
+		id=(SELECT (`+metadataJSON+`)->>'current_job_id' FROM aaa_experiments WHERE id=$5) OR experiment_id=ANY($6::text[])
 		OR experiment_id=ANY($7::text[])) ORDER BY id`, s.WorkerID, ref.JobID, ref.BaseJobID, ref.Full, ref.ExperimentID, ref.EvidenceIDs, ids)
 	if err != nil {
 		return err

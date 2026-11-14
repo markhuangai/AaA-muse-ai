@@ -45,7 +45,7 @@ class Recovery(Routing):
     def live_sibling(self):
         worker = self.new_worker()
         peer = self.peer(worker)
-        marker = "recovery-private-" + secrets.token_hex(12) + "\r\n" + "context\n" * 1500
+        marker = "recovery-private-" + secrets.token_hex(12) + "\x00 literal\\u0000\r\n" + "context\n" * 1500
         messages = [{"type": "message", "role": "user", "text": marker + self.client + worker["credential"]}]
         request, _ = self.submit(self.input(worker, messages=messages, tools=[]), "healthy-sibling")
         job, _, claim = self.claim(worker, peer, self.experiment(request["id"]))
@@ -58,7 +58,7 @@ class Recovery(Routing):
         require(any(e["msg"] == "recovery.restored" for e in events) and len({e["instance_id"] for e in events}) == 2, "request-to-operation trace omitted a participating broker")
         self.restored(request, "claimed_inference")
         detail = next(e for e in events if e["msg"] == "recovery.detail")
-        require(marker in json.dumps(detail).replace("\\r", "\r").replace("\\n", "\n") and "[REDACTED]" in json.dumps(detail), "reconstructable recovery context or redaction missing")
+        require(detail["request"]["input"]["messages"][0]["text"].startswith(marker) and "[REDACTED]" in json.dumps(detail), "reconstructable recovery context or redaction missing")
         replay, headers = self.checked("/api/v1/worker/jobs/" + job["id"] + "/claim", worker["credential"], "POST", claim)
         require(replay == job, "valid current-lease claim receipt changed")
         self.trace_request(headers["X-Request-Id"], request["id"])
@@ -77,7 +77,7 @@ class Recovery(Routing):
     def queue_and_uncertain_crash(self):
         worker = self.new_worker()
         peer = self.peer(worker)
-        busy, _ = self.submit(self.input(worker, tools=[]), "claimed-before-crash")
+        busy, _ = self.submit(self.input(worker, messages=[{"type": "message", "role": "user", "text": "held\x00 literal\\u0000"}], tools=[]), "claimed-before-crash")
         job, _, claim = self.claim(worker, peer, self.experiment(busy["id"]))
         queued, _ = self.submit(self.input(worker, tools=[]), "queued-before-crash")
         before = self.detail(queued)
@@ -124,7 +124,7 @@ class Recovery(Routing):
         peer = self.peer(worker)
         request, _ = self.submit(self.input(worker, tools=[]), "lost-decision-ack")
         job, _, _ = self.claim(worker, peer, self.experiment(request["id"]))
-        body = {"protocol_version": 1, "submission_id": secrets.token_hex(12), "connection_id": peer.opened["connection_id"], "connection_generation": peer.opened["connection_generation"], "conversation_id": job["conversation_id"], "generation": job["generation"], "lease_id": job["lease_id"], "context_receipt_id": job["context"]["receipt_id"], "decision": {"type": "final", "text": "committed exact\r\nresult\n"}}
+        body = {"protocol_version": 1, "submission_id": secrets.token_hex(12), "connection_id": peer.opened["connection_id"], "connection_generation": peer.opened["connection_generation"], "conversation_id": job["conversation_id"], "generation": job["generation"], "lease_id": job["lease_id"], "context_receipt_id": job["context"]["receipt_id"], "decision": {"type": "final", "text": "committed exact\x00 literal\\u0000\r\nresult\n"}}
         proxy = TLSFixture(self, self.origin_url)
         try:
             proxy.drop_decision = True
@@ -153,12 +153,13 @@ class Recovery(Routing):
         self.checked("/api/v1/worker/jobs/" + job["id"] + "/decisions", worker["credential"], "POST", conflicting, want=409)
         output, _ = self.read_native(request)
         require(output["output"] == body["decision"] and len([e for e in self.timeline(request["conversation_id"]) if e["kind"] == "decision.accepted"]) == 1, "lost acknowledgement duplicated acceptance or changed output")
-        self.receipt("recovery.lost_decision_acknowledgement", request=request["id"], response_dropped=True, accepted_once=True, exact_replay=True)
+        self.receipt("recovery.lost_decision_acknowledgement", request=request["id"], response_dropped=True, accepted_once=True, exact_replay=True, nul_output=True)
 
     def tool_wait_and_settled_pin(self):
         worker = self.new_worker()
         peer = self.peer(worker)
         initial = self.input(worker)
+        initial["messages"][0]["text"] += "\x00 literal\\u0000"
         request, _ = self.submit(initial, "tool-wait-recovery")
         call = {"type": "tool_call", "call_id": "recovery-call-" + secrets.token_hex(8), "name": "read_file", "arguments": {"path": "client-only"}}
         self.deliver(worker, peer, request, call)
@@ -169,7 +170,7 @@ class Recovery(Routing):
         events = self.restored(request)
         require(self.detail(request) == before and any(e["msg"] == "recovery.restored" and e["pending_call_id"] == call["call_id"] and e["pinned_worker_id"] == worker["worker"]["id"] for e in events), "tool wait or acknowledged delivery was not restored")
         current = self.peer(worker)
-        contents = "client-only-" + secrets.token_hex(20) + "\r\nexact trailing newline\n"
+        contents = "client-only-" + secrets.token_hex(20) + "\x00 literal\\u0000\r\nexact trailing newline\n"
         result = {"type": "tool_result", "call_id": call["call_id"], "output": contents}
         continued = self.input(worker, initial["messages"] + [call, result], previous=request["response_id"])
         wrong = {**continued, "messages": initial["messages"] + [call, {**result, "call_id": "wrong"}]}
@@ -188,15 +189,17 @@ class Recovery(Routing):
         self.deliver(worker, current, later, {"type": "final", "text": "later"})
         self.read_native(later)
         current.stop()
-        self.receipt("recovery.native_tool_wait_and_settled_affinity", request=request["id"], call_id=call["call_id"], exact_result=True, full_history=True, pin_preserved=True)
+        self.receipt("recovery.native_tool_wait_and_settled_affinity", request=request["id"], call_id=call["call_id"], exact_result=True, full_history=True, pin_preserved=True, nul_input_and_result=True)
 
     def incomplete_output(self):
         worker = self.new_worker()
         peer = self.peer(worker)
         request, _ = self.submit(self.input(worker, tools=[]), "output-boundary-recovery")
-        self.deliver(worker, peer, request, {"type": "final", "text": "durable output"})
+        output_text = "durable output\x00 literal\\u0000"
+        self.deliver(worker, peer, request, {"type": "final", "text": output_text})
         constraint = "recovery_output_finish"
-        self.sql("ALTER TABLE aaa_model_requests ADD CONSTRAINT " + constraint + " CHECK(id <> '" + request["id"] + "' OR data->>'output_completed_at' IS NULL);")
+        metadata = r"replace(data::text,E'\\u0000',E'\\u0001')::json"
+        self.sql("ALTER TABLE aaa_model_requests ADD CONSTRAINT " + constraint + " CHECK(id <> '" + request["id"] + "' OR (" + metadata + ")->>'output_completed_at' IS NULL);")
         try:
             _, headers = self.read_native(request)
             self.trace_request(headers["X-Request-Id"], request["id"])
@@ -209,16 +212,17 @@ class Recovery(Routing):
         require(self.detail(request) == before, "restart altered accepted output or delivery boundaries")
         self.restored(request, "output_delivery")
         output, _ = self.read_native(request)
-        require(output["output"]["text"] == "durable output" and "output_completed_at" in self.detail(request)["request"], "durable output could not be retrieved without inference")
-        self.receipt("recovery.incomplete_output_boundary", request=request["id"], retained_output=True, automatic_inference_retries=0, log_only_diagnosis=True)
+        require(output["output"]["text"] == output_text and "output_completed_at" in self.detail(request)["request"], "durable output could not be retrieved without inference")
+        self.receipt("recovery.incomplete_output_boundary", request=request["id"], retained_output=True, automatic_inference_retries=0, log_only_diagnosis=True, nul_output=True)
 
     def incomplete_context_without_decision(self):
         worker = self.new_worker()
         peer = self.peer(worker)
-        request, _ = self.submit(self.input(worker, tools=[]), "context-only-recovery")
+        request, _ = self.submit(self.input(worker, messages=[{"type": "message", "role": "user", "text": "context\x00 literal\\u0000"}], tools=[]), "context-only-recovery")
         job = self.detail(request)["assignment"]
         constraint = "recovery_context_finish"
-        self.sql("ALTER TABLE aaa_model_requests ADD CONSTRAINT " + constraint + " CHECK(id <> '" + request["id"] + "' OR data->>'context_delivery_written_at' IS NULL);")
+        metadata = r"replace(data::text,E'\\u0000',E'\\u0001')::json"
+        self.sql("ALTER TABLE aaa_model_requests ADD CONSTRAINT " + constraint + " CHECK(id <> '" + request["id"] + "' OR (" + metadata + ")->>'context_delivery_written_at' IS NULL);")
         try:
             _, headers = self.checked("/api/v1/worker/jobs/" + job["id"], worker["credential"])
             self.trace_request(headers["X-Request-Id"], request["id"])
@@ -243,7 +247,7 @@ class Recovery(Routing):
     def expired_lease_and_failed_startup(self):
         worker = self.new_worker()
         peer = self.peer(worker)
-        request, _ = self.submit(self.input(worker, tools=[]), "startup-storage-failure")
+        request, _ = self.submit(self.input(worker, messages=[{"type": "message", "role": "user", "text": "startup\x00 literal\\u0000"}], tools=[]), "startup-storage-failure")
         job, _, claim = self.claim(worker, peer, self.experiment(request["id"]))
         self.docker("kill", "--signal", "KILL", self.main_service)
         peer.stop()
