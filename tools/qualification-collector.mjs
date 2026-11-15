@@ -1,5 +1,5 @@
 import { randomBytes, randomUUID } from 'node:crypto';
-import { attachExport, decodeExport, identifier, instant, need, privateRead, publicOrigin, readExports, same } from './qualification-evidence.mjs';
+import { attachExport, decodeExport, hash, identifier, instant, need, privateRead, publicOrigin, readExports, same } from './qualification-evidence.mjs';
 import { validateReport } from './qualification-report.mjs';
 
 export class Collector {
@@ -49,9 +49,16 @@ export class Collector {
       await this.log('ERROR','qualification.exchange_failed',{case_id:item?.id,operation_id:item?.experiment_id,path,method,cause:error.name === 'TimeoutError' ? 'http_deadline' : 'http_exchange_failed'});
       throw new Error('http_exchange_failed');
     }
-    await this.log('DEBUG','qualification.http_exchange',{case_id:item?.id,operation_id:item?.experiment_id,conversation_id:item?.conversation_id,worker_id:item?.worker_id ?? this.workerID,path,method,input:body ?? null,http_status:response.status,request_id:response.headers.get('x-request-id'),output:raw});
+    const exporting = path.split('?')[0] === '/api/v1/admin/diagnostics/export';
+    let output = raw;
+    if (exporting) {
+      const sha256 = hash(raw), file = `http-export-${sha256}.ndjson`;
+      await this.state.write(file, raw);
+      output = { file, sha256, bytes: Buffer.byteLength(raw) };
+    }
+    await this.log('DEBUG','qualification.http_exchange',{case_id:item?.id,operation_id:item?.experiment_id,conversation_id:item?.conversation_id,worker_id:item?.worker_id ?? this.workerID,path,method,input:body ?? null,http_status:response.status,request_id:response.headers.get('x-request-id'),output});
     need(response.ok, `http_${response.status}`);
-    return path.includes('/diagnostics/export') ? raw : JSON.parse(raw);
+    return exporting ? raw : JSON.parse(raw);
   }
   async initialize() {
     const observations = await this.observe();

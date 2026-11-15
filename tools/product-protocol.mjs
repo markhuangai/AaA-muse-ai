@@ -92,7 +92,10 @@ export class ProductProtocol {
   async correlate(item, management) {
     const operations = [], workers = [], conversations = [], contexts = [];
     for (const turn of item.turns) {
-      const events = decodeExport(await management('/api/v1/admin/diagnostics/export?request_id=' + turn.request_id)).events;
+      const created = item.protocol === 'chat' ? turn.value.created : turn.value.created_at;
+      need(Number.isSafeInteger(created) && created >= 0 && Number.isFinite(new Date(created * 1000).getTime()), 'product_creation_time_invalid');
+      const query = new URLSearchParams({ request_id: turn.request_id, since: new Date(created * 1000).toISOString() });
+      const events = decodeExport(await management('/api/v1/admin/diagnostics/export?' + query)).events;
       const admitted = events.find(event => ['chat.request_admitted', 'responses.request_admitted'].includes(event.msg));
       need(identifier(admitted?.operation_id), 'product_request_operation_missing');
       const detail = await management('/api/v1/admin/requests/' + admitted.operation_id), execution = detail.execution;

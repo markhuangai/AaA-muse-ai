@@ -62,7 +62,12 @@ export class ReleaseCollector extends Collector {
     if (saved) {
       this.report = JSON.parse(saved);
       need(this.report.schema_version === 2 && this.report.suite === 'release' && this.report.origin === this.origin && this.report.evidence_kind === this.evidenceKind && this.report.source.service_sha === status.build.revision && this.report.source.image_digest === artifact.image_digest, 'release_run_identity_conflict');
-      for (const prior of this.report.workers) need(!prior.worker_id || workers.some(worker => same(worker, prior)), 'release_worker_identity_conflict');
+      for (const prior of this.report.workers) {
+        const current = workers.find(worker => worker.slot === prior.slot);
+        need(current && current.account_ref === prior.account_ref && (!prior.worker_id || current.worker_id === prior.worker_id) &&
+          (!prior.installed_version || current.installed_version === prior.installed_version) &&
+          (!prior.installed_sha256 || current.installed_sha256 === prior.installed_sha256), 'release_worker_identity_conflict');
+      }
       this.report.observations = [...observations.entries, ...this.report.observations.filter(entry => entry.kind === 'intervention' && !observations.entries.some(next => same(entry, next)))];
       this.report.workers = workers;
     } else {
@@ -248,9 +253,16 @@ export class ReleaseCollector extends Collector {
     let observations;
     try { observations = await this.observe(); } catch (error) { await failure('observations', 'all', error); }
     try {
-      const raw = await this.api('/api/v1/admin/diagnostics/export?since=' + encodeURIComponent(this.report.started_at));
-      const attached = await attachExport(this.state, 'broker', 'all', raw, this.logger.redactor);
-      if (!this.report.exports.some(previous => previous.file === attached.file)) this.report.exports.push(attached);
+      const started = Date.parse(this.report.started_at), snapshot = this.now();
+      need(Number.isFinite(started) && started <= snapshot, 'invalid_run_timing');
+      for (let since = started; since <= snapshot; since += 300000) {
+        const until = Math.min(since + 300000, snapshot);
+        const query = new URLSearchParams({ since: new Date(since).toISOString(), until: new Date(until).toISOString() });
+        const raw = await this.api('/api/v1/admin/diagnostics/export?' + query);
+        const attached = await attachExport(this.state, 'broker', 'all', raw, this.logger.redactor);
+        if (!this.report.exports.some(previous => previous.file === attached.file)) this.report.exports.push(attached);
+        if (until === snapshot) break;
+      }
     } catch (error) { await failure('broker', 'all', error); }
     for (const ref of observations?.worker_exports ?? []) {
       try {

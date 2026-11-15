@@ -5,6 +5,8 @@ import { releaseHarness } from './test/release-harness.mjs';
 import { liveCases } from './product-report.mjs';
 import { Redactor } from '../worker/dist/diagnostics.js';
 import { stamp } from './test/product-fixture.mjs';
+import { decodeExport, privateRead } from './qualification-evidence.mjs';
+import { exportFixture } from './qualification-fixtures.mjs';
 
 test('private access accepts paths, separates credential roles, and never adds a worker key', async () => {
   const value = { schema_version: 1, workers: [{ slot: 'a', account_ref: 'account-a' }, { slot: 'b', account_ref: 'account-b' }], clients: { a: { header_file: '/private/a' }, b: { header_file: '/private/b' } }, portal_password_file: '/private/password' };
@@ -33,6 +35,52 @@ test('release initialization requires the verified paired image and retains inte
   h.entries.find(entry => entry.kind === 'artifact_identity').installer_sha256 = ''; await h.write(); await assert.rejects(h.collector.initialize(), /verified_image_and_installer_required/);
   assert.throws(() => h.collector.worker('missing'), /worker_setup_required/);
   assert.throws(() => new ReleaseCollector({ ...h.evidence, origin: 'https://broker.test', header: 'Authorization: Bearer management-private', access: { ...h.access, keys: { ...h.access.keys, a: 'Bearer management-private' } } }), /distinct_management_key_required/);
+});
+
+test('resume fills unknown installation metadata once and preserves established identity', async t => {
+  const h = await releaseHarness(t);
+  const index = h.entries.findIndex(entry => entry.kind === 'setup_ended' && entry.worker_id === 'worker-a');
+  const [setup] = h.entries.splice(index, 1); await h.write(); await h.collector.initialize();
+  assert.equal(h.collector.worker('a').installed_version, null);
+  assert.equal(h.collector.worker('a').installed_sha256, null);
+  h.entries.push({ ...setup, worker_sha256: undefined }); await h.write(); await h.collector.initialize();
+  assert.equal(h.collector.worker('a').installed_version, setup.worker_version);
+  assert.equal(h.collector.worker('a').installed_sha256, null);
+  h.entries.at(-1).worker_sha256 = setup.worker_sha256; await h.write(); await h.collector.initialize();
+  assert.equal(h.collector.worker('a').installed_sha256, setup.worker_sha256);
+  const verified = { ...h.collector.worker('a') };
+  for (const change of [{ worker_id: 'foreign' }, { account_ref: 'foreign' }, { installed_version: 'different' }, { installed_sha256: 'e'.repeat(64) }]) {
+    h.collector.report.workers[0] = { ...verified, ...change }; await h.collector.save();
+    await assert.rejects(h.collector.initialize(), /release_worker_identity_conflict/);
+    h.collector.report.workers[0] = { ...verified }; await h.collector.save();
+  }
+  h.collector.report.workers[0] = { ...verified, worker_id: null, installed_version: null, installed_sha256: null }; await h.collector.save();
+  h.access.workers[0].account_ref = 'foreign-owner';
+  await assert.rejects(h.collector.initialize(), /release_worker_identity_conflict/);
+});
+
+test('release exports cover the entire run through contiguous bounded intervals', async t => {
+  const h = await releaseHarness(t); await h.collector.initialize();
+  const started = Date.parse(h.collector.report.started_at), snapshot = started + 601000;
+  h.collector.now = () => snapshot;
+  const events = [0, 300000, 600000, 601000].map((offset, index) => ({ time: new Date(started + offset).toISOString(), level: 'INFO', msg: 'boundary.observed', operation_id: 'operation-' + index }));
+  const fetcher = h.collector.fetcher, intervals = [];
+  h.collector.fetcher = async (url, options) => {
+    const parsed = new URL(url);
+    if (parsed.pathname !== '/api/v1/admin/diagnostics/export') return fetcher(url, options);
+    const since = Date.parse(parsed.searchParams.get('since')), until = Date.parse(parsed.searchParams.get('until'));
+    intervals.push([since, until]);
+    return new Response(exportFixture(events.filter(event => Date.parse(event.time) >= since && Date.parse(event.time) <= until)));
+  };
+  await h.collector.finalize();
+  assert.deepEqual(intervals, [[started, started + 300000], [started + 300000, started + 600000], [started + 600000, snapshot]]);
+  const retained = [];
+  for (const ref of h.collector.report.exports) retained.push(...decodeExport(await privateRead(h.collector.state.path(ref.file))).events);
+  assert.deepEqual([...new Set(retained.map(event => event.operation_id))], events.map(event => event.operation_id));
+  assert.deepEqual(h.collector.report.evidence_import_failures, []);
+  h.collector.report.started_at = 'invalid';
+  await h.collector.finalize();
+  assert.ok(h.collector.report.evidence_import_failures.some(item => item.cause === 'invalid_run_timing'));
 });
 
 test('native approval executes the actual evidence verifier before granting routing authority', async t => {

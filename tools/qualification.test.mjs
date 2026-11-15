@@ -287,6 +287,37 @@ async function harness(t,{mode='normal'}={}) {
   return {collector,evidence,requests,logs,experiments,root,entries,workerExports,writeObservations,advance:ms=>{clock+=ms;},stamp};
 }
 
+test('large diagnostic HTTP responses retain complete private bytes with bounded exchange logs', async t => {
+  const root = await temporary(t);
+  const raw = exportFixture([{ time: '2026-01-01T00:00:00.000Z', level: 'DEBUG', msg: 'large.context', text: 'x'.repeat(9 * 1024 * 1024) }]);
+  assert.ok(Buffer.byteLength(raw) < 16 * 1024 * 1024);
+  const server = createServer((req, res) => {
+    res.setHeader('X-Request-Id', 'export-request');
+    if (req.url.includes('denied')) { res.statusCode = 403; return res.end('{"error":"export_denied"}'); }
+    res.end(req.url.includes('malformed') ? 'incomplete export' : raw);
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  const evidence = await openEvidence(join(root, 'evidence'), { stderr: () => {} });
+  const collector = new Collector({ ...evidence, origin: 'https://broker.test', workerID: 'worker-1', header: 'Authorization: Bearer test-management',
+    fetcher: (url, options) => fetch(`http://127.0.0.1:${server.address().port}${new URL(url).pathname}${new URL(url).search}`, options) });
+  assert.equal(await collector.api('/api/v1/admin/diagnostics/export?large'), raw);
+  assert.equal(await collector.api('/api/v1/admin/diagnostics/export?malformed'), 'incomplete export');
+  await assert.rejects(collector.api('/api/v1/admin/diagnostics/export?denied'), /http_403/);
+  const exchanges = decodeExport(await evidence.capture.export({}, false)).events;
+  assert.equal(exchanges.length, 3);
+  for (const [index, expected] of [raw, 'incomplete export', '{"error":"export_denied"}'].entries()) {
+    const exchange = exchanges[index];
+    assert.equal(exchange.msg, 'qualification.http_exchange');
+    assert.ok(JSON.stringify(exchange).length < 2048);
+    assert.equal(exchange.output.sha256, hash(expected));
+    assert.equal(exchange.output.bytes, Buffer.byteLength(expected));
+    assert.equal(await privateRead(join(evidence.state.root, exchange.output.file)), expected);
+  }
+  assert.equal(decodeExport(await privateRead(join(evidence.state.root, exchanges[0].output.file))).events[0].text.length, 9 * 1024 * 1024);
+  assert.equal(exchanges[2].http_status, 403);
+});
+
 test('collector exercises real HTTP client-tool continuation and never posts worker decisions',async t=>{
   const h=await harness(t);await h.collector.initialize();await h.collector.runCase('trial-1');
   const item=h.collector.report.cases[0];

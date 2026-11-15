@@ -1,8 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import * as fs from 'node:fs/promises';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import { cycle, cycleIDs, finalText, retryOutput, ProductProtocol } from './product-protocol.mjs';
 import { productServer } from './test/product-server.mjs';
 import { exportFixture } from './qualification-fixtures.mjs';
+import { decodeExport, openEvidence } from './qualification-evidence.mjs';
+import { Capture } from '../worker/dist/diagnostics.js';
 
 const make = (protocol = 'chat', stream = false) => cycle({ id: 'case-a', slot: 'a', protocol, stream, session: 'session-a', fixture: { owner: 'client_driver', path: 'client-only.txt', contents: 'private-random\r\n😀\n' } });
 const keys = { a: 'Bearer client-a', b: 'Bearer client-b' };
@@ -77,4 +82,39 @@ test('production correlation requires captured admission, an assignment and one 
   const sameOwner = new ProductProtocol({ origin: h.origin, keys: { a: keys.a, b: keys.a } });
   const responseItem = make('responses'); await driver.start(responseItem); await driver.finish(responseItem);
   await assert.rejects(sameOwner.rejectOtherClient(responseItem), /product_cross_client_admitted/);
+});
+
+test('correlation survives unrelated pruned history but rejects missing current evidence and invalid service times', async t => {
+  for (const protocol of ['chat', 'responses']) {
+    const h = await productServer(t), item = make(protocol);
+    const driver = new ProductProtocol({ origin: h.origin, keys, readFixture: async () => item.fixture.contents });
+    await driver.start(item); await driver.finish(item);
+    const directory = await fs.mkdtemp(join(tmpdir(), 'aaa-product-retention-'));
+    t.after(() => fs.rm(directory, { recursive: true }));
+    let clock = 120000;
+    const evidence = await openEvidence(join(directory, 'evidence'), { now: () => clock, stderr: () => {} });
+    const capture = new Capture(evidence.capture.state, 1024 * 1024, 1000);
+    await capture.write({ time: new Date(clock).toISOString(), level: 'INFO', msg: 'old.history' });
+    clock = 123000;
+    for (const turn of item.turns) {
+      const [admitted] = decodeExport(await h.management('/api/v1/admin/diagnostics/export?request_id=' + turn.request_id)).events;
+      await capture.write({ ...admitted, time: new Date(clock).toISOString(), request_id: turn.request_id });
+    }
+    const unbounded = await capture.export({ request_id: item.turns[0].request_id }, false);
+    assert.throws(() => decodeExport(unbounded), /capture_incomplete/);
+    const management = path => path.includes('/diagnostics/export') ? capture.export(Object.fromEntries(new URL('http://test' + path).searchParams), false) : h.management(path);
+    const requests = h.requests.length;
+    const receipt = await driver.correlate(item, management);
+    assert.equal(receipt.operation_ids.length, 2);
+    assert.equal(h.requests.length, requests);
+    assert.equal(item.client_tool_executions, 1);
+    const field = protocol === 'chat' ? 'created' : 'created_at';
+    for (const value of [undefined, -1, 1.5, Infinity, Number.MAX_SAFE_INTEGER]) {
+      item.turns[0].value[field] = value;
+      await assert.rejects(driver.correlate(item, async () => { assert.fail('invalid service time must fail before export'); }), /product_creation_time_invalid/);
+    }
+    item.turns[0].value[field] = 123;
+    clock += 2000;
+    await assert.rejects(driver.correlate(item, management), /capture_incomplete/);
+  }
 });

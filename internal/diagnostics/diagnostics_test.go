@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -201,7 +202,8 @@ func TestCorruptChunksAreExplicit(t *testing.T) {
 
 type countingFiles struct {
 	OSFiles
-	reads, scans int
+	reads, scans    int
+	writes, removes int
 }
 
 func (f *countingFiles) ReadFile(p string) ([]byte, error) {
@@ -211,6 +213,134 @@ func (f *countingFiles) ReadFile(p string) ([]byte, error) {
 func (f *countingFiles) ReadDir(p string) ([]fs.DirEntry, error) {
 	f.scans++
 	return f.OSFiles.ReadDir(p)
+}
+func (f *countingFiles) WriteFile(p string, b []byte, m fs.FileMode) error {
+	f.writes++
+	return f.OSFiles.WriteFile(p, b, m)
+}
+func (f *countingFiles) Remove(p string) error {
+	f.removes++
+	return f.OSFiles.Remove(p)
+}
+
+func TestCapacityPruningBatchesDurableMetadata(t *testing.T) {
+	s, now := openFixture(t, 128*1024*1024)
+	var out bytes.Buffer
+	logger := fixtureLogger(s, now, &out)
+	for i := 0; i < 64; i++ {
+		logger.Info("fixture")
+	}
+	s.maxBytes = s.retainedBytes
+	files := &countingFiles{}
+	s.files = files
+	logger.Debug("larger", "payload", strings.Repeat("x", 12000))
+	if files.removes < 2 || files.writes != 2 {
+		t.Fatalf("pruning %d captures required %d durable writes; want capture and one watermark", files.removes, files.writes)
+	}
+	reopened, err := Open(OSFiles{}, s.dir, "replacement", func() time.Time { return *now }, 7*24*time.Hour, s.maxBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := reopened.Snapshot(Filter{})
+	if err != nil || snapshot.Metadata.Complete || snapshot.Metadata.Captures != len(s.retained) || reopened.retainedBytes != s.retainedBytes {
+		t.Fatal("batched pruning lost durable loss metadata or retained captures")
+	}
+}
+
+func TestInterruptedPruningKeepsConservativeWatermark(t *testing.T) {
+	s, now := openFixture(t, 128*1024*1024)
+	var out bytes.Buffer
+	logger := fixtureLogger(s, now, &out)
+	for i := 0; i < 4; i++ {
+		logger.Info("fixture")
+		*now = now.Add(time.Second)
+	}
+	s.maxBytes = 6144
+	s.files = &failingFiles{fail: "remove", after: 1}
+	payload, err := json.Marshal(map[string]any{"time": *now, "msg": "larger", "level": "DEBUG", "payload": strings.Repeat("x", 12000)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.Write(payload); err == nil {
+		t.Fatal("ignored interrupted deletion")
+	}
+	b, err := os.ReadFile(filepath.Join(s.dir, "retention.json"))
+	var state retentionState
+	if err != nil || json.Unmarshal(b, &state) != nil || !state.PrunedThrough.Equal(*now) {
+		t.Fatal("batch watermark was not durable before the first deletion")
+	}
+	reopened, err := Open(OSFiles{}, s.dir, "replacement", func() time.Time { return *now }, 7*24*time.Hour, s.maxBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := reopened.Snapshot(Filter{})
+	if err != nil || snapshot.Metadata.Complete || snapshot.Metadata.Captures != 0 || !snapshot.Metadata.PrunedThrough.Equal(*now) {
+		t.Fatal("restart hid the interrupted pruning batch")
+	}
+}
+
+type pausedCaptureFiles struct {
+	OSFiles
+	started, release chan struct{}
+	once             sync.Once
+}
+
+func (f *pausedCaptureFiles) ReadFile(path string) ([]byte, error) {
+	if strings.HasPrefix(filepath.Base(path), "capture-") {
+		f.once.Do(func() { close(f.started); <-f.release })
+	}
+	return f.OSFiles.ReadFile(path)
+}
+
+func TestSnapshotReportsConcurrentPruning(t *testing.T) {
+	s, now := openFixture(t, 6144)
+	var out bytes.Buffer
+	fixtureLogger(s, now, &out).Info("existing")
+	files := &pausedCaptureFiles{started: make(chan struct{}), release: make(chan struct{})}
+	s.files = files
+	var released sync.Once
+	unblock := func() { released.Do(func() { close(files.release) }) }
+	defer unblock()
+	type result struct {
+		snapshot Snapshot
+		err      error
+	}
+	exported := make(chan result, 1)
+	go func() {
+		snapshot, err := s.Snapshot(Filter{})
+		exported <- result{snapshot, err}
+	}()
+	select {
+	case <-files.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("export did not reach the capture read")
+	}
+	written := make(chan error, 1)
+	go func() {
+		_, err := s.Write([]byte(`{"time":"2026-11-08T01:02:03Z","msg":"larger","level":"DEBUG","payload":"` + strings.Repeat("x", 12000) + `"}`))
+		written <- err
+	}()
+	select {
+	case err := <-written:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		unblock()
+		<-written
+		<-exported
+		t.Fatal("pruning waited for an export read")
+	}
+	unblock()
+	select {
+	case result := <-exported:
+		metadata := result.snapshot.Metadata
+		if result.err != nil || metadata.Complete || metadata.Captures != 0 || len(metadata.Omissions) != 1 || !strings.HasPrefix(metadata.Omissions[0], "capture_removed_during_export:capture-") {
+			t.Fatalf("concurrent evidence loss was hidden: %+v, %v", metadata, result.err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("export did not resume after pruning")
+	}
 }
 
 func TestCaptureWritesDoNotRescanHistory(t *testing.T) {
