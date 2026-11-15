@@ -12,9 +12,11 @@ import (
 
 var revision = "development"
 var dirty = "true"
+var version = service.DevelopmentVersion
+var workerSHA256 = ""
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	os.Exit(app.Run(ctx, os.Args[1:], service.Build{Revision: revision, Dirty: dirty != "false"}, app.Production(os.Stdout, os.Stderr)))
+	os.Exit(app.Run(ctx, os.Args[1:], service.Build{Version: version, Revision: revision, Dirty: dirty != "false", WorkerPackage: service.PairedWorker(version, workerSHA256)}, app.Production(os.Stdout, os.Stderr)))
 }

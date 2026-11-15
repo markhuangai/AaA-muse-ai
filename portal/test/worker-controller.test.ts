@@ -118,7 +118,7 @@ test('enrollment copy, replacement, absolute expiry and suspended timers expose 
 
 test('enrollment errors, expired responses, logout races and clipboard failures remain explicit', async () => {
   const { controller, api, system, reports, denials } = fixture(); controller.activate(); await settle();
-  for (const [error, message] of [[new APIError('worker_package_unconfigured', 503, 'pin-error'), 'Configure the worker package'], [new APIError('request_failed', 403), 'denied'], [new Error('private detail'), 'could not be confirmed']] as const) {
+  for (const [error, message] of [[new APIError('worker_package_unconfigured', 503, 'pin-error'), 'verified paired worker metadata'], [new APIError('request_failed', 403), 'denied'], [new Error('private detail'), 'could not be confirmed']] as const) {
     api.enrollmentWork = async () => { throw error; }; await controller.createEnrollment('prompt');
     expect(controller.snapshot().enrollment).toBeNull(); expect(controller.snapshot().enrollmentMessage).toContain(message);
   }

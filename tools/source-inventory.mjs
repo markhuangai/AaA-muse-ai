@@ -24,7 +24,8 @@ export function componentsFor(paths) {
 
 export function inspectSource(root = process.cwd(), execute = execFileSync, read = readFileSync, stat = statSync) {
   const git = args => execute('git', ['--no-optional-locks', ...args], { cwd: root, encoding: 'utf8' });
-  const paths = [...new Set(git(['ls-files', '--cached', '--others', '--exclude-standard', '-z']).split('\0').filter(Boolean))].sort();
+  const deleted = new Set(git(['diff', '--name-only', '--diff-filter=D', '-z']).split('\0').filter(Boolean));
+  const paths = [...new Set(git(['ls-files', '--cached', '--others', '--exclude-standard', '-z']).split('\0').filter(path => path && !deleted.has(path)))].sort();
   const sha = git(['rev-parse', 'HEAD']).trim();
   if (!/^[a-f0-9]{40}$/.test(sha)) throw new Error('invalid_source_sha');
   const hash = createHash('sha256');

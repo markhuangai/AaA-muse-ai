@@ -3,8 +3,10 @@ DOCKER ?= docker
 SERVICE_IMAGE ?= aaa-muse-ai-service:local
 SOURCE_SHA ?= $(shell git rev-parse HEAD)
 SOURCE_DIRTY ?= $(shell test -z "$$(git --no-optional-locks status --porcelain --untracked-files=all)" && echo false || echo true)
+PRODUCT_VERSION ?= $(if $(WORKER_RELEASE_VERSION),$(WORKER_RELEASE_VERSION),$(shell node -p "require('./worker/package.json').version"))
+PRODUCT_E2E_SHARD ?= all
 
-.PHONY: check-ci-policy check-file-sizes test-unit-coverage check-workflows check-service test-service-unit test-service test-worker-auth test-inference test-history test-routing test-broker-recovery test-chat test-responses smoke-image image worker-package test-worker-transport test-worker-setup test-worker-recovery test-portal-shell test-portal-workers test-portal-history
+.PHONY: check-ci-policy check-file-sizes test-unit-coverage check-workflows check-service test-service-unit test-service test-worker-auth test-inference test-history test-routing test-broker-recovery test-chat test-responses smoke-image image worker-package test-worker-transport test-worker-setup test-worker-recovery test-portal-shell test-portal-workers test-portal-history test-product-e2e
 
 check-ci-policy:
 	node .github/scripts/ci-policy.mjs
@@ -25,8 +27,8 @@ check-service:
 test-service-unit:
 	sh scripts/go.sh unit
 
-image:
-	$(DOCKER) build --provenance=false --build-arg SOURCE_SHA=$(SOURCE_SHA) --build-arg SOURCE_DIRTY=$(SOURCE_DIRTY) -t $(SERVICE_IMAGE) .
+image: worker-package
+	$(DOCKER) build --provenance=false --build-arg SOURCE_SHA=$(SOURCE_SHA) --build-arg SOURCE_DIRTY=$(SOURCE_DIRTY) --build-arg PRODUCT_VERSION=$(PRODUCT_VERSION) --build-arg WORKER_SHA256="$$(node -p "require('./.artifacts/worker-package/latest.json').sha256")" -t $(SERVICE_IMAGE) .
 
 test-service: image
 	python3 tests/integration/service.py --image $(SERVICE_IMAGE) --suite service --source-sha $(SOURCE_SHA) --source-dirty $(SOURCE_DIRTY)
@@ -79,7 +81,7 @@ test-portal-history: image
 	python3 -B tests/integration/portal_history.py --image $(SERVICE_IMAGE) --source-sha $(SOURCE_SHA) --source-dirty $(SOURCE_DIRTY)
 
 worker-package:
-	npm run build --workspace worker
+	WORKER_RELEASE_VERSION=$(PRODUCT_VERSION) npm run build --workspace worker
 	npm run test:package --workspace worker
 
 test-worker-transport: image worker-package
@@ -90,3 +92,6 @@ test-worker-setup: image worker-package
 
 test-worker-recovery: image worker-package
 	python3 -B tests/integration/worker_recovery.py --image $(SERVICE_IMAGE) --source-sha $(SOURCE_SHA) --source-dirty $(SOURCE_DIRTY) --package-receipt .artifacts/worker-package/latest.json
+
+test-product-e2e: image
+	python3 -B tests/integration/product_runner.py --image $(SERVICE_IMAGE) --source-sha $(SOURCE_SHA) --source-dirty $(SOURCE_DIRTY) --package-receipt .artifacts/worker-package/latest.json --shard $(PRODUCT_E2E_SHARD)

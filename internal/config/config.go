@@ -32,7 +32,8 @@ type Config struct {
 		PublicURL string `yaml:"public-url" json:"public_url"`
 	} `yaml:"server" json:"server"`
 	Database struct {
-		URL Secret `yaml:"url" json:"url"`
+		URL      Secret `yaml:"url" json:"url"`
+		Password Secret `yaml:"password" json:"password"`
 	} `yaml:"database" json:"database"`
 	Management struct {
 		Key Secret `yaml:"key" json:"key"`
@@ -40,9 +41,8 @@ type Config struct {
 	Portal struct {
 		Password Secret `yaml:"password" json:"password"`
 	} `yaml:"control-portal" json:"control_portal"`
-	ClientKeys    map[string]Secret `yaml:"client-keys" json:"client_keys"`
-	WorkerPackage WorkerPackage     `yaml:"worker-package" json:"worker_package"`
-	Limits        struct {
+	ClientKeys map[string]Secret `yaml:"client-keys" json:"client_keys"`
+	Limits     struct {
 		MaxJobs  int `yaml:"max-jobs" json:"max_jobs"`
 		InFlight int `yaml:"in-flight-per-worker" json:"in_flight_per_worker"`
 	} `yaml:"limits" json:"limits"`
@@ -53,14 +53,6 @@ type Config struct {
 		MaxBytes      int64  `yaml:"max-bytes" json:"max_bytes"`
 	} `yaml:"diagnostics" json:"diagnostics"`
 }
-
-type WorkerPackage struct {
-	Version string `yaml:"version" json:"version"`
-	SHA256  string `yaml:"sha256" json:"sha256"`
-}
-
-var packageVersion = regexp.MustCompile(`^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(dev|rc)\.(0|[1-9][0-9]*))?$`)
-var packageDigest = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
 type Error struct {
 	Field, Reason string
@@ -131,6 +123,12 @@ func Parse(b []byte, lookup func(string) (string, bool)) (Config, error) {
 			}
 		}
 		return Config{}, err
+	}
+	if c.Database.Password != "" {
+		target, _ := url.Parse(string(c.Database.URL))
+		target.User = url.UserPassword(target.User.Username(), string(c.Database.Password))
+		c.Database.URL = Secret(target.String())
+		c.Database.Password = ""
 	}
 	return c, nil
 }
@@ -211,6 +209,7 @@ func resolve(n *yaml.Node, lookup func(string) (string, bool)) error {
 	}
 	if n.Kind == yaml.ScalarNode && strings.Contains(n.Value, "${") {
 		missing := false
+		malformed := strings.Contains(envReference.ReplaceAllString(n.Value, ""), "${")
 		n.Value = envReference.ReplaceAllStringFunc(n.Value, func(match string) string {
 			value, ok := lookup(match[2 : len(match)-1])
 			if !ok || value == "" {
@@ -218,7 +217,7 @@ func resolve(n *yaml.Node, lookup func(string) (string, bool)) error {
 			}
 			return value
 		})
-		if missing || strings.Contains(n.Value, "${") {
+		if missing || malformed {
 			return &Error{Field: "configuration", Reason: "unresolved_environment_reference", Line: n.Line, Column: n.Column}
 		}
 	}
@@ -232,14 +231,6 @@ func resolve(n *yaml.Node, lookup func(string) (string, bool)) error {
 
 func (c Config) Validate() error {
 	bad := func(field, reason string) error { return &Error{Field: field, Reason: reason} }
-	if c.WorkerPackage.Version != "" || c.WorkerPackage.SHA256 != "" {
-		if !packageVersion.MatchString(c.WorkerPackage.Version) {
-			return bad("worker-package.version", "canonical_version_required")
-		}
-		if !packageDigest.MatchString(c.WorkerPackage.SHA256) {
-			return bad("worker-package.sha256", "sha256_required")
-		}
-	}
 	_, port, err := net.SplitHostPort(c.Server.Listen)
 	p, portErr := strconv.Atoi(port)
 	if err != nil || portErr != nil || p < 1 || p > 65535 {
@@ -252,6 +243,21 @@ func (c Config) Validate() error {
 	db, err := url.Parse(string(c.Database.URL))
 	if err != nil || (db.Scheme != "postgres" && db.Scheme != "postgresql") || db.Hostname() == "" || db.Path == "" || db.Path == "/" {
 		return bad("database.url", "postgres_url_required")
+	}
+	if c.Database.Password != "" {
+		if db.User == nil || db.User.Username() == "" {
+			return bad("database.password", "database_user_required")
+		}
+		if _, exists := db.User.Password(); exists {
+			return bad("database.password", "conflicting_password_sources")
+		}
+		query, err := url.ParseQuery(db.RawQuery)
+		if err != nil {
+			return bad("database.url", "invalid_query")
+		}
+		if _, exists := query["password"]; exists {
+			return bad("database.password", "conflicting_password_sources")
+		}
 	}
 	if strings.TrimSpace(string(c.Portal.Password)) == "" {
 		return bad("control-portal.password", "required")
@@ -304,9 +310,16 @@ func usableBearerKey(value Secret) bool {
 
 func (c Config) Secrets() []string {
 	values := []string{string(c.Database.URL), string(c.Management.Key), string(c.Portal.Password)}
+	if c.Database.Password != "" {
+		values = append(values, string(c.Database.Password))
+	}
 	if u, err := url.Parse(string(c.Database.URL)); err == nil && u.User != nil {
 		if p, ok := u.User.Password(); ok {
 			values = append(values, p)
+			encoded := strings.TrimPrefix(url.UserPassword("", p).String(), ":")
+			if encoded != p {
+				values = append(values, encoded)
+			}
 		}
 	}
 	for _, key := range c.ClientKeys {

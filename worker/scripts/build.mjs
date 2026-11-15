@@ -11,7 +11,7 @@ export function stampBuild({ directory = fileURLToPath(new URL('../', import.met
   const manifest = JSON.parse(read(join(directory, 'package.json'), 'utf8'));
   const package_version = env.WORKER_RELEASE_VERSION || manifest.version;
   assert(/^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(dev|rc)\.(0|[1-9][0-9]*))?$/.test(package_version), 'canonical package version required');
-  const path = join(directory, 'dist/cli.js');
+  const path = join(directory, 'dist/version.js');
   const compiled = read(path, 'utf8');
   assert.equal((compiled.match(/export const VERSION = '[^']+';/g) || []).length, 1);
   write(path, compiled.replace(/export const VERSION = '[^']+';/, `export const VERSION = '${package_version}';`));

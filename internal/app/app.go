@@ -66,11 +66,16 @@ func sleep(ctx context.Context, delay time.Duration) error {
 }
 
 func Run(ctx context.Context, args []string, build service.Build, d Dependencies) int {
+	build = build.Normalized()
 	operation := fmt.Sprintf("startup-%d", d.Now().UnixNano())
 	fatal := func(event, cause string, attrs []any) {
 		emergency(d.Stderr, event, cause, append([]any{"operation_id", operation, "revision", build.Revision}, attrs...))
 	}
 	flags := flag.NewFlagSet("aaa-muse-ai", flag.ContinueOnError)
+	if !build.Valid() {
+		fatal("build.rejected", "invalid_release_metadata", nil)
+		return 1
+	}
 	flags.SetOutput(io.Discard)
 	path := flags.String("config", config.DefaultPath, "Configuration path")
 	if err := flags.Parse(args); err != nil || flags.NArg() != 0 {
@@ -157,7 +162,7 @@ func Run(ctx context.Context, args []string, build service.Build, d Dependencies
 	handler.Portal = service.NewPortal(authority, d.Random, d.Now)
 	handler.Assets = d.PortalAssets
 	startup.Info("portal.configured", "effective_settings", service.PortalSettings(), "session_scope", "process_memory", "browser_storage", "none")
-	handler.Setup = service.NewSetup(handler.Workers, c.Server.PublicURL, c.WorkerPackage)
+	handler.Setup = service.NewSetup(handler.Workers, c.Server.PublicURL, svc.Build().WorkerPackage)
 	server := &http.Server{Handler: handler, BaseContext: func(net.Listener) context.Context { return serveCtx }, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 * 1024, ErrorLog: slog.NewLogLogger(logger.Handler(), slog.LevelError)}
 	brokerDone := make(chan struct{})
 	go func() { defer close(brokerDone); broker.Run(serveCtx, logger) }()

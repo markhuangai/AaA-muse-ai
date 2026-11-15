@@ -245,7 +245,6 @@ def run(harness_type=WorkerSetup, suite="worker-setup"):
         proxy = h.proxy = TLSFixture(h, "http://127.0.0.1:1")
         config = h.configuration()
         config["server"]["public-url"] = proxy.origin
-        config["worker-package"] = {"version": h.package["version"], "sha256": h.package["sha256"]}
         config["limits"] = {"max-jobs": 8, "in-flight-per-worker": 1}
         h.broker, h.origin_url, _ = h.launch(config)
         proxy.target = urllib.parse.urlsplit(h.origin_url)

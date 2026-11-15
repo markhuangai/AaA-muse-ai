@@ -12,6 +12,7 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
+import urllib.parse
 
 POSTGRES = "postgres:18.6-alpine@sha256:123b17998ccaf47e53b502e8c6a1e79afd8f579c6f3eec83c563da026f957395"
 LABEL = "io.aaa-muse.test-owner"
@@ -111,7 +112,7 @@ class Harness:
                 "client-keys": {"fixture-client": self.client},
                 "diagnostics": {"level": "info", "directory": "/var/lib/aaa-muse-ai/diagnostics"}}
 
-    def launch(self, config=None, raw=None, diagnostic_volume=None, expect_startup=True, port_binding="127.0.0.1::8080"):
+    def launch(self, config=None, raw=None, diagnostic_volume=None, expect_startup=True, port_binding="127.0.0.1::8080", environment=()):
         index = len(self.resources["containers"])
         path = self.private("config-" + str(index) + ".yaml", raw if raw is not None else json.dumps(config or self.configuration()))
         # The bind source is inside a private directory; the container needs read access to its mounted file.
@@ -119,6 +120,7 @@ class Harness:
         volume = diagnostic_volume or self.volume("diagnostics-" + str(index))
         identity = self.remember("containers", self.docker("run", "-d", "--label", LABEL + "=" + self.owner,
                                   "--network", self.network, "-p", port_binding,
+                                  *[argument for name in environment for argument in ("--env", name)],
                                   "--mount", "type=bind,source=" + str(path) + ",target=/etc/aaa-muse-ai/config.yaml,readonly",
                                   "-v", volume + ":/var/lib/aaa-muse-ai/diagnostics", self.args.image).stdout.strip())
         return identity, self.origin(identity) if expect_startup else None, volume
@@ -234,6 +236,9 @@ class Harness:
         status = json.loads(body)
         require(status["schema_version"] == 5 and status["ready"], "wrong status schema/readiness")
         require(status["build"]["revision"] == self.args.source_sha, "HTTP source identity mismatch")
+        package_receipt = json.loads(Path(".artifacts/worker-package/latest.json").read_text())
+        require(status["build"]["version"] == package_receipt["version"] and status["build"]["worker_package"]["version"] == package_receipt["version"] and status["build"]["worker_package"]["sha256"] == package_receipt["sha256"], "paired image metadata differs from the tested worker bytes")
+        require("worker_package" not in status["configuration"], "worker release metadata remains operator configuration")
         self.assert_private(body.decode())
         denied = None
         for key in (None, "incorrect-test-key", self.client, self.portal):
@@ -287,6 +292,28 @@ class Harness:
         self.assert_private(self.logs(first))
         self.receipt("service.state_and_boundaries", schema_versions=5, database_recovery=True, readonly_config=True, http_ports=1)
         return first, origin, volume
+
+    def separate_database_password(self):
+        password = "test raw ${literal} @:/?#%$'\"\\秘密-" + secrets.token_hex(16)
+        username, database = "password_case", "password_case"
+        self.docker("exec", "-i", self.db, "psql", "-X", "-qAt", "-v", "ON_ERROR_STOP=1", "-U", "postgres", "-d", "aaa_muse", input_text="CREATE ROLE " + username + " LOGIN PASSWORD '" + password.replace("'", "''") + "';\n")
+        self.sql("CREATE DATABASE " + database + " OWNER " + username + ";")
+        config = self.configuration()
+        config["database"] = {"url": "postgres://" + username + "@db:5432/" + database + "?sslmode=disable", "password": "${FIXTURE_RAW_DB_PASSWORD}"}
+        os.environ["FIXTURE_RAW_DB_PASSWORD"] = password
+        try:
+            container, origin, _ = self.launch(config, environment=("FIXTURE_RAW_DB_PASSWORD",))
+        finally:
+            os.environ.pop("FIXTURE_RAW_DB_PASSWORD", None)
+        self.ready(container, origin)
+        status, _, body = self.request(origin, "/api/v1/admin/status", self.admin)
+        require(status == 200 and json.loads(body)["ready"], "raw special-character password did not authenticate to PostgreSQL")
+        encoded = urllib.parse.quote(password, safe="!$&'()*+,;=")
+        _, _, exported = self.request(origin, "/api/v1/admin/diagnostics/export", self.admin)
+        _, events = self.decode_export(exported)
+        for content in (self.logs(container), body.decode(), json.dumps(events)):
+            self.assert_private(content, (password, encoded))
+        self.receipt("database.separate_raw_password", special_characters=True, actual_postgresql=True, redacted=True)
 
     def migration_upgrade(self):
         for old_version in (1, 2, 3, 4):
@@ -533,6 +560,7 @@ def main():
         harness.setup()
         harness.migration_upgrade()
         service, origin, _ = harness.functional()
+        harness.separate_database_password()
         harness.generated_key()
         harness.adverse()
         harness.capture_completeness()

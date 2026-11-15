@@ -252,7 +252,10 @@ func (h *Handler) workerRequest(w *response, r *http.Request, logger *slog.Logge
 			inferenceError(w, err)
 			return
 		}
-		writeJSON(w, 200, v)
+		writeJSON(w, 200, struct {
+			workerView
+			WorkerPackage service.PackagePin `json:"worker_package"`
+		}{v, h.Service.Build().WorkerPackage})
 	case "/api/v1/admin/workers/{id}":
 		record, err := h.Workers.Rename(r.Context(), logger, id, input[field].(string))
 		w.workerID = id

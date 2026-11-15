@@ -18,17 +18,18 @@ export function shippedInput(path) {
   return /^worker\/(src\/|setup\/)/.test(path) || ['worker/package.json', 'worker/tsconfig.json', 'worker/LICENSE', 'worker/README.md', 'worker/scripts/build.mjs', 'worker/scripts/package.mjs', 'package.json', 'package-lock.json', '.nvmrc'].includes(path);
 }
 
-export function chooseVersion(refs, source) {
+export function chooseVersion(refs, source, paired = false) {
   let next = 0;
   const existing = [];
   for (const ref of refs) {
-    const version = ref.ref.slice(prefix.length);
-    if (!ref.ref.startsWith(prefix) || !rc.test(version)) continue;
+    const selectedPrefix = ref.ref.startsWith(prefix) ? prefix : paired && ref.ref.startsWith('refs/tags/v') ? 'refs/tags/v' : '';
+    const version = ref.ref.slice(selectedPrefix.length);
+    if (!selectedPrefix || !rc.test(version)) continue;
     requireThat(ref.object.type === 'commit' && sha.test(ref.object.sha), 'worker_release_invalid_tag');
     const number = Number(version.slice('0.1.0-rc.'.length));
     requireThat(Number.isSafeInteger(number) && number < Number.MAX_SAFE_INTEGER, 'worker_release_version_overflow');
     next = Math.max(next, number + 1);
-    if (ref.object.sha === source) existing.push(version);
+    if (ref.object.sha === source && (!paired || selectedPrefix === 'refs/tags/v')) existing.push(version);
   }
   requireThat(existing.length <= 1, 'worker_release_ambiguous_source_tags');
   return existing[0] ?? `0.1.0-rc.${next}`;
@@ -42,18 +43,18 @@ function completedRelease(release, refs) {
     ['markhuangai-aaa-muse-worker-' + version + '.tgz', 'SHA256SUMS', 'worker-release.json'].every(name => release.assets?.filter(asset => asset.name === name).length === 1);
 }
 
-export async function prepareRelease({ github, context }) {
+export async function prepareRelease({ github, context, paired = false }) {
   let operation = 'source_verification';
   try {
   const source_sha = await resolvePublication({ github, context });
   operation = 'version_tag_listing';
-  const refs = await github.paginate(github.rest.git.listMatchingRefs, { ...context.repo, ref: 'tags/worker-v0.1.0-rc.', per_page: 100 });
+  const refs = await github.paginate(github.rest.git.listMatchingRefs, { ...context.repo, ref: paired ? 'tags/' : 'tags/worker-v0.1.0-rc.', per_page: 100 });
   operation = 'completed_release_listing';
   const releases = await github.paginate(github.rest.repos.listReleases, { ...context.repo, per_page: 100 });
   const completed = releases.filter(release => completedRelease(release, refs)).sort((a, b) => Number(b.tag_name.split('.').at(-1)) - Number(a.tag_name.split('.').at(-1)));
   const current = refs.some(ref => ref.object.sha === source_sha);
   let relevant = true;
-  if (completed.length && !current) {
+  if (!paired && completed.length && !current) {
     const prior = refs.find(ref => ref.ref === 'refs/tags/' + completed[0].tag_name).object.sha;
     operation = 'shipped_input_comparison';
     const comparison = (await github.rest.repos.compareCommitsWithBasehead({ ...context.repo, basehead: `${prior}...${source_sha}`, per_page: 100 })).data;
@@ -62,8 +63,8 @@ export async function prepareRelease({ github, context }) {
     relevant = comparison.files.some(file => shippedInput(file.filename) || (file.previous_filename && shippedInput(file.previous_filename)));
   }
   operation = 'version_selection';
-  const version = chooseVersion(refs, source_sha);
-  const result = { source_sha, version, tag: 'worker-v' + version, should_publish: relevant || current };
+  const version = chooseVersion(refs, source_sha, paired);
+  const result = { source_sha, version, tag: (paired ? 'v' : 'worker-v') + version, should_publish: paired || relevant || current, ...(paired ? { paired: true } : {}) };
   logEvent(null, 'info', 'worker.release.prepared', result);
   return result;
   } catch (error) {
@@ -116,7 +117,7 @@ export async function publishRelease({ github, context, prepared, receipt, archi
   const at = (nextOperation, nextDestination, expected = receipt.sha256) => { operation = nextOperation; destination = nextDestination; expectedDigest = expected; observedDigest = 'unavailable'; };
   const evidence = () => ({ source_sha, version, tag, operation, destination, expected_digest: expectedDigest, observed_digest: observedDigest, completed_destinations: [...completed] });
   try {
-  requireThat(prepared.should_publish && rc.test(version) && tag === 'worker-v' + version && sha.test(source_sha), 'worker_release_invalid_preparation');
+  requireThat(prepared.should_publish && rc.test(version) && tag === (prepared.paired ? 'v' : 'worker-v') + version && sha.test(source_sha), 'worker_release_invalid_preparation');
   requireThat(receipt.source?.source_sha === source_sha && receipt.source.source_dirty === false && receipt.source.package_version === version && receipt.version === version && receipt.package === '@markhuangai/aaa-muse-worker', 'worker_release_package_identity_mismatch');
   matchingBytes(archive, receipt.sha256, 'local_archive');
   observedDigest = hash(archive);
@@ -160,7 +161,7 @@ export async function publishRelease({ github, context, prepared, receipt, archi
   catch (error) { if (error.status !== 404) throw error; }
   if (!release) {
     at('release_creation', 'github_release');
-    release = (await github.rest.repos.createRelease({ ...context.repo, tag_name: tag, target_commitish: source_sha, name: tag, prerelease: true, draft: false, make_latest: 'false', body: 'Worker installation candidate. Muse inference and refresh recovery remain unverified; require issue #7 live qualification.' })).data;
+    release = (await github.rest.repos.createRelease({ ...context.repo, tag_name: tag, target_commitish: source_sha, name: tag, prerelease: true, draft: false, make_latest: 'false', body: prepared.paired ? 'Paired product candidate: publication incomplete until service and worker verification completes. Live Muse qualification remains a separate gate.' : 'Worker installation candidate. Muse inference and refresh recovery remain unverified; require issue #7 live qualification.' })).data;
   }
   requireThat(!release.draft && release.prerelease && release.tag_name === tag, 'worker_release_destination_conflict');
   const name = 'markhuangai-aaa-muse-worker-' + version + '.tgz';
@@ -190,7 +191,7 @@ export async function publishRelease({ github, context, prepared, receipt, archi
     at('completion_marker_publication', 'release_receipt');
     await github.rest.repos.updateRelease({ ...context.repo, release_id: release.id, body: (release.body ?? '') + '\n\n' + marker });
   }
-  logEvent(null, 'info', 'worker.release.verified', { source_sha, version, archive_sha256: receipt.sha256, registry: receipt.package, public_url: `https://github.com/markhuangai/AaA-muse-ai/releases/download/${tag}/${name}`, destinations: ['github_packages', 'public_release'], outcome: 'complete' });
+  logEvent(null, 'info', 'worker.release.verified', { source_sha, version, archive_sha256: receipt.sha256, registry: receipt.package, public_url: `https://github.com/markhuangai/AaA-muse-ai/releases/download/${tag}/${name}`, destinations: ['github_packages', 'public_release'], outcome: prepared.paired ? 'worker_verified_product_incomplete' : 'complete' });
   } catch (error) {
     const safeCause = error instanceof ReleaseFailure ? error.message : /^publication_[a-z_]+$/.test(error.message ?? '') ? error.message : error.status === 403 ? 'permission_or_rate_limit' : 'required_api_operation_failed';
     throw new ReleaseFailure(safeCause, { ...evidence(), ...(error instanceof ReleaseFailure ? error.fields : {}), http_status: Number.isInteger(error.status) ? error.status : error.fields?.http_status ?? null, request_id: error.response?.headers?.['x-github-request-id'] ?? null });

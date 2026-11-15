@@ -6,8 +6,6 @@ import (
 	"log/slog"
 	"strings"
 	"time"
-
-	"github.com/markhuangai/AaA-muse-ai/internal/config"
 )
 
 var ErrWorkerPackageUnconfigured = errors.New("worker_package_unconfigured")
@@ -30,15 +28,15 @@ type SetupPrompt struct {
 type Setup struct {
 	workers *Workers
 	origin  string
-	pin     config.WorkerPackage
+	pin     PackagePin
 }
 
-func NewSetup(workers *Workers, origin string, pin config.WorkerPackage) *Setup {
+func NewSetup(workers *Workers, origin string, pin PackagePin) *Setup {
 	return &Setup{workers: workers, origin: strings.TrimSuffix(origin, "/"), pin: pin}
 }
 
 func (s *Setup) Create(ctx context.Context, logger *slog.Logger) (SetupPrompt, error) {
-	if s.pin.Version == "" || s.pin.SHA256 == "" {
+	if _, valid := ReleaseMajor(s.pin.Version); !valid || !archiveDigest.MatchString(s.pin.SHA256) {
 		logger.Error("setup.package_unconfigured", "cause", ErrWorkerPackageUnconfigured.Error(), "outcome", "not_started")
 		return SetupPrompt{}, ErrWorkerPackageUnconfigured
 	}
@@ -46,8 +44,7 @@ func (s *Setup) Create(ctx context.Context, logger *slog.Logger) (SetupPrompt, e
 	if err != nil {
 		return SetupPrompt{}, err
 	}
-	pin := PackagePin{Name: "@markhuangai/aaa-muse-worker", Version: s.pin.Version, SHA256: s.pin.SHA256,
-		URL: "https://github.com/markhuangai/AaA-muse-ai/releases/download/worker-v" + s.pin.Version + "/markhuangai-aaa-muse-worker-" + s.pin.Version + ".tgz"}
+	pin := PairedWorker(s.pin.Version, s.pin.SHA256)
 	quote := func(v string) string { return "'" + strings.ReplaceAll(v, "'", "'\"'\"'") + "'" }
 	prompt := strings.NewReplacer("@ORIGIN@", quote(s.origin), "@URL@", quote(pin.URL), "@VERSION@", quote(pin.Version), "@SHA@", quote(pin.SHA256), "@ID@", quote(e.ID), "@CODE@", code).Replace(setupInstruction)
 	result := SetupPrompt{EnrollmentID: e.ID, CreatedAt: e.CreatedAt, ExpiresAt: e.ExpiresAt, WorkerPackage: pin, Prompt: prompt}

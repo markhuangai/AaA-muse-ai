@@ -8,7 +8,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/markhuangai/AaA-muse-ai/internal/config"
 	"github.com/markhuangai/AaA-muse-ai/internal/service"
 )
 
@@ -23,12 +22,12 @@ func TestSetupHTTPBoundaryAndProtectedEvidence(t *testing.T) {
 	if call(h, "POST", route, "Bearer admin-private-sentinel", nil).Code != 503 {
 		t.Fatal("missing setup service accepted")
 	}
-	h.Setup = service.NewSetup(h.Workers, "https://example.test", config.WorkerPackage{})
+	h.Setup = service.NewSetup(h.Workers, "https://example.test", service.PackagePin{})
 	w := call(h, "POST", route, "Bearer admin-private-sentinel", nil)
 	if w.Code != 503 || !strings.Contains(w.Body.String(), "worker_package_unconfigured") || len(m.codes) != 0 {
 		t.Fatal("missing pins issued authority")
 	}
-	h.Setup = service.NewSetup(h.Workers, "https://example.test", config.WorkerPackage{Version: "0.1.0-rc.0", SHA256: strings.Repeat("a", 64)})
+	h.Setup = service.NewSetup(h.Workers, "https://example.test", service.PackagePin{Version: "0.1.0-rc.0", SHA256: strings.Repeat("a", 64)})
 	for _, body := range []string{`{"extra":true}`, `null`, `{} {}`, `{"enrollment_code":"private"}`} {
 		if call(h, "POST", route, "Bearer admin-private-sentinel", strings.NewReader(body)).Code != 400 {
 			t.Fatal("invalid setup body accepted")

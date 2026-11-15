@@ -273,6 +273,74 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  e2e-cases:
+    name: CI / e2e (${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [flow, boundaries]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          ref: ${{ env.SOURCE_SHA }}
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24.22.2
+      - name: Verify exact source
+        run: test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+      - name: Install locked product dependencies
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Install the pinned Chromium runtime
+        if: matrix.shard == 'flow'
+        run: npx --no-install playwright install --with-deps chromium
+      - name: Run real-container product cases with controlled Muse decisions
+        env:
+          PRODUCT_E2E_SHARD: ${{ matrix.shard }}
+        run: make test-product-e2e
+      - name: Retain only safe product receipts
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-${{ env.SOURCE_SHA }}-${{ matrix.shard }}-${{ github.run_attempt }}
+          path: .artifacts/ci/e2e/*.json
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+
+  e2e:
+    name: CI / e2e
+    needs: e2e-cases
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          ref: ${{ env.SOURCE_SHA }}
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24.22.2
+      - name: Install locked report dependencies
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Build diagnostic decoder
+        run: npm run build --workspace worker
+      - name: Download this run's product shards
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: e2e-${{ env.SOURCE_SHA }}-*-${{ github.run_attempt }}
+          path: .artifacts/downloaded-e2e
+      - name: Require every current-source case and complete shard
+        env:
+          E2E_RESULT: ${{ needs.e2e-cases.result }}
+        run: |
+          set -euo pipefail
+          node tools/product-ci.mjs .artifacts/downloaded-e2e
+          test "$E2E_RESULT" = success
+
   image:
     name: CI / image
     runs-on: ubuntu-latest
@@ -282,6 +350,11 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24.22.2
+      - name: Install locked package dependencies
+        run: npm ci --ignore-scripts --no-audit --no-fund
       - name: Packaged startup and diagnostic failures
         run: make smoke-image
 
