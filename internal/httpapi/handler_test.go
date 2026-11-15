@@ -11,7 +11,9 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -49,6 +51,72 @@ func call(h *Handler, method, path, authorization string, body io.Reader) *httpt
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, r)
 	return w
+}
+
+type blockedExportFiles struct {
+	diagnostics.OSFiles
+	started, release chan struct{}
+	once             sync.Once
+}
+
+func (f *blockedExportFiles) ReadFile(path string) ([]byte, error) {
+	if strings.HasPrefix(filepath.Base(path), "capture-") {
+		f.once.Do(func() { close(f.started); <-f.release })
+	}
+	return f.OSFiles.ReadFile(path)
+}
+
+func TestDiagnosticsExportDoesNotBlockHealthOrStatus(t *testing.T) {
+	h, _, _, _ := fixture(t)
+	files := &blockedExportFiles{started: make(chan struct{}), release: make(chan struct{})}
+	store, err := diagnostics.Open(files, t.TempDir(), "instance", time.Now, 7*24*time.Hour, 128*1024*1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.Logger = diagnostics.NewLogger(io.Discard, store, slog.LevelInfo, diagnostics.NewRedactor(nil), time.Now, func(err error) { t.Errorf("capture failed: %v", err) })
+	h.Exporter = store
+	h.Logger.Info("fixture")
+	exported := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		exported <- call(h, "GET", "/api/v1/admin/diagnostics/export", "Bearer admin-private-sentinel", nil)
+	}()
+	var laterRequests []string
+	defer func() {
+		close(files.release)
+		select {
+		case response := <-exported:
+			raw := response.Body.String()
+			var metadata diagnostics.Metadata
+			if response.Code != 200 || json.NewDecoder(strings.NewReader(raw)).Decode(&metadata) != nil || !metadata.Complete {
+				t.Error("export did not complete after the read resumed")
+			}
+			for _, id := range laterRequests {
+				if strings.Contains(raw, id) {
+					t.Error("export included a request admitted after its snapshot")
+				}
+			}
+		case <-time.After(5 * time.Second):
+			t.Error("export did not resume")
+		}
+	}()
+	select {
+	case <-files.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("export did not reach its capture read")
+	}
+	for _, request := range []struct{ path, auth string }{{"/healthz", ""}, {"/api/v1/admin/status", "Bearer admin-private-sentinel"}} {
+		done := make(chan *httptest.ResponseRecorder, 1)
+		go func() { done <- call(h, "GET", request.path, request.auth, nil) }()
+		select {
+		case response := <-done:
+			if response.Code != 200 {
+				t.Errorf("%s returned %d", request.path, response.Code)
+			}
+			laterRequests = append(laterRequests, response.Header().Get("X-Request-Id"))
+		case <-time.After(2 * time.Second):
+			t.Fatalf("%s waited for the diagnostics export", request.path)
+		}
+	}
 }
 
 func TestHTTPContractsAndLogOnlyDiagnosis(t *testing.T) {

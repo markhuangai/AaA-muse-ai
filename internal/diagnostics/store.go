@@ -225,17 +225,26 @@ func (s *Store) remember(c retainedCapture) {
 
 func (s *Store) prune() error {
 	cutoff := s.now().Add(-s.retention)
-	for len(s.retained) > 0 {
-		oldest := s.retained[0]
-		if s.retainedBytes <= s.maxBytes && !oldest.time.Before(cutoff) {
+	count, remaining := 0, s.retainedBytes
+	for _, oldest := range s.retained {
+		if remaining <= s.maxBytes && !oldest.time.Before(cutoff) {
 			break
 		}
+		count++
+		remaining -= oldest.size
 		if oldest.time.After(s.state.PrunedThrough) {
 			s.state.PrunedThrough = oldest.time
 		}
-		if err := s.saveState(); err != nil {
-			return err
-		}
+	}
+	if count == 0 {
+		return nil
+	}
+	// Persist the whole batch watermark before deletion so an interruption cannot hide lost evidence.
+	if err := s.saveState(); err != nil {
+		return err
+	}
+	for range count {
+		oldest := s.retained[0]
 		if err := s.files.Remove(filepath.Join(s.dir, oldest.name)); err != nil {
 			return err
 		}
@@ -246,33 +255,44 @@ func (s *Store) prune() error {
 	return nil
 }
 
-func (s *Store) Snapshot(filter Filter) (Snapshot, error) {
+func (s *Store) snapshotEntries() (Metadata, []fs.DirEntry, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.prune(); err != nil {
+		return Metadata{}, nil, err
+	}
+	metadata := Metadata{Type: "export", Complete: true, CreatedAt: s.state.CreatedAt, SnapshotAt: s.now().UTC(), PrunedThrough: s.state.PrunedThrough, Omissions: []string{}}
+	entries, err := s.captures()
+	return metadata, entries, err
+}
+
+func (s *Store) Snapshot(filter Filter) (Snapshot, error) {
+	metadata, entries, err := s.snapshotEntries()
+	if err != nil {
 		return Snapshot{}, err
 	}
-	result := Snapshot{Metadata: Metadata{Type: "export", Complete: true, CreatedAt: s.state.CreatedAt, SnapshotAt: s.now().UTC(), PrunedThrough: s.state.PrunedThrough, Omissions: []string{}}}
+	result := Snapshot{Metadata: metadata}
 	missing := func(reason string) {
 		result.Metadata.Complete = false
 		result.Metadata.Omissions = append(result.Metadata.Omissions, reason)
 	}
-	if (!filter.Since.IsZero() && filter.Since.Before(s.state.CreatedAt)) || (!filter.Until.IsZero() && filter.Until.Before(s.state.CreatedAt)) {
+	if (!filter.Since.IsZero() && filter.Since.Before(metadata.CreatedAt)) || (!filter.Until.IsZero() && filter.Until.Before(metadata.CreatedAt)) {
 		missing("requested_interval_precedes_capture")
 	}
 	if filter.Since.After(result.Metadata.SnapshotAt) || filter.Until.After(result.Metadata.SnapshotAt) {
 		missing("requested_interval_extends_after_snapshot")
 	}
-	if !s.state.PrunedThrough.IsZero() && (filter.Since.IsZero() || !filter.Since.After(s.state.PrunedThrough)) {
+	if !metadata.PrunedThrough.IsZero() && (filter.Since.IsZero() || !filter.Since.After(metadata.PrunedThrough)) {
 		result.Metadata.Complete = false
 		result.Metadata.Omissions = append(result.Metadata.Omissions, "expired_or_capacity_pruned_evidence")
 	}
-	entries, err := s.captures()
-	if err != nil {
-		return Snapshot{}, err
-	}
+	// Capture files are immutable after rename; reading outside the lock lets request logging continue during exports.
 	for _, e := range entries {
 		b, _, err := s.readCapture(e.Name())
+		if errors.Is(err, fs.ErrNotExist) {
+			missing("capture_removed_during_export:" + e.Name())
+			continue
+		}
 		if err != nil {
 			return Snapshot{}, err
 		}
