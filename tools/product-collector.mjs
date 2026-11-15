@@ -128,10 +128,14 @@ export class ReleaseCollector extends Collector {
     }
     await this.save();
   }
-  async select(slot) {
+  async select(slot, retainApproval = false) {
+    const { workers } = await this.api('/api/v1/admin/workers');
+    if (retainApproval) need(workers.some(worker => worker.id === this.worker(slot).worker_id && worker.inference_readiness === 'verified' && worker.qualification?.evidence.action === 'approve'), 'retained_worker_approval_required');
     for (const worker of this.report.workers) {
       const approve = worker.slot === slot || slot === 'all';
       need(!approve || this.report.qualifications[worker.slot], 'current_live_qualification_required');
+      const current = workers.find(value => value.id === worker.worker_id);
+      if (approve && current?.inference_readiness === 'verified' || !approve && current?.qualification?.evidence.action === 'withdraw') continue;
       await this.api(`/api/v1/admin/workers/${worker.worker_id}/qualifications`, 'POST', { protocol_version: 1, submission_id: this.uuid(), action: approve ? 'approve' : 'withdraw',
         evidence_kind: this.evidenceKind === 'live' ? 'live' : 'controlled', evidence_reference: `release ${this.report.run_id}; select qualified ${slot}`, ...(approve ? this.report.qualifications[worker.slot] : {}) });
     }
@@ -185,8 +189,11 @@ export class ReleaseCollector extends Collector {
       need(!saved, 'broker_checkpoint_already_created');
       await this.select('a');
       const item = await this.newCycle('broker-wait', 'a'); await this.driver.start(item); await this.correlated(item);
+      await this.select('all');
+      const { workers } = await this.api('/api/v1/admin/workers');
       const status = await this.api('/api/v1/admin/status');
-      this.report.checkpoints.broker = { before_instance: status.instance_id, pending_call_id: item.call_id, cycle_id: item.id, before_status: status, prepared_at: this.stamp() };
+      this.report.checkpoints.broker = { before_instance: status.instance_id, pending_call_id: item.call_id, cycle_id: item.id, before_status: status,
+        qualification: workers.find(worker => worker.id === this.worker('a').worker_id).qualification, prepared_at: this.stamp() };
       await this.save(); await this.log('INFO', 'e2e.owner_checkpoint', { checkpoint: 'broker_restart', pending_call_id: item.call_id, action: 'Owner restarts the qualification service, retaining PostgreSQL and diagnostics volumes; resume with broker-resume.' });
       return;
     }
@@ -195,7 +202,8 @@ export class ReleaseCollector extends Collector {
     const status = await this.api('/api/v1/admin/status'); need(status.instance_id !== saved.before_instance, 'owner_broker_restart_not_observed');
     need(Date.parse(action.time) > Date.parse(saved.prepared_at) && Date.parse(action.time) <= this.now(), 'owner_restart_time_required');
     saved.after_instance = status.instance_id; saved.after_status = status; saved.resumed_at = this.stamp();
-    for (const slot of ['a', 'b']) await this.native(slot, 'broker');
+    const { workers } = await this.api('/api/v1/admin/workers');
+    need(workers.some(worker => worker.id === this.worker('a').worker_id && worker.inference_readiness === 'verified' && same(worker.qualification, saved.qualification)), 'retained_worker_approval_required');
     const item = this.report.cycles.find(value => value.id === saved.cycle_id);
     need(item.call_id === saved.pending_call_id, 'pending_tool_identity_changed');
     await this.driver.finish(item); const receipt = await this.correlated(item);
@@ -214,12 +222,14 @@ export class ReleaseCollector extends Collector {
     for (const ref of imports.worker_exports) events.push(...decodeExport(await this.readPrivate(ref.path)).events);
     const recovery = recoveryBoundary(this.report, id, events, { probe: false });
     const worker = this.report.workers.find(value => value.worker_id === recovery.worker_id);
-    await this.native(worker.slot, kind);
-    await this.select(worker.slot);
+    await this.select(worker.slot, true);
+    const before = (await this.api('/api/v1/admin/workers')).workers.find(value => value.id === worker.worker_id).qualification;
     const item = await this.newCycle(kind + '-probe', worker.slot); await this.driver.start(item); await this.driver.finish(item);
     const receipt = await this.correlated(item);
     need(item.turns.every(turn => turn.connection_id === recovery.connection_id && turn.connection_generation === recovery.connection_generation), 'probe_recovery_generation_changed');
-    await this.record(id, { ...receipt, id, observation_ref: observed.source_ref, recovery });
+    const after = (await this.api('/api/v1/admin/workers')).workers.find(value => value.id === worker.worker_id).qualification;
+    need(same(before, after), 'recovery_qualification_changed');
+    await this.record(id, { ...receipt, id, observation_ref: observed.source_ref, recovery, qualification: after });
     await this.record('recovery.hook', { recovery_case_id: id, worker_ids: [worker.worker_id], operation_ids: receipt.operation_ids, observation_ref: observed.source_ref, recovery });
   }
   async replacement() {
@@ -228,7 +238,7 @@ export class ReleaseCollector extends Collector {
     const original = this.report.cycles.find(item => item.id === 'a.responses.json');
     need(original?.outcome === 'passed', 'completed_replacement_history_required');
     need(workers.workers.some(worker => worker.id === this.worker('a').worker_id && worker.connection_status === 'offline' && worker.work_status === 'idle'), 'original_worker_must_be_confirmed_offline_idle');
-    await this.native('b', 'replacement');
+    need(workers.workers.some(worker => worker.id === this.worker('b').worker_id && worker.inference_readiness === 'verified'), 'retained_worker_approval_required');
     const item = structuredClone(original); item.id = 'replacement'; item.replay_source_case_id = original.id; item.measured_from_turn = item.turns.length; item.started_at = this.stamp(); delete item.followup; this.report.cycles.push(item); await this.save();
     await this.driver.followup(item, 'replacement-' + this.random());
     const receipt = await this.correlated(item), detail = await this.api('/api/v1/admin/requests/' + item.turns.at(-1).operation_id);

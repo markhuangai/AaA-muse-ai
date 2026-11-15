@@ -15,7 +15,7 @@ function QualificationDetail({ qualification }: { qualification: Qualification }
     <div><dt>Approval action</dt><dd>{qualification.evidence.action}</dd></div>
     <div><dt>Evidence provenance</dt><dd>{qualification.evidence.evidence_kind === 'controlled' ? 'Controlled software evidence' : qualification.evidence.evidence_kind === 'live' ? 'Live trial evidence' : 'Not reported'}</dd></div>
     <div><dt>Recorded at</dt><dd>{timestamp(qualification.created_at)}</dd></div>
-    <div><dt>Connection</dt><dd><code>{qualification.connection_id}</code> · generation {qualification.connection_generation}</dd></div>
+    <div><dt>Evidence connection</dt><dd><code>{qualification.connection_id}</code> · generation {qualification.connection_generation}</dd></div>
     <div><dt>Capabilities</dt><dd>{qualification.capabilities.join(', ') || 'None approved'}</dd></div>
     <div><dt>Evidence reference</dt><dd>{qualification.evidence.evidence_reference}</dd></div>
   </dl>;
@@ -51,7 +51,7 @@ function WorkerDetail({ worker, controller, view, back }: { worker: Worker; cont
       </dl><p className="field-note">Busy means the broker retains an assignment. Tool waits depend on the calling client. Offline does not establish whether remote work stopped.</p></section>
       <section className="data-panel"><h3>Inference qualification</h3><p className="qualification-state">{stateName(worker.inference_readiness)}</p>
         {worker.qualification ? <QualificationDetail qualification={worker.qualification} /> : <p>No management-approved evidence is recorded.</p>}
-        <p className="field-note">Controlled evidence proves software behavior. It does not establish live Muse qualification. Reconnecting requires fresh approval for the new connection generation.</p>
+        <p className="field-note">Approval stays with this enrolled worker across authenticated reconnects until withdrawn or revoked. The evidence connection records the original trial. Controlled evidence does not establish live Muse qualification.</p>
         {worker.qualification_history.length > 0 && <details><summary>Qualification history ({worker.qualification_history.length})</summary><ol className="qualification-history">{worker.qualification_history.map(item => <li key={item.id}><QualificationDetail qualification={item} /></li>)}</ol></details>}
       </section>
       <section className="data-panel"><h3>Registration and access</h3><dl className="identity-list">

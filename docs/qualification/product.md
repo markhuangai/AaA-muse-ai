@@ -116,12 +116,12 @@ a shell subscriber as proof of a working Muse backend:
 | Stage | Action and required evidence |
 | --- | --- |
 | `enroll` | Real portal password login and two setup prompts; run once before account setup. |
-| `baseline` | Independently observed readiness and client-tool trial for each worker, management approval for the current connection, eight protocol cycles, later affinity, interleaving and cross-client rejection. Native observation IDs start `baseline-readiness-a`, `baseline-tool-a`, and the corresponding `b` names. |
-| `broker-prepare` | Stops with an accepted pending client-tool call, before executing its result. Retains the service process identity, call ID and source exports. |
-| `broker-resume` | Owner restarts only the qualification service while retaining PostgreSQL/diagnostics volumes. Record `product_case` for `recovery.broker-tool-wait`. The runner verifies a new service process, requalifies reconnected workers through new `broker-*` trials, and supplies the original result exactly once. |
-| `worker-restart` | Record the scoped supported worker restart. New `worker-*` readiness/tool trials and a client probe must preserve worker identity and one subscriber. No reinstall or state deletion. |
-| `refresh` | Owner approves the exact supported non-destructive refresh scope, performs it, and observes the retained hook/task recovering without a manual Muse message. New `refresh-*` trials and a probe verify the recovered connection. A browser reload alone cannot establish this. |
-| `replacement` | After a completed final answer with no pending tool, stop only worker A's identified subscriber. Record `recovery.replacement-full-history`. The runner requires A offline/idle, qualifies B, then continues the owned Responses session with full history and original accepted tool linkage. |
+| `baseline` | Independently observed readiness and client-tool trial for each worker, initial management capability approval, eight protocol cycles, later affinity, interleaving and cross-client rejection. Native observation IDs start `baseline-readiness-a`, `baseline-tool-a`, and the corresponding `b` names. |
+| `broker-prepare` | Stops with an accepted pending client-tool call, before executing its result. Retains the service process identity, call ID, worker approval and source exports. Both workers are approved before the restart checkpoint. |
+| `broker-resume` | Owner restarts only the qualification service while retaining PostgreSQL/diagnostics volumes. Record `product_case` for `recovery.broker-tool-wait`. The runner verifies a new service process and unchanged worker approval, then supplies the original result exactly once without requalification. |
+| `worker-restart` | Record the scoped supported worker restart. A real client tool cycle must complete on the recovered connection under unchanged approval, preserving identity and one subscriber. No reapproval, reinstall or state deletion. |
+| `refresh` | Owner approves the exact supported non-destructive refresh scope, performs it, and observes the retained hook/task recovering without a manual Muse message. A real client tool cycle verifies the recovered connection under retained worker approval. A browser reload alone cannot establish this. |
+| `replacement` | After a completed final answer with no pending tool, stop only worker A's identified subscriber. Record `recovery.replacement-full-history`. The runner requires A offline/idle and B already approved, then continues the owned Responses session with full history and original accepted tool linkage. |
 | `boundaries` | Import observed cross-worker rejection, old-generation rejection, partial-output and unresolved-work cases plus log-only diagnosis. Each needs exact operation/worker IDs and complete exports from the actual induced action. A declaration without causal broker evidence cannot pass. |
 | `portal` | Real password login, rename preserving immutable IDs, and request-history reads for the matrix's actual requests. |
 | `revoke` | Final confirmed portal revocation of only the two test workers; preceding required case receipts must exist. |
@@ -136,6 +136,15 @@ including deliberate worker commands and client disconnects. Never fabricate
 the supported-refresh path, replay an accepted client tool, or acknowledge
 uncertain native work as stopped just to continue the run. The collector does
 not install, reset, wipe or remotely restart a worker for these observations.
+
+The November 15 owner correction removes per-connection reapproval. Initial
+approval still requires independent readiness/tool proof. Before a recovery
+intervention, ensure the selected worker is approved; a deliberately withdrawn
+worker must remain withdrawn. Probe routing may withdraw a sibling worker to
+isolate selection, but never approves the recovered worker. New proof and
+approval before its first client request would mask the recovery behavior
+being tested. Retained approval is authorization, not evidence that the new
+connection has independently passed a live model trial.
 
 The partial-output receipt requires `request_id`, nonempty `operation_ids` and
 `worker_ids`, with a matching `request.output_interrupted` and Chat/Responses
@@ -516,7 +525,264 @@ protected state. Its current development archive SHA-256 was
 cleanup verified removal of 90 owned containers, two volumes and one network.
 These controlled results do not qualify live Muse.
 
-No live model job was submitted during this investigation. Both unknown native
-outcomes and all prior evidence remain retained. The repair needs current-head
-review/checks and an owner-deployed replacement before it can be evaluated
-against the remote stall; full live qualification and #18 remain incomplete.
+No live model job was submitted during that investigation. Both unknown native
+outcomes and all prior evidence remain retained. At that checkpoint, the repair
+still required current-head review/checks and an owner-deployed replacement.
+The following record covers its subsequent deployment and live observations.
+
+## Live rc.8 observation record
+
+[PR #45](https://github.com/markhuangai/AaA-muse-ai/pull/45) merged as
+`ed5d4d78d30566414b90912c58dbcf72655c8e78`. Main CI, CodeQL and coordinated
+publication passed. The public release receipt, image manifests/configuration,
+source tag and identical GitHub Packages/public Release worker bytes were
+independently verified for
+[version `0.1.0-rc.8`](https://github.com/markhuangai/AaA-muse-ai/releases/tag/v0.1.0-rc.8).
+The owner's deployed identifiers matched those verified artifacts:
+
+```text
+ghcr.io/markhuangai/aaa-muse-ai@sha256:1edd443a5c219fbeaa06298e9c4331caaa0c6ffe075374767b56cb37d5f4b87d
+sha256:c914f0ebe4076acbd666a2999ffba5fedea38f945ca85f39a80c8eecfeb6e78e
+```
+
+Authenticated HTTPS status confirmed rc.8, that clean source, PostgreSQL
+availability, four maximum jobs and one inference in flight per worker.
+The image's paired worker archive SHA-256 is
+`117cc463782520c945e8df9199f4a30b2820f8ec1f5e5148f68bcd12bef6caad`.
+Both actual installations remained `0.1.0-rc.7`, archive SHA-256
+`76cfaa6944a5dd72d5e08988e545509c156d83b78a3d13cbf05d2abf1494ba0a`.
+This exercised same-major compatibility without an upgrade, reinstall,
+re-enrollment or identity change. Installed versions and recommended
+installation metadata remain separate in the report.
+
+The preflight completed 23 read-only requests without failure, including
+eighteen health probes and two complete diagnostic exports while health
+remained responsive. Its maximum health latency was 1,561 ms. Earlier rc.7
+interrupted jobs already had native idle acknowledgements corroborated by
+broker receipts; their original unknown inference outcomes remain retained.
+No new acknowledgement was used to clear them for this run.
+
+| Fresh native case | Experiment | Observed outcome (UTC) |
+| --- | --- | --- |
+| `rc8-readiness-a` | `983cbc964a53e8f6a2cf5b2ecc22a4bf` | Exact challenge completed at `19:52:10.489Z`; strict `inspectCase` passed. |
+| `rc8-tool-a` | `d8e6155550d3a0f4dd7a474e635bafe2` | Five-minute turn deadline; cancelled outcome recorded at `20:03:14.463Z`, with unknown remote outcome and no client tool executed. |
+| `rc8-readiness-b` | `4af53c795ee956492f3b62bd3fbbc637` | Exact challenge completed at `20:29:43.630Z`; strict `inspectCase` passed. |
+| `rc8-tool-b` | `07cfcecb65b416ccf34d9481059e9ad6` | Structured client-only `read_file`, exact linked result and final JSON completed at `20:37:07.639Z`; strict `inspectCase` passed. |
+
+Each submitted trial had a fresh observed two-minute quiet period. The first
+following quiet periods for A and B were interrupted by visible native
+activity; the collector stopped before submitting either tool case. Their
+readiness receipts were retained, and only the never-submitted tool phase
+continued after a new quiet period. These interruptions were recorded without
+being relabeled as inference attempts or operator interventions.
+
+A's tool job `4c7f8884f20edb081820c80ec4647450` woke and read the exact
+authenticated context at `19:58:40.712Z`, then submitted no decision. Supported
+native metadata identified conversation
+`2fbb6fd0-d4f0-4479-966b-d3f4ef8376b9` and invocation
+`ac201759-fc08-419f-9c85-64f0f53cbb2d`. Muse reports a refusal at its native
+agent-run safety boundary after the read. The exact refusal text/code is
+unavailable, and no approvable permission card was observed. That reported
+cause is separate from the verified timeout. No further A qualification or
+protocol trial was submitted after that report; A received no function-tool
+routing approval.
+Its later broker idle confirmation does not turn the cancelled inference's
+unknown outcome into a completed answer.
+
+B's complete native/broker receipts passed strict validation before management
+approved its current connection with live provenance. All four B protocol
+cycles subsequently passed full report validation, including the native
+observations:
+
+| Case | Final affinity completion (UTC) | Client tool executions |
+| --- | --- | --- |
+| `b.chat.json` | `21:02:57.456Z` | 1 |
+| `b.chat.sse` | `21:08:28.775Z` | 1 |
+| `b.responses.json` | `21:15:01.548Z` | 1 |
+| `b.responses.sse` | `21:20:54.954Z` | 1 |
+
+All twelve distinct model jobs match their exact canonical messages, tool
+definitions and normalized decisions, with authenticated context reads,
+accepted decisions and native hook wakes. Exact client retries reused the
+accepted operation and created no additional model job or tool execution.
+Every cycle preserved its worker/conversation across the later affinity turn.
+Continuous passive observations cover both accounts, and no operator message
+overlapped any protocol quiet/trial window. Evidence collection waited until
+all four windows closed. SSE here is buffered delivery, not token streaming.
+No account-memory influence or VM-side client-file read was observable in the
+receipts; hidden native context and a full independent memory audit remain
+unavailable.
+
+Portal password login, both rc.8 setup-prompt cases, renaming with immutable
+worker IDs, empty browser credential storage, and history/timeline reads for
+the four current-source B result requests passed. Generated installation
+prompts were not used to replace the existing workers. Client A's attempt to
+continue B's owned Responses reference returned 404. B's own installed CLI
+also received `404 worker_scope_denied` for A's completed readiness job
+`829b4e9b0f373f02647aac428bec1015`; stdout was empty. Complete worker/broker
+exports correlate request `b363c46fa5dd5fe9fed1f945575ae152` to B's
+authentication, the foreign-job rejection and its HTTP response. This also
+passed log-only diagnosis without business-table queries. Neither negative
+check qualifies as model inference or stale-assignment fencing.
+
+| Verified native export | Bytes | SHA-256 |
+| --- | --- | --- |
+| A baseline | 1,323,228 | `11afb86e5e9490a1e4262c80f14eee9832834cc6b1f7420b276c2cddc667f809` |
+| B baseline | 1,043,445 | `aeb11342644d10e2e6f4428fc4c4cd97e2110e34439ca0f73e7b2668dfe995f8` |
+| B protocol cycles | 3,102,854 | `9b6d8b5e3dc273a60b534cc532db6a30e05a68ba3ab7488d918e04e97b736862` |
+| B cross-worker rejection | 3,722 | `21ade16a9eed5209575f4cf48b578ed455687777720aa3b8265e9acf023a2a78` |
+| B post-run reconnect | 869,468 | `227f6d5822b1e6c6d0f1458d30ac07160787a17c8b76c218fd38e1d882b9b8bd` |
+
+The initial A chat copy lost base64 characters and failed its segment digest;
+those unverified bytes remain retained. Subsequent administrative transfers
+used the existing authenticated worker result channel, piping inspected
+compression/encoding output directly into the CLI and checking each original
+byte count, SHA-256 and complete capture envelope locally. These transfers
+were explicitly excluded from qualification. Protected exports, raw failures,
+interventions and the older rc.7 reports remain outside the checkout.
+
+Product run `d430eeaa-4e21-4f57-bec3-284e500f4c04` finalized at
+`2026-11-15T21:33:28Z` with no schema or export errors: sixteen of the
+thirty-five required live cases passed, nineteen remained missing, and the
+verdict is `inconclusive`. Twelve concurrent health/readiness probes during
+the final exports all returned 200, with maximum latency 777 ms. These
+observations establish responsiveness during the tested windows, not the
+cause of the earlier outage or long-term availability.
+
+Independent `validate-report` exited 0; `validate-report --require-complete`
+correctly exited 1 for the missing required cases. The original finalized
+report remains retained alongside its later post-run supplement.
+
+The post-run state check at `21:38:02.571Z` found both workers online/idle,
+A's routing qualification withdrawn and B's stale, while the same service
+process remained ready. Complete worker and broker exports show that B's
+generation-18 subscriber logged `worker.stream_retrying` with
+`cause: UND_ERR_SOCKET` at `21:33:44.129Z`, then `worker.stopped` at
+`21:33:44.778Z`. The broker recorded its stream closed at `21:33:45.155Z`.
+A new subscriber was started at `21:33:58.525Z`; exclusive supervision recorded
+PID 1691 and a different run instance. Connection generation 19 became online
+at `21:34:04.435Z`, retaining the same worker identity. No operator restart,
+reinstall or re-enrollment was performed. The initiating socket-close cause
+and reason the old process stopped are unavailable; the retained error code
+does not identify which endpoint or network component initiated the failure.
+
+B's accepted qualification and all four successful protocol cycles refer to
+generation 18. Deployed rc.8 required new independent readiness/tool trials
+and management approval for generation 19; none was submitted or restored. The
+post-run export and reconnect observation preserve those earlier passes
+without claiming the current connection is inference-ready. This spontaneous
+restart is separate from the still-missing controlled recovery/refresh cases.
+Adding the complete post-run evidence left the assessment unchanged at sixteen
+passed, nineteen missing and no schema/export errors.
+
+The missing `readiness.a` product gate includes both a readiness challenge and
+a successful tool trial; A's challenge alone does not satisfy it. A's four
+protocol cycles, two-account interleaving/isolation/affinity, formal broker and
+worker recovery, replacement/full-history replay, stale-result rejection,
+recovery tool deduplication, adverse-output/unresolved-work cases, supported
+refresh and final confirmed revocation remain incomplete. No formal restart
+checkpoint or refresh was performed in this rc.8 run. The earlier runtime
+inquiry exposed no supported non-destructive VM refresh scope, so none was
+invented. Full live qualification and #18 remain incomplete.
+
+## Automatic recovery correction and A retry
+
+The November 15 owner correction retains the latest capability approval for
+the same enrolled worker across authenticated reconnects. It supersedes the
+old per-connection invalidation rule without turning historical proof into a
+new live observation. Initial qualification, explicit withdrawal, revocation,
+current connection/assignment fencing, accepted receipts and uncertain busy
+holds remain authoritative. The protected existing credential suffices; no
+token exchange, reinstall or re-enrollment is required.
+
+Before any B reapproval, a real client-B request at
+`2026-11-15T22:05:31.999Z`–`22:05:32.840Z` returned
+`503 no_ready_worker`; no job was assigned. Request
+`53d221b64c8a7718fd45fd076b1ea2bc` has a complete seven-capture broker
+export, SHA-256
+`b6923d302276de8d6b4211ea09d584e403aef923d16346ee0308c5dcd3d85af8`.
+It identifies B as online/idle with capacity on generation 19, excluded only
+for `readiness_stale` because its approval referenced generation 18. This
+proves the missing client-processing behavior in deployed rc.8; subscriber
+reconnection alone had not tested it. The correction is unshipped here.
+
+A's independent fresh readiness experiment
+`3a0e54cf56322d25d38ea9b8fc3843e5`, job
+`9f27ed6b0936f383f8903d086dd81dbd`, completed its exact challenge during
+`22:12:02.000Z`–`22:12:50.574Z`. Later native activity interrupted the first
+tool quiet window; no assignment was created during the interrupted waits.
+At `22:16:34Z`, inspection found an old operator message pausing tests. The
+owner's newer retry instruction superseded that pause, and a scoped message
+at `22:17:45.815Z` restored the existing authenticated-job delegation. Muse
+reported no pending permission card or unresolved native restriction. This
+did not establish the cause of the earlier tool failure, which preceded the
+old pause.
+
+After a new uninterrupted quiet window,
+`22:19:07.792Z`–`22:21:08.448Z`, experiment
+`d5d1222c20896c1ec8df9d161c8f28a5`, job
+`f123dc485b96018692fa358b9e65dbd2`, again reached `turn_deadline` at
+`22:26:10.662Z`. The installed worker authenticated and displayed its context;
+no tool proposal or decision was submitted and the client executed no tool.
+Cancellation retained an unknown remote outcome. Muse later reported an
+explicit idle acknowledgement, confirmed at `22:27:46.979Z`; this is an
+observed intervention after the failed window, not a passing model trial.
+
+The retry export covers `22:09:40Z`–`22:29:45.904231Z`, with 2,042,681 bytes,
+305 complete captures and SHA-256
+`cd9a8201b073bbc1a09bfaca559b66797e7788db6cc01546ca54f2016caed203`.
+Original bytes and chunk envelopes were verified after an administrative
+transfer excluded from qualification. Muse reported a prompt-injection
+safety-check failure, but no exact notice text or code is exposed in the
+retained receipts; the specific refusal remains unavailable. No pending
+permission approval was observed and no safety check was bypassed. The new
+A failure remains separate from B's verified routing-policy defect.
+
+The service fix retains the existing approval record and historical evidence
+metadata. Controlled regressions must complete client requests after
+reconnect and broker/worker restart without approving the recovered worker.
+The combined packed-worker runner now continues its accepted client-tool
+wait after broker restart and performs a fresh client tool cycle after
+worker restart under unchanged approval. Collector selection can withdraw
+siblings, but fails on a withdrawn/unapproved recovery target. Controlled
+success does not qualify either live recovery or A's failed tool path.
+
+Controlled validation passed by `2026-11-15T22:56:24Z` at base
+`ed5d4d78d30566414b90912c58dbcf72655c8e78`, working-source snapshot
+`3c4cc5e155862015bf4ade5968cb91d3175e66e4aaa38bdfdfc5d10ccc44d561`
+before these validation-note updates. The local combined image ID was
+`sha256:f8e3347828aa7d644d87311e254418c1e104be56c455ee17efdd97e2832e059b`;
+its paired `0.1.0-dev.0` worker archive SHA-256 was
+`bd1a7cf42b95a9e66c3152bfdaae32c874c644ac2ca66c48c7d194c16f564ec7`.
+No artifact was published or deployed by these checks.
+
+The product flow passed 32 cases in 151,121 ms. Its adverse shard passed in
+225,316 ms, reusing 34 Chat and 54 Responses receipts. Both shards passed the
+aggregate source/artifact/case validator. Broker restart continued the same
+accepted call on connection generation 2, executing its client tool once.
+Worker restart preserved its key/identity/journals and completed a fresh
+client tool cycle on generation 3. Complete broker exports contain zero
+qualification mutations for the recovered worker during either action/probe
+window. The HTTP/PostgreSQL routing regression also completed client work
+after reconnect under the unchanged original approval and rejected work
+after withdrawal and another reconnect.
+
+Standalone broker recovery, packed-worker recovery and portal-worker browser
+regressions passed. Go race tests, formatting/vet/build, portal TypeScript,
+file-size and CI-policy checks passed. All six unit components exceeded 90%
+using their separate raw counts:
+
+| Component | Covered / total statements |
+| --- | --- |
+| Service | 4,337 / 4,569 |
+| Worker | 1,358 / 1,364 |
+| Portal | 1,006 / 1,038 |
+| CI helpers | 665 / 691 |
+| Qualification/build tools | 2,105 / 2,143 |
+| Worker build scripts | 89 / 89 |
+
+The established direct-container-network harness option was used. Each
+integration harness verified removal of its owned containers, volumes and
+network. Private fixtures and complete exports remain outside CI uploads;
+only safe receipts/screenshots are eligible for retention. Final-head CI,
+Codex, the configured AI reviewer and CodeQL remain separate delivery gates.

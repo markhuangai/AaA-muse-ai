@@ -36,15 +36,16 @@ class PortalWorkers(Portal, History):
         self.deliver(waiting, waiting_peer, request, {"type": "tool_call", "call_id": "portal-client-read", "name": "read_file", "arguments": {"path": "client-only-controlled-fixture.txt"}})
         self.read_native(request)
         require(self.status(waiting)["waiting_for_client_tool"] == 1, "controlled tool wait was not observed")
-        stale = self.named_worker("Reconnected subscriber")
-        previous = self.peer(stale, qualify=False)
-        self.qualify_worker(stale, previous, tools=False)
+        reconnected = self.named_worker("Reconnected subscriber")
+        previous = self.peer(reconnected, qualify=False)
+        approval, _ = self.qualify_worker(reconnected, previous, tools=False)
         previous.stop()
-        self.peer(stale, qualify=False)
-        require(self.status(stale)["inference_readiness"] == "stale", "reconnection did not stale qualification")
+        self.peer(reconnected, qualify=False)
+        recovered = self.status(reconnected)
+        require(recovered["inference_readiness"] == "verified" and recovered["qualification"] == approval, "reconnection lost or rewrote worker approval")
         self.receipt("portal.workers_controlled_activity", heartbeat_is_not_readiness=True, live_qualification=False)
         return {"offline_id": offline["worker"]["id"], "transport_id": transport["worker"]["id"],
-                "busy_id": busy["worker"]["id"], "busy_job_id": job["id"], "waiting_id": waiting["worker"]["id"], "stale_id": stale["worker"]["id"]}
+                "busy_id": busy["worker"]["id"], "busy_job_id": job["id"], "waiting_id": waiting["worker"]["id"], "reconnected_id": reconnected["worker"]["id"]}
 
     def expiry_and_role_boundaries(self):
         expired = self.issue()

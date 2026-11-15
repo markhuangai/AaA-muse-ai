@@ -29,9 +29,6 @@ func readiness(s *inference.State) string {
 	if q.Input.Action != "approve" {
 		return "withdrawn"
 	}
-	if q.ConnectionID != s.Connection.ID || q.ConnectionGeneration != s.Connection.Generation {
-		return "stale"
-	}
 	return "verified"
 }
 
