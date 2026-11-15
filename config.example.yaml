@@ -1,18 +1,18 @@
 server:
-  listen: "0.0.0.0:${MUSE_HTTP_PORT}"
+  listen: "0.0.0.0:8080"
   public-url: "${MUSE_PUBLIC_URL}"
 database:
-  url: "${MUSE_DATABASE_URL}"
+  url: "postgres://aaa_muse@database:5432/aaa_muse?sslmode=disable"
+  password: "${POSTGRES_PASSWORD}"
 management:
-  key: ""
+  key: "${MUSE_MANAGEMENT_KEY}"
 control-portal:
   password: "${MUSE_PORTAL_PASSWORD}"
-client-keys: {}
-worker-package:
-  version: ""
-  sha256: ""
+client-keys:
+  qualification-a: "${MUSE_CLIENT_KEY_A}"
+  qualification-b: "${MUSE_CLIENT_KEY_B}"
 limits:
-  max-jobs: 1
+  max-jobs: 4
   in-flight-per-worker: 1
 diagnostics:
   level: info

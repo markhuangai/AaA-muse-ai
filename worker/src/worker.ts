@@ -4,11 +4,12 @@ import { Transport, origin, validateBody, type Network } from './transport.js';
 import { cause, Failure, requireValue } from './errors.js';
 import { decision, encode, identifier, integer, object, parse, text, type ObjectValue, type Value } from './json.js';
 import { correlation, job, version } from './protocol.js';
+import { VERSION } from './version.js';
 
 export class Worker {
   config: ObjectValue = {};
   credential = '';
-  constructor(readonly state: State, readonly logger: Logger, readonly net?: Network) {}
+  constructor(readonly state: State, readonly logger: Logger, readonly net?: Network, readonly productVersion = VERSION) {}
   async readRecord(state: State, name: string, validate?: (record: ObjectValue) => void): Promise<ObjectValue | undefined> {
     let raw: string | undefined;
     try {
@@ -32,7 +33,7 @@ export class Worker {
     this.credential = (await this.state.read('credential.key'))?.trim() ?? '';
     this.logger.redactor.add(this.credential);
     if (enrolled) requireValue(/^muse_worker_[A-Za-z0-9_-]{43}$/.test(this.credential), 'worker_not_enrolled');
-    return new Transport(endpoint, this.credential, this.logger, this.state.sys, this.net);
+    return new Transport(endpoint, this.credential, this.logger, this.state.sys, this.net, this.productVersion);
   }
   async configure(endpoint: string): Promise<ObjectValue> {
     const normalized = origin(endpoint);
@@ -69,13 +70,14 @@ export class Worker {
         await this.logger.log('INFO', 'worker.identity_preserved', { worker_id: id });
         return { worker_id: id, identity_preserved: true };
       }
+      await transport.enrollmentCompatibility();
       const saved = await this.state.read('enrollment.json');
       requireValue(!saved || object(parse(saved)).state === 'rejected', 'enrollment_uncertain', { corrective_action: 'inspect management issuance records, revoke any orphaned identity, then use a separate clean state directory' });
       await this.state.write('enrollment.json', encode({ state: 'pending', started_at: new Date(this.state.sys.now()).toISOString() }));
       let response;
       try { response = await transport.request('/api/v1/worker/enroll', 'POST', encode({ enrollment_code: code }), {}, 1); }
       catch (error) {
-        if (error instanceof Failure && error.code === 'broker_rejected' && !error.retryable) await this.state.write('enrollment.json', encode({ state: 'rejected', ...error.fields }));
+        if (error instanceof Failure && ['broker_rejected', 'update_required'].includes(error.code) && !error.retryable) await this.state.write('enrollment.json', encode({ state: 'rejected', ...error.fields }));
         throw error;
       }
       const credential = text(response.data.credential);

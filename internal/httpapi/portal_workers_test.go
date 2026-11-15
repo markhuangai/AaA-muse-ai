@@ -7,14 +7,13 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/markhuangai/AaA-muse-ai/internal/config"
 	"github.com/markhuangai/AaA-muse-ai/internal/service"
 )
 
 func TestPortalWorkerActionsUseManagementLogicAndProtectedDiagnostics(t *testing.T) {
 	h, repository, out, store := workerHTTPFixture(t)
 	h.Portal = service.NewPortal(h.Authority, rand.Reader, h.Now)
-	h.Setup = service.NewSetup(h.Workers, "https://example.test", config.WorkerPackage{Version: "0.1.0-rc.0", SHA256: strings.Repeat("a", 64)})
+	h.Setup = service.NewSetup(h.Workers, "https://example.test", service.PackagePin{Version: "0.1.0-rc.0", SHA256: strings.Repeat("a", 64)})
 	session := portalLogin(t, h)
 	operation := map[string]string{"X-Portal-Operation-Id": "portal-workers-operation"}
 	issued := portalHTTP(h, "POST", "/api/v1/admin/enrollments", session.Token, "", operation)

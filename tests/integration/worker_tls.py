@@ -89,7 +89,7 @@ class TLSFixture:
                         if delayed and delayed[0] == identity:
                             # Expire liveness while leaving time for the final HTTP attempt to receive the broker's refusal.
                             time.sleep(max(0, delayed[1] - time.monotonic()))
-                    headers = {key: self.headers[key] for key in ("Authorization", "Content-Type", "X-Request-Id") if key in self.headers}
+                    headers = {key: self.headers[key] for key in ("Authorization", "Content-Type", "X-Request-Id", "X-Muse-Worker-Version") if key in self.headers}
                     connection.request(self.command, self.path, body=body or None, headers=headers)
                     response = connection.getresponse()
                     streaming = self.path == "/api/v1/worker/events" and response.status == 200
@@ -127,7 +127,7 @@ class TLSFixture:
                             self.close_connection = True
                             return
                     self.send_response(response.status)
-                    for key in ("Content-Type", "X-Request-Id"):
+                    for key in ("Content-Type", "X-Request-Id", "X-Muse-Service-Version"):
                         if response.getheader(key):
                             self.send_header(key, response.getheader(key))
                     if not streaming:

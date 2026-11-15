@@ -12,7 +12,8 @@ import type { Network } from './transport.js';
 import { Setup, captureBootstrap } from './setup.js';
 import { setupIO, backgroundStderr, type SetupIO } from './setup-os.js';
 
-export const VERSION = '0.1.0-dev.0';
+import { VERSION } from './version.js';
+export { VERSION } from './version.js';
 const help = 'aaa-muse-worker setup --origin HTTPS_ORIGIN --code-stdin --install-dir ABSOLUTE_PATH --setup-id ID [--bootstrap FILE] | hook-check | configure --origin HTTPS_ORIGIN | enroll --code-stdin | run | status | doctor | job-show --job-id ID | decision-submit --job-id ID (--input FILE|- | --ack-idle) | diagnostics-export [--operation-id ID] [--request-id ID] [--since RFC3339] [--until RFC3339] [--decode]\nCommon: --state-dir ABSOLUTE_PATH, --help, --version\n';
 export interface Adapters {
   files: Files;
@@ -131,7 +132,7 @@ export async function execute(args: string[], io: Adapters): Promise<number> {
     const code = cause(error);
     const event = { stopped_operation: command, cause: code, ...(error instanceof Failure ? error.fields : {}) };
     if (logger && code !== 'diagnostics_unavailable' && !(error instanceof Failure && error.fields.diagnostic_recorded)) {
-      try { await logger.log('ERROR', code === 'state_unsafe' ? 'worker.state_unsafe' : 'worker.command_failed', event); }
+      try { await logger.log('ERROR', code === 'update_required' ? 'worker.update_required' : code === 'state_unsafe' ? 'worker.state_unsafe' : 'worker.command_failed', event); }
       catch { return 1; }
     } else if (!logger) io.stderr(encode({ level: 'ERROR', msg: code === 'state_unsafe' ? 'worker.state_unsafe' : 'worker.command_failed', protected_capture_unavailable: true, ...event }) + '\n');
     return 1;

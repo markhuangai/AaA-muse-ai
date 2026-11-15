@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { chmodSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import test from 'node:test';
 import { componentsFor, inspectSource, isTest } from './source-inventory.mjs';
@@ -15,6 +15,17 @@ test('component inventory includes every production module and activates a track
   assert(!Object.hasOwn(componentsFor(['worker/src/main.ts']), 'portal'));
   assert(isTest('tests/fixture.js')); assert(isTest('x/__tests__/fixture.mjs'));
   for (const path of ['other/helper.js', 'outside/main.ts']) assert.throws(() => componentsFor([path]), /unowned_production_module/);
+});
+
+test('unstaged Git deletions leave the working inventory while new untracked production files remain covered', t => {
+  const f = fixture(t, ['tools/kept.mjs', 'tools/removed.mjs', 'tools/untracked.mjs']);
+  const before = f.inspect();
+  unlinkSync(join(f.root, 'tools/removed.mjs'));
+  const execute = (file, args) => args.includes('diff') ? 'tools/removed.mjs\0' : args.includes('status') ? ' D tools/removed.mjs\n?? tools/untracked.mjs\n' : f.execute(file, args);
+  const after = inspectSource(f.root, execute);
+  assert.deepEqual(after.paths, ['tools/kept.mjs', 'tools/untracked.mjs']);
+  assert.deepEqual(after.components.tools, after.paths); assert.equal(after.identity.dirty, true);
+  assert.notEqual(after.identity.tree_sha256, before.identity.tree_sha256);
 });
 
 test('working-source identity binds Git identity, complete bytes and filenames without optional Git locks', t => {

@@ -79,11 +79,11 @@ function EnrollmentPanel({ controller, view }: { controller: WorkersController; 
     <div className="section-intro"><h2 id="enrollment-title">Enroll a worker</h2><p>Generate a private, single-use enrollment. Existing installations reconnect using their retained identity.</p></div>
     <div className="data-panel"><label htmlFor="enrollment-kind">Enrollment format</label><select id="enrollment-kind" value={kind} onChange={event => setKind(event.target.value as EnrollmentKind)} disabled={!!view.pending}>
       <option value="prompt">Complete Muse setup prompt</option><option value="code">Enrollment code only</option></select>
-      <p className="field-note">Setup text includes the configured package pin and supported reconnection instructions. Each generation issues a new enrollment and replaces the text shown here.</p>
+      <p className="field-note">Setup text includes the service image’s verified worker release and supported reconnection instructions. Each generation issues a new enrollment and replaces the text shown here.</p>
       <button className="primary" disabled={!!view.pending} onClick={() => void controller.createEnrollment(kind)}>{view.pending === 'enrollment' ? 'Generating…' : kind === 'prompt' ? 'Generate setup prompt' : 'Generate enrollment code'}</button>
       {view.enrollmentMessage && <p className="field-note" role="status">{view.enrollmentMessage}</p>}
       {enrollment && <div className="enrollment-result"><dl className="identity-list"><div><dt>Enrollment ID</dt><dd><code>{enrollment.enrollment_id}</code></dd></div><div><dt>Expires at</dt><dd>{timestamp(enrollment.expires_at)}</dd></div>
-        {enrollment.worker_package && <><div><dt>Package pin</dt><dd>{enrollment.worker_package.version}</dd></div><div><dt>Archive SHA-256</dt><dd><code>{enrollment.worker_package.sha256}</code></dd></div></>}
+        {enrollment.worker_package && <><div><dt>Recommended installer</dt><dd>{enrollment.worker_package.version}</dd></div><div><dt>Archive SHA-256</dt><dd><code>{enrollment.worker_package.sha256}</code></dd></div></>}
       </dl><p className="field-note">Use once before expiry. This portal cannot confirm whether the code has already been used. Keep the copied text private.</p>
         <div className="copy-controls"><button onClick={() => void controller.copyEnrollment()}>Copy {view.enrollmentKind === 'prompt' ? 'complete prompt' : 'enrollment code'}</button><button onClick={() => { text.current?.focus(); text.current?.select(); }}>Select text</button></div>
         <label className="sr-only" htmlFor="enrollment-text">{view.enrollmentKind === 'prompt' ? 'Complete setup prompt' : 'Single-use enrollment code'}</label>

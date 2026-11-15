@@ -44,6 +44,14 @@ The November 14 [#42 approval](https://github.com/markhuangai/AaA-muse-ai/issues
 
 Controlled NUL-history validation passed in [CI](https://github.com/markhuangai/AaA-muse-ai/actions/runs/43610017152) by `2026-11-14T15:29:48Z` for source `2298bc3ba4ea9b23bb479f9ccb33c10831f66184`, working-source digest `9ab0ddc31e203605e249dadf646c0073868e46ab0c1fe1803a110a33700eed3a`. The portal history suite passed 51 safe receipts, including native/legacy NUL and literal-escape fidelity at 1440, 768 and 390 pixels, malformed-projection diagnosis and cleanup of its two containers, two volumes and network. Its combined image was `sha256:30c78be4247b89f200e12b0c690d559d10e42ca90d582bd822a2ee1ec0cee0fb`. Native history and broker-recovery checks passed, including NUL output receipt replay, accepted tool linkage and uncertain holds; all six unit components separately exceeded 90% raw statement coverage. These controlled results do not qualify live Muse. Final-head CI and required reviews remain separate [PR #43](https://github.com/markhuangai/AaA-muse-ai/pull/43) gates.
 
+The November 14, 2026 owner-approved prerequisite replaces operator package pins with image-owned paired-release metadata, requires equal full service/worker release versions and same-major connection compatibility, and leaves worker upgrades manual. It also permits a single raw database password shared through Compose, with URL construction inside Go. Engineering and controlled validation precede issue #18; the inconclusive live verdict and passing-live gate remain. No publication, merge, deployment or live qualification has been performed by this change.
+
+The same owner-approved plan adds [the combined product runner and staged two-account release matrix](docs/qualification/product.md) for [#18](https://github.com/markhuangai/AaA-muse-ai/issues/18). The prerequisite’s round-six independent audit was conformant at base `b095988e02abb31e1eca97873f9900d88caa1180`. Its service/PostgreSQL, archived `0.1.0-rc.6` worker, current packed worker, installer/recovery and portal-worker browser checks passed by `2026-11-14T22:34:10Z`, using local combined-image ID `sha256:0ca01bdd25e469f7fd3524244e85be3394e681a9bd05f08d4e9949e3d4c28d6d`. An initial browser run failed because the required Playwright Chromium was absent; installing that exact runtime resolved the environment failure. The local direct-container-network option was used; every harness verified its owned container/volume/network cleanup. These prerequisite receipts precede the #18 source changes, do not establish a final same-source validation, and do not qualify live Muse. The new deployment/configuration, authorized account logins and required live evidence remain outstanding.
+
+The owner’s follow-up defers live Muse execution until they confirm the PR is merged and the updated service is deployed. The two private VNC sessions remain available for owner login. Local controlled validation and read-only reviews may continue; neither changes the inconclusive live verdict.
+
+Controlled #18 product validation passed at `2026-11-15T00:29:09Z` for approved base `b095988e02abb31e1eca97873f9900d88caa1180`, working-source digest `43f80f0255b25a21ddb9a5294d94d9a4c84683b53915f7c2c79e69adb4f62d83`: 32 combined portal/installer/packed-worker cases and the adverse Chat/Responses shard. Both shards used identical worker bytes and passed aggregate validation; all six unit components separately exceeded 90% raw statement coverage. The standalone service, native/history/routing/recovery, worker and portal regressions also passed. See the [controlled validation record](docs/qualification/product.md#controlled-validation-record) for artifact identities, corrected failures and limits. Required final-head CI, configured AI review, CodeQL and live Muse evidence remain separate gates; #18 is incomplete.
+
 ## Run the service
 
 Requires Docker and Docker Compose. Copy the [example configuration](config.example.yaml):
@@ -55,30 +63,31 @@ cp config.example.yaml config.yaml
 Create a private `.env` with real values:
 
 ```dotenv
-MUSE_HTTP_PORT=8080
+MUSE_SERVICE_IMAGE=ghcr.io/markhuangai/aaa-muse-ai@sha256:<verified-paired-release-digest>
 MUSE_PUBLIC_URL=https://muse.example.com
 POSTGRES_PASSWORD=<database-password>
-MUSE_DATABASE_URL=postgres://aaa_muse:<URL-encoded-database-password>@database:5432/aaa_muse?sslmode=disable
+MUSE_MANAGEMENT_KEY=<management-key>
 MUSE_PORTAL_PASSWORD=<distinct-portal-password>
+MUSE_CLIENT_KEY_A=<first-model-client-key>
+MUSE_CLIENT_KEY_B=<second-model-client-key>
 ```
 
-The database passwords must match; URL-encode the one in `MUSE_DATABASE_URL`. Use the distinct portal password to sign in at your public origin. Configure the worker package pin in `config.yaml`; this is the tested prerelease:
+Use `compose.yaml` in a separate qualification directory. Its default HTTP binding is `127.0.0.1:8081`; the operator owns reverse-proxy routing and TLS. The example config fixes the database host, user and name and uses the same `POSTGRES_PASSWORD` as PostgreSQL. Go escapes the password; no second URL-encoded secret or `MUSE_DATABASE_URL` setting is needed. Existing complete database URLs remain supported. Do not combine a URL password with `database.password`.
 
-```yaml
-worker-package:
-  version: "0.1.0-rc.0"
-  sha256: "240163c49cc30f9ac8b0906e8047b9c7bfb10756ca045b7d71e7977c2f566e77"
-```
+The service and worker are released together with the same full version and source SHA. Same-major workers may connect regardless of minor or patch differences. A different major reports `update_required`; the worker logs manual operator action and never updates itself. Product versions are independent of the existing `protocol_version: 1` wire field. Legacy handshakes without product metadata remain supported only by major-zero services and do not establish an exact installed version.
 
-Verify the [published worker release](https://github.com/markhuangai/AaA-muse-ai/releases/tag/worker-v0.1.0-rc.0) before using its pin. Both pin fields are required to generate setup prompts. Keep deployment credentials out of Git.
+Worker installation metadata comes from the service image, never `config.yaml`. Setup prompts still verify the exact archive version and trusted SHA-256 before executing code. Read [paired release and manual upgrade](docs/releases.md) before changing versions. Existing `worker-v0.1.0-rc.N` releases remain unchanged; new paired releases use `vVERSION` and include a `product-release.json` receipt. A partial publication is not a complete pair.
 
-Start the configured service:
+The published image recorded before this change does not implement the new configuration. Use the immutable digest of the verified prerequisite build when available; no replacement release is published by this documentation change.
+
+After selecting that verified image:
 
 ```sh
-docker compose up --build -d
+docker compose config --quiet
+docker compose up -d
 ```
 
-Compose mounts `config.yaml` read-only. The service runs as UID/GID `10001:10001`, so that user must be able to read the mount. Put your own Traefik, Nginx or other HTTPS reverse proxy in front of the single HTTP port; configure `MUSE_PUBLIC_URL` as its HTTPS origin. No bundled proxy or TLS management is provided.
+Compose mounts `config.yaml` read-only. The service runs as UID/GID `10001:10001`, so that user must be able to read the mount. Put your own Traefik, Nginx or other HTTPS reverse proxy in front of the single HTTP port; configure `MUSE_PUBLIC_URL` as its HTTPS origin and allow at least 330 seconds for inference responses. No bundled proxy or TLS management is provided.
 
 If `management.key` is empty, startup prints an automatically generated management key once. Keep it local in a protected header file containing `Authorization: Bearer <management-key>` under a `0700` directory, with file mode `0600`. Never send that key to Muse. Liveness is `GET /healthz`; readiness is `GET /readyz`.
 

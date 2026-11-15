@@ -53,11 +53,15 @@ jobs:
           ref: ${{ env.SOURCE_SHA }}
           path: source
           persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24.22.2
       - name: Verify source and build tested image
         working-directory: source
         run: |
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
           test "$(git rev-parse HEAD^{tree})" = "$TREE_SHA"
+          npm ci --ignore-scripts --no-audit --no-fund
           make smoke-image SOURCE_SHA="$SOURCE_SHA" SOURCE_DIRTY=false SERVICE_IMAGE=aaa-muse-candidate:tested
       - name: Fence source before candidate export
         uses: actions/github-script@v9

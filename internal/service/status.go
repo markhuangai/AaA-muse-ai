@@ -13,8 +13,10 @@ import (
 
 type Database interface{ Ping(context.Context) error }
 type Build struct {
-	Revision string `json:"revision"`
-	Dirty    bool   `json:"dirty"`
+	Version       string     `json:"version"`
+	Revision      string     `json:"revision"`
+	Dirty         bool       `json:"dirty"`
+	WorkerPackage PackagePin `json:"worker_package"`
 }
 type Status struct {
 	Build         Build         `json:"build"`
@@ -39,7 +41,7 @@ type Service struct {
 }
 
 func New(db Database, c config.Config, b Build, instance string, now func() time.Time, logger *slog.Logger) *Service {
-	return &Service{db: db, config: c, build: b, instance: instance, started: now(), now: now, logger: logger, lastReady: true}
+	return &Service{db: db, config: c, build: b.Normalized(), instance: instance, started: now(), now: now, logger: logger, lastReady: true}
 }
 
 func (s *Service) Status(ctx context.Context, logger *slog.Logger) Status {

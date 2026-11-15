@@ -1,5 +1,9 @@
 # Muse PoC qualification procedure
 
+For issue #18's combined software runner, two-account protocol matrix and owner
+restart checkpoints, see [product qualification](product.md). Historical PoC
+reports remain schema one; product reports use schema two.
+
 This tooling prepares issue [#7](https://github.com/markhuangai/AaA-muse-ai/issues/7).
 The preparation PR uses `Refs #7`; it does not close the investigation. No live
 Muse qualification report is shipped. Synthetic fixtures prove software behavior
@@ -9,11 +13,18 @@ only. A passing live report, not this CI job, gates release work.
 
 Wait for human merge of the tooling PR and owner authorization of the live run.
 The owner deploys an exact published image behind their HTTPS reverse proxy,
-configures the verified worker version/SHA-256 pin, and supplies a management
+verifies its embedded paired worker metadata, and supplies a management
 header file containing `Authorization: Bearer <key>`. Keep that file in a `0700`
 directory with mode `0600`, outside this checkout. Never paste its contents into
 chat, a shell command, a URL, or a report. No registry or durable worker key is
 needed by the client driver.
+
+Allow at least 330 seconds for inference responses in the reverse proxy. The
+service image owns the installer version/digest; operator YAML has no package
+pin. An installed worker can have another compatible version. Record its actual
+CLI version and verified archive digest independently of the image's installer
+recommendation; connection health or an absent legacy version header proves
+neither exact installed version nor live readiness.
 
 Configure `limits.max-jobs: 2` and `in-flight-per-worker: 1`. The first setting
 allows two sessions to wait for client tools; it does not permit concurrent
@@ -52,7 +63,7 @@ Required entries use these additional fields:
 | Kind | Fields and meaning |
 | --- | --- |
 | `artifact_identity` | `service_sha`, immutable `image_digest`; independently inspect the deployed image. The authenticated service status must identify the same clean source. |
-| `setup_ended` | `worker_id`, `hook_id`, `consumer_count: 1`, `interval_seconds: 5`, `state_mode: "0700"`, `key_file_mode: "0600"`, nonempty `actual_permissions`; `time` is the end of setup. Retain runtime and registration observations in the referenced evidence. |
+| `setup_ended` | `worker_id`, `hook_id`, `consumer_count: 1`, `interval_seconds: 5`, `state_mode: "0700"`, `key_file_mode: "0600"`, nonempty `actual_permissions`; `time` is the end of setup. New collections also require `worker_version` from the actual installed CLI and `worker_sha256` from verified installed-archive provenance, including when using a legacy service. Retain that evidence with runtime and registration observations. These fields identify the installation, not the service's recommended package. |
 | `quiet_window` | `case_id`, `started_at`, `ended_at`, `exclusive: true`; observe at least 120 seconds ending at the case's `started_at`. Use actual collector timestamps and passive observation, not retrospective assumptions. |
 | `model_turn` | `case_id`, `job_id`, observed `native_conversation_id`, `effective_instructions` as canonical system/developer items (including a delta's inherited base), and nonempty `account_memory_observation`. State what was observable; do not claim private reasoning or hidden instructions. |
 | `no_model_turn` | `case_id`, `job_id`, `started_at`, `ended_at`, `last_boundary`; continuous passive coverage of the complete failed turn, matching its recorded boundaries. Retain detector and worker exports even if no native turn occurs. |

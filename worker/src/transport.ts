@@ -2,6 +2,7 @@ import { Failure, cause, requireValue } from './errors.js';
 import { encode, parse, object, text, type ObjectValue, type Value } from './json.js';
 import { Logger } from './diagnostics.js';
 import type { System } from './state.js';
+import { VERSION } from './version.js';
 
 export interface Network {
   fetch: typeof fetch;
@@ -28,7 +29,22 @@ export function validateBody(input?: string): void {
 }
 
 export class Transport {
-  constructor(readonly endpoint: string, readonly credential: string, readonly logger: Logger, readonly sys: System, readonly net: Network = network) { origin(endpoint); }
+  constructor(readonly endpoint: string, readonly credential: string, readonly logger: Logger, readonly sys: System, readonly net: Network = network, readonly productVersion = VERSION) { origin(endpoint); }
+  compatibility(response: Response, route: string, data: ObjectValue = {}): void {
+    const declared = response.headers.get('x-muse-service-version');
+    const major = (value: string): string | undefined => /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(dev|rc)\.(0|[1-9][0-9]*))?$/.exec(value)?.[1];
+    if (declared !== null) requireValue(major(declared) !== undefined, 'invalid_service_version');
+    const checked = route.endsWith('/enroll') || route.endsWith('/status') || route.endsWith('/events') || route.endsWith('/claim');
+    if (data.error === 'update_required' || (checked && major(this.productVersion) !== (declared === null ? '0' : major(declared)))) {
+      const recommended = data.worker_package ?? (declared === null ? null : { version: declared, release_url: 'https://github.com/markhuangai/AaA-muse-ai/releases/tag/v' + declared });
+      throw new Failure('update_required', { worker_version: this.productVersion, service_version: declared ?? 'legacy-major-zero', recommended_worker: recommended, automatic_update: false, corrective_action: 'Install the service-paired worker manually, or align the service major; preserve worker identity and journals.', http_status: response.status, request_id: response.headers.get('x-request-id') ?? '' });
+    }
+  }
+  async enrollmentCompatibility(): Promise<void> {
+    if (this.productVersion.startsWith('0.')) return;
+    try { await this.request('/api/v1/worker/status'); }
+    catch (error) { if (!(error instanceof Failure && error.code === 'worker_unauthorized')) throw error; }
+  }
   // Final receipts duplicate answer text from the bounded canonical context and add broker metadata.
   async body(response: Response, limit = 3 * 1024 * 1024): Promise<string> {
     if (!response.body) return '';
@@ -55,7 +71,7 @@ export class Transport {
       const timer = this.net.setTimer(() => controller.abort(), 10_000);
       let requestId = this.sys.uuid();
       try {
-        const response = await this.net.fetch(this.endpoint + route, { method, body: input, redirect: 'manual', signal: controller.signal, headers: { ...(this.credential ? { Authorization: 'Bearer ' + this.credential } : {}), Accept: 'application/json', ...(input === undefined ? {} : { 'Content-Type': 'application/json' }), 'X-Request-Id': requestId } });
+        const response = await this.net.fetch(this.endpoint + route, { method, body: input, redirect: 'manual', signal: controller.signal, headers: { ...(this.credential ? { Authorization: 'Bearer ' + this.credential } : {}), Accept: 'application/json', ...(input === undefined ? {} : { 'Content-Type': 'application/json' }), 'X-Request-Id': requestId, 'X-Muse-Worker-Version': this.productVersion } });
         requestId = response.headers.get('x-request-id') || requestId;
         requireValue(response.status < 300 || response.status >= 400, 'redirect_forbidden');
         const raw = await this.body(response);
@@ -68,6 +84,7 @@ export class Transport {
         }
         const validation = responseValidation ? { response_validation_cause: responseValidation } : {};
         await this.logger.log('DEBUG', 'worker.http_exchange', { ...correlation, ...validation, request_id: requestId, endpoint: this.endpoint, route, method, attempt, duration_ms: this.sys.now() - started, http_status: response.status, input: input === undefined ? null : parse(input), output: responseValidation ? raw : data });
+        this.compatibility(response, route, data);
         if (!response.ok) throw new Failure(response.status === 401 ? 'worker_unauthorized' : 'broker_rejected', { ...correlation, ...validation, request_id: requestId, http_status: response.status, reason: typeof data.error === 'string' ? data.error : 'invalid_error_response' }, response.status === 429 || response.status >= 500);
         return { data, requestId, status: response.status };
       } catch (error) {
@@ -86,10 +103,13 @@ export class Transport {
     let timer = this.net.setTimer(abort, 10_000);
     let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
     try {
-      const response = await this.net.fetch(this.endpoint + '/api/v1/worker/events', { redirect: 'manual', signal: controller.signal, headers: { Authorization: 'Bearer ' + this.credential, Accept: 'text/event-stream' } });
+      const response = await this.net.fetch(this.endpoint + '/api/v1/worker/events', { redirect: 'manual', signal: controller.signal, headers: { Authorization: 'Bearer ' + this.credential, Accept: 'text/event-stream', 'X-Muse-Worker-Version': this.productVersion } });
       this.net.clearTimer(timer);
       const requestId = response.headers.get('x-request-id') ?? '';
       requireValue(response.status < 300 || response.status >= 400, 'redirect_forbidden');
+      let rejection: ObjectValue = {};
+      if (response.status === 426) rejection = object(parse(await this.body(response)));
+      this.compatibility(response, '/api/v1/worker/events', rejection);
       if (response.status !== 200) throw new Failure(response.status === 401 ? 'worker_unauthorized' : 'stream_rejected', { request_id: requestId, http_status: response.status }, response.status === 409 || response.status === 429 || response.status >= 500);
       requireValue(response.headers.get('content-type')?.split(';')[0].trim() === 'text/event-stream' && response.body, 'invalid_stream_response');
       reader = response.body.getReader();

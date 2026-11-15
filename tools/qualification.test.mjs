@@ -223,7 +223,7 @@ async function harness(t,{mode='normal'}={}) {
   const root=await temporary(t);let clock=Date.UTC(2026,0,2),sequence=0,exportAttempts=0;
   const logs=[],requests=[],experiments=new Map();
   const observations=join(root,'observations.json'),workerExports=[];
-  const entries=[{kind:'setup_ended',time:new Date(clock-1000).toISOString(),worker_id:'worker-1',observer:'synthetic',source_ref:'synthetic-setup'}, {kind:'artifact_identity',time:new Date(clock-1000).toISOString(),observer:'synthetic',source_ref:'synthetic-image',service_sha:'a'.repeat(40),image_digest:'sha256:'+'b'.repeat(64)}];
+  const entries=[{kind:'setup_ended',time:new Date(clock-1000).toISOString(),worker_id:'worker-1',worker_version:'0.1.0-rc.0',worker_sha256:'c'.repeat(64),observer:'synthetic',source_ref:'synthetic-setup'}, {kind:'artifact_identity',time:new Date(clock-1000).toISOString(),observer:'synthetic',source_ref:'synthetic-image',service_sha:'a'.repeat(40),image_digest:'sha256:'+'b'.repeat(64)}];
   const writeObservations=()=>fs.writeFile(observations,JSON.stringify({schema_version:1,entries,worker_exports:workerExports}),{mode:0o600});
   await writeObservations();
   const stamp=()=>new Date(clock).toISOString();

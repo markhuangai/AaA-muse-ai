@@ -108,6 +108,9 @@ func (h *Handler) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 	}
 	out.Header().Set("X-Request-Id", id)
 	out.Header().Set("Cache-Control", "no-store")
+	if h.Service != nil {
+		out.Header().Set(service.ServiceVersionHeader, h.Service.Build().Version)
+	}
 	route, requestedWorker := routeFor(r.URL.Path)
 	logger := h.Logger.With("request_id", id, "route", route)
 	w := &response{ResponseWriter: out, capture: route != "/api/v1/admin/diagnostics/export" && route != "/api/v1/portal/login", openAI: chatRoute(route), now: h.Now}
@@ -219,6 +222,9 @@ func (h *Handler) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 		logger.Warn("request.rejected", "reason", "method_not_allowed", "expected_method", method, "observed_method", r.Method)
 		w.Header().Set("Allow", method)
 		writeJSON(w, 405, map[string]any{"error": "method_not_allowed"})
+		return
+	}
+	if !h.workerCompatibility(w, r, logger, route) {
 		return
 	}
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, MaxBodyBytes))

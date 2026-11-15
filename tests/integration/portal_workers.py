@@ -13,11 +13,6 @@ from service import require
 
 
 class PortalWorkers(Portal, History):
-    def configuration(self, generated=False):
-        config = super().configuration(generated)
-        config["worker-package"] = {"version": "0.1.0-rc.0", "sha256": "240163c49cc30f9ac8b0906e8047b9c7bfb10756ca045b7d71e7977c2f566e77"}
-        return config
-
     def named_worker(self, name):
         worker = self.new_worker()
         self.checked("/api/v1/admin/workers/" + worker["worker"]["id"], self.admin, "PATCH", {"name": name})
@@ -69,7 +64,7 @@ class PortalWorkers(Portal, History):
     def worker_browser(self, phase, workers):
         fixture = self.private("worker-browser-" + phase + ".json", json.dumps({"origin": self.origin_url, "password": self.portal,
             "source_sha": self.args.source_sha, "container": self.main_service, "database": self.db, "owner": self.owner,
-            "directory": str(self.root.resolve()), "phase": phase, "workers": workers, "pin": self.configuration()["worker-package"]}))
+            "directory": str(self.root.resolve()), "phase": phase, "workers": workers, "pin": self.checked("/api/v1/admin/status", self.admin)[0]["build"]["worker_package"]}))
         result = subprocess.run(["node", "tests/portal/workers.mjs", "--fixture", str(fixture)], capture_output=True, text=True, timeout=600)
         self.private("worker-browser-" + phase + ".log", result.stdout + result.stderr)
         secret_path = self.root / ("worker-browser-secrets-" + phase + ".json")

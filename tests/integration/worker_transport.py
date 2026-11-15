@@ -6,6 +6,9 @@ import os
 from pathlib import Path
 import secrets
 import time
+import io
+import tarfile
+import urllib.request
 
 from inference import Inference
 from service import LABEL, require
@@ -57,6 +60,31 @@ class WorkerTransport(Inference):
         self.command(worker, "enroll", "--code-stdin", input_text=registration["enrollment_code"] + "\n")
         require((worker["state"] / "credential.key").read_text().strip() == credential, "repeated enrollment replaced healthy identity")
         return worker
+
+    def legacy_release(self):
+        url = "https://github.com/markhuangai/AaA-muse-ai/releases/download/worker-v0.1.0-rc.6/markhuangai-aaa-muse-worker-0.1.0-rc.6.tgz"
+        with urllib.request.urlopen(url, timeout=120) as response:
+            archive = response.read(1024 * 1024)
+        expected = "2c29f4cfee3b58148ce4ec614ef6ada5e11a4b3e5de44109916c9cc3f81d959f"
+        require(hashlib.sha256(archive).hexdigest() == expected, "legacy release bytes changed")
+        directory = self.root.resolve() / "legacy-release"
+        directory.mkdir(mode=0o700)
+        with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as package:
+            require(all(item.name.startswith("package/") and ".." not in Path(item.name).parts and not item.issym() and not item.islnk() for item in package.getmembers()), "legacy package archive paths unsafe")
+            package.extractall(directory, filter="data")
+        current = self.package
+        try:
+            self.package = directory / "package"
+            worker = self.cli_worker("legacy-rc6")
+            self.start(worker)
+            probe = self.create(worker, "actual archived worker compatibility")
+            shown = self.wait_job(worker, probe)
+            self.submit_cli(worker, shown["job_id"], {"type": "final", "text": "legacy actual archive accepted"})
+            require(self.experiment(probe["id"])["final_text"] == "legacy actual archive accepted", "legacy package did not finish its controlled turn")
+            self.receipt("worker.compatibility_legacy_archive", installed_version="0.1.0-rc.6", archive_sha256=expected, controlled=True, live_muse=False)
+            self.docker("stop", "--time", "2", worker["daemon"])
+        finally:
+            self.package = current
 
     def start(self, worker):
         connection_file = worker["state"] / "connection.json"
@@ -427,6 +455,7 @@ def main():
         _, h.origin_url, _ = h.launch(config)
         h.ready(h.resources["containers"][-1], h.origin_url)
         proxy = h.proxy = TLSFixture(h, h.origin_url)
+        h.legacy_release()
         worker = h.cli_worker("primary")
         h.start(worker)
         node = json.loads(h.docker("image", "inspect", NODE_IMAGE).stdout)[0]

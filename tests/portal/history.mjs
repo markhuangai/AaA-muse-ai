@@ -289,7 +289,8 @@ async function failuresAndExpiry() {
   passed('portal.history_outage_malformed_timeout_stale_and_browser_expiry', { actual_postgres_outage: true, browser_clock_is_not_server_expiry: true, render_source_correlated: true }); await context.close();
   const deniedContext = await browser.newContext({ serviceWorkers: 'block' }); const deniedPage = await deniedContext.newPage(); const deniedSession = await login(deniedPage);
   expect((await control('/api/v1/portal/logout', { key: deniedSession.session_token, method: 'POST' })).response.status).toBe(204);
-  const denied = deniedPage.waitForResponse(response => new URL(response.url()).pathname === '/api/v1/admin/requests' && response.status() === 401); await deniedPage.getByRole('button', { name: 'Refresh history', exact: true }).click(); const deniedResponse = await denied; receipt.diagnostics.push({ request_id: deniedResponse.headers()['x-request-id'] });
+  // The first denied parallel read clears the session and can abort its sibling.
+  const denied = deniedPage.waitForResponse(response => ['/api/v1/admin/requests', '/api/v1/admin/workers'].includes(new URL(response.url()).pathname) && response.status() === 401); await deniedPage.getByRole('button', { name: 'Refresh history', exact: true }).click(); const deniedResponse = await denied; receipt.diagnostics.push({ request_id: deniedResponse.headers()['x-request-id'] });
   await expect(deniedPage.getByText('Your session ended. Sign in again.')).toBeVisible(); await deniedContext.close();
   const lateContext = await browser.newContext({ serviceWorkers: 'block' }); const late = await lateContext.newPage(); await login(late);
   let finish, seenLate; const pending = new Promise(resolve => { finish = resolve; }), observed = new Promise(resolve => { seenLate = resolve; });

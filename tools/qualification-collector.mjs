@@ -49,7 +49,7 @@ export class Collector {
       await this.log('ERROR','qualification.exchange_failed',{case_id:item?.id,operation_id:item?.experiment_id,path,method,cause:error.name === 'TimeoutError' ? 'http_deadline' : 'http_exchange_failed'});
       throw new Error('http_exchange_failed');
     }
-    await this.log('DEBUG','qualification.http_exchange',{case_id:item?.id,operation_id:item?.experiment_id,conversation_id:item?.conversation_id,worker_id:this.workerID,path,method,input:body ?? null,http_status:response.status,request_id:response.headers.get('x-request-id'),output:raw});
+    await this.log('DEBUG','qualification.http_exchange',{case_id:item?.id,operation_id:item?.experiment_id,conversation_id:item?.conversation_id,worker_id:item?.worker_id ?? this.workerID,path,method,input:body ?? null,http_status:response.status,request_id:response.headers.get('x-request-id'),output:raw});
     need(response.ok, `http_${response.status}`);
     return path.includes('/diagnostics/export') ? raw : JSON.parse(raw);
   }
@@ -70,9 +70,11 @@ export class Collector {
     need(status.ready === true && status.build?.dirty === false && /^[a-f0-9]{40}$/.test(status.build.revision), 'exact_ready_service_required');
     need(status.configuration?.limits?.max_jobs >= 2 && status.configuration.limits.in_flight_per_worker === 1, 'interleave_requires_two_jobs_one_inference');
     need(artifact?.service_sha === status.build.revision && /^sha256:[a-f0-9]{64}$/.test(artifact.image_digest ?? ''), 'verified_image_identity_required');
-    const pin = status.configuration.worker_package;
+    const pin = status.build?.worker_package ?? status.configuration.worker_package;
     need(pin?.version && /^[a-f0-9]{64}$/.test(pin.sha256 ?? ''), 'published_worker_pin_required');
-    this.report = {schema_version:1,evidence_kind:this.evidenceKind,run_id:this.uuid(),origin:this.origin,worker_id:this.workerID,started_at:this.stamp(),setup_ended_at:setup.time,settings:{idle_seconds:120,turn_seconds:300},status_receipt:status,source:{service_sha:status.build.revision,image_digest:artifact.image_digest,worker_version:pin.version,worker_sha256:pin.sha256},cases:[],observations:observations.entries,exports:[],context_strategy:{baseline:'full',delta:'inconclusive'},verdict:'inconclusive'};
+    const installed = {version:setup.worker_version,sha256:setup.worker_sha256};
+    need(installed.version && /^[a-f0-9]{64}$/.test(installed.sha256 ?? ''), 'observed_installed_worker_identity_required');
+    this.report = {schema_version:1,evidence_kind:this.evidenceKind,run_id:this.uuid(),origin:this.origin,worker_id:this.workerID,started_at:this.stamp(),setup_ended_at:setup.time,settings:{idle_seconds:120,turn_seconds:300},status_receipt:status,source:{service_sha:status.build.revision,image_digest:artifact.image_digest,worker_version:installed.version,worker_sha256:installed.sha256,installer_version:pin.version,installer_sha256:pin.sha256},cases:[],observations:observations.entries,exports:[],context_strategy:{baseline:'full',delta:'inconclusive'},verdict:'inconclusive'};
     await this.save();
     await this.log('INFO','qualification.started',{worker_id:this.workerID,source:this.report.source,effective_settings:this.report.settings});
   }
