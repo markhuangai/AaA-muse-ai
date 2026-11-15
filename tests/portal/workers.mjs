@@ -103,7 +103,7 @@ async function viewports() {
     await expect(row(fixture.workers.transport_id)).toContainText('Not yet qualified');
     await expect(row(fixture.workers.busy_id)).toContainText('Busy');
     await expect(row(fixture.workers.waiting_id)).toContainText('1 client-tool waits');
-    await expect(row(fixture.workers.stale_id)).toContainText('Stale qualification');
+    await expect(row(fixture.workers.reconnected_id)).toContainText('Approved');
     await screenshot(page, 'list', width);
     await openWorker(page, fixture.workers.busy_id);
     await expect(page.getByText(fixture.workers.busy_job_id, { exact: true })).toBeVisible();

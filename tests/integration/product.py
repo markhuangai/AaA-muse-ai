@@ -133,7 +133,7 @@ class Product(WorkerRecovery, History):
     def client_flow(self, phase, cycle=None):
         names = [f"{slot}.{protocol}.{mode}" for slot in ("a", "b") for protocol in ("chat", "responses") for mode in ("json", "sse")]
         fixtures = {}
-        for name in [*names, "interleave-a", "interleave-b", "restart"]:
+        for name in [*names, "interleave-a", "interleave-b", "restart", "worker-probe"]:
             contents = "client-only-" + secrets.token_hex(32) + "\nexact 😀\n"
             path = self.private("product-" + phase + "-" + name + "-" + secrets.token_hex(6) + ".txt", contents)
             fixtures[name] = {"id": secrets.token_hex(12), "owner": "client_driver", "created_at": datetime.now(timezone.utc).isoformat(), "path": str(path), "contents": contents}
@@ -179,6 +179,7 @@ class Product(WorkerRecovery, History):
 
     def restart_and_replace(self):
         prepared = self.client_flow("prepare-restart")["cycles"][0]
+        qualifications = {worker["slot"]: self.status(worker)["qualification"] for worker in self.workers}
         before = self.checked("/api/v1/admin/status", self.admin)[0]
         checkpoint = self.product_checkpoints["broker"] = {"cycle_id": prepared["id"], "pending_call_id": prepared["call_id"],
             "before_instance": before["instance_id"], "before_status": before, "prepared_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds")}
@@ -196,7 +197,8 @@ class Product(WorkerRecovery, History):
             "observer": "controlled-product-runner", "source_ref": "product-client-prepare-restart-receipt.json"})
         for worker in self.workers:
             self.online(worker)
-            self.qualify_packed(worker)
+            current = self.status(worker)
+            require(current["inference_readiness"] == "verified" and current["qualification"] == qualifications[worker["slot"]], "broker restart lost or rewrote worker approval")
         resumed = self.client_flow("resume-restart", prepared)["cycles"][0]
         checkpoint["completed_request_id"] = resumed["turns"][1]["operation_id"]
         self.add("recovery.tool-dedup", call_id=resumed["call_id"], client_tool_executions=resumed["client_tool_executions"], request_ids=[t["request_id"] for t in resumed["turns"]])
@@ -224,14 +226,14 @@ class Product(WorkerRecovery, History):
             {**common, "kind": "worker_reconnected", "time": reconnected_at, "consumer_count": 1, "state_mode": "0700", "key_file_mode": "0600",
              "reinstalled": False, "reenrolled": False, "manual_message": False, "connection_id": recovered["connection_id"], "connection_generation": recovered["connection_generation"]}])
         self.models = [PackedModel(self, a).start(), PackedModel(self, b).start()]
-        ready, trial = self.qualify_packed(b)
-        self.add("recovery.worker", worker_ids=[b["worker"]["id"]], operation_ids=[ready["id"], trial["id"]], identity_preserved=True)
-        self.add("recovery.hook", recovery_case_id="recovery.worker", worker_ids=[b["worker"]["id"]], operation_ids=[ready["id"], trial["id"]], one_consumer=True, supported_refresh_qualified=False)
+        probe = self.client_flow("worker-recovery")["cases"][0]
+        require(self.status(b)["qualification"] == qualifications["b"], "worker recovery changed approval")
+        require(all(turn["connection_id"] == recovered["connection_id"] and turn["connection_generation"] == recovered["connection_generation"] for turn in self.cycles[-1]["turns"]), "client probe did not use recovered connection")
+        self.add("recovery.hook", recovery_case_id="recovery.worker", worker_ids=[b["worker"]["id"]], operation_ids=probe["operation_ids"], one_consumer=True, supported_refresh_qualified=False)
         self.stop(a)
         self.proxy.interrupt()
         self.until(lambda: self.status(a)["connection_status"] == "offline", "stopped replacement worker remained healthy", timeout=45)
         self.online(b)
-        self.qualify_packed(b)
         self.client_flow("replacement", resumed)
         self.hook(a)
         self.online(a)

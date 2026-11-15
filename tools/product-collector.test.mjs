@@ -127,7 +127,11 @@ test('broker checkpoint requires the owner action and preserves a pending tool a
   Object.assign(observation, { time: h.collector.stamp(), expected_boundary: 'waiting tool', observed_boundary: 'new service process', worker_ids: ['worker-a'], operation_ids: ['native-operation'] });
   h.collector.report.observations = h.entries;
   await assert.rejects(h.collector.broker('broker-resume'), /owner_broker_restart_not_observed/);
+  const before = h.requests.length, qualification = structuredClone(h.qualifications['worker-a']);
   h.instance = 'process-two'; await h.collector.broker('broker-resume');
+  assert.equal(h.requests.slice(before).filter(request => request.path.endsWith('/qualifications')).length, 0);
+  assert.deepEqual(h.qualifications['worker-a'], qualification);
+  assert.equal(h.collector.report.native_cases.length, 4);
   assert.equal(h.collector.report.checkpoints.broker.after_instance, 'process-two');
   assert.equal(h.collector.report.cycles.at(-1).client_tool_executions, 1);
   assert.ok(h.collector.report.cases.some(item => item.id === 'recovery.tool-dedup'));
@@ -136,19 +140,38 @@ test('broker checkpoint requires the owner action and preserves a pending tool a
 
 test('recovery probes require observed identity/scope and boundary imports retain missing evidence', async t => {
   const h = await releaseHarness(t); await h.collector.initialize();
+  for (const slot of ['a', 'b']) await h.collector.native(slot, 'baseline');
   for (const entry of h.entries.filter(entry => entry.kind === 'product_case')) Object.assign(entry, { operation_ids: ['observed-operation'], capture_complete: true, receipt: {} });
   h.imports.set('/private/product-worker', h.fixture.files.get('worker-product.ndjson'));
   h.source.worker_exports.push({ case_id: 'all', path: '/private/product-worker' }); await h.write();
   h.collector.report.observations = h.entries;
+  const before = h.requests.length, qualification = structuredClone(h.qualifications['worker-a']);
   await h.collector.recovered('worker');
   h.connections.a = { connection_id: 'refresh-connection-worker-a', connection_generation: 3 };
   await h.collector.recovered('refresh'); await h.collector.boundaries(); await h.collector.boundaries();
+  assert.equal(h.requests.slice(before).filter(request => request.body?.action === 'approve').length, 0);
+  assert.ok(!h.requests.slice(before).some(request => request.path === '/api/v1/admin/workers/worker-a/qualifications'));
+  assert.deepEqual(h.qualifications['worker-a'], qualification);
+  assert.equal(h.collector.report.native_cases.length, 4);
   assert.ok(h.collector.report.cases.some(item => item.id === 'recovery.refresh'));
   h.collector.report.observations = []; assert.throws(() => h.collector.observation('missing'), /observed_product_case_required/);
   h.collector.report.observations = [{ kind: 'product_case', case_id: 'foreign', time: stamp(0), expected_boundary: 'one', observed_boundary: 'two', worker_ids: ['foreign'], operation_ids: ['operation'] }];
   assert.throws(() => h.collector.observation('foreign'), /observation_worker_mismatch/);
   h.source.worker_exports.push({ case_id: 'all', path: '/missing/export' }); await h.write();
   const result = await h.collector.finalize(); assert.ok(result.missing.some(reason => reason.includes('evidence_import_failed')));
+});
+
+test('recovery never restores withdrawn approval or manufactures missing initial proof', async t => {
+  const h = await releaseHarness(t); await h.collector.initialize();
+  const before = h.requests.length;
+  await assert.rejects(h.collector.select('a', true), /retained_worker_approval_required/);
+  assert.ok(!h.requests.slice(before).some(request => request.path.endsWith('/qualifications')));
+  for (const slot of ['a', 'b']) await h.collector.native(slot, 'baseline');
+  await h.collector.select('b');
+  const withdrawn = structuredClone(h.qualifications['worker-a']), checkpoint = h.requests.length;
+  await assert.rejects(h.collector.select('a', true), /retained_worker_approval_required/);
+  assert.deepEqual(h.qualifications['worker-a'], withdrawn);
+  assert.ok(!h.requests.slice(checkpoint).some(request => request.path.endsWith('/qualifications')));
 });
 
 test('staged collector catches adverse browser results, forbids early revocation and accounts for completion', async t => {
