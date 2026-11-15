@@ -54,6 +54,43 @@ test('future-major enrollment preflights a legacy server without consuming its c
   await assert.rejects(down.enrollmentCompatibility(), /broker_unreachable/);
 });
 
+test('major-one workers retain HTTP retries and retryable streams through headerless proxy outages', async t => {
+  for (const status of [429, 502, 503, 504]) {
+    const f = await fixture(t); let calls = 0;
+    const net = { ...f.net, fetch: async (_url, options) => {
+      assert.equal(options.headers['X-Muse-Worker-Version'], '1.2.0');
+      return ++calls < 3 ? new Response('<html>temporary proxy outage</html>', { status }) :
+        new Response(JSON.stringify({ id: ID }), { headers: { 'x-muse-service-version': '1.5.0' } });
+    } };
+    const transport = new Transport('https://broker.example.test', KEY, f.logger, f.state.sys, net, '1.2.0');
+    assert.equal((await transport.request('/api/v1/worker/status')).data.id, ID);
+    assert.equal(calls, 3); assert.deepEqual(f.waits, [1000, 2000]);
+  }
+  for (const status of [409, 429, 502, 503, 504]) {
+    const f = await fixture(t);
+    const transport = new Transport('https://broker.example.test', KEY, f.logger, f.state.sys,
+      { ...f.net, fetch: async () => new Response('<html>temporary proxy outage</html>', { status }) }, '1.2.0');
+    await assert.rejects(async () => { for await (const _ of transport.events(new AbortController().signal)) {} },
+      error => error.code === 'stream_rejected' && error.retryable && error.fields.http_status === status);
+  }
+});
+
+test('transient status codes cannot hide declared version mismatches or explicit update requirements', async t => {
+  for (const [headers, body, streamStatus, version, expected] of [
+    [{ 'x-muse-service-version': '2.0.0' }, {}, 503, '1.2.0', 'update_required'],
+    [{}, { error: 'update_required', worker_package: { version: '2.0.0' } }, 426, '0.1.0-dev.0', 'update_required'],
+    [{ 'x-muse-service-version': 'invalid' }, {}, 503, '1.2.0', 'invalid_service_version'],
+  ]) {
+    const f = await fixture(t); let calls = 0;
+    const transport = new Transport('https://broker.example.test', KEY, f.logger, f.state.sys, { ...f.net, fetch: async url => {
+      calls++; return new Response(JSON.stringify(body), { status: url.endsWith('/events') ? streamStatus : 503, headers });
+    } }, version);
+    await assert.rejects(transport.request('/api/v1/worker/status'), error => error.code === expected && !error.retryable);
+    await assert.rejects(async () => { for await (const _ of transport.events(new AbortController().signal)) {} }, error => error.code === expected && !error.retryable);
+    assert.equal(calls, 2); assert.deepEqual(f.waits, []);
+  }
+});
+
 test('update-required RPC and stream errors retain metadata and CLI logs without installing or changing identity', async t => {
   const f = await fixture(t); await f.worker.configure('https://broker.example.test'); await f.worker.enroll(CODE);
   await f.state.write('pending.json', '{"preserved":true}');

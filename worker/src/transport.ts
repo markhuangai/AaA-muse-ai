@@ -34,6 +34,8 @@ export class Transport {
     const declared = response.headers.get('x-muse-service-version');
     const major = (value: string): string | undefined => /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(dev|rc)\.(0|[1-9][0-9]*))?$/.exec(value)?.[1];
     if (declared !== null) requireValue(major(declared) !== undefined, 'invalid_service_version');
+    const retryable = response.status === 429 || response.status >= 500 || (route.endsWith('/events') && response.status === 409);
+    if (declared === null && retryable && data.error !== 'update_required') return;
     const checked = route.endsWith('/enroll') || route.endsWith('/status') || route.endsWith('/events') || route.endsWith('/claim');
     if (data.error === 'update_required' || (checked && major(this.productVersion) !== (declared === null ? '0' : major(declared)))) {
       const recommended = data.worker_package ?? (declared === null ? null : { version: declared, release_url: 'https://github.com/markhuangai/AaA-muse-ai/releases/tag/v' + declared });

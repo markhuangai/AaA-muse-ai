@@ -6,7 +6,7 @@ import { Subscriber } from '../dist/subscriber.js';
 import { Worker } from '../dist/worker.js';
 import { State } from '../dist/state.js';
 import { encode, parse } from '../dist/json.js';
-import { fixture, enrolled, claimed, ID, JOB, CONN, KEY } from './helpers.mjs';
+import { fixture, enrolled, claimed, ID, JOB, CONN, KEY, CODE } from './helpers.mjs';
 
 const opened = { protocol_version: 1, connection_id: CONN, connection_generation: 1 };
 function stream() {
@@ -47,6 +47,42 @@ test('background startup retries exhausted authentication and reconciliation out
     assert(log.some(e => e.msg === 'worker.supervision_started' && e.outcome === 'exclusive_owner' && e.pid));
     assert(log.some(e => e.msg === 'worker.recovery_reconciled'));
     assert(!f.broker.calls.some(c => c.path.endsWith('/decisions') || c.input?.idle_ack));
+  }
+});
+
+test('major-one background recovery survives headerless authentication and subscription outages with retained work', async t => {
+  for (const phase of ['authentication', 'subscription']) {
+    const f = await fixture(t);
+    const net = { ...f.net, fetch: async (...args) => {
+      const response = await f.net.fetch(...args);
+      if (response.ok) response.headers.set('x-muse-service-version', '1.5.0');
+      return response;
+    } };
+    const worker = new Worker(f.state, f.logger, net, '1.2.0');
+    await worker.configure('https://broker.example.test'); await worker.enroll(CODE);
+    await worker.claim(await worker.load(), JOB, opened);
+    const key = await f.state.read('credential.key'), config = await f.state.read('config.json');
+    const journals = await f.state.child('journals'), pointer = parse(await journals.read('claim-' + JOB + '.json'));
+    const receipt = await journals.read('operation-' + pointer.submission_id + '.json'), assignment = encode(f.broker.jobs.get(JOB));
+    const stop = new AbortController(); let failed = 0;
+    f.broker.override = call => {
+      if (phase === 'authentication' && call.path.endsWith('/status') && failed++ < 3) return unavailable();
+      if (call.path.endsWith('/events')) return phase === 'subscription' && failed++ < 1 ? unavailable() : stream();
+      if (call.path.endsWith('/heartbeat')) stop.abort();
+    };
+    await new Subscriber(worker).run(stop.signal, true);
+    assert.equal(await f.state.read('run-stop.json'), undefined);
+    assert.equal(await f.state.read('credential.key'), key); assert.equal(await f.state.read('config.json'), config);
+    assert.equal(await journals.read('operation-' + pointer.submission_id + '.json'), receipt);
+    assert.equal(encode(f.broker.jobs.get(JOB)), assignment); assert.equal(f.broker.jobs.get(JOB).held, true);
+    assert.equal(f.broker.calls.filter(call => call.path.endsWith('/enroll')).length, 1);
+    assert.equal(f.broker.calls.filter(call => call.path.endsWith('/claim')).length, 1);
+    assert(!f.broker.calls.some(call => call.path.endsWith('/decisions') || call.input?.idle_ack));
+    const log = await events(f);
+    assert(log.some(event => event.msg === 'worker.stream_retrying' && event.phase === phase));
+    assert(log.some(event => event.msg === 'worker.recovery_reconciled' && event.disposition === 'preserve_busy_hold'));
+    assert.equal(parse(await f.state.read('connection.json')).status, 'online');
+    await assert.rejects(fs.lstat(f.state.path('daemon.lock')), { code: 'ENOENT' });
   }
 });
 
