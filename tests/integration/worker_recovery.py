@@ -191,7 +191,7 @@ class WorkerRecovery(WorkerSetup):
         require((worker["state"] / "run-stop.json").read_bytes() == marker and (worker["state"] / "credential.key").read_text().strip() == worker["credential"], "restart restored revoked authority or replaced its evidence")
         denied = [e for e in self.events(worker) if e["msg"] == "worker.command_failed" and e.get("cause") == "worker_unauthorized" and e.get("request_id")]
         require(denied, "revoked daemon has no correlated authorization failure")
-        self.diagnose(denied[-1]["request_id"], "worker.auth_denied", "worker_revoked")
+        self.diagnose(denied[-1]["request_id"], ("worker.auth_denied", "lease.rejected"), "worker_revoked")
         self.receipt("worker.recovery_invalid_and_revoked", no_reenrollment=True, invalid_state_preserved=True, terminal_stop_preserved=True)
 
     def exercise(self):

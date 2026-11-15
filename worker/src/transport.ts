@@ -36,7 +36,7 @@ export class Transport {
     if (declared !== null) requireValue(major(declared) !== undefined, 'invalid_service_version');
     const retryable = response.status === 429 || response.status >= 500 || (route.endsWith('/events') && response.status === 409);
     if (declared === null && retryable && data.error !== 'update_required') return;
-    const checked = route.endsWith('/enroll') || route.endsWith('/status') || route.endsWith('/events') || route.endsWith('/claim');
+    const checked = route.endsWith('/enroll') || (route.endsWith('/status') && !this.credential) || route.endsWith('/events') || route.endsWith('/claim');
     if (data.error === 'update_required' || (checked && major(this.productVersion) !== (declared === null ? '0' : major(declared)))) {
       const recommended = data.worker_package ?? (declared === null ? null : { version: declared, release_url: 'https://github.com/markhuangai/AaA-muse-ai/releases/tag/v' + declared });
       throw new Failure('update_required', { worker_version: this.productVersion, service_version: declared ?? 'legacy-major-zero', recommended_worker: recommended, automatic_update: false, corrective_action: 'Install the service-paired worker manually, or align the service major; preserve worker identity and journals.', http_status: response.status, request_id: response.headers.get('x-request-id') ?? '' });

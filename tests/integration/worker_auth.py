@@ -50,8 +50,9 @@ class WorkerAuth(Harness):
         self.private("diagnosis-" + request_id + ".json", json.dumps({"request_id": request_id, "expected_event": event_name, "expected_cause": reason, "events": events}, ensure_ascii=False))
         require(metadata["complete"] and events, "operation capture incomplete")
         require(all(e["request_id"] == request_id for e in events), "operation export mixed request identities")
-        matched = [e for e in events if e["msg"] == event_name]
-        require(len(matched) == 1, "required diagnostic event missing or duplicated: " + event_name)
+        expected = (event_name,) if isinstance(event_name, str) else event_name
+        matched = [e for e in events if e["msg"] in expected]
+        require(len(matched) == 1, "required diagnostic event missing or duplicated: " + " or ".join(expected))
         event = matched[0]
         if reason is not None:
             require(event.get("reason", event.get("cause")) == reason, "log-only cause differs")

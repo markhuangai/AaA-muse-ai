@@ -106,7 +106,9 @@ export function productFixture(live = false) {
     if (id === 'recovery.replacement-full-history') Object.assign(fields, { full_history: true, accepted_call_id: original.call_id, worker_ids: ['worker-a', 'worker-b'], operation_ids: [turn.operation_id] });
     if (id === 'recovery.stale-result') Object.assign(fields, { job_id: 'job-stale', worker_id: 'worker-a', generation: 1, connection_generation: 2 });
     if (id === 'recovery.hook') Object.assign(fields, { recovery_case_id: 'recovery.worker', operation_ids: ['operation-recovery-worker'] });
-    for (const msg of caseEvents[id] ?? []) broker.push({ time: stamp(900), level: 'INFO', msg, operation_id: fields.operation_ids[0], request_id: fields.request_id, worker_id: 'worker-' + slot,
+    const messages = id === 'failure.partial-output' ? ['request.output_interrupted', 'responses.stream_terminated'] : caseEvents[id] ?? [];
+    for (const msg of messages) broker.push({ time: stamp(900), level: 'INFO', msg, operation_id: fields.operation_ids[0], request_id: fields.request_id, worker_id: 'worker-' + slot,
+      ...(id === 'failure.partial-output' ? { outcome: 'uncertain', attempted_bytes: 512, written_bytes: 256, ...(msg.endsWith('.stream_terminated') ? { stream: true, output_accepted: true } : {}) } : {}),
       ...(id === 'recovery.stale-result' ? { operation: 'decision', job_id: fields.job_id, reason: 'stale_assignment', evidence: { observed_generation: 1, observed_connection_generation: 2 } } : {}) });
     if (id.startsWith('readiness.') || id.startsWith('idle.')) {
       broker.push({ time: stamp(200), level: 'INFO', msg: 'decision.accepted', operation_id: operation, worker_id: 'worker-' + slot, job_id: 'job-' + id, request_id: fields.request_id });

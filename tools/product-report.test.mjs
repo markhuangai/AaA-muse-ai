@@ -96,6 +96,49 @@ test('cross-worker rejection is insufficient evidence for a stale decision fence
   assert.ok(result.missing.includes('recovery.stale-result:correlated_stale_decision_fence'));
 });
 
+test('partial-output qualification requires correlated interrupted writes with exposed model output', () => {
+  for (const msg of ['chat.stream_terminated', 'responses.stream_terminated']) {
+    for (const outcome of ['uncertain', 'client_aborted']) {
+      const fixture = productFixture(true), item = fixture.report.cases.find(item => item.id === 'failure.partial-output');
+      Object.assign(fixture.broker.find(event => event.request_id === item.request_id && event.msg.endsWith('.stream_terminated')), { msg, outcome });
+      const result = validateReport(fixture.report, fixture.evidence);
+      assert.deepEqual(result.missing, []); assert.equal(result.verdict, 'pass');
+    }
+  }
+  for (const change of [
+    ({ terminal }) => { terminal.outcome = 'completed'; },
+    ({ terminal }) => { terminal.outcome = 'failed'; terminal.output_accepted = false; },
+    ({ terminal }) => { terminal.stream = false; },
+    ({ terminal }) => { terminal.output_accepted = false; },
+    ({ terminal, interrupted }) => { terminal.written_bytes = interrupted.written_bytes = 0; },
+    ({ terminal, interrupted }) => { terminal.written_bytes = interrupted.written_bytes = -1; },
+    ({ terminal, interrupted }) => { terminal.attempted_bytes = interrupted.attempted_bytes = 1; },
+    ({ terminal }) => { delete terminal.written_bytes; },
+    ({ terminal }) => { terminal.attempted_bytes = 512.5; },
+    ({ interrupted }) => { interrupted.outcome = 'completed'; },
+    ({ interrupted }) => { interrupted.msg = 'request.output_completed'; },
+    ({ interrupted }) => { interrupted.request_id = 'other-request'; },
+    ({ interrupted }) => { interrupted.operation_id = 'other-operation'; },
+    ({ interrupted }) => { interrupted.worker_id = 'worker-b'; },
+    ({ interrupted }) => { interrupted.written_bytes = 1; },
+    ({ interrupted }) => { interrupted.attempted_bytes = 1024; },
+    ({ item }) => { delete item.request_id; },
+    ({ item }) => { item.operation_ids = []; },
+    ({ item }) => { item.operation_ids = ['invalid/id']; },
+    ({ item }) => { item.worker_ids = []; },
+    ({ item }) => { item.worker_ids = ['invalid/id']; },
+    ({ item, terminal, interrupted }) => { item.worker_ids = ['foreign-worker']; terminal.worker_id = interrupted.worker_id = 'foreign-worker'; },
+  ]) {
+    const fixture = productFixture(true), item = fixture.report.cases.find(item => item.id === 'failure.partial-output');
+    const terminal = fixture.broker.find(event => event.request_id === item.request_id && event.msg.endsWith('.stream_terminated'));
+    const interrupted = fixture.broker.find(event => event.request_id === item.request_id && event.msg === 'request.output_interrupted');
+    change({ item, terminal, interrupted });
+    const result = validateReport(fixture.report, fixture.evidence);
+    assert.ok(result.missing.includes('failure.partial-output:correlated_partial_output_interruption'));
+    assert.notEqual(result.observed_result, 'pass');
+  }
+});
+
 test('a generic broker restoration and placeholder checkpoint cannot satisfy the tool-wait case', () => {
   const fixture = productFixture(true);
   fixture.report.checkpoints.broker = { before_instance: 'old', after_instance: 'new', pending_call_id: 'accepted-call', completed_request_id: 'final-request' };

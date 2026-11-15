@@ -25,6 +25,17 @@ const digest = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value
 const provenance = value => instant(value?.time) && typeof value.observer === 'string' && value.observer && typeof value.source_ref === 'string' && value.source_ref;
 const eventsOf = (evidence, source) => [...new Map(evidence.filter(ref => ref.source === source && !ref.error).flatMap(ref => ref.events ?? []).map(event => [hash(JSON.stringify(event)), event])).values()];
 
+function partialOutput(item, report, events) {
+  if (!identifier(item.request_id) || !item.operation_ids?.length || !item.operation_ids.every(identifier) || !item.worker_ids?.length || !item.worker_ids.every(identifier)) return false;
+  return events.some(terminal => ['chat.stream_terminated', 'responses.stream_terminated'].includes(terminal.msg) &&
+    terminal.stream === true && terminal.output_accepted === true && ['uncertain', 'client_aborted'].includes(terminal.outcome) &&
+    item.worker_ids.includes(terminal.worker_id) && report.workers.some(worker => worker.worker_id === terminal.worker_id) &&
+    Number.isSafeInteger(terminal.written_bytes) && terminal.written_bytes > 0 && Number.isSafeInteger(terminal.attempted_bytes) && terminal.attempted_bytes >= terminal.written_bytes &&
+    events.some(interrupted => interrupted.msg === 'request.output_interrupted' && interrupted.outcome === 'uncertain' &&
+      interrupted.request_id === terminal.request_id && interrupted.operation_id === terminal.operation_id && interrupted.worker_id === terminal.worker_id &&
+      interrupted.written_bytes === terminal.written_bytes && interrupted.attempted_bytes === terminal.attempted_bytes));
+}
+
 function inspectCycle(item, report, broker, workers) {
   const issues = [], miss = code => issues.push(`${item.id}:${code}`);
   const worker = report.workers.find(value => value.slot === item.slot);
@@ -97,6 +108,7 @@ function inspectProductReport(report, evidence = []) {
     if (item.outcome !== 'passed') { failures.push(id); gaps.push(`${id}:${item.outcome ?? 'missing_outcome'}`); }
     const scoped = broker.filter(event => (!item.request_id || event.request_id === item.request_id) && (!item.operation_ids?.length || item.operation_ids.includes(event.operation_id)));
     if (caseEvents[id] && !scoped.some(event => caseEvents[id].includes(event.msg))) gaps.push(`${id}:causal_broker_evidence`);
+    if (id === 'failure.partial-output' && !partialOutput(item, report, scoped)) gaps.push(`${id}:correlated_partial_output_interruption`);
     if (id.startsWith('readiness.') || id.startsWith('idle.')) {
       const worker = report.workers.find(value => value.slot === id.at(-1));
       const jobs = scoped.filter(event => event.msg === 'decision.accepted' && event.worker_id === worker?.worker_id).map(event => event.job_id);

@@ -137,6 +137,13 @@ the supported-refresh path, replay an accepted client tool, or acknowledge
 uncertain native work as stopped just to continue the run. The collector does
 not install, reset, wipe or remotely restart a worker for these observations.
 
+The partial-output receipt requires `request_id`, nonempty `operation_ids` and
+`worker_ids`, with a matching `request.output_interrupted` and Chat/Responses
+stream termination in the broker export. Both events must agree on identity and
+attempted/written byte counts; written bytes must be positive. The stream must
+have accepted model output and an uncertain or client-aborted outcome. A normal
+completion or a failure before any output cannot satisfy this case.
+
 Recovery additionally requires `action_at`, retained `hook_id`/`hook_path`,
 `before_connection_id` and `before_connection_generation` on the scoped action.
 Record `worker_reconnected` or `refresh_reconnected` for that exact worker/hook,

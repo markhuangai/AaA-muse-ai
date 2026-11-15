@@ -98,6 +98,38 @@ test('cancellation during startup backoff stops cleanly and leaves no terminal m
   assert((await events(f)).some(e => e.msg === 'worker.stopped'));
 });
 
+test('major changes permit receipt and busy-hold reconciliation before rejecting new subscription authority', async t => {
+  const f = await fixture(t), transport = await enrolled(f);
+  await f.worker.claim(transport, JOB, opened);
+  let fail = false;
+  const state = new State(f.state.root, { ...fs, open: async (path, ...args) => {
+    if (fail && path.includes('/cues/.')) { fail = false; throw Object.assign(new Error('cue persistence fault'), { code: 'ENOSPC' }); }
+    return fs.open(path, ...args);
+  } }, f.state.sys);
+  f.broker.override = call => { if (call.path.endsWith('/decisions')) fail = true; };
+  await assert.rejects(new Worker(state, f.logger, f.net).submit(JOB, '{"type":"final","text":"accepted before upgrade"}'));
+  const journals = await f.state.child('journals'), pointer = parse(await journals.read('decision-' + JOB + '.json'));
+  const name = 'operation-' + pointer.submission_id + '.json', receipt = await journals.read(name);
+  const heldID = '9'.repeat(32), hold = claimed(); hold.id = heldID; hold.context.receipt_id = heldID;
+  f.broker.jobs.set(heldID, hold);
+  const assignment = encode(hold), key = await f.state.read('credential.key'), config = await f.state.read('config.json');
+  const fetch = f.net.fetch;
+  f.net.fetch = async (...args) => { const response = await fetch(...args); response.headers.set('x-muse-service-version', '1.0.0'); return response; };
+  f.broker.override = call => call.path.endsWith('/events') ? new Response('{"error":"update_required"}', { status: 426 }) : undefined;
+  const before = f.broker.calls.length;
+  await assert.rejects(new Subscriber(f.worker).run(new AbortController().signal, true), error => error.code === 'update_required' && !error.retryable);
+  const calls = f.broker.calls.slice(before);
+  assert.equal(calls.filter(call => call.path.endsWith('/events')).length, 1);
+  assert(!calls.some(call => call.path.endsWith('/enroll') || call.path.endsWith('/claim') || call.path.endsWith('/decisions') || call.input?.idle_ack));
+  assert.equal(await journals.read(name), receipt); assert.equal(encode(f.broker.jobs.get(heldID)), assignment);
+  assert.equal(await f.state.read('credential.key'), key); assert.equal(await f.state.read('config.json'), config);
+  assert.equal(parse(await f.state.read('run-stop.json')).cause, 'update_required');
+  const log = await events(f);
+  assert(log.some(event => event.msg === 'worker.recovery_reconciled' && event.job_id === JOB && event.disposition === 'broker_accepted'));
+  assert(log.some(event => event.msg === 'worker.recovery_reconciled' && event.job_id === heldID && event.disposition === 'preserve_busy_hold'));
+  await assert.rejects(fs.lstat(f.state.path('daemon.lock')), { code: 'ENOENT' });
+});
+
 test('a rejected duplicate background command cannot create or overwrite the owner stop, launch, or lock', async t => {
   for (const prior of [undefined, encode({ cause: 'retained_terminal_failure', requires_operator_action: true })]) {
     const f = await fixture(t); await enrolled(f);
