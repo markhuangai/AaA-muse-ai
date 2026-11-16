@@ -87,41 +87,44 @@ export class Capture {
     });
   }
   async export(filter: Filter, decode: boolean): Promise<string> {
-    return await this.state.withLock('capture', async () => {
+    for (const time of [filter.since, filter.until]) if (time !== undefined) requireValue(/^\d{4}-\d\d-\d\dT/.test(time) && Number.isFinite(Date.parse(time)), 'invalid_time_filter');
+    requireValue(!filter.since || !filter.until || Date.parse(filter.since) <= Date.parse(filter.until), 'invalid_time_interval');
+    const { now, retained, names } = await this.state.withLock('capture', async () => {
       const now = this.state.sys.now();
-      for (const time of [filter.since, filter.until]) if (time !== undefined) requireValue(/^\d{4}-\d\d-\d\dT/.test(time) && Number.isFinite(Date.parse(time)), 'invalid_time_filter');
-      requireValue(!filter.since || !filter.until || Date.parse(filter.since) <= Date.parse(filter.until), 'invalid_time_interval');
       const retained = await this.prune();
-      const omissions: string[] = [];
-      const created = Date.parse(text(retained.created_at));
-      const pruned = Date.parse(text(retained.pruned_through));
-      if (Number.isFinite(pruned) && (!filter.since || Date.parse(filter.since) <= pruned)) omissions.push('expired_or_capacity_pruned_evidence');
-      if ([filter.since, filter.until].some(t => t && Date.parse(t) < created)) omissions.push('requested_interval_precedes_capture');
-      if ([filter.since, filter.until].some(t => t && Date.parse(t) > now)) omissions.push('requested_interval_extends_after_snapshot');
-      const captures: string[] = [];
-      for (const name of (await this.state.list()).filter(n => /^capture-.*\.ndjson$/.test(n)).sort()) {
-        const raw = (await this.state.read(name))!;
-        try {
-          const rows = raw.trimEnd().split('\n').map(line => { requireValue(Buffer.byteLength(line) + 1 <= 6144, 'invalid_capture'); return object(parse(line)); });
-          const first = rows[0];
-          requireValue(first && Number(textNumber(first.chunks)) === rows.length, 'invalid_capture');
-          const buffers = rows.map((r, i) => {
-            requireValue(r.type === 'event' && Number(textNumber(r.chunk)) === i && r.capture_id === first.capture_id && textNumber(r.chunks) === textNumber(first.chunks) && r.payload_sha256 === first.payload_sha256 && /^[A-Za-z0-9+/]*={0,2}$/.test(text(r.data_base64)), 'invalid_capture');
-            const bytes = Buffer.from(text(r.data_base64), 'base64');
-            requireValue(bytes.toString('base64') === r.data_base64, 'invalid_capture');
-            return bytes;
-          });
-          const payload = Buffer.concat(buffers);
-          requireValue(digest(payload) === first.payload_sha256, 'invalid_capture');
-          const event = object(parse(new TextDecoder('utf8', { fatal: true }).decode(payload)));
-          const time = Date.parse(text(event.time));
-          if ((filter.operation_id && event.operation_id !== filter.operation_id) || (filter.request_id && event.request_id !== filter.request_id) || (filter.since && time < Date.parse(filter.since)) || (filter.until && time > Date.parse(filter.until))) continue;
-          captures.push(decode ? encode(event) + '\n' : raw);
-        } catch { omissions.push('incomplete_capture:' + name); }
-      }
-      if (!captures.length && (filter.operation_id || filter.request_id)) omissions.push('requested_identity_not_captured_in_interval');
-      return encode({ type: 'export', complete: omissions.length === 0, created_at: retained.created_at, snapshot_at: new Date(now).toISOString(), pruned_through: retained.pruned_through, captures: captures.length, omissions }) + '\n' + captures.join('');
+      const names = (await this.state.list()).filter(n => /^capture-.*\.ndjson$/.test(n)).sort();
+      return { now, retained, names };
     });
+    const omissions: string[] = [];
+    const created = Date.parse(text(retained.created_at));
+    const pruned = Date.parse(text(retained.pruned_through));
+    if (Number.isFinite(pruned) && (!filter.since || Date.parse(filter.since) <= pruned)) omissions.push('expired_or_capacity_pruned_evidence');
+    if ([filter.since, filter.until].some(t => t && Date.parse(t) < created)) omissions.push('requested_interval_precedes_capture');
+    if ([filter.since, filter.until].some(t => t && Date.parse(t) > now)) omissions.push('requested_interval_extends_after_snapshot');
+    const captures: string[] = [];
+    for (const name of names) {
+      const raw = await this.state.read(name);
+      if (raw === undefined) { omissions.push('capture_removed_during_export:' + name); continue; }
+      try {
+        const rows = raw.trimEnd().split('\n').map(line => { requireValue(Buffer.byteLength(line) + 1 <= 6144, 'invalid_capture'); return object(parse(line)); });
+        const first = rows[0];
+        requireValue(first && Number(textNumber(first.chunks)) === rows.length, 'invalid_capture');
+        const buffers = rows.map((r, i) => {
+          requireValue(r.type === 'event' && Number(textNumber(r.chunk)) === i && r.capture_id === first.capture_id && textNumber(r.chunks) === textNumber(first.chunks) && r.payload_sha256 === first.payload_sha256 && /^[A-Za-z0-9+/]*={0,2}$/.test(text(r.data_base64)), 'invalid_capture');
+          const bytes = Buffer.from(text(r.data_base64), 'base64');
+          requireValue(bytes.toString('base64') === r.data_base64, 'invalid_capture');
+          return bytes;
+        });
+        const payload = Buffer.concat(buffers);
+        requireValue(digest(payload) === first.payload_sha256, 'invalid_capture');
+        const event = object(parse(new TextDecoder('utf8', { fatal: true }).decode(payload)));
+        const time = Date.parse(text(event.time));
+        if ((filter.operation_id && event.operation_id !== filter.operation_id) || (filter.request_id && event.request_id !== filter.request_id) || (filter.since && time < Date.parse(filter.since)) || (filter.until && time > Date.parse(filter.until))) continue;
+        captures.push(decode ? encode(event) + '\n' : raw);
+      } catch { omissions.push('incomplete_capture:' + name); }
+    }
+    if (!captures.length && (filter.operation_id || filter.request_id)) omissions.push('requested_identity_not_captured_in_interval');
+    return encode({ type: 'export', complete: omissions.length === 0, created_at: retained.created_at, snapshot_at: new Date(now).toISOString(), pruned_through: retained.pruned_through, captures: captures.length, omissions }) + '\n' + captures.join('');
   }
 }
 
