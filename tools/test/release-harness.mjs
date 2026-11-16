@@ -53,7 +53,7 @@ export async function releaseHarness(t) {
     requests.push({ path: parsed.pathname, search: parsed.search, method: options.method, body });
     let value;
     if (parsed.pathname === '/api/v1/admin/status') value = { ...status, instance_id: h.instance };
-    else if (parsed.pathname === '/api/v1/admin/workers') value = { workers: access.workers.map(worker => ({ id: worker.worker_id, work_status: 'idle',
+    else if (parsed.pathname === '/api/v1/admin/workers') value = { workers: access.workers.map(worker => ({ id: worker.worker_id, work_status: h.offline && worker.slot === 'a' ? 'unknown' : 'idle', current_job: null, waiting_for_client_tool: 0,
       connection_status: h.offline && worker.slot === 'a' ? 'offline' : 'online', qualification: h.qualifications[worker.worker_id],
       inference_readiness: h.qualifications[worker.worker_id]?.evidence.action === 'approve' ? 'verified' : h.qualifications[worker.worker_id] ? 'withdrawn' : 'unverified' })) };
     else if (parsed.pathname.includes('/qualifications')) {

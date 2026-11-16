@@ -1,13 +1,83 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { brokerBoundary, recoveryBoundary } from './product-recovery.mjs';
+import { brokerBoundary, recoveryBoundary, replacementBoundary } from './product-recovery.mjs';
 import { productFixture, stamp } from './test/product-fixture.mjs';
+import { Redactor } from '../worker/dist/diagnostics.js';
+
+function replacementWorkers() {
+  return [{ id: 'worker-a', connection_status: 'offline', work_status: 'unknown', current_job: null, waiting_for_client_tool: 0 },
+    { id: 'worker-b', connection_status: 'online', work_status: 'idle', current_job: null, waiting_for_client_tool: 0, inference_readiness: 'verified' }];
+}
+
+test('replacement accepts the production offline projection without claiming observed idle state', () => {
+  const workers = replacementWorkers(), before = structuredClone(workers);
+  assert.doesNotThrow(() => replacementBoundary(workers, 'worker-a', 'worker-b'));
+  assert.deepEqual(workers, before);
+});
+
+test('replacement rejects held work, tool waits, missing metadata and an unavailable sibling', () => {
+  for (const [index, field, value] of [
+    [0, 'connection_status', 'online'], [0, 'work_status', 'busy'], [0, 'work_status', 'idle'],
+    [0, 'current_job', { job_id: 'unresolved-job' }], [0, 'current_job', undefined],
+    [0, 'waiting_for_client_tool', 1], [0, 'waiting_for_client_tool', undefined],
+    [1, 'connection_status', 'offline'], [1, 'work_status', 'unknown'], [1, 'work_status', 'busy'],
+    [1, 'current_job', { job_id: 'other-job' }], [1, 'current_job', undefined],
+    [1, 'waiting_for_client_tool', 1], [1, 'waiting_for_client_tool', undefined],
+    [1, 'inference_readiness', 'withdrawn'], [1, 'inference_readiness', undefined],
+  ]) {
+    const workers = replacementWorkers(); workers[index][field] = value;
+    assert.throws(() => replacementBoundary(workers, 'worker-a', 'worker-b'));
+  }
+  for (const ids of [['missing', 'worker-b'], ['worker-a', 'missing'], ['worker-a', 'worker-a']]) {
+    assert.throws(() => replacementBoundary(replacementWorkers(), ...ids));
+  }
+});
 
 test('broker recovery joins the accepted tool, authenticated process identities and one resumed execution', () => {
   for (const live of [false, true]) {
     const { report, broker } = productFixture(live), item = report.cases.find(item => item.id === 'recovery.broker-tool-wait');
     assert.equal(brokerBoundary(report, broker, item), report.checkpoints.broker);
   }
+});
+
+test('broker proof survives report redaction and a response log after client receipt', () => {
+  for (const variant of ['redaction', 'logging', 'both']) {
+    const { report, broker } = productFixture(true), checkpoint = report.checkpoints.broker;
+    if (variant !== 'logging') for (const side of ['before', 'after']) {
+      const status = checkpoint[side + '_status'];
+      status.configuration = { client_keys: { 'owner-a': '[REDACTED]', 'owner-b': '[REDACTED]' } };
+      broker.find(event => event.msg === 'request.exchange' && event.instance_id === status.instance_id).response = JSON.stringify(status);
+      checkpoint[side + '_status'] = new Redactor().value(status);
+      assert.equal(checkpoint[side + '_status'].configuration.client_keys, '[REDACTED]');
+    }
+    if (variant !== 'redaction') broker.find(event => event.msg === 'request.exchange').time = stamp(401);
+    assert.equal(brokerBoundary(report, broker, report.cases.find(item => item.id === 'recovery.broker-tool-wait')), checkpoint);
+  }
+});
+
+test('redaction cannot conceal raw key values, other status differences or post-restart receipts', () => {
+  for (const change of [
+    status => { status.configuration.client_keys = { a: 'raw-value' }; },
+    status => { status.configuration.client_keys = null; },
+    status => { status.configuration.client_keys = ['[REDACTED]']; },
+    status => { status.configuration.client_keys = false; },
+    status => { status.configuration.client_keys = 'raw-value'; },
+    status => { status.configuration.extra = 'different'; },
+    status => { delete status.configuration.client_keys; },
+  ]) {
+    const { report, broker } = productFixture(true), checkpoint = report.checkpoints.broker;
+    checkpoint.before_status.configuration = { client_keys: '[REDACTED]' };
+    const status = structuredClone(checkpoint.before_status); change(status);
+    broker.find(event => event.msg === 'request.exchange').response = JSON.stringify(status);
+    assert.throws(() => brokerBoundary(report, broker, report.cases.find(item => item.id === 'recovery.broker-tool-wait')), /authenticated_broker_status_required/);
+  }
+  const { report, broker } = productFixture(true);
+  broker.find(event => event.msg === 'request.exchange').time = stamp(460);
+  assert.throws(() => brokerBoundary(report, broker, report.cases.find(item => item.id === 'recovery.broker-tool-wait')), /authenticated_broker_status_required/);
+  const unsafe = productFixture(true);
+  unsafe.report.checkpoints.broker.before_status.configuration = { client_keys: { a: 'raw-value' } };
+  unsafe.broker.find(event => event.msg === 'request.exchange').response = JSON.stringify(unsafe.report.checkpoints.broker.before_status);
+  assert.throws(() => brokerBoundary(unsafe.report, unsafe.broker, unsafe.report.cases.find(item => item.id === 'recovery.broker-tool-wait')), /authenticated_broker_status_required/);
 });
 
 test('placeholder checkpoints, unrelated recovery and changed tool/session identities cannot prove broker recovery', () => {

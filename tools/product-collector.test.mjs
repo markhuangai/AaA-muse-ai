@@ -174,6 +174,56 @@ test('recovery never restores withdrawn approval or manufactures missing initial
   assert.ok(!h.requests.slice(checkpoint).some(request => request.path.endsWith('/qualifications')));
 });
 
+test('replacement keeps saved history, correlates only new work and verifies the complete replay', async t => {
+  for (const corruptHistory of [false, true]) {
+    const h = await releaseHarness(t); await h.collector.initialize();
+    for (const slot of ['a', 'b']) await h.collector.native(slot, 'baseline');
+    const original = await h.collector.newCycle('a.responses.json', 'a', 'responses');
+    await h.collector.driver.start(original); await h.collector.driver.finish(original);
+    await h.collector.driver.followup(original, 'prior-final'); await h.collector.correlated(original);
+    h.collector.report.observations = h.collector.report.observations.filter(entry => entry.case_id !== 'recovery.replacement-full-history');
+    h.collector.report.observations.push({ kind: 'product_case', case_id: 'recovery.replacement-full-history', time: h.collector.stamp(),
+      expected_boundary: 'completed session without pending tools', observed_boundary: 'original subscriber offline', worker_ids: ['worker-a'],
+      operation_ids: [original.turns.at(-1).operation_id], observer: 'controlled adapter', source_ref: 'replacement action' });
+    const priorTurns = structuredClone(original.turns), oldRequests = new Set(priorTurns.map(turn => turn.request_id));
+    const fetcher = h.collector.fetcher;
+    h.collector.fetcher = async (url, options) => {
+      const parsed = new URL(url);
+      assert.ok(!oldRequests.has(parsed.searchParams.get('request_id')), 'saved request must not be re-correlated through expired captures');
+      const response = await fetcher(url, options);
+      if (!parsed.pathname.startsWith('/api/v1/admin/requests/')) return response;
+      const value = await response.json(), latest = h.protocol.requests.at(-1).body;
+      value.execution.worker_id = 'worker-b';
+      const call = original.turns[0].value.output[0];
+      value.delivery = { kind: 'full', tools: [], messages: [
+        { type: 'message', role: 'system', text: latest.instructions },
+        { type: 'message', role: 'user', text: original.initial_body.input[0].content },
+        { type: 'tool_call', call_id: call.call_id, name: call.name, arguments: JSON.parse(call.arguments) },
+        { type: 'tool_result', call_id: original.call_id, output: original.fixture.contents },
+        { type: 'message', role: 'assistant', text: original.fixture.contents },
+        { type: 'message', role: 'user', text: 'aaa-product:echo:prior-final' },
+        { type: 'message', role: 'assistant', text: 'prior-final' },
+        { type: 'message', role: 'user', text: latest.input },
+      ] };
+      if (corruptHistory) value.delivery.messages[1].text = 'unrelated history';
+      return new Response(JSON.stringify(value), { headers: { 'x-request-id': 'new-detail' } });
+    };
+    h.offline = true;
+    if (corruptHistory) await assert.rejects(h.collector.replacement(), /replacement_full_history_missing/);
+    else {
+      await h.collector.replacement();
+      const receipt = h.collector.report.cases.find(item => item.id === 'recovery.replacement-full-history');
+      assert.deepEqual(receipt.worker_ids, ['worker-a', 'worker-b']);
+      assert.equal(receipt.operation_ids.length, 4);
+    }
+    const replay = h.collector.report.cycles.at(-1);
+    assert.deepEqual(replay.turns.slice(0, 4), priorTurns);
+    assert.equal(replay.turns.length, 5); assert.equal(replay.client_tool_executions, 1);
+    assert.deepEqual(original.turns, priorTurns);
+    assert.equal(h.requests.filter(request => request.body?.action === 'approve').length, 2);
+  }
+});
+
 test('staged collector catches adverse browser results, forbids early revocation and accounts for completion', async t => {
   const h = await releaseHarness(t); h.browserFailure = true;
   let result = await h.collector.collect('enroll'); assert.equal(result.verdict, 'inconclusive'); assert.ok(h.logs.some(event => event.msg === 'e2e.case_failed'));

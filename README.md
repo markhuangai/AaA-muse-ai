@@ -4,6 +4,21 @@ A self-hosted broker that connects model clients to a Muse worker through outbou
 
 ## Status
 
+The November 16 rc.10 continuation at service/worker source
+`caed10795c063178902aee2d4cf402a704fa4875` exposed a collector limitation: native
+hook agents report run/agent identities with no conversation record. The candidate
+[background execution proof](docs/qualification/README.md#private-observation-input)
+requires actual native command receipts linked to authenticated worker captures
+and leaves conversation IDs null. It preserves historical reports and the
+stricter conversation requirements for delta/replay. This collector change passed controlled validation and awaits hosted review;
+it does not establish a passing live verdict. The [rc.10 continuation record](docs/qualification/rc10-live.md)
+retains the observed passes, failures and evidence gaps. Issue #18 remains incomplete.
+
+The same collector repair handles redacted management-status maps and server
+response logs written after client receipt. Broker proof still requires the
+authenticated old/new process identities, a status recorded before the owner's
+restart, the exact restored pending call and one resumed client-tool execution.
+
 One-account testing demonstrated background wake, authenticated replies, six basic client-tool trials, full-history continuation, fresh-conversation replay, and automatic hook-based subscriber reconnection. A later weather question completed through the same service and client-tool loop.
 
 **Full qualification remains inconclusive:** interleaving failed in both runs, and the exact supported-refresh scope and formal recovery case remain incomplete. Full history is the baseline; the tested delta candidate is rejected. A passing live receipt still gates release work. Detailed [findings and receipts are in #7](https://github.com/markhuangai/AaA-muse-ai/issues/7#issuecomment-6784686856), with [reconnection](https://github.com/markhuangai/AaA-muse-ai/issues/7#issuecomment-6785064072) and [weather-demo](https://github.com/markhuangai/AaA-muse-ai/issues/7#issuecomment-6785270949) updates.
@@ -25,6 +40,8 @@ Controlled recovery validation passed by `2026-11-15T22:56:24Z`: the combined pr
 The owner's `2026-11-16T01:03:19Z` service restart subsequently passed B's formal broker tool-wait continuation and tool-deduplication checks. The new broker restored the exact pending call; B continued on connection generation 22 under unchanged approval, with one client execution and an exact retry of the completed operation. Complete native/broker exports and passive observations passed independent validation after documented collector receipt corrections. The report has fifteen of thirty-five required cases passed. A later worker-restart control stopped before signalling because B had already restarted spontaneously onto generation 23; its cause and real client processing are being checked separately. Worker/refresh, two-account and remaining adverse cases still keep #18 incomplete. See the [recovery evidence and collector limitations](docs/qualification/rc9-live.md#broker-restart-and-client-tool-continuation).
 
 The generation-23 client probe subsequently completed its tool/result/retry assertions, confirmed by broker receipts. At `2026-11-16T01:44:25.003Z`, B entered a terminal `diagnostics_unavailable` stop during a native diagnostic read; neither scoped restart control sent a signal. Source inspection and a failing local regression reproduce export reads holding the worker capture lock long enough to make required subscriber logging terminal. The local repair freezes export metadata/filenames under the lock and performs payload reads and verification outside it, reporting concurrent removal honestly. All six unit components exceed 90% coverage, and both combined product shards plus standalone packed-worker recovery passed locally. Required PR review and hosted checks remain pending. B's terminal marker and identity remain preserved, with no automatic restart, upgrade or re-enrollment. Formal worker/refresh qualification and #18 remain incomplete; see the [terminal-stop investigation](docs/qualification/rc9-live.md#terminal-worker-diagnostics-stop).
+
+The rc.10 live large-output attempt subsequently hit a worker `state_lock_timeout` during required logging, before accepted output. Its terminal marker and unknown broker busy hold remain preserved. A local regression reproduces per-deletion retention metadata syncs exhausting concurrent subscriber logging; the repair persists a conservative batch watermark before deletion, matching the existing service pattern. Fault checks preserve captures before failed persistence and honest omissions after partial deletion. The precise live lock holder remains unobserved, and this repair does not qualify live recovery. See the [capacity-pruning record](docs/qualification/product.md#worker-capacity-pruning-regression).
 
 The experiment API and worker exist. The [native request API](docs/history-api.md) adds named-client canonical conversations, one decision per request, and management timelines. The [OpenAI Chat Completions subset](docs/history-api.md#openai-chat-completions) and [Responses subset](docs/history-api.md#openai-responses) provide text and client function tools with JSON or buffered SSE responses. Responses adds typed items and linear owned response continuation. The [control portal](docs/portal.md) adds password login, read-only settings, worker management and request histories/cancellation in the same image and origin. Decisions and evidence are recorded in this repository and GitHub; project memory may supplement them.
 

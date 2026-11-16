@@ -5,6 +5,7 @@ import { validateResponse } from './responses-conformance.mjs';
 import { productTranscript } from './product-transcript.mjs';
 import { brokerBoundary, recoveryBoundary } from './product-recovery.mjs';
 import { inspectCase } from './qualification-case.mjs';
+import { nativeTurnObserved } from './native-proof.mjs';
 
 export const flowCases = ['portal.login', 'portal.enrollment.a', 'portal.enrollment.b', 'readiness.a', 'readiness.b', 'idle.a', 'idle.b', ...cycleIDs,
   'sessions.interleaved', 'sessions.affinity', 'sessions.isolation', 'boundary.cross-client', 'boundary.cross-worker',
@@ -61,7 +62,7 @@ function inspectCycle(item, report, broker, workers) {
     if (!workers.some(event => event.msg === 'worker.context' && event.worker_id === turn.worker_id && event.job_id === turn.job_id && same(event.context, context?.context))) miss('authenticated_worker_context');
     if (report.evidence_kind === 'live') {
       const observedCaseID = index < (item.measured_from_turn ?? 0) ? item.replay_source_case_id : item.id;
-      const observation = report.observations.find(entry => entry.kind === 'model_turn' && entry.case_id === observedCaseID && entry.worker_id === turn.worker_id && entry.job_id === turn.job_id && provenance(entry) && identifier(entry.native_conversation_id) && typeof entry.account_memory_observation === 'string' && entry.account_memory_observation && Array.isArray(entry.effective_instructions));
+      const observation = report.observations.find(entry => entry.kind === 'model_turn' && entry.case_id === observedCaseID && entry.worker_id === turn.worker_id && entry.job_id === turn.job_id && provenance(entry) && nativeTurnObserved(entry, workers, decision?.decision) && typeof entry.account_memory_observation === 'string' && entry.account_memory_observation && Array.isArray(entry.effective_instructions));
       if (!observation || !same(observation.effective_instructions, expected?.messages.filter(message => ['system', 'developer'].includes(message.role)))) miss('native_model_turn');
       if (!workers.some(event => event.msg === 'setup.wake_emitted' && event.worker_id === turn.worker_id && event.jobs?.some(job => job.job_id === turn.job_id))) miss('native_hook_wake');
     }

@@ -3,6 +3,13 @@ import { identifier, instant, need, same } from './qualification-evidence.mjs';
 const after = (time, boundary) => Date.parse(time) > Date.parse(boundary);
 const before = (time, boundary) => Date.parse(time) <= Date.parse(boundary);
 
+function comparableStatus(status) {
+  if (!status.configuration || !Object.hasOwn(status.configuration, 'client_keys')) return status;
+  const keys = status.configuration.client_keys;
+  need(keys === '[REDACTED]' || keys && typeof keys === 'object' && !Array.isArray(keys) && Object.values(keys).every(value => value === '[REDACTED]'), 'broker_status_not_redacted');
+  return { ...status, configuration: { ...status.configuration, client_keys: '[REDACTED]' } };
+}
+
 export function brokerBoundary(report, broker, item) {
   const checkpoint = report.checkpoints?.broker, cycle = report.cycles.find(value => value.id === checkpoint?.cycle_id);
   need(cycle?.turns?.length === 3 && cycle.outcome === 'passed', 'pending_broker_cycle_required');
@@ -18,13 +25,14 @@ export function brokerBoundary(report, broker, item) {
     before(checkpoint.prepared_at, entry.time) && before(entry.time, checkpoint.resumed_at));
   need(action, 'scoped_owner_broker_action_required');
   const statuses = [];
-  for (const [side, earliest, latest] of [['before', pending.finished_at, checkpoint.prepared_at], ['after', action.time, checkpoint.resumed_at]]) {
+  // Server response logging can follow client receipt; the owner action bounds the pre-restart response.
+  for (const [side, earliest, latest] of [['before', pending.finished_at, action.time], ['after', action.time, checkpoint.resumed_at]]) {
     const status = checkpoint[side + '_status'], instance = checkpoint[side + '_instance'];
     need(identifier(instance) && status?.instance_id === instance && status.ready === true && same(status.build, report.status_receipt.build), 'broker_status_identity_required');
     const event = broker.find(event => {
       if (event.msg !== 'request.exchange' || event.route !== '/api/v1/admin/status' || event.role !== 'management' || event.status !== 200 || event.instance_id !== instance ||
         !before(earliest, event.time) || !before(event.time, latest)) return false;
-      try { return same(JSON.parse(event.response), status); } catch { return false; }
+      try { return same(comparableStatus(JSON.parse(event.response)), comparableStatus(status)); } catch { return false; }
     });
     need(event, 'authenticated_broker_status_required');
     statuses.push(event);
@@ -40,6 +48,14 @@ export function brokerBoundary(report, broker, item) {
   need(broker.some(event => event.msg === 'decision.accepted' && event.instance_id === checkpoint.after_instance && event.operation_id === continued.operation_id &&
     event.job_id === continued.job_id && event.worker_id === continued.worker_id && event.decision_type === 'final' && before(checkpoint.resumed_at, event.time)), 'authenticated_resumed_tool_required');
   return checkpoint;
+}
+
+export function replacementBoundary(workers, originalID, replacementID) {
+  const original = workers.find(worker => worker.id === originalID), replacement = workers.find(worker => worker.id === replacementID);
+  need(original?.connection_status === 'offline' && original.work_status === 'unknown' && original.current_job === null && original.waiting_for_client_tool === 0,
+    'original_worker_must_be_confirmed_offline_without_held_work');
+  need(replacement?.connection_status === 'online' && replacement.work_status === 'idle' && replacement.current_job === null && replacement.waiting_for_client_tool === 0 && replacement.inference_readiness === 'verified',
+    'healthy_replacement_worker_required');
 }
 
 export function recoveryBoundary(report, id, workers, { probe = true, item } = {}) {

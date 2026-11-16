@@ -90,8 +90,13 @@ archive. These are observed artifact identities, separate from the service's
 recommended installer. Historical schema-one reports retain their original
 interpretation; new collection never infers an installed version from a pin.
 
-Every model turn needs its actual job/worker/case IDs, native conversation ID,
-effective observable instructions and account-memory observation. Quiet windows
+Every model turn needs its actual job/worker/case IDs, an observed native
+conversation ID or the [native background execution proof](README.md#private-observation-input),
+effective observable instructions and account-memory observation. A background
+agent without a conversation keeps that ID null and requires native command
+receipts joined to authenticated worker captures; a hook delivery thread cannot
+substitute for the deciding execution. This does not prove fresh-conversation
+replay or shared delta context. Quiet windows
 need continuous passive observation for at least 120 seconds; no manual message
 may wake the measured inference. Preserve every intervention and its time.
 Export worker diagnostics without `--decode` after measured windows. Supply all
@@ -99,6 +104,14 @@ exports through the observation file's `worker_exports` array. Missing native
 observations, omissions or expired captures leave qualification inconclusive.
 
 ## Live stages and owner checkpoints
+
+Broker identity proof compares the recorded management status with its
+authenticated server response. Report redaction may collapse `client_keys` to
+`[REDACTED]`; comparison accepts the equivalent map only when every value is
+already `[REDACTED]`, retaining every other status field. The old broker's
+response log must precede the recorded owner restart, but may follow the client
+checkpoint timestamp because server logging happens after the HTTP write.
+Instance, source, pending-tool and resumed-decision checks remain required.
 
 Use the same private evidence directory throughout a run:
 
@@ -121,7 +134,7 @@ a shell subscriber as proof of a working Muse backend:
 | `broker-resume` | Owner restarts only the qualification service while retaining PostgreSQL/diagnostics volumes. Record `product_case` for `recovery.broker-tool-wait`. The runner verifies a new service process and unchanged worker approval, then supplies the original result exactly once without requalification. |
 | `worker-restart` | Record the scoped supported worker restart. A real client tool cycle must complete on the recovered connection under unchanged approval, preserving identity and one subscriber. No reapproval, reinstall or state deletion. |
 | `refresh` | Owner approves the exact supported non-destructive refresh scope, performs it, and observes the retained hook/task recovering without a manual Muse message. A real client tool cycle verifies the recovered connection under retained worker approval. A browser reload alone cannot establish this. |
-| `replacement` | After a completed final answer with no pending tool, stop only worker A's identified subscriber. Record `recovery.replacement-full-history`. The runner requires A offline/idle and B already approved, then continues the owned Responses session with full history and original accepted tool linkage. |
+| `replacement` | After a completed final answer with no pending tool, stop only worker A's identified subscriber. Record `recovery.replacement-full-history`. The runner requires A offline with no held assignment or client-tool wait and B online/idle with retained approval, then continues the owned Responses session with full history and original accepted tool linkage. Offline work status stays `unknown`. |
 | `boundaries` | Import observed cross-worker rejection, old-generation rejection, partial-output and unresolved-work cases plus log-only diagnosis. Each needs exact operation/worker IDs and complete exports from the actual induced action. A declaration without causal broker evidence cannot pass. |
 | `portal` | Real password login, rename preserving immutable IDs, and request-history reads for the matrix's actual requests. |
 | `revoke` | Final confirmed portal revocation of only the two test workers; preceding required case receipts must exist. |
@@ -793,3 +806,32 @@ See the [rc.9 observation and recovery record](rc9-live.md) for exact release
 identities, native exports, unattended protocol cases and owner checkpoints.
 This separate record keeps the maintained qualification documents below the
 repository line limit. Earlier observations remain above.
+
+## Live rc.10 continuation
+
+The [rc.10 continuation record](rc10-live.md) retains exact deployment and
+worker identities, manual updates, native-command evidence, broker and worker
+recovery, safe replacement, the later terminal failure and remaining gates.
+Historical reports remain unchanged; live qualification is inconclusive.
+
+## Worker capacity-pruning regression
+
+A later rc.10 live large-output attempt failed before any output. A's original
+subscriber stderr records `worker.capture_failed` with `state_lock_timeout` and
+`stopped_operation: worker.http_exchange`; a genuine `diagnostics_unavailable`
+terminal marker stopped PID 1867 at `2026-11-16T15:49:30.732Z`. The broker
+interrupted its claimed assignment and fenced a late decision. The native
+capture store had 18,816 files and 134,216,746 bytes against a 134,217,728-byte
+cap. The lock owner at that instant is unavailable, so the exact live critical
+section remains unproved. New inference stopped; marker, journals, rejected
+operation and unconfirmed native acknowledgement remain preserved.
+
+A local regression runs the actual subscriber, state locks, logger and capture
+store while capacity pruning incurs delayed filesystem metadata syncs. The
+previous per-deletion watermark writes reproduce a terminal logging failure.
+Persisting the whole conservative watermark before the deletion batch fixes
+that mechanism, matching the service's existing retention ordering. Fault
+checks retain all captures if watermark persistence fails and explicit omissions
+if deletion fails partway. This local repair does not establish the exact live
+lock holder or qualify a new live partial-output/recovery attempt. Manual
+operator recovery must preserve the genuine marker and uncertain assignment.
