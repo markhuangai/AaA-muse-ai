@@ -59,15 +59,17 @@ export class Capture {
     const files = (await this.state.list()).filter(n => /^capture-\d+-[a-f0-9-]+\.ndjson$/.test(n)).sort((a, b) => Number(a.split('-')[1]) - Number(b.split('-')[1]));
     const sizes = await Promise.all(files.map(async name => (await this.state.io.lstat(this.state.path(name))).size));
     let total = sizes.reduce((a, b) => a + b, 0);
+    const removals: string[] = [];
     for (let i = 0; i < files.length; i++) {
       const time = Number(files[i].split('-')[1]);
       if (total <= this.maxBytes && time >= this.state.sys.now() - this.retentionMs) break;
       metadata.pruned_through = new Date(Math.max(time, Date.parse(text(metadata.pruned_through)) || 0)).toISOString();
-      await this.state.write('retention.json', encode(metadata));
-      await this.state.remove(files[i]);
+      removals.push(files[i]);
       total -= sizes[i];
     }
+    // Persist the whole batch watermark before deletion so interruption cannot hide lost evidence.
     await this.state.write('retention.json', encode(metadata));
+    for (const name of removals) await this.state.remove(name);
     return metadata;
   }
   async write(event: Record<string, Value>): Promise<void> {

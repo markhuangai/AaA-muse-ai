@@ -5,8 +5,9 @@ import { Collector } from './qualification-collector.mjs';
 import { inspectCase } from './qualification-report.mjs';
 import { attachExport, decodeExport, identifier, instant, need, privateRead, readExports, same } from './qualification-evidence.mjs';
 import { cycle, cycleIDs, ProductProtocol } from './product-protocol.mjs';
+import { productTranscript } from './product-transcript.mjs';
 import { liveCases, validateProductReport } from './product-report.mjs';
-import { recoveryBoundary } from './product-recovery.mjs';
+import { recoveryBoundary, replacementBoundary } from './product-recovery.mjs';
 
 const execute = promisify(execFile);
 const stages = ['enroll', 'baseline', 'broker-prepare', 'broker-resume', 'worker-restart', 'refresh', 'replacement', 'boundaries', 'portal', 'revoke', 'finalize'];
@@ -237,12 +238,17 @@ export class ReleaseCollector extends Collector {
     const workers = await this.api('/api/v1/admin/workers');
     const original = this.report.cycles.find(item => item.id === 'a.responses.json');
     need(original?.outcome === 'passed', 'completed_replacement_history_required');
-    need(workers.workers.some(worker => worker.id === this.worker('a').worker_id && worker.connection_status === 'offline' && worker.work_status === 'idle'), 'original_worker_must_be_confirmed_offline_idle');
-    need(workers.workers.some(worker => worker.id === this.worker('b').worker_id && worker.inference_readiness === 'verified'), 'retained_worker_approval_required');
+    replacementBoundary(workers.workers, this.worker('a').worker_id, this.worker('b').worker_id);
     const item = structuredClone(original); item.id = 'replacement'; item.replay_source_case_id = original.id; item.measured_from_turn = item.turns.length; item.started_at = this.stamp(); delete item.followup; this.report.cycles.push(item); await this.save();
-    await this.driver.followup(item, 'replacement-' + this.random());
-    const receipt = await this.correlated(item), detail = await this.api('/api/v1/admin/requests/' + item.turns.at(-1).operation_id);
-    need(receipt.worker_ids.length === 2 && detail.delivery?.kind === 'full' && detail.delivery.messages.some(message => message.type === 'tool_result' && message.call_id === item.call_id && message.output === item.fixture.contents), 'replacement_full_history_missing');
+    const turn = await this.driver.followup(item, 'replacement-' + this.random());
+    const receipt = await this.correlated({ ...item, turns: [turn] }), detail = await this.api('/api/v1/admin/requests/' + turn.operation_id);
+    const expected = productTranscript(item).at(-1), delivery = detail.delivery;
+    need(receipt.worker_ids.length === 1 && receipt.worker_ids[0] === this.worker('b').worker_id && receipt.conversation_id === original.turns[0].conversation_id &&
+      delivery?.kind === 'full' && same(delivery.messages, expected.messages) && same(delivery.tools, expected.tools) &&
+      delivery.messages.some(message => message.type === 'tool_result' && message.call_id === item.call_id && message.output === item.fixture.contents), 'replacement_full_history_missing');
+    receipt.worker_ids = [...new Set(item.turns.map(turn => turn.worker_id))];
+    receipt.operation_ids = [...new Set(item.turns.map(turn => turn.operation_id))];
+    receipt.request_ids = item.turns.map(turn => turn.request_id);
     await this.record('recovery.replacement-full-history', { ...receipt, id: 'recovery.replacement-full-history', full_history: true, accepted_call_id: item.call_id, observation_ref: observed.source_ref });
   }
   async boundaries() {

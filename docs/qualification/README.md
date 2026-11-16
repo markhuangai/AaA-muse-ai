@@ -65,13 +65,53 @@ Required entries use these additional fields:
 | `artifact_identity` | `service_sha`, immutable `image_digest`; independently inspect the deployed image. The authenticated service status must identify the same clean source. |
 | `setup_ended` | `worker_id`, `hook_id`, `consumer_count: 1`, `interval_seconds: 5`, `state_mode: "0700"`, `key_file_mode: "0600"`, nonempty `actual_permissions`; `time` is the end of setup. New collections also require `worker_version` from the actual installed CLI and `worker_sha256` from verified installed-archive provenance, including when using a legacy service. Retain that evidence with runtime and registration observations. These fields identify the installation, not the service's recommended package. |
 | `quiet_window` | `case_id`, `started_at`, `ended_at`, `exclusive: true`; observe at least 120 seconds ending at the case's `started_at`. Use actual collector timestamps and passive observation, not retrospective assumptions. |
-| `model_turn` | `case_id`, `job_id`, observed `native_conversation_id`, `effective_instructions` as canonical system/developer items (including a delta's inherited base), and nonempty `account_memory_observation`. State what was observable; do not claim private reasoning or hidden instructions. |
+| `model_turn` | `case_id`, `job_id`, observed `native_conversation_id` or the background execution proof below, `effective_instructions` as canonical system/developer items (including a delta's inherited base), and nonempty `account_memory_observation`. State what was observable; do not claim private reasoning or hidden instructions. |
 | `no_model_turn` | `case_id`, `job_id`, `started_at`, `ended_at`, `last_boundary`; continuous passive coverage of the complete failed turn, matching its recorded boundaries. Retain detector and worker exports even if no native turn occurs. |
 | `intervention` | The exact activity, actor, scope and time, including messages, clicks, approvals or manual worker commands. Entries invalidate overlapping quiet/trial windows. Do not erase them for a pass. |
 | `fresh_conversation` | Observed `native_conversation_id`; create the fresh native conversation after the `full` case and before replay. A new broker experiment ID alone is insufficient. |
 | `refresh_approval` | `owner: true`, exact supported `scope`, `destructive: false`; the owner's explicit approval precedes the action. |
 | `refresh_performed` | The same `scope` and actual action time; no reset, wipe, reinstall, re-enrollment, or manual message. |
 | `refresh_reconnected` | Retained `worker_id`, `hook_id`, `consumer_count: 1`, protected modes, `reinstalled: false`, `reenrolled: false`, `manual_message: false`; observe automatic recovery before the refresh probe. |
+
+A native background agent can have no conversation. Record
+`native_conversation_id: null`, its actual `native_invocation_id`, `worker_id`,
+`context_command_id` and `decision_command_id`, plus `native_execution`:
+
+```json
+{
+  "kind": "background_agent",
+  "run_id": "event-hook:<actual-invocation-uuid>",
+  "agent_id": "<actual-agent-uuid>",
+  "status": "completed_notified",
+  "agent_status": "shutdown",
+  "session_id": null,
+  "source_ref": "/private/native-execution-records.json",
+  "commands": ["<job-show receipt object>", "<decision-submit receipt object>"]
+}
+```
+
+Each command receipt contains `action`, `agent_id`, `job_id`, the captured worker
+`command_id`, native `call_id`, positive distinct `tool_call_item_id` and
+`tool_output_item_id`, and the observed booleans `call_names_job_id`,
+`output_success` and `worker_command_id_matches_captured`, all true. These values
+must come from actual native tool-call/output joins, linked to the deciding
+agent, not inferred from the wake text or broker state. Worker exports must
+contain the matching context read, complete decision input equal to the broker's
+accepted decision, and accepted worker receipt.
+Keep the raw operational source records; do not read private reasoning to build
+these receipts. A hook's delivery thread is not its deciding conversation.
+
+Observed terminal run values are `completed_notified` and `completed_noop`;
+observed finished agent values are `shutdown` and `completed`. Retain the actual
+values. Native notification outcomes do not establish a worker decision without
+the complete command/capture chain. The exposed native schema does not enumerate
+these lifecycle values; these accepted values come from retained operational
+observations, not a claim about every possible Muse lifecycle state.
+
+This proof establishes the background turn only. Delta-base continuity and
+fresh-conversation replay still require observed real conversation IDs.
+Historical reports remain unchanged. Validation checks recorded links and does
+not authenticate the observer's claims or provide native Muse attestation.
 
 `worker_exports` contains `{ "case_id": "all", "path": "/absolute/private/export.ndjson" }`
 or one export per case. Export through the installed CLI's existing protected
@@ -195,3 +235,13 @@ scope, failures, interventions, full/delta decision and limitations in the final
 report. A conclusive failure describes this tested mechanism; it does not prove
 all Muse integrations impossible. Inconclusive reports leave issue #7 open;
 only a live pass permits release work.
+
+
+The live replacement collector accepts the production offline projection only
+with `work_status: unknown`, explicit null current assignment and zero client-tool
+waits. The replacement must already be online, idle and verified with no pending
+work. An offline worker is never relabeled idle. Correlation queries only the
+new continuation; retained original turns remain immutable when older diagnostic
+captures have expired. The complete replayed messages and tools must match the
+client transcript, including the already accepted tool result. Neither this
+collector correction nor a controlled pass qualifies live replacement.

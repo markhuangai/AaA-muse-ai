@@ -136,3 +136,73 @@ test('an export reports a frozen capture removed by concurrent retention', async
   assert.equal(snapshot[0].captures, 0);
   assert.deepEqual(snapshot[0].omissions, ['capture_removed_during_export:' + name]);
 });
+
+test('capacity pruning cannot exhaust a concurrent subscriber logging deadline through repeated watermark syncs', async t => {
+  const f = await fixture(t); await enrolled(f); f.broker.jobs.clear();
+  for (let i = 0; i < 24; i++) {
+    await f.logger.log('DEBUG', 'retained', { payload: 'old-'.repeat(100) }); f.advance(1);
+  }
+  let entered, release;
+  const started = new Promise(resolve => { entered = resolve; }), gate = new Promise(resolve => { release = resolve; });
+  let first = true;
+  const io = { ...fs, async open(path, ...args) {
+    const handle = await fs.open(path, ...args);
+    if (!String(path).split('/').at(-1).startsWith('.retention.json.')) return handle;
+    const sync = handle.sync.bind(handle);
+    handle.sync = async () => {
+      if (first) { first = false; entered(); await gate; }
+      f.advance(2000); await new Promise(resolve => setTimeout(resolve, 5)); await sync();
+    };
+    return handle;
+  } };
+  f.logger.capture = new Capture(new State(f.logger.capture.state.root, io, f.state.sys), 16 * 1024);
+  const writing = f.logger.log('DEBUG', 'capacity-burst', { payload: 'x'.repeat(6000) });
+  await started;
+  const stop = new AbortController(), connection = { protocol_version: 1, connection_id: CONN, connection_generation: 1 };
+  f.broker.override = call => {
+    if (call.path.endsWith('/events')) return new Response(new ReadableStream({ start(controller) {
+      controller.enqueue(Buffer.from(`id: opened\nevent: connection.opened\ndata: ${encode(connection)}\n\nid: health\nevent: health.challenge\ndata: ${encode({ ...connection, challenge_id: 'prune-health' })}\n\n`));
+    } }), { headers: { 'content-type': 'text/event-stream' } });
+    if (call.path.endsWith('/heartbeat')) stop.abort();
+  };
+  const waits = f.waits.length; let settled = false, failure;
+  const running = new Subscriber(f.worker).run(stop.signal, true).catch(error => { failure = error; }).finally(() => { settled = true; });
+  try {
+    await until(() => settled || f.waits.length > waits); release();
+    await writing; await running;
+    assert.equal(failure, undefined, 'capacity pruning made required subscriber logging terminal');
+    assert.equal(await f.state.read('run-stop.json'), undefined);
+    assert.equal((await f.state.read('credential.key')).trim(), KEY);
+    assert(f.broker.calls.some(call => call.path.endsWith('/heartbeat')));
+    assert(!f.output.some(line => JSON.parse(line).msg === 'worker.capture_failed'));
+    const metadata = JSON.parse((await f.logger.capture.export({}, false)).split('\n')[0]);
+    assert.equal(metadata.complete, false); assert(metadata.pruned_through);
+  } finally { release(); stop.abort(); await writing; await running; }
+});
+
+test('pruning failures preserve captures before watermark persistence and report conservative omissions after it', async t => {
+  for (const stage of ['persist', 'remove']) {
+    const f = await fixture(t);
+    await f.logger.log('INFO', 'first'); f.advance(1); await f.logger.log('INFO', 'second'); f.advance(300);
+    const state = f.logger.capture.state, before = await state.read('retention.json');
+    const names = (await state.list()).filter(name => name.startsWith('capture-')).sort((a, b) => Number(a.split('-')[1]) - Number(b.split('-')[1]));
+    const failure = () => Object.assign(new Error('injected filesystem failure'), { code: 'EIO' });
+    const io = { ...fs,
+      async rename(from, to) { if (stage === 'persist' && to === state.path('retention.json')) throw failure(); return fs.rename(from, to); },
+      async unlink(path) { if (stage === 'remove' && path === state.path(names[1])) throw failure(); return fs.unlink(path); },
+    };
+    const capture = new Capture(new State(state.root, io, f.state.sys), undefined, 100);
+    await assert.rejects(capture.prune(), { code: 'EIO' });
+    if (stage === 'persist') {
+      assert.equal(await state.read('retention.json'), before);
+      for (const name of names) assert.notEqual(await state.read(name), undefined);
+    } else {
+      assert.equal(await state.read(names[0]), undefined); assert.notEqual(await state.read(names[1]), undefined);
+      const retained = JSON.parse(await state.read('retention.json'));
+      assert.equal(Date.parse(retained.pruned_through), Number(names[1].split('-')[1]));
+      const metadata = JSON.parse((await new Capture(state, undefined, 100).export({}, false)).split('\n')[0]);
+      assert.equal(metadata.complete, false); assert.equal(metadata.captures, 0);
+      assert.deepEqual(metadata.omissions, ['expired_or_capacity_pruned_evidence']);
+    }
+  }
+});

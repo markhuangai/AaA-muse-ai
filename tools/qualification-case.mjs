@@ -1,4 +1,5 @@
 import { identifier, instant, same } from './qualification-evidence.mjs';
+import { nativeTurnObserved } from './native-proof.mjs';
 
 const time = value => Date.parse(value);
 const provenance = entry => entry && instant(entry.time) && typeof entry.observer === 'string' && entry.observer.length > 0 && typeof entry.source_ref === 'string' && entry.source_ref.length > 0;
@@ -27,7 +28,7 @@ export function inspectCase(item, report, evidence) {
   const turns = item.turns ?? [];
   const initialMessages = item.request?.messages ?? [];
   if (turns[0]?.context?.kind !== 'full' || !same(turns[0]?.context?.messages,initialMessages)) fail('initial_full_delivery');
-  const native = observations.filter(entry => entry.kind === 'model_turn' && entry.case_id === item.id && provenance(entry) && identifier(entry.native_conversation_id));
+  const native = observations.filter(entry => entry.kind === 'model_turn' && entry.case_id === item.id && provenance(entry) && nativeTurnObserved(entry, w, b.find(event => event.msg === 'inference.decision' && event.job_id === entry.job_id)?.decision));
   const nativeMatches = (entry,turn) => entry.job_id === turn.job_id && typeof entry.account_memory_observation === 'string' && entry.account_memory_observation.length && same(entry.effective_instructions, initialMessages.filter(message => ['system','developer'].includes(message.role)));
   for (const turn of turns) {
     if (time(turn.finished_at) - time(turn.started_at) >= 300000 || time(turn.finished_at) < time(turn.started_at)) fail('turn_deadline');
@@ -46,8 +47,9 @@ export function inspectCase(item, report, evidence) {
     if (context?.kind === 'delta') {
       const base = turns.find(previous => previous.job_id === context.base_receipt_id);
       if (!base || context.base_prefix !== base.context?.history_count || context.base_sha256 !== base.context?.canonical_sha256 || context.history_count !== context.base_prefix + context.messages?.length) fail('delta_base_contract');
-      if (!turns.every(previous => native.some(entry => nativeMatches(entry,previous)))) miss('delta_native_base');
-      else if (new Set(native.filter(entry => turns.some(previous => nativeMatches(entry,previous))).map(entry => entry.native_conversation_id)).size !== 1) fail('delta_native_base');
+      const baseNative = native.filter(entry => turns.some(previous => nativeMatches(entry,previous)));
+      if (!turns.every(previous => baseNative.some(entry => nativeMatches(entry,previous))) || baseNative.some(entry => !identifier(entry.native_conversation_id))) miss('delta_native_base');
+      else if (new Set(baseNative.map(entry => entry.native_conversation_id)).size !== 1) fail('delta_native_base');
     }
   }
   if (!item.initial || !item.observed || !same(item.initial.messages, item.request?.messages)) miss('canonical_input');
@@ -59,7 +61,7 @@ export function inspectCase(item, report, evidence) {
     const original = report.cases.find(previous => previous.id === 'full');
     const boundary = observations.find(entry => entry.kind === 'fresh_conversation' && provenance(entry) && instant(original?.finished_at) && time(entry.time) > time(original.finished_at) && time(entry.time) < time(item.started_at));
     const oldNative = observations.filter(entry => entry.kind === 'model_turn' && entry.case_id === 'full').map(entry => entry.native_conversation_id);
-    if (!boundary || !native.length || native.some(entry => entry.native_conversation_id !== boundary.native_conversation_id || oldNative.includes(entry.native_conversation_id))) miss('fresh_native_conversation');
+    if (!boundary || !identifier(boundary.native_conversation_id) || !native.length || native.some(entry => entry.native_conversation_id !== boundary.native_conversation_id || oldNative.includes(entry.native_conversation_id))) miss('fresh_native_conversation');
     if (!original || !same(initialMessages.slice(0, -1), original.observed?.messages) || !same(item.request?.tools,original.request?.tools) || !same(turns[0]?.context?.tools,original.request?.tools)) fail('canonical_replay');
     if (!same(item.expected,original?.expected) || !same(parseFinal(observed?.final_text), original?.expected) || observed?.state !== 'completed' || turns.length !== 1) fail('replay_answer');
   } else {

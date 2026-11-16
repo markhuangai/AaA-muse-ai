@@ -86,6 +86,8 @@ The state directory must be owned by the current user with mode `0700`; files mu
 
 INFO, WARN, and ERROR JSON events go to stderr. DEBUG detail is always captured in `diagnostics/` after redaction. Retention is seven days or 128 MiB. Exports use the service's NDJSON metadata/chunk format, with records at most 6 KiB, Base64 payload chunks, and SHA-256 integrity. Missing, corrupt, expired, or capacity-pruned evidence is explicit. Large context/decision exchanges are reconstructed rather than truncated. Authentication fields and known/token-shaped secrets are masked, including overlapping secrets and object keys. Payload numbers retain their text.
 
+Capacity pruning persists one conservative watermark for the entire deletion batch before removing captures. This avoids a metadata sync for every removed file while holding the shared capture lock. A failed watermark write removes no captures; an interrupted deletion may conservatively report omissions for planned captures that still exist. Required logging failures still stop work and preserve a terminal marker; this change never clears that marker or releases uncertain broker work.
+
 Collect an experiment timeline without business-table queries or process inspection:
 
 ```sh
