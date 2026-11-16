@@ -786,3 +786,10 @@ integration harness verified removal of its owned containers, volumes and
 network. Private fixtures and complete exports remain outside CI uploads;
 only safe receipts/screenshots are eligible for retention. Final-head CI,
 Codex, the configured AI reviewer and CodeQL remain separate delivery gates.
+
+## Live rc.9 observation record
+
+See the [rc.9 observation and recovery record](rc9-live.md) for exact release
+identities, native exports, unattended protocol cases and owner checkpoints.
+This separate record keeps the maintained qualification documents below the
+repository line limit. Earlier observations remain above.
