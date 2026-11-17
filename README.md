@@ -4,6 +4,12 @@ A self-hosted broker that connects model clients to a Muse worker through outbou
 
 ## Status
 
+On November 17 the owner accepted rc.11 functional testing and closed [#18](https://github.com/markhuangai/AaA-muse-ai/issues/18#issuecomment-6947082016). Its final record retains 68 complete exports, 30/35 formal cases and an inconclusive qualification verdict, including unavailable supported-refresh evidence. Both test registrations were permanently revoked. These facts supersede the historical incomplete-task status below without changing its observations or the standing passing-live release gate.
+
+The owner-approved [#19](https://github.com/markhuangai/AaA-muse-ai/issues/19) delivery adds [immutable final-version candidates and release verification](docs/releases.md). Candidate publication follows the owner's merge of the reviewed implementation PR; stable promotion requires separately authorized passing exact-candidate evidence and explicit publication confirmation. The new workflow does not re-enroll the retired workers or rerun the live matrix. Engineering checks cannot qualify Muse. No `0.1.0` artifact has been published by this source change.
+
+Controlled #19 validation passed by `2026-11-17T13:33:43.347Z` at base `bc4ce9c10620b74f203bc719c3eb1f38535719ee`, working-source digest `54797456389952f6765e3f26e6342f112d56ea1e49c255a614da4fb77a74e748` before this note: the actual final-version image smoke check, 22 release/qualification cases, actual-logger failure diagnosis, and all six independent unit-coverage gates above 90%. File-size, workflow policy/actionlint and documentation checks passed. The independent plan audit was conformant on round three; subsequent changes corrected a test's expected rejection and moved `runner.temp` into step-level environment configuration. Local Docker attempts first failed on an unavailable Desktop credential helper and then a missing Buildx discovery path; the passing run used the same daemon with a temporary anonymous client configuration and the existing plugin, preserving operator settings. Hosted current-head CI, Codex, complete configured AI review and CodeQL remain required. These controlled results do not satisfy the stable live-release gate.
+
 The November 16 rc.10 continuation at service/worker source
 `caed10795c063178902aee2d4cf402a704fa4875` exposed a collector limitation: native
 hook agents report run/agent identities with no conversation record. The candidate

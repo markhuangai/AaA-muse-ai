@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { registryManifest, resolvePublication } from './image-policy.mjs';
 import { ReleaseFailure } from './worker-release.mjs';
 import { logEvent } from './ci-log.mjs';
+import { makeManifest } from './release-manifest.mjs';
 
 const hash = value => createHash('sha256').update(value).digest('hex');
 const need = (condition, cause) => { if (!condition) throw new ReleaseFailure(cause); };
@@ -16,7 +17,7 @@ export async function finalizeProductRelease({ github, context, prepared, worker
   const registry = await registryManifest({ token, image: 'markhuangai/aaa-muse-ai', tag: version, expectedConfig: image.image_config_digest, fetcher });
   const sourceTag = await registryManifest({ token, image: 'markhuangai/aaa-muse-ai', tag: 'sha-' + source_sha, expectedConfig: image.image_config_digest, fetcher });
   need(registry.exists && sourceTag.exists && registry.digest === sourceTag.digest, 'product_release_image_unverified');
-  const receipt = { version, source_sha, image: 'ghcr.io/markhuangai/aaa-muse-ai@' + registry.digest, image_config_digest: image.image_config_digest, worker: { package: worker.package, version, sha256: worker.sha256, archive: `markhuangai-aaa-muse-worker-${version}.tgz` }, outcome: 'complete', live_qualification: 'not_established' };
+  const receipt = makeManifest({ source_sha, tree_sha: image.tree_sha, version, image_digest: registry.digest, image_config_digest: image.image_config_digest, worker });
   const content = Buffer.from(JSON.stringify(receipt, null, 2) + '\n');
   const matches = release.assets.filter(asset => asset.name === 'product-release.json');
   need(matches.length <= 1, 'product_release_ambiguous_receipts');

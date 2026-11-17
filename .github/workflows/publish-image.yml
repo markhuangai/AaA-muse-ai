@@ -104,6 +104,7 @@ jobs:
             const { execFileSync } = await import('node:child_process');
             const { imageConfigDigest, registryManifest, resolvePublication } = await import(`${process.env.GITHUB_WORKSPACE}/trusted/.github/scripts/image-policy.mjs`);
             const { finalizeProductRelease } = await import(`${process.env.GITHUB_WORKSPACE}/trusted/.github/scripts/product-release.mjs`);
+            const { inspectWorker } = await import(`${process.env.GITHUB_WORKSPACE}/trusted/.github/scripts/release-manifest.mjs`);
             const { reportReleaseFailure } = await import(`${process.env.GITHUB_WORKSPACE}/trusted/.github/scripts/worker-release.mjs`);
             const prepared = { source_sha: process.env.SOURCE_SHA, version: process.env.PRODUCT_VERSION, tag: process.env.RELEASE_TAG, paired: true };
             try {
@@ -115,6 +116,8 @@ jobs:
               const destinations = await Promise.all(tags.map(tag => registryManifest({ token: process.env.REGISTRY_TOKEN, image: 'markhuangai/aaa-muse-ai', tag, expectedConfig })));
               if (destinations.some(result => !result.exists)) execFileSync('docker', ['login', 'ghcr.io', '--username', process.env.GITHUB_ACTOR, '--password-stdin'], { input: process.env.REGISTRY_TOKEN, stdio: ['pipe', 'ignore', 'ignore'] });
               for (let index = 0; index < tags.length; index++) if (!destinations[index].exists) execFileSync('docker', ['push', `${process.env.IMAGE}:${tags[index]}`], { stdio: 'inherit' });
-              const worker = JSON.parse(readFileSync('source/.artifacts/worker-package/latest.json', 'utf8'));
-              await finalizeProductRelease({ github, context, prepared, worker, image: { source_sha: prepared.source_sha, version: prepared.version, image_config_digest: expectedConfig, worker_sha256: worker.sha256 }, token: process.env.REGISTRY_TOKEN });
+              const receipt = JSON.parse(readFileSync('source/.artifacts/worker-package/latest.json', 'utf8'));
+              const worker = { ...receipt, ...inspectWorker(receipt.archive) };
+              const treeSHA = execFileSync('git', ['-C', 'source', 'rev-parse', 'HEAD^{tree}'], { encoding: 'utf8' }).trim();
+              await finalizeProductRelease({ github, context, prepared, worker, image: { source_sha: prepared.source_sha, tree_sha: treeSHA, version: prepared.version, image_config_digest: expectedConfig, worker_sha256: worker.sha256 }, token: process.env.REGISTRY_TOKEN });
             } catch (error) { reportReleaseFailure(core, error, { ...prepared, outcome: 'incomplete' }); }

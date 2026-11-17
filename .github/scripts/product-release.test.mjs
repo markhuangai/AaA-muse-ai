@@ -20,8 +20,8 @@ function fixture() {
   }, paginate: async route => route === refsRoute ? [{ ref: 'refs/tags/worker-v0.1.0-rc.6', object: { type: 'commit', sha: 'e'.repeat(40) } }] : route === releasesRoute ? [] : [{ merged_at: '2026-11-14', merge_commit_sha: source, base: { ref: 'main', repo: repository } }] };
   const context = { eventName: 'workflow_run', repo: { owner: 'markhuangai', repo: 'AaA-muse-ai' }, payload: { workflow_run: { id: 3, workflow_id: 7, event: 'push', conclusion: 'success', head_branch: 'main', head_sha: source, repository, head_repository: repository } } };
   const prepared = { source_sha: source, version: '0.1.0-rc.7', tag: 'v0.1.0-rc.7', paired: true };
-  const worker = { source: { source_sha: source, source_dirty: false, package_version: prepared.version }, version: prepared.version, sha256: digest, package: '@markhuangai/aaa-muse-worker' };
-  const image = { source_sha: source, version: prepared.version, image_config_digest: imageConfig, worker_sha256: digest };
+  const worker = { source: { source_sha: source, source_dirty: false, package_version: prepared.version }, version: prepared.version, sha256: digest, installer_sha256: 'f'.repeat(64), package: '@markhuangai/aaa-muse-worker' };
+  const image = { source_sha: source, tree_sha: 'e'.repeat(40), version: prepared.version, image_config_digest: imageConfig, worker_sha256: digest };
   const fetcher = async (url, options) => {
     if (url.startsWith('https://ghcr.io/token')) return Response.json({ token: 'registry-fixture' });
     if (url.startsWith('https://ghcr.io/v2/')) return state.registry ? Response.json({ config: { digest: state.configs } }, { headers: { 'docker-content-digest': state.digest } }) : new Response(null, { status: 404 });
