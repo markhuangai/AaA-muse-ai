@@ -33,6 +33,7 @@ test('real failing candidate path emits sufficient INFO/WARN/ERROR evidence with
   assert(events.some(event => event.level === 'INFO' && event.event === 'product.release.source_verified'));
   assert(!(child.stdout + child.stderr).includes('secret-sentinel'));
   assert(!(child.stdout + child.stderr).includes('fixture-registry-bearer'));
+  for (const event of events) console.log(JSON.stringify({ ...event, controlled_reproduction: true, qualifies_live_muse: false }));
 });
 
 test('source and qualification rejection logs identify the exact safe mismatch and blocked operation', () => {
@@ -83,6 +84,8 @@ test('source and qualification rejection logs identify the exact safe mismatch a
     else assert.equal(rejected.observed_source, 'f'.repeat(40));
   }
   assert(!(child.stdout + child.stderr).includes('secret-sentinel'));
+  assert(!(child.stdout + child.stderr).includes('fixture-registry-bearer'));
+  for (const event of events) console.log(JSON.stringify({ ...event, controlled_reproduction: true, qualifies_live_muse: false }));
 });
 
 test('npm process failures after image promotion retain an accurate ledger and process exit evidence', () => {
@@ -108,11 +111,14 @@ test('npm process failures after image promotion retain an accurate ledger and p
   `;
   const child = spawnSync(process.execPath, ['--input-type=module', '-e', script], { encoding: 'utf8', timeout: 30000 });
   assert.equal(child.status, 0, child.stderr);
-  const failed = child.stderr.trim().split('\n').map(JSON.parse).find(event => event.level === 'ERROR');
+  const events = child.stderr.trim().split('\n').map(JSON.parse);
+  const failed = events.find(event => event.level === 'ERROR');
   assert.equal(failed.process_status, 1); assert.equal(failed.http_status, null); assert.equal(failed.uncertain_destination, 'npm_latest');
   assert(failed.completed_destinations.includes('0.1.0')); assert(failed.completed_destinations.includes('latest'));
   assert(failed.missing_destinations.includes('github_release')); assert(failed.missing_destinations.includes('promotion.json'));
   assert(!failed.missing_destinations.includes('npm_latest'));
   assert(failed.completed_destinations.every(destination => !failed.missing_destinations.includes(destination)));
   assert(!(child.stdout + child.stderr).includes('secret-sentinel'));
+  assert(!(child.stdout + child.stderr).includes('fixture-registry-bearer'));
+  for (const event of events) console.log(JSON.stringify({ ...event, controlled_reproduction: true, qualifies_live_muse: false }));
 });
