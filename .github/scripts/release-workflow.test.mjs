@@ -15,9 +15,12 @@ test('release workflow keeps executable trust, original bundle retention, shared
   assert.match(build.if, /resume_run_id == ''/);
   const upload = build.steps.find(step => step.uses?.startsWith('actions/upload-artifact@'));
   assert.equal(upload.with['retention-days'], 7); assert.equal(upload.with.overwrite, false);
+  const freeze = build.steps.find(step => step.name === 'Freeze original image and worker bytes before any publication');
+  assert.equal(upload.with.path, freeze.env.BUNDLE_DIR);
   const publish = workflow.jobs.publish;
   assert(publish.needs.includes('build'));
   assert(publish.steps.some(step => step.uses?.startsWith('actions/download-artifact@') && step.with['run-id']));
+  assert.equal(publish.steps.find(step => step.uses?.startsWith('actions/download-artifact@')).with.path, upload.with.path);
   assert(!JSON.stringify(workflow.jobs.promote).includes('smoke-image'));
   assert(JSON.stringify(workflow.jobs.promote).includes('QUALIFICATION_SHA256'));
   const ci = parse(readFileSync('.github/workflows/ci.yml', 'utf8'));
