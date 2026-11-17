@@ -1,0 +1,250 @@
+name: Stable release candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      phase:
+        description: Candidate preparation or explicitly gated stable promotion
+        required: true
+        type: choice
+        options: [candidate, promote]
+      version:
+        description: Final package version (0.1.0)
+        required: true
+        type: string
+      source_sha:
+        description: Exact merge commit of the issue 19 delivery
+        required: true
+        type: string
+      resume_run_id:
+        description: Original run holding the frozen bundle (otherwise discovered)
+        type: string
+      manifest_sha256:
+        description: Required candidate manifest digest for promotion
+        type: string
+      qualification_asset_id:
+        description: Owner-approved safe qualification receipt asset on v0.1.0
+        type: string
+      qualification_sha256:
+        description: Required qualification receipt digest for promotion
+        type: string
+      confirmation:
+        description: 'Promotion only: promote 0.1.0 MANIFEST_SHA256 QUALIFICATION_SHA256'
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: paired-product-release
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      source_sha: ${{ steps.resolve.outputs.source_sha }}
+      tree_sha: ${{ steps.resolve.outputs.tree_sha }}
+      resume_run_id: ${{ steps.resolve.outputs.resume_run_id }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - uses: actions/github-script@v9
+        id: resolve
+        env:
+          REQUESTED_SOURCE: ${{ inputs.source_sha }}
+          REQUESTED_VERSION: ${{ inputs.version }}
+          REQUESTED_PHASE: ${{ inputs.phase }}
+          RESUME_RUN_ID: ${{ inputs.resume_run_id }}
+        with:
+          script: |
+            const { resolveStableSource, candidateRecovery } = await import(`${process.env.GITHUB_WORKSPACE}/.github/scripts/release-control.mjs`);
+            const { reportReleaseFailure } = await import(`${process.env.GITHUB_WORKSPACE}/.github/scripts/worker-release.mjs`);
+            try {
+              const prepared = await resolveStableSource({ github, context, sourceSHA: process.env.REQUESTED_SOURCE, phase: process.env.REQUESTED_PHASE, version: process.env.REQUESTED_VERSION });
+              core.setOutput('source_sha', prepared.source_sha);
+              core.setOutput('tree_sha', prepared.tree_sha);
+              if (prepared.phase === 'candidate') {
+                const recovery = await candidateRecovery({ github, context, prepared, resumeRunID: process.env.RESUME_RUN_ID });
+                core.setOutput('resume_run_id', recovery?.run_id ?? '');
+              }
+            } catch (error) { reportReleaseFailure(core, error); }
+
+  build:
+    needs: resolve
+    if: inputs.phase == 'candidate' && needs.resolve.outputs.resume_run_id == ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
+      TREE_SHA: ${{ needs.resolve.outputs.tree_sha }}
+      PRODUCT_VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: trusted
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          path: source
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24.22.2
+      - name: Build and smoke-test final-version bytes once
+        working-directory: source
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test "$(git rev-parse HEAD^{tree})" = "$TREE_SHA"
+          npm ci --ignore-scripts --no-audit --no-fund
+          make smoke-image SOURCE_SHA="$SOURCE_SHA" SOURCE_DIRTY=false SERVICE_IMAGE=aaa-muse-stable:prepared
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22.12.0
+      - name: Verify the same worker on minimum Node
+        working-directory: source
+        run: npm run test:package --workspace worker -- --verify-receipt .artifacts/worker-package/latest.json
+      - name: Freeze original image and worker bytes before any publication
+        working-directory: source
+        env:
+          BUNDLE_DIR: ${{ runner.temp }}/release-bundle
+        run: |
+          node --input-type=module <<'JS'
+          import { freezeBundle } from '../trusted/.github/scripts/release-bundle.mjs';
+          const result = freezeBundle(process.env.BUNDLE_DIR, { source_sha: process.env.SOURCE_SHA, tree_sha: process.env.TREE_SHA, version: process.env.PRODUCT_VERSION });
+          console.log(JSON.stringify({ event: 'product.release.bundle_frozen', ...result }));
+          JS
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-bundle-${{ inputs.version }}-${{ env.SOURCE_SHA }}
+          path: ${{ runner.temp }}/release-bundle
+          if-no-files-found: error
+          retention-days: 7
+          overwrite: false
+      - name: Verify removal of the owned local build image
+        if: always()
+        run: |
+          if docker image inspect aaa-muse-stable:prepared >/dev/null 2>&1; then
+            docker image rm --no-prune aaa-muse-stable:prepared >/dev/null
+          fi
+          test -z "$(docker image ls -q aaa-muse-stable:prepared)"
+          printf '%s\n' '{"level":"INFO","event":"product.release.runner_cleanup","image_tag":"aaa-muse-stable:prepared","outcome":"removed_or_absent","remote_artifacts_retained":true}'
+
+  publish:
+    needs: [resolve, build]
+    if: always() && inputs.phase == 'candidate' && needs.resolve.result == 'success' && (needs.build.result == 'success' || needs.build.result == 'skipped')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      actions: read
+      contents: write
+      packages: write
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24.22.2
+          registry-url: https://npm.pkg.github.com
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-bundle-${{ inputs.version }}-${{ needs.resolve.outputs.source_sha }}
+          path: ${{ runner.temp }}/release-bundle
+          run-id: ${{ needs.resolve.outputs.resume_run_id || github.run_id }}
+          github-token: ${{ github.token }}
+      - name: Reconcile and publish only missing identical destinations
+        id: publish
+        uses: actions/github-script@v9
+        env:
+          SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
+          TREE_SHA: ${{ needs.resolve.outputs.tree_sha }}
+          PRODUCT_VERSION: ${{ inputs.version }}
+          BUNDLE_DIR: ${{ runner.temp }}/release-bundle
+          NODE_AUTH_TOKEN: ${{ github.token }}
+        with:
+          script: |
+            const { mkdirSync, writeFileSync } = await import('node:fs');
+            const { publishCandidate } = await import(`${process.env.GITHUB_WORKSPACE}/.github/scripts/release-candidate.mjs`);
+            const { reportReleaseFailure } = await import(`${process.env.GITHUB_WORKSPACE}/.github/scripts/worker-release.mjs`);
+            try {
+              const prepared = { source_sha: process.env.SOURCE_SHA, tree_sha: process.env.TREE_SHA, version: process.env.PRODUCT_VERSION, tag: 'v' + process.env.PRODUCT_VERSION, candidate: true, paired: true, should_publish: true };
+              const receipt = await publishCandidate({ github, context, prepared, directory: process.env.BUNDLE_DIR, token: process.env.NODE_AUTH_TOKEN });
+              mkdirSync('.artifacts/ci/release', { recursive: true });
+              writeFileSync('.artifacts/ci/release/candidate.json', JSON.stringify(receipt));
+            } catch (error) { reportReleaseFailure(core, error); }
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-verification-${{ inputs.source_sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .artifacts/ci/release/candidate.json
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+      - name: Verify owned local image cleanup and retain published bytes
+        if: always()
+        env:
+          SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
+          PRODUCT_VERSION: ${{ inputs.version }}
+        run: |
+          for image in aaa-muse-stable:prepared "ghcr.io/markhuangai/aaa-muse-ai:candidate-$PRODUCT_VERSION" "ghcr.io/markhuangai/aaa-muse-ai:sha-$SOURCE_SHA-$PRODUCT_VERSION"; do
+            if docker image inspect "$image" >/dev/null 2>&1; then
+              docker image rm --no-prune "$image" >/dev/null
+            fi
+            test -z "$(docker image ls -q "$image")"
+          done
+          docker logout ghcr.io >/dev/null 2>&1
+          printf '%s\n' '{"level":"INFO","event":"product.release.runner_cleanup","outcome":"removed_or_absent","remote_artifacts_retained":true}'
+
+  promote:
+    needs: resolve
+    if: inputs.phase == 'promote'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      actions: read
+      contents: write
+      packages: write
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24.22.2
+          registry-url: https://npm.pkg.github.com
+      - name: Verify human gate and promote existing digests without building
+        uses: actions/github-script@v9
+        env:
+          SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
+          PRODUCT_VERSION: ${{ inputs.version }}
+          MANIFEST_SHA256: ${{ inputs.manifest_sha256 }}
+          QUALIFICATION_ASSET_ID: ${{ inputs.qualification_asset_id }}
+          QUALIFICATION_SHA256: ${{ inputs.qualification_sha256 }}
+          CONFIRMATION: ${{ inputs.confirmation }}
+          NODE_AUTH_TOKEN: ${{ github.token }}
+        with:
+          script: |
+            const { promoteCandidate } = await import(`${process.env.GITHUB_WORKSPACE}/.github/scripts/release-promote.mjs`);
+            const { download } = await import(`${process.env.GITHUB_WORKSPACE}/.github/scripts/release-io.mjs`);
+            const { need } = await import(`${process.env.GITHUB_WORKSPACE}/.github/scripts/release-manifest.mjs`);
+            const { reportReleaseFailure } = await import(`${process.env.GITHUB_WORKSPACE}/.github/scripts/worker-release.mjs`);
+            try {
+              const prepared = { source_sha: process.env.SOURCE_SHA, version: process.env.PRODUCT_VERSION, tag: 'v' + process.env.PRODUCT_VERSION };
+              const release = (await github.rest.repos.getReleaseByTag({ ...context.repo, tag: prepared.tag })).data;
+              const assets = release.assets.filter(asset => String(asset.id) === process.env.QUALIFICATION_ASSET_ID);
+              need(assets.length === 1 && assets[0].size <= 65536 && /^[A-Za-z0-9_.-]+\.json$/.test(assets[0].name), 'product_release_qualification_asset_required');
+              const qualificationBytes = await download(`https://github.com/${context.repo.owner}/${context.repo.repo}/releases/download/${prepared.tag}/${assets[0].name}`, { limit: 65536 });
+              await promoteCandidate({ github, context, prepared, manifestSHA256: process.env.MANIFEST_SHA256, qualificationBytes,
+                qualificationSHA256: process.env.QUALIFICATION_SHA256, confirmation: process.env.CONFIRMATION, token: process.env.NODE_AUTH_TOKEN });
+            } catch (error) { reportReleaseFailure(core, error); }

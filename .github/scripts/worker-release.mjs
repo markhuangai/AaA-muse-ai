@@ -103,8 +103,8 @@ function matchingBytes(actual, expected, destination) {
   requireThat(observed === expected, 'worker_release_artifact_conflict', { destination, expected_digest: expected, observed_digest: observed });
 }
 
-export async function publishRelease({ github, context, prepared, receipt, archive, token, fetcher = fetch, publishNpm = path => {
-  try { execFileSync('npm', ['publish', path, '--ignore-scripts', '--registry', 'https://npm.pkg.github.com', '--tag', 'rc', '--json', '--silent'], { env: { ...process.env, NODE_AUTH_TOKEN: token }, stdio: 'pipe', maxBuffer: 6144 }); }
+export async function publishRelease({ github, context, prepared, receipt, archive, token, fetcher = fetch, verifySource = () => resolvePublication({ github, context }), publishNpm = path => {
+  try { execFileSync('npm', ['publish', path, '--ignore-scripts', '--registry', 'https://npm.pkg.github.com', '--tag', prepared.candidate ? 'candidate' : 'rc', '--json', '--silent'], { env: { ...process.env, NODE_AUTH_TOKEN: token }, stdio: 'pipe', maxBuffer: 6144 }); }
   catch (error) {
     let npmCode = 'unavailable';
     try { const value = JSON.parse(String(error.stdout)); if (/^E[A-Z0-9_]+$/.test(value.error?.code ?? '')) npmCode = value.error.code; } catch { /* Raw registry error bodies are excluded by the repository CI exposure policy. */ }
@@ -117,12 +117,12 @@ export async function publishRelease({ github, context, prepared, receipt, archi
   const at = (nextOperation, nextDestination, expected = receipt.sha256) => { operation = nextOperation; destination = nextDestination; expectedDigest = expected; observedDigest = 'unavailable'; };
   const evidence = () => ({ source_sha, version, tag, operation, destination, expected_digest: expectedDigest, observed_digest: observedDigest, completed_destinations: [...completed] });
   try {
-  requireThat(prepared.should_publish && rc.test(version) && tag === (prepared.paired ? 'v' : 'worker-v') + version && sha.test(source_sha), 'worker_release_invalid_preparation');
+  requireThat(prepared.should_publish && (rc.test(version) || (prepared.paired && prepared.candidate && version === '0.1.0')) && tag === (prepared.paired ? 'v' : 'worker-v') + version && sha.test(source_sha), 'worker_release_invalid_preparation');
   requireThat(receipt.source?.source_sha === source_sha && receipt.source.source_dirty === false && receipt.source.package_version === version && receipt.version === version && receipt.package === '@markhuangai/aaa-muse-worker', 'worker_release_package_identity_mismatch');
   matchingBytes(archive, receipt.sha256, 'local_archive');
   observedDigest = hash(archive);
   at('source_verification', 'source_repository');
-  requireThat(await resolvePublication({ github, context }) === source_sha, 'worker_release_source_changed');
+  requireThat(await verifySource() === source_sha, 'worker_release_source_changed');
   let ref;
   at('tag_lookup', 'git_tag');
   try { ref = (await github.rest.git.getRef({ ...context.repo, ref: 'tags/' + tag })).data; }
@@ -183,7 +183,7 @@ export async function publishRelease({ github, context, prepared, receipt, archi
     logEvent(null, 'info', 'worker.release.destination_verified', { ...evidence(), outcome: 'verified' });
   }
   at('source_reverification', 'source_repository');
-  requireThat(await resolvePublication({ github, context }) === source_sha, 'worker_release_source_changed');
+  requireThat(await verifySource() === source_sha, 'worker_release_source_changed');
   const marker = `<!-- aaa-muse-worker:verified:${source_sha}:${receipt.sha256} -->`;
   const existingMarker = /<!-- aaa-muse-worker:verified:[^>]* -->/.exec(release.body ?? '');
   requireThat(!existingMarker || existingMarker[0] === marker, 'worker_release_receipt_conflict');
