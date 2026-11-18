@@ -7,6 +7,7 @@ import { hash, jsonBytes, validateManifest, inspectWorker, makeManifest } from '
 import { download, npmArchive, npmVersion, registryImage, ensureAsset } from './release-io.mjs';
 import { verifyPublished, verifyImageConfig } from './release-verify.mjs';
 import { freezeBundle, verifyBundle } from './release-bundle.mjs';
+import { candidateNpmTag } from './release-versions.mjs';
 
 test('published verification reads real tar bytes and every destination; public downloads carry no authority', async t => {
   const f = await releaseFixture(t); f.seed();
@@ -42,7 +43,11 @@ test('identity, destination, and anonymous content failures cannot produce succe
   const saved = f.state.assets.get(f.manifest.worker.archive);
   f.state.assets.delete(f.manifest.worker.archive); await assert.rejects(run(), /download_failed/); f.state.assets.set(f.manifest.worker.archive, saved);
   f.state.npmBytes = Buffer.from('other archive'); await assert.rejects(run(), /artifact_conflict/); delete f.state.npmBytes;
-  delete f.state.tags.candidate; await assert.rejects(run(), /distribution_missing/); f.state.tags.candidate = f.version;
+  delete f.state.tags[candidateNpmTag(f.version)];
+  await assert.rejects(run(), /distribution_missing/);
+  f.state.tags[candidateNpmTag(f.version)] = f.version;
+  f.state.tags.candidate = '0.1.2';
+  assert.equal((await run()).receipt.publication, 'complete');
   f.state.images.delete('candidate-' + f.version); await assert.rejects(run(), /destination_missing/);
   assert.throws(() => verifyImageConfig({}, f.manifest), /embedded_image/);
   await assert.rejects(run({ sourceSHA: 'f'.repeat(40) }), /requested_identity/);
@@ -77,6 +82,8 @@ test('frozen bundles retain exact image, worker and installer bytes and reject a
   writeFileSync(join(f.directory, 'package-receipt.json'), jsonBytes(receipt));
   const frozen = freezeBundle(join(f.directory, 'frozen'), f.prepared, { execute: f.execute, receiptPath: join(f.directory, 'package-receipt.json') });
   assert.equal(frozen.worker.installer_sha256, f.worker.installer_sha256);
+  assert.deepEqual(frozen.source_rc, f.prepared.source_rc);
+  assert.throws(() => verifyBundle(f.directory, { ...f.prepared, source_rc: { ...f.prepared.source_rc, tag: 'v0.1.0-rc.14' } }), /bundle_identity/);
   assert.equal(hash(readFileSync(join(f.directory, 'frozen/worker.tgz'))), f.worker.sha256);
   assert.throws(() => verifyBundle(f.directory, { ...f.prepared, tree_sha: 'f'.repeat(40) }, f), /bundle_identity/);
   writeFileSync(join(f.directory, 'image.tar'), 'changed'); assert.throws(() => verifyBundle(f.directory, f.prepared, f), /artifact_conflict/);

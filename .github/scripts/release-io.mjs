@@ -10,13 +10,19 @@ export async function download(url, { fetcher = fetch, token, limit = 64 * 1024 
   return Buffer.concat(parts);
 }
 
-export async function npmVersion(version, { fetcher = fetch, token } = {}) {
+export async function npmPackage({ fetcher = fetch, token } = {}) {
   const response = await fetcher('https://npm.pkg.github.com/@markhuangai%2faaa-muse-worker', {
     headers: { Authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(120000) });
-  if (response.status === 404) return { metadata: null, tags: {} };
+  if (response.status === 404) return { versions: {}, tags: {} };
   need(response.ok, 'product_release_registry_metadata_failed', { http_status: response.status });
   const value = JSON.parse(await boundedBody(response, 1024 * 1024));
-  return { metadata: value.versions?.[version] ?? null, tags: value['dist-tags'] ?? {} };
+  need(value.versions && typeof value.versions === 'object' && !Array.isArray(value.versions), 'product_release_registry_metadata_invalid');
+  return { versions: value.versions, tags: value['dist-tags'] ?? {} };
+}
+
+export async function npmVersion(version, options) {
+  const { versions, tags } = await npmPackage(options);
+  return { metadata: versions[version] ?? null, tags };
 }
 
 async function boundedBody(response, limit) {

@@ -3,8 +3,8 @@
 The service and worker share one full release version and source SHA. A service
 accepts every worker in its product major; minor and patch releases must retain
 that worker contract in both version orders. The existing HTTP routes and
-`protocol_version: 1` are separate wire identities. RC allocation continues
-`0.1.0-rc.N`; the explicit final-version candidate uses `0.1.0`.
+`protocol_version: 1` are separate wire identities. The current release line allocates `0.1.X-rc.N` and stamps the
+selected final candidate `0.1.X`.
 
 New workers advertise `X-Muse-Worker-Version` on HTTP and SSE requests. Services
 return `X-Muse-Service-Version`. Incompatible enrollment, subscriptions and
@@ -25,8 +25,11 @@ into the diagnostic request or report. Missing captures remain incomplete.
 
 ## Publication
 
-One workflow selects a monotonic, source-bound version using existing legacy and
-paired tags. It packs and verifies the worker, embeds that archive's digest and
+Successful CI for an eligible merge to main triggers the paired publisher. It
+increments the active patch series' RC number using the reserved Git tags and
+reuses the same version for a retry of the same source. The initial series is
+`0.1.0-rc.N`. A completed stable promotion starts the next patch series at
+`rc.0`. The publisher packs and verifies the worker, embeds that archive's digest and
 the shared version in the service image, smoke-tests the image, and checks the
 same worker bytes on the minimum Node runtime. Service-only releases still
 publish their paired worker. Operator configuration has no package selector.
@@ -54,33 +57,43 @@ the owner's authorization and the repository's human merge gate.
 
 ## Final-version candidate
 
-After the issue #19 delivery PR is reviewed and human-merged, an administrator
-dispatches `.github/workflows/release.yml` from `main` with `phase=candidate`,
-`version=0.1.0` and the exact delivery merge `source_sha`. The source must remain
-on main with successful main CI (including `Release / verify`) and CodeQL.
-Executable release helpers come from the workflow revision. Dispatching this
-phase does not authorize deployment or model submissions.
+After the owner merges the reviewed workflow and authorizes candidate publication,
+an administrator dispatches `.github/workflows/release.yml` from `main` with
+`phase=candidate`. The workflow selects the highest-numbered complete paired RC
+in the active series. It verifies the exact release, artifact digests, merged
+main source, successful main CI including `Release / verify`, and CodeQL.
+An incomplete newer RC is ineligible. A verified completion marker with
+conflicting artifacts blocks selection.
+
+The allocator uses the RC's base as the minimum final version and advances
+above existing final version reservations. The previously published
+`v0.1.0` prerelease consumes that npm version. For example, a new candidate
+selected from rc.13 with only that final reservation would use `0.1.1`.
+The workflow logs the selected RC, version, and source and pins the originating
+RC tag and manifest SHA-256 in the bundle and final manifest. Executable release
+helpers come from the trusted workflow revision. The build uses the exact RC
+commit and tree.
 
 The workflow builds and smoke-tests final-version bytes once and checks the
-same worker on Node 22.12.0. It freezes `worker.tgz`, `image.tar` and `bundle.json`
-in `release-bundle-0.1.0-SOURCE_SHA` before publication. This immutable workflow
-artifact is retained for seven days. The public destinations are:
+same worker on Node 22.12.0. It freezes `worker.tgz`, `image.tar`, and
+`bundle.json` in `release-bundle-VERSION-SOURCE_SHA` before publication.
+This immutable workflow artifact is retained for seven days.
 
-| Destination | Candidate identity |
+| Destination | Example for version 0.1.1 |
 | --- | --- |
-| GitHub Packages | `@markhuangai/aaa-muse-worker@0.1.0`, npm tag `candidate` |
-| Public GitHub Release | `v0.1.0`, marked prerelease; the service's existing installation URL |
-| GHCR | `candidate-0.1.0` and `sha-SOURCE_SHA-0.1.0`, identical manifest digests |
+| GitHub Packages | `@markhuangai/aaa-muse-worker@0.1.1` with dist-tag `candidate-0.1.1` |
+| Public GitHub Release | `v0.1.1` marked prerelease with the service's paired installation assets |
+| GHCR | `candidate-0.1.1` and `sha-SOURCE_SHA-0.1.1` with identical manifest digests |
 
-Version `0.1.0` is consumed when its package is published. If its bytes need a
-fix, stop for an owner-approved new version; do not repack or overwrite them.
-The version-qualified source tag avoids collision with an RC image built from
-the same source. Previous source tags and releases remain untouched.
+The npm `candidate` alias advances after the exact pair verifies. The candidate
+receipt supplies the final version and manifest SHA-256 for live qualification.
+Existing exact tags and packages are reservations. A fix to published bytes
+requires another version. Historical pairs remain verifiable after aliases move.
 
 ## Verification and incomplete publication
 
 After the independent plan audit, `make verify-release` builds and smoke-tests
-controlled `0.1.0` artifacts and exercises the production release logic against
+controlled `0.1.1` artifacts and exercises the production release logic against
 replaceable external I/O. It proves conflicts, missing destinations, partial
 recovery, source drift, anonymous downloads, qualification rejection and
 promotion without rebuilding. Its safe receipt is
@@ -90,7 +103,7 @@ These controlled results never qualify live Muse.
 For read-only verification of a published schema-two pair:
 
 ```sh
-RELEASE_TAG=v0.1.0 RELEASE_SOURCE_SHA='<verified-merge-sha>' \
+RELEASE_TAG=v0.1.1 RELEASE_SOURCE_SHA='<verified-merge-sha>' \
 RELEASE_MANIFEST_SHA256='<trusted-candidate-manifest-sha256>' make verify-release
 ```
 
@@ -100,12 +113,13 @@ The verifier checks every destination, Git source/tree, embedded versions,
 image configuration and archive/installer bytes. All three selectors are
 required together. It does not infer trusted digests from a mutable tag.
 
-A failed publication remains incomplete. Re-dispatch the same candidate inputs;
-the resolver discovers its original bundle, or accept `resume_run_id` naming
-that trusted run. It verifies existing destinations and publishes only missing
-identical bytes. An ambiguous write requires inspecting destination state before
-retrying. Differing bytes, a foreign source reservation or expired original
-bundle stop recovery; never delete published history to make a retry succeed.
+A failed publication remains incomplete. Re-dispatch `phase=candidate` for
+the same latest RC to recover its original bundle. `resume_run_id` can name
+that trusted run explicitly. The workflow verifies existing destinations and
+publishes only missing identical bytes. Inspect the destination after an
+ambiguous write. Conflicting artifacts, an unrelated reservation, or a missing
+or expired original bundle block recovery. A newer complete RC supersedes
+the earlier candidate for a new promotion.
 
 Collect the exact job logs with `gh run view RUN_ID --job JOB_ID --log`. Filter
 `worker.release.*` and `product.release.*` JSON events by `operation_id`, source
@@ -142,22 +156,30 @@ candidate source, version, image, installed workers and installer. Synthetic,
 missing, altered and mismatched evidence fails. Keep the report and exports
 private; the output contains only safe identities/digests. The owner reviews
 the generated receipt and uploads that safe file, without replacement, as an
-asset of `v0.1.0`.
+asset of the selected final-version prerelease.
 
 Only an explicit owner-authorized administrator dispatch of `phase=promote`
-may publish stable distribution tags. Supply the same source/version,
-`manifest_sha256`, `qualification_asset_id`, `qualification_sha256` and exact
-confirmation `promote 0.1.0 MANIFEST_SHA256 QUALIFICATION_SHA256`.
-The dispatcher pins the owner-approved evidence; it cannot manufacture a pass.
+may publish stable distribution tags. Supply the final version,
+`manifest_sha256`, `qualification_asset_id`, `qualification_sha256`, and exact
+confirmation `promote X.Y.Z MANIFEST_SHA256 QUALIFICATION_SHA256` with the
+candidate's final version substituted for `X.Y.Z`. The pinned manifest supplies
+the source. The current latest complete RC must match before stable publication
+begins. Separate execution authorization covers deployment and live validation.
 
-Promotion verifies the candidate again, copies its existing manifest digest to
-GHCR `0.1.0` and `latest`, adds npm `latest`, and changes the same Release from
-prerelease to stable. It never builds, repacks, republishes a package or replaces
-assets. Conflicting tags fail. A separate `promotion.json` is complete only
-after every stable destination verifies. Partial promotion preserves its exact
-progress for reconciliation. The candidate manifest and earlier artifacts
-remain unchanged. Stable promotion is not authorized by the #19 engineering
-and candidate-publication approval.
+Promotion records the approved digests and prior stable identity in
+`promotion-intent.json`. It copies the verified image digest to GHCR `X.Y.Z`,
+advances GHCR and npm `latest` from their verified prior targets, and marks
+the same Release stable and latest. It then re-reads every stable destination
+and uploads `promotion.json`. Promotion uses the original verified image and
+worker bytes. Unknown or conflicting stable destinations block writes.
+
+If the versioned stable image tag already verifies against its saved intent,
+retry the same promotion inputs to reconcile the remaining destinations.
+That retry completes the original operation even if a newer RC has since shipped.
+A saved intent alone still requires the latest RC check. Another started and
+incomplete promotion blocks a new one. A completed promotion can be verified
+again by exact version after `latest` moves. Close #19 after the first complete
+stable promotion and passing qualification receipt verify.
 
 ## Manual worker upgrade
 

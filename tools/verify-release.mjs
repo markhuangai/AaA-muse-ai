@@ -7,6 +7,8 @@ import { imageConfigDigest } from '../.github/scripts/image-policy.mjs';
 import { verifyPublished } from '../.github/scripts/release-verify.mjs';
 import { logEvent } from '../.github/scripts/ci-log.mjs';
 
+const controlledVersion = '0.1.1';
+
 export async function main({ env = process.env, execute = execFileSync, read = readFileSync, write = writeFileSync,
   mkdir = mkdirSync, list = readdirSync, inspect = inspectSource, verify = verifyPublished } = {}) {
   const selectors = [env.RELEASE_TAG, env.RELEASE_SOURCE_SHA, env.RELEASE_MANIFEST_SHA256];
@@ -19,20 +21,20 @@ export async function main({ env = process.env, execute = execFileSync, read = r
     }
     const source = inspect();
     image = `aaa-muse-release-verification:${process.pid}`;
-    execute('make', ['smoke-image', 'PRODUCT_VERSION=0.1.0', `SERVICE_IMAGE=${image}`], { stdio: 'inherit' });
+    execute('make', ['smoke-image', 'PRODUCT_VERSION=' + controlledVersion, `SERVICE_IMAGE=${image}`], { stdio: 'inherit' });
     imageCreated = true;
     const packageReceipt = JSON.parse(read('.artifacts/worker-package/latest.json'));
     const worker = inspectWorker(packageReceipt.archive, { read, execute });
-    need(worker.version === '0.1.0' && worker.source.source_sha === source.identity.sha, 'product_release_controlled_worker_identity_mismatch');
+    need(worker.version === controlledVersion && worker.source.source_sha === source.identity.sha, 'product_release_controlled_worker_identity_mismatch');
     sameDigest(worker.sha256, packageReceipt.sha256, 'controlled_worker');
     const built = JSON.parse(execute('docker', ['image', 'inspect', image], { encoding: 'utf8' }))[0];
-    need(built.Config.Labels['org.opencontainers.image.version'] === '0.1.0' && built.Config.Labels['org.opencontainers.image.revision'] === source.identity.sha,
+    need(built.Config.Labels['org.opencontainers.image.version'] === controlledVersion && built.Config.Labels['org.opencontainers.image.revision'] === source.identity.sha,
       'product_release_controlled_image_identity_mismatch');
     const tests = list('.github/scripts').filter(name => /^release.*\.test\.mjs$/.test(name)).sort().map(name => '.github/scripts/' + name);
     need(tests.length > 0, 'product_release_controlled_tests_missing');
     execute(process.execPath, ['--test', ...tests, 'tools/release-qualification.test.mjs'], { stdio: 'inherit' });
     need(inspect().identity.tree_sha256 === source.identity.tree_sha256, 'product_release_controlled_source_drift');
-    receipt = { schema_version: 1, source: source.identity, version: '0.1.0', suite: 'controlled_release',
+    receipt = { schema_version: 1, source: source.identity, version: controlledVersion, suite: 'controlled_release',
       image_config_digest: imageConfigDigest(built), worker_sha256: worker.sha256, installer_sha256: worker.installer_sha256,
       outcome: 'passed', live_qualification: 'not_established', tests, cleanup: 'pending' };
     return { exit_code: 0, receipt };

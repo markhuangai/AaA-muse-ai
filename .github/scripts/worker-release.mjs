@@ -3,36 +3,38 @@ import { readFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { resolvePublication } from './image-policy.mjs';
 import { logEvent } from './ci-log.mjs';
+import { ReleaseFailure } from './release-manifest.mjs';
+import { candidateNpmTag, isFinalVersion, isRCTag, releaseVersion } from './release-versions.mjs';
+import { latestStableRelease, nextPatch } from './release-history.mjs';
 
 const prefix = 'refs/tags/worker-v';
 const rc = /^0\.1\.0-rc\.(0|[1-9][0-9]*)$/;
 const sha = /^[a-f0-9]{40}$/;
 const hash = value => createHash('sha256').update(value).digest('hex');
 
-export class ReleaseFailure extends Error {
-  constructor(code, fields = {}) { super(code); this.fields = fields; }
-}
+export { ReleaseFailure };
 function requireThat(ok, code, fields) { if (!ok) throw new ReleaseFailure(code, fields); }
 
 export function shippedInput(path) {
   return /^worker\/(src\/|setup\/)/.test(path) || ['worker/package.json', 'worker/tsconfig.json', 'worker/LICENSE', 'worker/README.md', 'worker/scripts/build.mjs', 'worker/scripts/package.mjs', 'package.json', 'package-lock.json', '.nvmrc'].includes(path);
 }
 
-export function chooseVersion(refs, source, paired = false) {
+export function chooseVersion(refs, source, paired = false, patch = 0) {
   let next = 0;
   const existing = [];
   for (const ref of refs) {
     const selectedPrefix = ref.ref.startsWith(prefix) ? prefix : paired && ref.ref.startsWith('refs/tags/v') ? 'refs/tags/v' : '';
     const version = ref.ref.slice(selectedPrefix.length);
-    if (!selectedPrefix || !rc.test(version)) continue;
+    const parsed = releaseVersion(version);
+    const pairedTag = selectedPrefix === 'refs/tags/v';
+    if (!selectedPrefix || !parsed || parsed.rc === null || (!pairedTag && parsed.patch !== 0)) continue;
     requireThat(ref.object.type === 'commit' && sha.test(ref.object.sha), 'worker_release_invalid_tag');
-    const number = Number(version.slice('0.1.0-rc.'.length));
-    requireThat(Number.isSafeInteger(number) && number < Number.MAX_SAFE_INTEGER, 'worker_release_version_overflow');
-    next = Math.max(next, number + 1);
-    if (ref.object.sha === source && (!paired || selectedPrefix === 'refs/tags/v')) existing.push(version);
+    requireThat(Number.isSafeInteger(parsed.patch) && Number.isSafeInteger(parsed.rc) && parsed.rc < Number.MAX_SAFE_INTEGER, 'worker_release_version_overflow');
+    if (parsed.patch === patch) next = Math.max(next, parsed.rc + 1);
+    if (ref.object.sha === source && (!paired || pairedTag)) existing.push(version);
   }
   requireThat(existing.length <= 1, 'worker_release_ambiguous_source_tags');
-  return existing[0] ?? `0.1.0-rc.${next}`;
+  return existing[0] ?? ('0.1.' + patch + '-rc.' + next);
 }
 
 function completedRelease(release, refs) {
@@ -43,7 +45,7 @@ function completedRelease(release, refs) {
     ['markhuangai-aaa-muse-worker-' + version + '.tgz', 'SHA256SUMS', 'worker-release.json'].every(name => release.assets?.filter(asset => asset.name === name).length === 1);
 }
 
-export async function prepareRelease({ github, context, paired = false }) {
+export async function prepareRelease({ github, context, paired = false, fetcher = fetch }) {
   let operation = 'source_verification';
   try {
   const source_sha = await resolvePublication({ github, context });
@@ -63,7 +65,8 @@ export async function prepareRelease({ github, context, paired = false }) {
     relevant = comparison.files.some(file => shippedInput(file.filename) || (file.previous_filename && shippedInput(file.previous_filename)));
   }
   operation = 'version_selection';
-  const version = chooseVersion(refs, source_sha, paired);
+  const patch = paired ? nextPatch(await latestStableRelease(releases, fetcher)) : 0;
+  const version = chooseVersion(refs, source_sha, paired, patch);
   const result = { source_sha, version, tag: (paired ? 'v' : 'worker-v') + version, should_publish: paired || relevant || current, ...(paired ? { paired: true } : {}) };
   logEvent(null, 'info', 'worker.release.prepared', result);
   return result;
@@ -104,7 +107,7 @@ function matchingBytes(actual, expected, destination) {
 }
 
 export async function publishRelease({ github, context, prepared, receipt, archive, token, fetcher = fetch, verifySource = () => resolvePublication({ github, context }), publishNpm = path => {
-  try { execFileSync('npm', ['publish', path, '--ignore-scripts', '--registry', 'https://npm.pkg.github.com', '--tag', prepared.candidate ? 'candidate' : 'rc', '--json', '--silent'], { env: { ...process.env, NODE_AUTH_TOKEN: token }, stdio: 'pipe', maxBuffer: 6144 }); }
+  try { execFileSync('npm', ['publish', path, '--ignore-scripts', '--registry', 'https://npm.pkg.github.com', '--tag', prepared.candidate ? candidateNpmTag(prepared.version) : 'rc', '--json', '--silent'], { env: { ...process.env, NODE_AUTH_TOKEN: token }, stdio: 'pipe', maxBuffer: 6144 }); }
   catch (error) {
     let npmCode = 'unavailable';
     try { const value = JSON.parse(String(error.stdout)); if (/^E[A-Z0-9_]+$/.test(value.error?.code ?? '')) npmCode = value.error.code; } catch { /* Raw registry error bodies are excluded by the repository CI exposure policy. */ }
@@ -117,7 +120,8 @@ export async function publishRelease({ github, context, prepared, receipt, archi
   const at = (nextOperation, nextDestination, expected = receipt.sha256) => { operation = nextOperation; destination = nextDestination; expectedDigest = expected; observedDigest = 'unavailable'; };
   const evidence = () => ({ source_sha, version, tag, operation, destination, expected_digest: expectedDigest, observed_digest: observedDigest, completed_destinations: [...completed] });
   try {
-  requireThat(prepared.should_publish && (rc.test(version) || (prepared.paired && prepared.candidate && version === '0.1.0')) && tag === (prepared.paired ? 'v' : 'worker-v') + version && sha.test(source_sha), 'worker_release_invalid_preparation');
+  const validVersion = prepared.candidate ? prepared.paired && isFinalVersion(version) : prepared.paired ? isRCTag('v' + version) : rc.test(version);
+  requireThat(prepared.should_publish && validVersion && tag === (prepared.paired ? 'v' : 'worker-v') + version && sha.test(source_sha), 'worker_release_invalid_preparation');
   requireThat(receipt.source?.source_sha === source_sha && receipt.source.source_dirty === false && receipt.source.package_version === version && receipt.version === version && receipt.package === '@markhuangai/aaa-muse-worker', 'worker_release_package_identity_mismatch');
   matchingBytes(archive, receipt.sha256, 'local_archive');
   observedDigest = hash(archive);
