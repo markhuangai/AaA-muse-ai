@@ -1,7 +1,11 @@
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
-import { ReleaseFailure } from './worker-release.mjs';
+import { isFinalVersion, isRCTag } from './release-versions.mjs';
+
+export class ReleaseFailure extends Error {
+  constructor(code, fields = {}) { super(code); this.fields = fields; }
+}
 
 export const repository = 'markhuangai/AaA-muse-ai';
 export const imageName = 'ghcr.io/markhuangai/aaa-muse-ai';
@@ -30,12 +34,13 @@ export function inspectWorkerBytes(bytes, { execute = execFileSync } = {}) {
     installer_sha256: hash(extract('package/setup/install.sh')) };
 }
 
-export function makeManifest({ source_sha, tree_sha, version, image_digest, image_config_digest, worker, publication_kind = 'rc' }) {
+export function makeManifest({ source_sha, tree_sha, version, image_digest, image_config_digest, worker, publication_kind = 'rc', source_rc }) {
   const manifest = { schema_version: 2, version, source_sha, tree_sha, protocol_version: 1, publication_kind,
     image: imageName + '@' + image_digest, image_config_digest,
     worker: { package: packageName, version, sha256: worker.sha256, archive: archiveName(version) },
     installer: { path: 'package/setup/install.sh', sha256: worker.installer_sha256 },
     outcome: 'complete', live_qualification: 'not_established' };
+  if (source_rc) manifest.source_rc = source_rc;
   need(worker.source?.source_sha === source_sha && worker.source.source_dirty === false && worker.source.package_version === version && worker.version === version,
     'product_release_worker_identity_mismatch');
   return validateManifest(manifest);
@@ -49,9 +54,14 @@ export function validateManifest(value, { historical = false } = {}) {
   if (value.schema_version === undefined && historical) return { ...value, missing_identity_fields: ['tree_sha', 'protocol_version', 'installer.sha256'] };
   need(value.schema_version === 2 && sha(value.tree_sha) && value.protocol_version === 1 &&
     ['rc', 'candidate'].includes(value.publication_kind) && value.installer?.path === 'package/setup/install.sh' && digest(value.installer.sha256) &&
-    (value.publication_kind === 'candidate' ? value.version === '0.1.0' : /^0\.1\.0-rc\.(0|[1-9][0-9]*)$/.test(value.version)), 'product_release_manifest_identity_incomplete');
+    (value.publication_kind === 'candidate' ? isFinalVersion(value.version) : isRCTag('v' + value.version)), 'product_release_manifest_identity_incomplete');
+  if (value.source_rc !== undefined) need(value.publication_kind === 'candidate' && validRCIdentity(value.source_rc), 'product_release_rc_identity_invalid');
   return value;
 }
+
+export const validRCIdentity = value => isRCTag(value?.tag) && digest(value?.manifest_sha256);
+export const sameRC = (left, right) => validRCIdentity(left) && validRCIdentity(right) &&
+  left.tag === right.tag && left.manifest_sha256 === right.manifest_sha256;
 
 export function sameDigest(observed, expected, destination) {
   need(observed === expected, 'product_release_artifact_conflict', { destination, expected_digest: expected, observed_digest: observed });

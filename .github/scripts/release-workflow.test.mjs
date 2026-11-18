@@ -13,6 +13,10 @@ test('release workflow keeps executable trust, original bundle retention, shared
   }
   const build = workflow.jobs.build;
   assert.match(build.if, /resume_run_id == ''/);
+  assert.match(build.name, /^Build final candidate /);
+  assert(!Object.hasOwn(workflow.on.workflow_dispatch.inputs, 'source_sha'));
+  assert.notEqual(workflow.on.workflow_dispatch.inputs.version.required, true);
+  assert.match(JSON.stringify(workflow.jobs.resolve), /requestedVersion/);
   const upload = build.steps.find(step => step.uses?.startsWith('actions/upload-artifact@'));
   assert.equal(upload.with['retention-days'], 7); assert.equal(upload.with.overwrite, false);
   const freeze = build.steps.find(step => step.name === 'Freeze original image and worker bytes before any publication');
@@ -22,7 +26,9 @@ test('release workflow keeps executable trust, original bundle retention, shared
   assert(publish.steps.some(step => step.uses?.startsWith('actions/download-artifact@') && step.with['run-id']));
   assert.equal(publish.steps.find(step => step.uses?.startsWith('actions/download-artifact@')).with.path, upload.with.path);
   assert(!JSON.stringify(workflow.jobs.promote).includes('smoke-image'));
+  assert(!JSON.stringify(workflow.jobs.promote).includes('SOURCE_SHA'));
   assert(JSON.stringify(workflow.jobs.promote).includes('QUALIFICATION_SHA256'));
+  assert.match(JSON.stringify(workflow.jobs.promote), /promoteRelease/);
   const ci = parse(readFileSync('.github/workflows/ci.yml', 'utf8'));
   assert.equal(ci.jobs.release.name, 'Release / verify'); assert(ci.jobs.release.steps.some(step => step.run === 'make verify-release'));
 });
