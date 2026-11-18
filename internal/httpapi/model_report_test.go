@@ -15,10 +15,12 @@ func TestWorkerModelReportIsFencedAndOptional(t *testing.T) {
 	defer server.Close()
 	const reported = "2026-11-18T01:02:03Z"
 	const fixtureName = "Controlled Muse"
-	encoded := func(fragment string) string {
-		return base64.RawURLEncoding.EncodeToString([]byte("{\"reported_at\":\"" + reported + "\"," + fragment + "}"))
+	encodedAt := func(at, fragment string) string {
+		return base64.RawURLEncoding.EncodeToString([]byte("{\"reported_at\":\"" + at + "\"," + fragment + "}"))
 	}
-	valid := encoded("\"model_name\":\"" + fixtureName + "\",\"context_window_tokens\":350000")
+	encoded := func(fragment string) string { return encodedAt(reported, fragment) }
+	fields := "\"model_name\":\"" + fixtureName + "\",\"context_window_tokens\":350000"
+	valid := encoded(fields)
 	knownCredential := "client-private-sentinel"
 	for i, tc := range []struct {
 		values []string
@@ -26,11 +28,12 @@ func TestWorkerModelReportIsFencedAndOptional(t *testing.T) {
 		ok     bool
 	}{
 		{values: []string{valid}, ok: true},
-		{values: []string{valid}, ok: true},
+		{values: []string{encodedAt("2026-11-18T02:02:03+01:00", fields)}, ok: true},
 		{},
 		{values: []string{valid, valid}, cause: "invalid_model_report_header"},
 		{values: []string{strings.Repeat("a", 700)}, cause: "invalid_model_report_header"},
 		{values: []string{"!invalid"}, cause: "invalid_model_report_encoding"},
+		{values: []string{encodedAt("9999-12-31T23:59:59-01:00", fields)}, cause: "invalid_reported_at"},
 		{values: []string{encoded("\"model_name\":\"x\",\"extra\":true")}, cause: "unsupported_field_spelling"},
 		{values: []string{encoded("\"model_name\":null")}, cause: "incomplete_model_report"},
 		{values: []string{encoded("\"model_name\":\"\\n\"")}, cause: "invalid_model_name"},

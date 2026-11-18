@@ -50,5 +50,8 @@ func (h *Handler) readModelReport(headers http.Header) (*inference.ModelReport, 
 		return nil, errors.New("invalid_context_window")
 	}
 	report.ReportedAt = report.ReportedAt.UTC()
+	if _, err = report.ReportedAt.MarshalJSON(); err != nil {
+		return nil, errors.New("invalid_reported_at")
+	}
 	return &report, nil
 }
