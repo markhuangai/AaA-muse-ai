@@ -115,6 +115,10 @@ func (h *Handler) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 	route, requestedWorker := routeFor(r.URL.Path)
 	logger := h.Logger.With("request_id", id, "route", route)
 	w := &response{ResponseWriter: out, capture: route != "/api/v1/admin/diagnostics/export" && route != "/api/v1/portal/login", openAI: chatRoute(route), now: h.Now}
+	if isMediaRoute(route) {
+		w.capture = false
+		w.captureReason = "media_content_omitted"
+	}
 	if route == "/api/v1/portal/login" {
 		w.captureReason = "credentials_omitted"
 	}
@@ -176,7 +180,7 @@ func (h *Handler) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 		expectedRole = "management"
 	} else if strings.HasPrefix(route, "/api/v1/portal/") && route != "/api/v1/portal/login" {
 		expectedRole = "portal_session"
-	} else if strings.HasPrefix(route, "/api/v1/requests") || chatRoute(route) {
+	} else if strings.HasPrefix(route, "/api/v1/requests") || strings.HasPrefix(route, mediaJobs) || chatRoute(route) {
 		expectedRole = "client"
 	} else if strings.HasPrefix(route, "/api/v1/worker/") && route != "/api/v1/worker/enroll" {
 		expectedRole = "worker"
@@ -204,7 +208,7 @@ func (h *Handler) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 			}
 			role, identity = "worker", viewWorker(record)
 		}
-		if role != expectedRole && !(expectedRole == "management" && role == "portal_session") {
+		if role != expectedRole && !(expectedRole == "management" && role == "portal_session" && route != mediaTrials) {
 			event := "auth.denied"
 			if strings.HasPrefix(route, "/api/v1/worker/") || route == "/api/v1/admin/enrollments" || strings.HasPrefix(route, "/api/v1/admin/workers") {
 				event = "worker.auth_denied"
@@ -226,6 +230,10 @@ func (h *Handler) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !h.workerCompatibility(w, r, logger, route) {
+		return
+	}
+	if isMediaRoute(route) {
+		h.serveMedia(w, r, logger, route, requestedWorker, clientID, identity.ID)
 		return
 	}
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, MaxBodyBytes))

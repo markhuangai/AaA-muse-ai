@@ -20,6 +20,7 @@ import (
 	"github.com/markhuangai/AaA-muse-ai/internal/config"
 	"github.com/markhuangai/AaA-muse-ai/internal/diagnostics"
 	"github.com/markhuangai/AaA-muse-ai/internal/httpapi"
+	"github.com/markhuangai/AaA-muse-ai/internal/media"
 	"github.com/markhuangai/AaA-muse-ai/internal/postgres"
 	"github.com/markhuangai/AaA-muse-ai/internal/service"
 )
@@ -32,6 +33,7 @@ type Repository interface {
 	Close()
 }
 type Dependencies struct {
+	MediaDir       string
 	ReadFile       func(string) ([]byte, error)
 	LookupEnv      func(string) (string, bool)
 	Random         io.Reader
@@ -46,7 +48,7 @@ type Dependencies struct {
 }
 
 func Production(stdout, stderr io.Writer) Dependencies {
-	return Dependencies{ReadFile: os.ReadFile, LookupEnv: os.LookupEnv, Random: rand.Reader, Now: time.Now, Sleep: sleep, Wait: sleep, Files: diagnostics.OSFiles{}, PortalAssets: os.DirFS("/usr/share/aaa-muse-ai/portal"), OpenDB: func(ctx context.Context, u string) (Repository, error) {
+	return Dependencies{MediaDir: "/var/lib/aaa-muse-ai/media", ReadFile: os.ReadFile, LookupEnv: os.LookupEnv, Random: rand.Reader, Now: time.Now, Sleep: sleep, Wait: sleep, Files: diagnostics.OSFiles{}, PortalAssets: os.DirFS("/usr/share/aaa-muse-ai/portal"), OpenDB: func(ctx context.Context, u string) (Repository, error) {
 		repo, err := postgres.Open(ctx, u)
 		if err != nil {
 			return nil, err
@@ -130,6 +132,9 @@ func Run(ctx context.Context, args []string, build service.Build, d Dependencies
 	}
 	defer repo.Close()
 	broker := service.NewBroker(repo, d.Random, d.Now, d.Wait, c.Limits.MaxJobs)
+	if d.MediaDir != "" {
+		broker.Media = media.New(d.MediaDir)
+	}
 	if err = broker.Recover(ctx, startup); err != nil {
 		return 1
 	}
@@ -137,6 +142,10 @@ func Run(ctx context.Context, args []string, build service.Build, d Dependencies
 	case <-failed:
 		return 1
 	default:
+	}
+	if err := broker.CleanupMedia(ctx, startup); err != nil {
+		startup.Error("media.cleanup_failed", "stage", "startup", "cause", err.Error())
+		return 1
 	}
 	listener, err := d.Listen("tcp", c.Server.Listen)
 	if err != nil {

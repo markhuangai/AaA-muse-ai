@@ -1,3 +1,4 @@
+import { drainMedia } from './media.js';
 import { Worker } from './worker.js';
 import { Failure, cause, requireValue } from './errors.js';
 import { connection, correlation } from './protocol.js';
@@ -7,6 +8,8 @@ import type { Transport } from './transport.js';
 export class Subscriber {
   active?: ObjectValue;
   lastEvent = '';
+  private mediaUpload?: Promise<void>;
+  private mediaFailure?: unknown;
   constructor(readonly worker: Worker) {}
   async heartbeat(transport: Transport, challenge: ObjectValue): Promise<void> {
     connection(challenge);
@@ -77,6 +80,8 @@ export class Subscriber {
               await worker.logger.log('INFO', 'worker.connected', { worker_id: worker.config.worker_id, ...event.data });
             } else if (event.type === 'health.challenge') {
               await this.heartbeat(transport, event.data);
+              if (this.mediaFailure) throw this.mediaFailure;
+              this.mediaUpload ??= drainMedia(worker, transport).catch(error => { this.mediaFailure = error; }).finally(() => { this.mediaUpload = undefined; });
               attempt = 0;
             } else if (event.type === 'job.available') {
               requireValue(this.active && event.data.worker_id === worker.config.worker_id, 'job_owner_mismatch');
@@ -111,6 +116,7 @@ export class Subscriber {
         }
       }
       throw error;
-    } finally { await release(); }
+    } finally { await this.mediaUpload;
+      await release(); }
   }
 }

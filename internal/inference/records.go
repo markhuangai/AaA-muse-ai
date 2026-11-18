@@ -115,7 +115,38 @@ type Delivery struct {
 	Tools           []Tool `json:"tools"`
 }
 
+type MediaStream struct {
+	Type  string `json:"type"`
+	Codec string `json:"codec"`
+}
+
+type MediaProperties struct {
+	MediaType   string        `json:"media_type"`
+	Size        int64         `json:"size"`
+	SHA256      string        `json:"sha256"`
+	Duration    float64       `json:"duration"`
+	Width       int           `json:"width,omitempty"`
+	Height      int           `json:"height,omitempty"`
+	FPS         float64       `json:"fps,omitempty"`
+	VideoFrames int           `json:"video_frames,omitempty"`
+	Streams     []MediaStream `json:"streams"`
+}
+
+// Media contains the durable receipt. Customer prompts and file bytes live only in the private spool.
+type Media struct {
+	Owner       string           `json:"owner"`
+	Profile     string           `json:"profile"`
+	PromptHash  string           `json:"prompt_sha256,omitempty"`
+	InputHash   string           `json:"input_sha256,omitempty"`
+	InputType   string           `json:"input_type,omitempty"`
+	InputSize   int64            `json:"input_size,omitempty"`
+	Artifact    *MediaProperties `json:"artifact,omitempty"`
+	CommittedAt *time.Time       `json:"committed_at,omitempty"`
+	ExpiresAt   *time.Time       `json:"expires_at,omitempty"`
+}
+
 type Job struct {
+	Media                *Media         `json:"media,omitempty"`
 	Version              int            `json:"protocol_version"`
 	ID                   string         `json:"id"`
 	ExperimentID         string         `json:"experiment_id"`
@@ -149,6 +180,7 @@ type ModelReport struct {
 }
 
 type Connection struct {
+	MediaJobs            bool         `json:"media_jobs,omitempty"`
 	ID                   string       `json:"connection_id"`
 	Generation           int64        `json:"connection_generation"`
 	AssignmentGeneration int64        `json:"assignment_generation"`
@@ -212,6 +244,7 @@ type Ref struct {
 }
 
 type State struct {
+	DatabaseTime          func() (time.Time, error) `json:"-"`
 	WorkerID              string
 	Revoked               bool
 	Now                   time.Time

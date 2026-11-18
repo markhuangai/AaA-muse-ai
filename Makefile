@@ -6,7 +6,7 @@ SOURCE_DIRTY ?= $(shell test -z "$$(git --no-optional-locks status --porcelain -
 PRODUCT_VERSION ?= $(if $(WORKER_RELEASE_VERSION),$(WORKER_RELEASE_VERSION),$(shell node -p "require('./worker/package.json').version"))
 PRODUCT_E2E_SHARD ?= all
 
-.PHONY: verify-release check-ci-policy check-file-sizes test-unit-coverage check-workflows check-service test-service-unit test-service test-worker-auth test-inference test-history test-routing test-broker-recovery test-chat test-responses smoke-image image worker-package test-worker-transport test-worker-setup test-worker-recovery test-portal-shell test-portal-workers test-portal-history test-product-e2e
+.PHONY: test-media verify-release check-ci-policy check-file-sizes test-unit-coverage check-workflows check-service test-service-unit test-service test-worker-auth test-inference test-history test-routing test-broker-recovery test-chat test-responses smoke-image image worker-package test-worker-transport test-worker-setup test-worker-recovery test-portal-shell test-portal-workers test-portal-history test-product-e2e
 
 verify-release:
 	node tools/verify-release.mjs
@@ -45,6 +45,9 @@ test-inference: image
 test-history: image
 	npm run build --workspace worker
 	python3 -B tests/integration/history.py --image $(SERVICE_IMAGE) --source-sha $(SOURCE_SHA) --source-dirty $(SOURCE_DIRTY)
+
+test-media: image worker-package
+	python3 -B tests/integration/media.py --image $(SERVICE_IMAGE) --source-sha $(SOURCE_SHA) --source-dirty $(SOURCE_DIRTY) --package-receipt .artifacts/worker-package/latest.json
 
 test-routing: image
 	npm run build --workspace worker

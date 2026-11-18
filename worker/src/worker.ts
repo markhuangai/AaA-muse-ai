@@ -1,3 +1,4 @@
+import { prepareMedia } from './media.js';
 import { State } from './state.js';
 import { Logger } from './diagnostics.js';
 import { Transport, origin, validateBody, type Network } from './transport.js';
@@ -244,6 +245,7 @@ export class Worker {
     const transport = await this.load();
     await this.identity(transport);
     const current = await this.getJob(transport, id);
+    if (current.media) return prepareMedia(this, transport, current);
     await this.logger.log('DEBUG', 'worker.context', { ...correlation(current), context: current.context });
     await this.publish(current, text(current.state), 'context_shown');
     return { protocol_version: 1, ...correlation(current), state: current.state, context: current.context };
@@ -255,6 +257,7 @@ export class Worker {
       const transport = await this.load();
       await this.identity(transport);
       current = await this.getJob(transport, id);
+      requireValue(!current.media, 'media_upload_required');
       try {
         validateBody(input);
         await this.logger.log('DEBUG', 'worker.decision_input', { ...correlation(current), input: parse(input), input_complete: true });

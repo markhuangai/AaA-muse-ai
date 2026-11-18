@@ -236,6 +236,9 @@ func (b *Broker) Decide(ctx context.Context, logger *slog.Logger, workerID, id s
 		if j == nil {
 			return nil, inference.Reject("inference_not_found", 404)
 		}
+		if j.Media != nil {
+			return nil, inference.Reject("media_upload_required", 409)
+		}
 		if err := assignmentConnection(s, j, d.ConnectionID, d.ConnectionGeneration, d.Generation); err != nil {
 			return nil, err
 		}

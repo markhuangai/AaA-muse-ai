@@ -112,7 +112,12 @@ func (r *Repository) WithinInference(ctx context.Context, ref inference.Ref, app
 		if s.Revoked && ref.WorkerAuth != "" {
 			return inference.Reject("worker_revoked", 401, "correlation", ref.Correlation, "expected_worker_id", ref.WorkerID, "observed_worker_id", ref.WorkerAuth)
 		}
-		if err = tx.QueryRow(ctx, "SELECT clock_timestamp()").Scan(&s.Now); err != nil {
+		s.DatabaseTime = func() (time.Time, error) {
+			var now time.Time
+			err := tx.QueryRow(ctx, "SELECT clock_timestamp()").Scan(&now)
+			return now, err
+		}
+		if s.Now, err = s.DatabaseTime(); err != nil {
 			return err
 		}
 		var data []byte

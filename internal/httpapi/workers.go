@@ -20,6 +20,9 @@ import (
 var workerIDPattern = regexp.MustCompile(`^[0-9a-f]{32}$`)
 
 func routeFor(path string) (string, string) {
+	if route, id := mediaRoute(path); route != "" {
+		return route, id
+	}
 	switch path {
 	case "/api/v1/portal/login", "/api/v1/portal/logout", "/api/v1/portal/settings", "/api/v1/portal/events":
 		return path, ""
@@ -48,6 +51,10 @@ func routeFor(path string) (string, string) {
 
 func routeMethod(route string) string {
 	switch route {
+	case mediaJobs, mediaTrials:
+		return http.MethodPost
+	case workerMediaArtifact:
+		return http.MethodPut
 	case "/api/v1/portal/login", "/api/v1/portal/logout", "/api/v1/portal/events":
 		return http.MethodPost
 	case "/v1/chat/completions", "/v1/responses", "/api/v1/admin/workers/{id}/qualifications", "/api/v1/admin/enrollments", "/api/v1/admin/setup-prompts", "/api/v1/worker/enroll", "/api/v1/admin/workers/{id}/revoke":

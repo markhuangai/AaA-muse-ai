@@ -20,6 +20,7 @@ services:
         bind:
           create_host_path: false
       - diagnostics:/var/lib/aaa-muse-ai/diagnostics
+      - media:/var/lib/aaa-muse-ai/media
     depends_on:
       database:
         condition: service_healthy
@@ -50,3 +51,4 @@ services:
 volumes:
   database:
   diagnostics:
+  media:

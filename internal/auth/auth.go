@@ -47,6 +47,8 @@ func New(c config.Config) *Authority {
 	return a
 }
 
+func (a *Authority) HasClient(name string) bool { _, ok := a.clients[name]; return ok }
+
 func (a *Authority) Role(header string) string {
 	role, _ := a.Identity(header)
 	return role

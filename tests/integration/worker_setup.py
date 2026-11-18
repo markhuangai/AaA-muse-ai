@@ -335,6 +335,8 @@ def run(harness_type=WorkerSetup, suite="worker-setup"):
             require(h.docker("image", "inspect", h.fixture_image, success=False).returncode != 0, "fixture image cleanup unproven")
             h.private("setup-image-cleanup.json", json.dumps({"removed": h.fixture_image, "image_id": info["Id"], "owner": h.owner}))
 
+    return h
+
 
 if __name__ == "__main__":
     run()

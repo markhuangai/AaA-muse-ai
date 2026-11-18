@@ -16,6 +16,15 @@ class TLSFixture:
         self.connections = []
         self.lock = threading.Lock()
         self.drop_decision = False
+        self.interrupt_media = False
+        self.media_interrupted = threading.Event()
+        self.slow_media = False
+        self.media_pause_path = None
+        self.media_release = threading.Event()
+        self.media_finished = threading.Event()
+        self.media_status = None
+        self.lose_media_ack = False
+        self.media_ack_lost = threading.Event()
         self.dropped = 0
         self.expire_heartbeat = False
         self.delayed_heartbeat = None
@@ -46,6 +55,9 @@ class TLSFixture:
                 return
 
             def do_GET(self):
+                self.forward()
+
+            def do_PUT(self):
                 self.forward()
 
             def do_POST(self):
@@ -90,12 +102,44 @@ class TLSFixture:
                             # Expire liveness while leaving time for the final HTTP attempt to receive the broker's refusal.
                             time.sleep(max(0, delayed[1] - time.monotonic()))
                     headers = {key: self.headers[key] for key in ("Authorization", "Content-Type", "X-Request-Id",
-                               "X-Muse-Worker-Version", "X-Muse-Worker-Model-Report") if key in self.headers}
-                    connection.request(self.command, self.path, body=body or None, headers=headers)
+                               "X-Muse-Worker-Version", "X-Muse-Worker-Model-Report", "X-Muse-Media-Jobs",
+                               "X-Muse-Artifact-Sha256", "X-Muse-Connection-Id", "X-Muse-Connection-Generation",
+                               "X-Muse-Generation", "X-Muse-Lease-Id") if key in self.headers}
+                    if self.command == "PUT" and fixture.interrupt_media:
+                        headers["Content-Length"] = str(len(body))
+                        connection.request("PUT", self.path, body=body[:len(body) // 2], headers=headers)
+                        connection.sock.shutdown(socket.SHUT_WR)
+                        connection.getresponse().read()
+                        fixture.media_interrupted.set()
+                        self.send_error(503)
+                        return
+                    pause = self.command == "PUT" and self.path == fixture.media_pause_path
+                    if self.command == "PUT" and (fixture.slow_media or pause):
+                        split = max(1, len(body) // 2)
+                        headers["Content-Length"] = str(len(body))
+                        connection.request("PUT", self.path, body=body[:split], headers=headers)
+                        if pause:
+                            if not fixture.media_release.wait(timeout=35):
+                                raise TimeoutError("media precommit checkpoint expired")
+                        else:
+                            fixture.slow_media = False
+                            time.sleep(11)
+                        connection.send(body[split:])
+                    else:
+                        connection.request(self.command, self.path, body=body or None, headers=headers)
                     response = connection.getresponse()
+                    if pause:
+                        fixture.media_status = response.status
+                        fixture.media_finished.set()
                     streaming = self.path == "/api/v1/worker/events" and response.status == 200
                     if not streaming:
                         payload = response.read()
+                        if self.command == "PUT" and fixture.lose_media_ack and response.status == 200:
+                            fixture.lose_media_ack = False
+                            fixture.media_ack_lost.set()
+                            self.connection.shutdown(socket.SHUT_RDWR)
+                            self.close_connection = True
+                            return
                         with fixture.lock:
                             paused_claim = fixture.pause_claim and self.path.endswith('/claim') and response.status == 200
                             if paused_claim:

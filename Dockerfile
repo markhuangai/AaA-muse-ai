@@ -1,5 +1,5 @@
 FROM golang:1.27.3-alpine3.24@sha256:fa3d596898d9f126af7c01d14ee7597bab3f39cccf392ef36b69fe77cd681f18 AS tools
-RUN apk add --no-cache build-base
+RUN apk add --no-cache build-base ffmpeg
 WORKDIR /src
 
 FROM node:24.22.2-alpine3.24@sha256:a34ab6d7f6f4813f4d0c5469d74685604b962fbdbf5793a7bc7b4998ecb867c8 AS frontend
@@ -25,10 +25,10 @@ ARG WORKER_SHA256
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.revision=${SOURCE_SHA} -X main.dirty=${SOURCE_DIRTY} -X main.version=${PRODUCT_VERSION} -X main.workerSHA256=${WORKER_SHA256}" -o /out/service ./cmd/service
 
 FROM alpine:3.24@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf AS runtime
-RUN addgroup -g 10001 service && adduser -D -H -u 10001 -G service service \
-    && mkdir -p /etc/aaa-muse-ai /var/lib/aaa-muse-ai/diagnostics \
-    && chown service:service /var/lib/aaa-muse-ai/diagnostics \
-    && chmod 0700 /var/lib/aaa-muse-ai/diagnostics
+RUN apk add --no-cache ffmpeg && addgroup -g 10001 service && adduser -D -H -u 10001 -G service service \
+    && mkdir -p /etc/aaa-muse-ai /var/lib/aaa-muse-ai/diagnostics /var/lib/aaa-muse-ai/media \
+    && chown service:service /var/lib/aaa-muse-ai/diagnostics /var/lib/aaa-muse-ai/media \
+    && chmod 0700 /var/lib/aaa-muse-ai/diagnostics /var/lib/aaa-muse-ai/media
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=build /out/service /usr/local/bin/service
 COPY --from=frontend /src/portal/dist /usr/share/aaa-muse-ai/portal
