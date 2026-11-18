@@ -1,0 +1,143 @@
+package httpapi
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"io"
+	"mime/multipart"
+	"net/http/httptest"
+	"os"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/markhuangai/AaA-muse-ai/internal/inference"
+	"github.com/markhuangai/AaA-muse-ai/internal/media"
+)
+
+func TestMediaHTTP(t *testing.T) {
+	h, db, w, key := inferenceHTTPFixture(t)
+	c := onlineHTTP(t, h, w.ID)
+	db.states[w.ID].Connection.MediaJobs = true
+	db.states[w.ID].Routing.Qualifications = []inference.Qualification{{Capabilities: []string{"text"}, Input: inference.QualificationInput{Action: "approve"}}}
+	h.Broker.Media = media.New(t.TempDir())
+	h.Broker.Media.Inspect = func(_ context.Context, path, kind string) (inference.MediaProperties, error) {
+		_, err := os.Stat(path)
+		return inference.MediaProperties{MediaType: kind, Width: 64, Height: 48, Duration: 1, VideoFrames: 24}, err
+	}
+	const client = "client-private-sentinel"
+	const admin = "admin-private-sentinel"
+	req := func(method, path, principal, kind string, body []byte, headers map[string]string, status int) *httptest.ResponseRecorder {
+		t.Helper()
+		r := httptest.NewRequest(method, path, bytes.NewReader(body))
+		r.Header.Set("Authorization", "Bearer "+principal)
+		r.Header.Set("Content-Type", kind)
+		for k, v := range headers {
+			r.Header.Set(k, v)
+		}
+		out := httptest.NewRecorder()
+		h.ServeHTTP(out, r)
+		if out.Code != status {
+			t.Fatalf("%s %s got %d expected %d: %s", method, path, out.Code, status, out.Body.String())
+		}
+		return out
+	}
+	for _, pair := range []struct {
+		body string
+		code int
+	}{{"{}", 400}, {`{"prompt":"x","submission_id":"ok","bad":true}`, 400}, {`{"prompt":"   ","submission_id":"ok"}`, 400}, {`{"prompt":"` + strings.Repeat("m", 4097) + `","submission_id":"ok"}`, 413}} {
+		req("POST", mediaJobs, client, "application/json", []byte(pair.body), nil, pair.code)
+	}
+	req("POST", mediaJobs, client, "text/plain", nil, nil, 415)
+	req("POST", mediaJobs+"?other", client, "application/json", nil, nil, 400)
+	input := []byte(`{"prompt":"private-media-user-text","submission_id":"user-job"}`)
+	req("POST", mediaJobs, admin, "application/json", input, nil, 401)
+	created := req("POST", mediaJobs, client, "application/json", input, nil, 202)
+	var row struct {
+		ID string `json:"job_id"`
+	}
+	if err := json.Unmarshal(created.Body.Bytes(), &row); err != nil {
+		t.Fatal(err)
+	}
+	if replay := req("POST", mediaJobs, client, "application/json", input, nil, 202); replay.Body.String() != created.Body.String() {
+		t.Fatal("submission replay changed")
+	}
+	req("POST", mediaJobs, client, "application/json", bytes.ReplaceAll(input, []byte("user-text"), []byte("changed")), nil, 409)
+	url := mediaJobs + "/" + row.ID
+	req("GET", url, client, "", nil, nil, 200)
+	req("GET", url+"/artifact", client, "", nil, nil, 409)
+	workerRoute := "/api/v1/worker/jobs/" + row.ID
+	claim := apiJSON(t, h, "POST", workerRoute+"/claim", key, map[string]any{"protocol_version": 1, "submission_id": "claim-media", "connection_id": c.ID, "connection_generation": c.Generation}, 200)
+	headers := map[string]string{"X-Muse-Connection-Id": c.ID, "X-Muse-Connection-Generation": "1", "X-Muse-Generation": "1", "X-Muse-Lease-Id": claim["lease_id"].(string)}
+	if actual := req("GET", workerRoute+"/media/prompt", key, "", nil, headers, 200); actual.Body.String() != "private-media-user-text" {
+		t.Fatal("wrong prompt")
+	}
+	req("GET", workerRoute+"/media/image", key, "", nil, headers, 404)
+	payload := []byte("private-byte-sentinel")
+	digest := sha256.Sum256(payload)
+	req("PUT", workerRoute+"/artifact", key, "video/mp4", payload, headers, 400)
+	headers["X-Muse-Artifact-Sha256"] = hex.EncodeToString(digest[:])
+	req("PUT", workerRoute+"/artifact", key, "audio/wav", payload, headers, 415)
+	req("PUT", workerRoute+"/artifact", key, "video/mp4", payload, headers, 200)
+	req("PUT", workerRoute+"/artifact", key, "video/mp4", payload, headers, 200)
+	download := req("GET", url+"/artifact", client, "", nil, nil, 200)
+	if !bytes.Equal(download.Body.Bytes(), payload) || download.Header().Get("Cache-Control") != "no-store" {
+		t.Fatal("unprotected or changed artifact")
+	}
+	job := db.states[w.ID].Jobs[row.ID]
+	past := time.Now().Add(-time.Second)
+	job.Media.ExpiresAt = &past
+	req("GET", url+"/artifact", client, "", nil, nil, 410)
+	req("POST", mediaTrials, client, "application/json", nil, nil, 401)
+	req("POST", mediaTrials, admin, "application/json", []byte("{}"), nil, 400)
+	trial, _ := json.Marshal(map[string]string{"worker_id": w.ID, "owner": "client", "profile": "native_mp3", "submission_id": "trial"})
+	req("POST", mediaTrials, admin, "application/json", trial, nil, 202)
+	if strings.Contains(db.output.String(), "private-media-user-text") || strings.Contains(db.output.String(), string(payload)) {
+		t.Fatal("raw media captured")
+	}
+}
+
+func TestMediaMultipartBoundary(t *testing.T) {
+	store := media.New(t.TempDir())
+	store.Inspect = func(context.Context, string, string) (inference.MediaProperties, error) {
+		return inference.MediaProperties{}, nil
+	}
+	for _, kind := range []string{"valid", "duplicate", "missing", "unsupported", "unknown"} {
+		var b bytes.Buffer
+		w := multipart.NewWriter(&b)
+		w.WriteField("prompt", "motion")
+		w.WriteField("submission_id", "image1")
+		if kind == "duplicate" {
+			w.WriteField("prompt", "other")
+		}
+		if kind == "unknown" {
+			w.WriteField("profile", "native_mp3")
+		}
+		if kind != "missing" {
+			p, err := w.CreateFormFile("image", "a.png")
+			if err != nil {
+				t.Fatal(err)
+			}
+			data := "\x89PNG\r\n\x1a\nimage"
+			if kind == "unsupported" {
+				data = "gif"
+			}
+			io.WriteString(p, data)
+		}
+		w.Close()
+		r := httptest.NewRequest("POST", mediaJobs, &b)
+		r.Header.Set("Content-Type", w.FormDataContentType())
+		stage, err := store.Begin()
+		if err != nil {
+			t.Fatal(err)
+		}
+		in, err := readMediaRequest(r.Context(), r, store, stage)
+		stage.Close()
+		if kind == "valid" && (err != nil || in.Submission != "image1" || stage.Record.InputType != "image/png") || kind != "valid" && err == nil {
+			t.Fatal(kind, in, err)
+		}
+	}
+}

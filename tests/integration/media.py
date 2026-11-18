@@ -1,0 +1,258 @@
+"""Controlled artifact delivery using the production broker, PostgreSQL and installed packed worker."""
+import hashlib
+import http.client
+import urllib.parse
+import json
+import os
+import secrets
+import struct
+import subprocess
+import time
+from datetime import datetime
+from pathlib import Path
+
+from product import PackedModel, Product
+from service import require
+from worker_setup import run
+
+
+def sha(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def timestamp(value):
+    return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+
+
+def multipart(fields, image, kind):
+    boundary = "aaa-" + secrets.token_hex(16)
+    pieces = []
+    for k, v in fields.items():
+        pieces.append((f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n').encode())
+    pieces += [(f'--{boundary}\r\nContent-Disposition: form-data; name="image"; filename="source"\r\nContent-Type: {kind}\r\n\r\n').encode(),
+               image, f'\r\n--{boundary}--\r\n'.encode()]
+    return b''.join(pieces), {"Content-Type": "multipart/form-data; boundary=" + boundary}
+
+
+class MediaFlow(Product):
+    def launch(self, *args, **kwargs):
+        if not hasattr(self, "media_volume"):
+            self.media_volume = self.volume("media")
+        return super().launch(*args, **kwargs, media_volume=self.media_volume)
+
+    def render(self, ext, *args):
+        path = "/tmp/controlled-" + secrets.token_hex(8) + "." + ext
+        self.docker("exec", self.broker, "ffmpeg", "-nostdin", "-v", "error", *args, "-threads", "1", "-y", path)
+        return subprocess.run(["docker", "exec", self.broker, "cat", path], check=True, capture_output=True, timeout=30).stdout
+
+    def inputs(self):
+        stills = {kind: self.render(ext, "-f", "lavfi", "-i", "color=c=blue:s=64x48", "-frames:v", "1")
+                  for kind, ext in (("image/webp", "webp"), ("image/png", "png"), ("image/jpeg", "jpg"))}
+        video = self.render("mp4", "-f", "lavfi", "-i", "testsrc2=s=64x48:r=8", "-t", "1", "-c:v", "libx264")
+        self.sentinel = ("controlled-binary-" + secrets.token_hex(12)).encode()
+        private = (self.sentinel * 250000)[:3900000]
+        video += struct.pack(">I4s", 8 + len(private), b"free") + private
+        audios = {profile: self.render(ext, "-f", "lavfi", "-i", "sine=frequency=400:duration=0.25", "-c:a", codec)
+                  for profile, ext, codec in (("native_mp3", "mp3", "libmp3lame"), ("offline_wav", "wav", "pcm_s16le"))}
+        return stills, video, audios
+
+    def exercise(self):
+        worker = self.environment("media")
+        worker["slot"] = "media"
+        self.install(worker, self.prompt())
+        ready = PackedModel(self, worker).start()
+        try:
+            self.qualify_packed(worker)
+        finally:
+            ready.stop()
+        foreign = self.new_worker()
+        stills, video, audios = self.inputs()
+        prompt = "private-motion-" + secrets.token_hex(20)
+        jobs = []
+        for case, image in [*stills.items(), ("prompt_video", None), *audios.items()]:
+            motion = "\ufeff" + prompt if case == "prompt_video" else prompt
+            fields = {"prompt": motion, "submission_id": secrets.token_hex(16)}
+            route = "/api/v1/media/jobs"
+            key = self.client
+            if case in audios:
+                raw, headers, key, route = None, None, self.admin, "/api/v1/admin/media/trials"
+                fields = {"submission_id": fields["submission_id"], "profile": case, "owner": "fixture-client",
+                          "worker_id": worker["worker"]["id"], "fixture_sha256": sha(image), "fixture_bytes": len(image)}
+            elif image:
+                raw, headers = multipart(fields, image, case)
+            else:
+                raw, headers = None, None
+
+            def submit():
+                status, _, data = self.api(route, key, "POST", fields, raw=raw, headers=headers)
+                require(status == 202, f"{case} admission failed with {status}")
+                return json.loads(data)["job_id"]
+
+            identity = submit()
+            require(submit() == identity, "exact retry created a second job")
+            url = "/api/v1/media/jobs/" + identity
+            self.until(lambda: (worker["state"] / "cues" / (identity + ".json")).exists(), "media claim missing", timeout=30)
+            self.hook(worker)
+            shown = json.loads(self.cli(worker, "job-show", "--job-id", identity).stdout)
+            spool = worker["state"] / "media" / identity
+            output = spool / Path(shown["output_path"]).name
+            expected = audios.get(case, video)
+            if case in stills:
+                require(shown["action"] == "animate_reference" and (spool / Path(shown["reference_path"]).name).read_bytes() == image, "staged reference differs")
+            elif case in audios:
+                require(shown["action"] == "stage_verified_audio_fixture" and shown["fixture_sha256"] == sha(expected), "unbound audio trial")
+                require(self.api(route, self.client, "POST", fields)[0] == 401, "client created an audio trial")
+                login = self.checked("/api/v1/portal/login", None, "POST", {"password": self.portal})[0]
+                require(self.api(route, login["session_token"], "POST", fields)[0] == 401, "portal authority created an audio trial")
+            else:
+                require(shown["action"] == "generate_still_then_animate", "missing native two-step action")
+                (spool / Path(shown["generated_still_path"]).name).write_bytes(stills["image/webp"])
+            if case not in audios:
+                require(shown["prompt"] == motion, "motion text changed")
+            again = json.loads(self.cli(worker, "job-show", "--job-id", identity).stdout)
+            require(again["action"] == "preserve_existing_generation", "repeat wake can regenerate")
+            require(self.api(url, self.other_client)[0] == self.api(url + "/artifact", self.other_client)[0] == 404, "foreign owner read media")
+            require(self.api(url + "/artifact", self.client)[0] == 409, "uncommitted artifact downloadable")
+            if not jobs:
+                self.adverse_upload(worker, foreign, identity, expected, output)
+            else:
+                if case == "image/png":
+                    extra = (32 << 20) - len(expected)
+                    expected += struct.pack(">I4s", extra, b"free") + bytes(extra - 8)
+                    self.proxy.slow_media = True
+                started = time.monotonic()
+                output.write_bytes(expected)
+                self.cli(worker, "media-finish", "--job-id", identity)
+            self.until(lambda: self.api(url + "/artifact", self.client)[0] == 200, "automatic upload missing", timeout=45)
+            if case == "image/png":
+                require(time.monotonic() - started >= 11 and len(expected) == 32 << 20 and not self.proxy.slow_media, "slow maximum-size transfer was not exercised")
+                self.add("media.slow_maximum_upload", bytes=len(expected))
+            status = self.checked(url, self.client)[0]
+            properties = status["artifact"]
+            require(properties["sha256"] == sha(expected) and properties["size"] == len(expected) and properties["duration"] > 0 and properties["streams"], "artifact metadata mismatch")
+            require(self.api(url + "/artifact", self.client)[2] == expected and self.api(url + "/artifact", self.other_client)[0] == 404, "owner download integrity or isolation failed")
+            if case not in audios:
+                require((properties["width"], properties["height"], properties["fps"], properties["video_frames"]) == (64, 48, 8, 8), "wrong video measurements")
+            self.until(lambda: not output.exists() and not any(spool.glob("reference.*")) and not (spool / "generated.webp").exists(), "worker retained confirmed media", timeout=35)
+            self.docker("exec", self.broker, "test", "!", "-e", "/var/lib/aaa-muse-ai/media/" + identity + "/prompt")
+            self.docker("exec", self.broker, "test", "!", "-e", "/var/lib/aaa-muse-ai/media/" + identity + "/image")
+            require(submit() == identity and self.checked(url, self.client)[0]["expires_at"] == status["expires_at"], "retry extended expiry")
+            end = timestamp(status["expires_at"])
+            require(abs(end - timestamp(status["committed_at"]) - 600) < 0.001, "download lifetime changed")
+            jobs.append((identity, end))
+            self.add("media." + case, artifact_sha256=sha(expected), bytes=len(expected))
+        self.limits(stills, prompt)
+        self.diagnosis(worker, jobs[0][0], prompt, video)
+        self.cancel_during_upload(worker, video, prompt)
+        self.expire(jobs)
+
+    def adverse_upload(self, worker, foreign, identity, expected, output):
+        current = self.checked("/api/v1/worker/jobs/" + identity, worker["credential"])[0]
+        base = "/api/v1/worker/jobs/" + identity
+        fence = {"X-Muse-Connection-Id": current["connection_id"], "X-Muse-Connection-Generation": str(current["connection_generation"]),
+                 "X-Muse-Generation": str(current["generation"]), "X-Muse-Lease-Id": current["lease_id"]}
+        self.checked("/api/v1/media/jobs/" + identity, self.client)
+        require(self.api(base + "/media/image", foreign["credential"], headers=fence)[0] == 404, "foreign worker staged source")
+        bad = {**fence, "X-Muse-Generation": str(current["generation"] + 1), "X-Muse-Artifact-Sha256": sha(expected), "Content-Type": "video/mp4"}
+        status, _, refusal = self.api(base + "/artifact", worker["credential"], "PUT", raw=expected[:128], headers=bad)
+        require(status == 409 and json.loads(refusal)["error"] == "stale_assignment", "stale worker published result")
+        with output.open("wb") as oversized:
+            oversized.truncate((32 << 20) + 1)
+        self.cli(worker, "media-finish", "--job-id", identity, want=1)
+        origin = urllib.parse.urlsplit(self.origin_url)
+        connection = http.client.HTTPConnection(origin.hostname, origin.port, timeout=5)
+        try:
+            connection.putrequest("PUT", base + "/artifact")
+            for k,v in {**bad, **fence, "Authorization": "Bearer " + worker["credential"], "Content-Length": str(output.stat().st_size)}.items():
+                connection.putheader(k,v)
+            connection.endheaders()
+            response = connection.getresponse()
+            require(response.status == 413 and json.loads(response.read())["error"] == "media_too_large", "over-limit artifact accepted by HTTP")
+        finally:
+            connection.close()
+        require(output.stat().st_size == (32 << 20) + 1 and self.api("/api/v1/media/jobs/" + identity + "/artifact", self.client)[0] == 409, "oversized upload was published or worker file erased")
+        self.proxy.interrupt_media = True
+        output.write_bytes(expected)
+        self.cli(worker, "media-finish", "--job-id", identity)
+        require(self.proxy.media_interrupted.wait(35) and output.read_bytes() == expected, "worker lost interrupted upload")
+        require(self.api("/api/v1/media/jobs/" + identity + "/artifact", self.client)[0] == 409, "partial upload published")
+        self.proxy.lose_media_ack = True
+        self.proxy.interrupt_media = False
+        require(self.proxy.media_ack_lost.wait(35), "committed acknowledgement loss missed")
+        self.add("media.interruption_and_fencing")
+
+    def limits(self, stills, prompt):
+        path = "/api/v1/media/jobs"
+        fields = {"submission_id": secrets.token_hex(16), "prompt": prompt}
+        require(self.api(path, self.client, "POST", {**fields, "prompt": "x" * 4097})[0] == 413, "prompt limit missed")
+        raw, headers = multipart(fields, stills["image/png"] + bytes(8 << 20), "image/png")
+        require(self.api(path, self.client, "POST", raw=raw, headers=headers)[0] == 413, "image byte limit missed")
+        large = self.render("png", "-f", "lavfi", "-i", "color=c=white:s=4100x4000", "-frames:v", "1")
+        raw, headers = multipart(fields, large, "image/png")
+        require(self.api(path, self.client, "POST", raw=raw, headers=headers)[0] == 422, "image pixel limit missed")
+        self.add("media.admission_limits")
+
+    def cancel_during_upload(self, worker, expected, prompt):
+        identity = self.checked("/api/v1/media/jobs", self.client, "POST", {"prompt": prompt, "submission_id": secrets.token_hex(16)}, want=202)[0]["job_id"]
+        self.until(lambda: (worker["state"] / "cues" / (identity + ".json")).exists(), "cancellation case lacked claim", timeout=30)
+        shown = json.loads(self.cli(worker, "job-show", "--job-id", identity).stdout)
+        output = worker["state"] / "media" / identity / Path(shown["output_path"]).name
+        output.write_bytes(expected)
+        self.proxy.media_pause_path = "/api/v1/worker/jobs/" + identity + "/artifact"
+        self.cli(worker, "media-finish", "--job-id", identity)
+        try:
+            self.until(lambda: bool(self.docker("exec", self.broker, "find", "/var/lib/aaa-muse-ai/media", "-maxdepth", "1", "-name", ".upload-" + identity + "-*").stdout.strip()), "transfer never passed broker preflight", timeout=35)
+            self.checked("/api/v1/admin/experiments/" + identity + "/cancel", self.admin, "POST", {"protocol_version": 1, "submission_id": secrets.token_hex(16)})
+        finally:
+            self.proxy.media_release.set()
+        require(self.proxy.media_finished.wait(25) and self.proxy.media_status == 409, "commit-time fence missed cancellation")
+        status = self.checked("/api/v1/worker/jobs/" + identity, worker["credential"])[0]
+        require(status["state"] == "cancelled" and status["held"] and output.read_bytes() == expected, "lost uncertain hold or local output")
+        require(self.api("/api/v1/media/jobs/" + identity + "/artifact", self.client)[0] == 409, "cancelled stream published")
+        _, events = self.decode_export(self.api("/api/v1/admin/diagnostics/export?operation_id=" + identity, self.admin)[2])
+        require(any(e["msg"] == "lease.fenced" and e.get("evidence", {}).get("busy_hold") is True for e in events), "missing commit-time fence diagnosis")
+        self.add("media.cancel_during_upload")
+
+    def diagnosis(self, worker, identity, prompt, original):
+        status, _, raw = self.api("/api/v1/admin/diagnostics/export?operation_id=" + identity, self.admin)
+        meta, events = self.decode_export(raw)
+        require(status == 200 and meta["complete"] and not meta["omissions"], "broker evidence incomplete")
+        committed = next(e for e in events if e["msg"] == "media.committed")
+        require(committed["artifact"]["size"] > 3_000_000 and any(e["msg"] == "lease.fenced" or e.get("cause") == "stale_assignment" for e in events), "fence and commit cannot be diagnosed")
+        interrupted = next(e for e in events if e["msg"] == "media.rejected" and e.get("cause") == "artifact_transfer_interrupted")
+        evidence = interrupted["evidence"]
+        half = original[:len(original) // 2]
+        require(evidence["expected_bytes"] == len(original) and evidence["observed_bytes"] == len(half)
+                and evidence["expected_sha256"] == sha(original) and evidence["observed_sha256"] == sha(half)
+                and evidence["stage"] == "receive" and evidence["partial_cleanup"] == "removed" and interrupted.get("request_id"),
+                "interrupted transfer cannot be reconstructed from broker diagnostics")
+        worker_log = self.cli(worker, "diagnostics-export", "--operation-id", identity, "--decode").stdout
+        require("worker.media_upload_confirmed" in worker_log and "worker.media_transfer_pending" in worker_log, "missing worker diagnosis")
+        for capture in [json.dumps(events), worker_log]:
+            require(prompt not in capture and self.sentinel.decode() not in capture, "raw media content retained")
+        self.add("media.private_diagnostics")
+
+    def expire(self, jobs):
+        last, deadline = jobs[-1]
+        url = "/api/v1/media/jobs/" + last + "/artifact"
+        require(self.api(url, self.client)[0] == 200, "file unavailable before expiry")
+        time.sleep(max(0, deadline - time.time() - 8))
+        self.docker("stop", "-t", "2", self.broker)
+        time.sleep(max(0, deadline - time.time() + 1))
+        self.docker("start", self.broker)
+        self.origin_url = self.origin(self.broker)
+        self.ready(self.broker, self.origin_url)
+        for identity, _ in jobs:
+            route = "/api/v1/media/jobs/" + identity
+            require(self.api(route + "/artifact", self.client)[0] == 410 and self.api(route, self.client)[0] == 200, "restart lost receipt or served expired media")
+            self.docker("exec", self.broker, "test", "!", "-e", "/var/lib/aaa-muse-ai/media/" + identity)
+        self.add("media.expiry_across_restart", window_seconds=600)
+
+
+if __name__ == "__main__":
+    harness = run(MediaFlow, "media")
+    receipt = Path(".artifacts/ci/media/receipt.json")
+    receipt.parent.mkdir(parents=True, exist_ok=True)
+    receipt.write_text(json.dumps({"source_sha": harness.args.source_sha, "package_sha256": harness.package["sha256"],
+                                  "cases": harness.product_cases, "cleanup": json.loads((harness.root / "cleanup.json").read_text()),
+                                  "evidence_kind": "controlled", "outcome": "passed"}, indent=2))

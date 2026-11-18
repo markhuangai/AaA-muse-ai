@@ -11,6 +11,7 @@ import (
 
 	"github.com/markhuangai/AaA-muse-ai/internal/auth"
 	"github.com/markhuangai/AaA-muse-ai/internal/inference"
+	"github.com/markhuangai/AaA-muse-ai/internal/media"
 	"github.com/markhuangai/AaA-muse-ai/internal/postgres"
 )
 
@@ -20,6 +21,7 @@ type InferenceRepository interface {
 }
 
 type Broker struct {
+	Media   *media.Store
 	repo    InferenceRepository
 	random  io.Reader
 	now     func() time.Time
@@ -426,6 +428,9 @@ func (b *Broker) Run(ctx context.Context, logger *slog.Logger) {
 			return
 		}
 		_ = b.Sweep(ctx, logger)
+		if err := b.CleanupMedia(ctx, logger); err != nil {
+			logger.Error("media.cleanup_failed", "cause", err.Error(), "stage", "sweep")
+		}
 	}
 }
 
@@ -456,6 +461,10 @@ func connectionMatches(s *inference.State, id string, generation int64) error {
 }
 
 func (b *Broker) Open(ctx context.Context, logger *slog.Logger, workerID string, report *inference.ModelReport) (json.RawMessage, error) {
+	return b.OpenSubscriber(ctx, logger, workerID, report, false)
+}
+
+func (b *Broker) OpenSubscriber(ctx context.Context, logger *slog.Logger, workerID string, report *inference.ModelReport, mediaJobs bool) (json.RawMessage, error) {
 	return b.run(ctx, logger, inference.Ref{WorkerID: workerID, WorkerAuth: workerID}, "connect", report, func(s *inference.State, events *[]inferenceEvent) (any, error) {
 		if s.Connection.Connected {
 			return nil, inference.Reject("subscriber_already_connected", 409)
@@ -464,7 +473,7 @@ func (b *Broker) Open(ctx context.Context, logger *slog.Logger, workerID string,
 		if err != nil {
 			return nil, err
 		}
-		s.Connection = inference.Connection{ID: id, Generation: s.Connection.Generation + 1, AssignmentGeneration: s.Connection.AssignmentGeneration, Connected: true, OpenedAt: s.Now, ModelReport: report}
+		s.Connection = inference.Connection{ID: id, Generation: s.Connection.Generation + 1, AssignmentGeneration: s.Connection.AssignmentGeneration, Connected: true, OpenedAt: s.Now, ModelReport: report, MediaJobs: mediaJobs}
 		if err = b.challenge(s, events); err != nil {
 			return nil, err
 		}

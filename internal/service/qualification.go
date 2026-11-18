@@ -54,6 +54,15 @@ func eligible(s *inference.State, required []string) string {
 }
 
 func nativeEligibility(s *inference.State, j *inference.Job) error {
+	if j.Media != nil {
+		w := poolWorker(s, j.WorkerID)
+		if reason := eligible(w, nil); reason != "" {
+			return inference.Reject("no_ready_worker", 503, "eligibility_reason", reason)
+		}
+		if !w.Connection.MediaJobs {
+			return inference.Reject("media_worker_unsupported", 409)
+		}
+	}
 	if r := s.Requests[j.ExperimentID]; r != nil {
 		w := poolWorker(s, j.WorkerID)
 		if reason := eligible(w, inference.RequiredCapabilities(r.Input.Messages, r.Input.Tools)); reason != "" {

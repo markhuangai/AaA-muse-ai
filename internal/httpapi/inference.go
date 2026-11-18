@@ -186,7 +186,7 @@ func (h *Handler) subscribe(w *response, r *http.Request, logger *slog.Logger, w
 		return
 	}
 	report, reportErr := h.readModelReport(r.Header)
-	data, err := h.Broker.Open(r.Context(), logger, workerID, report)
+	data, err := h.Broker.OpenSubscriber(r.Context(), logger, workerID, report, r.Header.Get("X-Muse-Media-Jobs") == "1")
 	if err != nil {
 		inferenceError(w, err)
 		return

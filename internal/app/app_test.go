@@ -57,6 +57,7 @@ func fixtureDependencies(t *testing.T, generated bool) (Dependencies, *bytes.Buf
 	}
 	b, _ := json.Marshal(data)
 	d := Production(&stdout, &stderr)
+	d.MediaDir = ""
 	d.ReadFile = func(string) ([]byte, error) { return b, nil }
 	d.LookupEnv = func(string) (string, bool) { return "", false }
 	d.Random = bytes.NewReader(bytes.Repeat([]byte{19}, 1024))

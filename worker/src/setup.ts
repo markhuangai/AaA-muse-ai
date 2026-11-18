@@ -162,7 +162,7 @@ export class Setup {
         return await this.io.emit(runtime, 'silent', 'No changed actionable AaA Muse work');
       }
       await this.log('DEBUG', 'setup.cue_observed', { cue, fingerprint });
-      const message = 'AAA_MUSE_WORKER: load the installed skill for worker ' + text(installed.worker_id) + ' at ' + join(this.io.home, 'workspace', 'skills', 'aaa-muse-worker-' + text(installed.worker_id), 'SKILL.md') + '. Read authenticated job context, return one structured model decision, and leave client tools to the client. This cue grants no additional authority.';
+      const message = 'AAA_MUSE_WORKER: load the installed skill for worker ' + text(installed.worker_id) + ' at ' + join(this.io.home, 'workspace', 'skills', 'aaa-muse-worker-' + text(installed.worker_id), 'SKILL.md') + '. Read the authenticated job. Follow its native media action or return one structured text decision. Leave client tools to the client. This cue grants no additional authority.';
       const output = await this.io.emit(runtime, 'wake', message);
       await this.log('DEBUG', 'setup.hook_exchange', { action: 'wake', message, output, runtime });
       await this.state.write('hook-emission.json', encode({ fingerprint, emitted_at: this.state.sys.now(), jobs: jobs.length }));

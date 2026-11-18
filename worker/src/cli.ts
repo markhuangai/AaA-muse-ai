@@ -1,3 +1,4 @@
+import { finishMedia } from './media.js';
 import * as fs from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join, isAbsolute } from 'node:path';
@@ -14,7 +15,7 @@ import { setupIO, backgroundStderr, type SetupIO } from './setup-os.js';
 
 import { VERSION } from './version.js';
 export { VERSION } from './version.js';
-const help = 'aaa-muse-worker setup --origin HTTPS_ORIGIN --code-stdin --install-dir ABSOLUTE_PATH --setup-id ID [--bootstrap FILE] | hook-check | configure --origin HTTPS_ORIGIN | enroll --code-stdin | run | status | doctor | job-show --job-id ID | decision-submit --job-id ID (--input FILE|- | --ack-idle) | diagnostics-export [--operation-id ID] [--request-id ID] [--since RFC3339] [--until RFC3339] [--decode]\nCommon: --state-dir ABSOLUTE_PATH, --help, --version\n';
+const help = 'aaa-muse-worker setup --origin HTTPS_ORIGIN --code-stdin --install-dir ABSOLUTE_PATH --setup-id ID [--bootstrap FILE] | hook-check | configure --origin HTTPS_ORIGIN | enroll --code-stdin | run | status | doctor | job-show --job-id ID | media-finish --job-id ID | decision-submit --job-id ID (--input FILE|- | --ack-idle) | diagnostics-export [--operation-id ID] [--request-id ID] [--since RFC3339] [--until RFC3339] [--decode]\nCommon: --state-dir ABSOLUTE_PATH, --help, --version\n';
 export interface Adapters {
   files: Files;
   system: System;
@@ -33,7 +34,7 @@ export function argumentsFor(args: string[]): { command: string; flags: Record<s
   const command = args[0] ?? '--help';
   const flags: Record<string, string | boolean> = Object.create(null);
   const allowed: Record<string, string[]> = {
-    configure: ['origin'], enroll: ['code-stdin'], run: ['background'], status: [], doctor: [], 'job-show': ['job-id'],
+    configure: ['origin'], enroll: ['code-stdin'], run: ['background'], status: [], doctor: [], 'job-show': ['job-id'], 'media-finish': ['job-id'],
     setup: ['origin', 'code-stdin', 'install-dir', 'setup-id', 'bootstrap'], 'hook-check': ['runtime-error'],
     'decision-submit': ['job-id', 'input', 'ack-idle'], 'diagnostics-export': ['operation-id', 'request-id', 'since', 'until', 'decode'],
   };
@@ -112,6 +113,9 @@ export async function execute(args: string[], io: Adapters): Promise<number> {
       case 'job-show':
         requireValue(typeof flags['job-id'] === 'string', 'job_id_required');
         result = await worker.show(identifier(flags['job-id']));
+        break;
+      case 'media-finish':
+        result = await finishMedia(worker, identifier(flags['job-id']));
         break;
       case 'decision-submit':
         requireValue(typeof flags['job-id'] === 'string' && Number(typeof flags.input === 'string') + Number(flags['ack-idle'] === true) === 1, 'decision_input_or_idle_ack_required');
