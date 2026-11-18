@@ -69,7 +69,7 @@ func (h *Handler) responsesRequest(w *response, r *http.Request, logger *slog.Lo
 		if outcome == "failed" || outcome == "uncertain" {
 			level = slog.LevelError
 		}
-		logger.Log(r.Context(), level, name, "stream", value.Stream, "model", openai.Model, "last_event", last, "attempted_sequence", attemptedSequence, "completed_sequence", completedSequence, "cause", cause, "state", admitted.State, "disposition_scope", "last_observed", "output_accepted", admitted.Output != nil, "outcome", outcome, "attempted_bytes", w.attempted, "written_bytes", w.written, "attempt", 1, "duration_ms", h.Now().Sub(started).Milliseconds())
+		logger.Log(r.Context(), level, name, "stream", value.Stream, "model", value.Model, "last_event", last, "attempted_sequence", attemptedSequence, "completed_sequence", completedSequence, "cause", cause, "state", admitted.State, "disposition_scope", "last_observed", "output_accepted", admitted.Output != nil, "outcome", outcome, "attempted_bytes", w.attempted, "written_bytes", w.written, "attempt", 1, "duration_ms", h.Now().Sub(started).Milliseconds())
 	}()
 	admitted, err = h.Broker.SubmitResponse(r.Context(), logger, client, session, value.Input)
 	if err != nil {
@@ -84,7 +84,7 @@ func (h *Handler) responsesRequest(w *response, r *http.Request, logger *slog.Lo
 	w.Header().Set("X-Muse-Session-Id", admitted.SessionID)
 	w.workerID, w.conversationID, w.sessionID, w.requestRecordID = admitted.WorkerID, admitted.ConversationID, admitted.SessionID, admitted.ID
 	logger = logger.With("operation_id", admitted.ID, "request_record_id", admitted.ID, "conversation_id", admitted.ConversationID, "session_id", admitted.SessionID, "response_id", admitted.ResponseID)
-	logger.Info("responses.request_admitted", "model", openai.Model, "stream", value.Stream, "timeout_seconds", 300, "poll_interval_ms", 250, "write_timeout_seconds", 5, "state", admitted.State)
+	logger.Info("responses.request_admitted", "model", value.Model, "stream", value.Stream, "timeout_seconds", 300, "poll_interval_ms", 250, "write_timeout_seconds", 5, "state", admitted.State)
 	last = "waiting"
 	admitted, err = h.Broker.AwaitRequest(r.Context(), logger, client, admitted)
 	w.workerID = admitted.WorkerID
@@ -110,10 +110,10 @@ func (h *Handler) responsesRequest(w *response, r *http.Request, logger *slog.Lo
 	logger.Debug("responses.accepted_decision", "decision", admitted.Output, "metadata", admitted.Response)
 	var frames []openai.Frame
 	if value.Stream {
-		frames, err = openai.ResponseFrames(admitted, failure)
+		frames, err = openai.ResponseFrames(admitted, value.Model, failure)
 	} else {
 		var object map[string]any
-		object, err = openai.ResponseObject(admitted, "completed", "")
+		object, err = openai.ResponseObject(admitted, value.Model, "completed", "")
 		if err == nil {
 			var encoded []byte
 			encoded, err = json.Marshal(object)

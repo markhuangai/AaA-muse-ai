@@ -98,7 +98,7 @@ func (h *Handler) chatRequest(w *response, r *http.Request, logger *slog.Logger,
 		if outcome == "failed" || outcome == "uncertain" {
 			level = slog.LevelError
 		}
-		logger.Log(r.Context(), level, event, "stream", chat.Stream, "model", openai.Model, "last_event", last, "cause", cause, "job_disposition", admitted.State, "disposition_scope", "last_observed", "output_accepted", admitted.Output != nil, "outcome", outcome, "attempted_bytes", w.attempted, "written_bytes", w.written, "duration_ms", h.Now().Sub(started).Milliseconds())
+		logger.Log(r.Context(), level, event, "stream", chat.Stream, "model", chat.Model, "last_event", last, "cause", cause, "job_disposition", admitted.State, "disposition_scope", "last_observed", "output_accepted", admitted.Output != nil, "outcome", outcome, "attempted_bytes", w.attempted, "written_bytes", w.written, "duration_ms", h.Now().Sub(started).Milliseconds())
 	}()
 	admitted, err = h.Broker.SubmitRequest(r.Context(), logger, client, session, chat.Input)
 	if err != nil {
@@ -119,7 +119,7 @@ func (h *Handler) chatRequest(w *response, r *http.Request, logger *slog.Logger,
 	w.Header().Set("X-Muse-Session-Id", admitted.SessionID)
 	w.workerID, w.conversationID, w.sessionID, w.requestRecordID = admitted.WorkerID, admitted.ConversationID, admitted.SessionID, admitted.ID
 	logger = logger.With("operation_id", admitted.ID, "request_record_id", admitted.ID, "conversation_id", admitted.ConversationID, "session_id", admitted.SessionID)
-	logger.Info("chat.request_admitted", "model", openai.Model, "stream", chat.Stream, "timeout_seconds", 300, "poll_interval_ms", 250, "write_timeout_seconds", 5, "state", admitted.State)
+	logger.Info("chat.request_admitted", "model", chat.Model, "stream", chat.Stream, "include_usage", chat.IncludeUsage, "timeout_seconds", 300, "poll_interval_ms", 250, "write_timeout_seconds", 5, "state", admitted.State)
 	last = "waiting"
 	admitted, err = h.Broker.AwaitRequest(r.Context(), logger, client, admitted)
 	w.workerID = admitted.WorkerID
@@ -142,10 +142,10 @@ func (h *Handler) chatRequest(w *response, r *http.Request, logger *slog.Logger,
 	logger.Debug("chat.accepted_decision", "decision", admitted.Output)
 	frames := []openai.Frame{}
 	if chat.Stream {
-		frames, err = openai.Frames(admitted)
+		frames, err = openai.Frames(admitted, chat.Model, chat.IncludeUsage)
 	} else {
 		var encoded []byte
-		encoded, err = openai.Completion(admitted)
+		encoded, err = openai.Completion(admitted, chat.Model)
 		frames = []openai.Frame{{Kind: "completion", Bytes: append(encoded, '\n')}}
 	}
 	if err != nil {

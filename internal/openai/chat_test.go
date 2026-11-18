@@ -45,7 +45,7 @@ func TestChatNormalizeTextToolsAndRoundTrip(t *testing.T) {
 		t.Fatal("assistant text or definition lost")
 	}
 	r := inference.RequestView{ID: "test", CreatedAt: time.Unix(100, 0), Output: &inference.Item{Type: "tool_call", CallID: "call-b", Name: "read_file", Arguments: map[string]any{"path": "client-only"}}}
-	encoded, err := Completion(r)
+	encoded, err := Completion(r, Model)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,7 +77,13 @@ func TestChatRejectsUnsupportedAndMalformedInputsWithPaths(t *testing.T) {
 		{map[string]any{"model": "other"}, user, "model"},
 		{map[string]any{"model": nil}, user, "model"},
 		{map[string]any{"temperature": 1}, user, "temperature"},
+		{map[string]any{"max_tokens": 5}, user, "max_tokens"},
+		{map[string]any{"max_completion_tokens": 5}, user, "max_completion_tokens"},
 		{map[string]any{"stream": "true"}, user, "stream"},
+		{map[string]any{"stream_options": map[string]any{}}, user, "stream_options"},
+		{map[string]any{"stream": true, "stream_options": false}, user, "stream_options"},
+		{map[string]any{"stream": true, "stream_options": map[string]any{"include_usage": nil}}, user, "stream_options.include_usage"},
+		{map[string]any{"stream": true, "stream_options": map[string]any{"other": true}}, user, "stream_options.other"},
 		{map[string]any{"n": 2}, user, "n"},
 		{map[string]any{"parallel_tool_calls": true}, user, "parallel_tool_calls"},
 		{map[string]any{"tool_choice": "required"}, user, "tool_choice"},
@@ -116,6 +122,39 @@ func TestChatRejectsUnsupportedAndMalformedInputsWithPaths(t *testing.T) {
 	}
 }
 
+func TestChatUsageOptionKeepsModelAndMarksUnknownUsage(t *testing.T) {
+	user := []any{map[string]any{"role": "user", "content": "question"}}
+	for _, tc := range []struct {
+		options any
+		include bool
+	}{
+		{nil, false},
+		{map[string]any{}, false},
+		{map[string]any{"include_usage": false}, false},
+		{map[string]any{"include_usage": true}, true},
+	} {
+		chat, err := Normalize(chatBody(user, map[string]any{"model": LegacyModel, "stream": true, "stream_options": tc.options}))
+		if err != nil || chat.Model != LegacyModel || chat.IncludeUsage != tc.include {
+			t.Fatalf("invalid stream options: %+v, %v", chat, err)
+		}
+		r := inference.RequestView{ID: "request", Output: &inference.Item{Type: "final", Text: "answer"}}
+		frames, err := Frames(r, chat.Model, chat.IncludeUsage)
+		if err != nil || len(frames) != 4 || frames[3].Kind != "done" {
+			t.Fatal("invalid stream", err)
+		}
+		for _, frame := range frames[:3] {
+			var chunk map[string]any
+			if err = json.Unmarshal(frame.Bytes[6:], &chunk); err != nil {
+				t.Fatal(err)
+			}
+			u, present := chunk["usage"]
+			if chunk["model"] != LegacyModel || present != tc.include || u != nil {
+				t.Fatalf("unexpected chunk fields: %v", chunk)
+			}
+		}
+	}
+}
+
 func TestChatFunctionValidationPaths(t *testing.T) {
 	for _, value := range []any{7, map[string]any{"type": "custom"}, map[string]any{"type": "function", "function": 7}, map[string]any{"type": "function", "function": map[string]any{"name": 7}}, map[string]any{"type": "function", "function": map[string]any{"name": "f", "description": 7}}, map[string]any{"type": "function", "function": map[string]any{"name": "f", "strict": true}}, map[string]any{"type": "function", "function": map[string]any{"name": "f", "parameters": false}}, map[string]any{"type": "function", "function": map[string]any{"name": "f", "parameters": map[string]any{"$ref": "https://example.test/schema"}}}} {
 		if _, err := normalizeTool(value, "tools[0]"); err == nil {
@@ -147,7 +186,7 @@ func TestChatFunctionValidationPaths(t *testing.T) {
 func TestChatJSONAndBufferedSSE(t *testing.T) {
 	for _, d := range []inference.Item{{Type: "final", Text: "exact\r\n😀\""}, {Type: "tool_call", CallID: "call-a", Name: "f", Arguments: map[string]any{"number": json.Number("9007199254740993"), "path": "a\nb"}}} {
 		r := inference.RequestView{ID: "request", CreatedAt: time.Unix(100, 0), Output: &d}
-		b, err := Completion(r)
+		b, err := Completion(r, Model)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -158,7 +197,7 @@ func TestChatJSONAndBufferedSSE(t *testing.T) {
 		if value["model"] != Model || value["id"] != "chatcmpl-request" || value["usage"] != nil {
 			t.Fatal("identity or unknown usage incorrect")
 		}
-		frames, err := Frames(r)
+		frames, err := Frames(r, Model, false)
 		if err != nil || len(frames) != 4 || string(frames[3].Bytes) != "data: [DONE]\n\n" {
 			t.Fatal("buffered SSE termination incorrect", err)
 		}
@@ -179,10 +218,10 @@ func TestChatJSONAndBufferedSSE(t *testing.T) {
 	}
 	for _, d := range []*inference.Item{nil, {Type: "unsupported"}, {Type: "tool_call", Arguments: map[string]any{"bad": math.Inf(1)}}} {
 		r := inference.RequestView{Output: d}
-		if _, err := Completion(r); err == nil {
+		if _, err := Completion(r, Model); err == nil {
 			t.Fatal("invalid decision encoded")
 		}
-		if _, err := Frames(r); err == nil {
+		if _, err := Frames(r, Model, false); err == nil {
 			t.Fatal("invalid decision streamed")
 		}
 	}

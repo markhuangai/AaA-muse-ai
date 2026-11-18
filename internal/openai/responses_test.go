@@ -77,11 +77,11 @@ func TestResponsesEncodeLifecycleAndExactOutput(t *testing.T) {
 	for _, output := range []inference.Item{{Type: "final", Text: "exact\r\n😀"}, {Type: "tool_call", CallID: "exact-call", Name: "read_file", Arguments: map[string]any{"path": "fixture"}}} {
 		instruction := "current"
 		r := inference.RequestView{ID: "request", ResponseID: "resp_request", CreatedAt: time.Unix(123, 0), Output: &output, Response: &inference.ResponseMetadata{Instructions: &instruction, PreviousResponseID: "resp_old", Tools: []inference.Tool{{Name: "read_file", Parameters: map[string]any{"type": "object"}}}}}
-		object, err := ResponseObject(r, "completed", "")
+		object, err := ResponseObject(r, Model, "completed", "")
 		if err != nil || object["usage"] != nil || object["instructions"] != "current" {
 			t.Fatal(object, err)
 		}
-		frames, err := ResponseFrames(r, "")
+		frames, err := ResponseFrames(r, Model, "")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -95,16 +95,16 @@ func TestResponsesEncodeLifecycleAndExactOutput(t *testing.T) {
 		if frames[0].Kind != "response.created" || frames[1].Kind != "response.in_progress" || frames[len(frames)-1].Kind != "response.completed" {
 			t.Fatal(frames)
 		}
-		failed, err := ResponseFrames(r, "worker_disconnected")
+		failed, err := ResponseFrames(r, Model, "worker_disconnected")
 		if err != nil || len(failed) != 3 || failed[2].Kind != "response.failed" {
 			t.Fatal(failed, err)
 		}
 	}
 	for _, r := range []inference.RequestView{{}, {ID: "r", ResponseID: "resp_r"}, {ID: "r", ResponseID: "resp_r", Output: &inference.Item{Type: "unknown"}}, {ID: "r", ResponseID: "resp_r", Output: &inference.Item{Type: "tool_call", Arguments: map[string]any{"invalid": make(chan int)}}}} {
-		if _, err := ResponseObject(r, "completed", ""); err == nil {
+		if _, err := ResponseObject(r, Model, "completed", ""); err == nil {
 			t.Fatal("invalid output encoded", r)
 		}
-		if _, err := ResponseFrames(r, ""); err == nil {
+		if _, err := ResponseFrames(r, Model, ""); err == nil {
 			t.Fatal("invalid output streamed", r)
 		}
 	}

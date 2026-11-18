@@ -1,6 +1,7 @@
 import { Failure, cause, requireValue } from './errors.js';
 import { encode, parse, object, text, type ObjectValue, type Value } from './json.js';
 import { Logger } from './diagnostics.js';
+import { maxModelReportBytes } from './protocol.js';
 import type { System } from './state.js';
 import { VERSION } from './version.js';
 
@@ -97,7 +98,7 @@ export class Transport {
       } finally { this.net.clearTimer(timer); }
     }
   }
-  async *events(signal: AbortSignal): AsyncGenerator<Event> {
+  async *events(signal: AbortSignal, modelReport?: Value): AsyncGenerator<Event> {
     const controller = new AbortController();
     const abort = () => controller.abort();
     signal.addEventListener('abort', abort, { once: true });
@@ -105,7 +106,16 @@ export class Transport {
     let timer = this.net.setTimer(abort, 10_000);
     let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
     try {
-      const response = await this.net.fetch(this.endpoint + '/api/v1/worker/events', { redirect: 'manual', signal: controller.signal, headers: { Authorization: 'Bearer ' + this.credential, Accept: 'text/event-stream', 'X-Muse-Worker-Version': this.productVersion } });
+      const headers: Record<string, string> = { Authorization: 'Bearer ' + this.credential, Accept: 'text/event-stream', 'X-Muse-Worker-Version': this.productVersion };
+      if (modelReport !== undefined) {
+        const report = Buffer.from(encode(modelReport));
+        if (report.length <= maxModelReportBytes) {
+          headers['X-Muse-Worker-Model-Report'] = report.toString('base64url');
+        } else {
+          await this.logger.log('WARN', 'worker.model_report_rejected', { cause: 'model_report_too_large', outcome: 'unavailable' });
+        }
+      }
+      const response = await this.net.fetch(this.endpoint + '/api/v1/worker/events', { redirect: 'manual', signal: controller.signal, headers });
       this.net.clearTimer(timer);
       const requestId = response.headers.get('x-request-id') ?? '';
       requireValue(response.status < 300 || response.status >= 400, 'redirect_forbidden');

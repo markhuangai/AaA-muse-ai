@@ -85,7 +85,7 @@ class Chat(History):
         return bot
 
     def chat_body(self, text, stream=False, **fields):
-        return {"model": "muse-pool-text", "messages": [{"role": "user", "content": text}], "stream": stream, **fields}
+        return {"model": "muse-ai", "messages": [{"role": "user", "content": text}], "stream": stream, **fields}
 
     def chat(self, body, session=None, key=None, origin=None, raw=None, timeout=45, path="/v1/chat/completions"):
         target = urllib.parse.urlsplit(origin or self.origin_url)
@@ -227,7 +227,7 @@ class Chat(History):
         for key in ("", self.admin, self.portal, worker["credential"]):
             status, _, raw = self.chat(self.chat_body("x"), key=key)
             require(status == 401 and json.loads(raw)["error"]["type"] == "authentication_error", "wrong authority admitted to Chat")
-        bad = [self.chat_body("x", **{name: value}) for name, value in (("temperature", 1), ("store", False), ("n", 2), ("parallel_tool_calls", True), ("tool_choice", "required"), ("stream_options", {"include_usage": True}), ("response_format", {"type": "json_object"}))]
+        bad = [self.chat_body("x", **{name: value}) for name, value in (("store", False), ("n", 2), ("parallel_tool_calls", True), ("tool_choice", "required"), ("stream_options", {"include_usage": "true"}), ("response_format", {"type": "json_object"}))]
         bad += [self.chat_body("x", messages=[{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "https://example.test/image"}}]}]),
                 self.chat_body("x", tools=[{"type": "custom", "custom": {"name": "f"}}]),
                 self.chat_body("x", tools=[{"type": "function", "function": {"name": "f", "parameters": {"$ref": "https://example.test/schema"}}}]),
@@ -238,15 +238,39 @@ class Chat(History):
                 status, headers, raw = self.chat(body)
                 error = json.loads(raw)["error"]
                 require(status == 400 and error["param"] and error["type"] == "invalid_request_error", "unsupported option silently accepted")
-        status, headers, _ = self.chat(bad[0])
-        self.diagnose_chat(headers["X-Request-Id"], "chat.request_rejected", "unsupported_parameter")
+        for field, value in (("max_tokens", 5), ("max_completion_tokens", 5), ("temperature", 1)):
+            status, headers, raw = self.chat(self.chat_body("aaa-chat:text:must-not-dispatch", **{field: value}))
+            error = json.loads(raw)["error"]
+            require(status == 400 and error["code"] == "unsupported_parameter" and error["param"] == field and headers.get("X-Muse-Session-Id") is None, "unsupported parameter reached admission")
+            events = self.diagnose_chat(headers["X-Request-Id"], "chat.request_rejected", "unsupported_parameter")
+            require(not any(event["msg"] == "chat.request_admitted" for event in events), "rejected generation parameter was admitted")
         for raw, status in ((b'{"model":"muse-pool-text","model":"other"}', 400), (b'{"model":"muse-pool-text","messages":[{"role":"user","content":"x","content":"y"}]}', 400), (b'\xff', 400), (b'x' * 1048577, 413)):
             observed, _, body = self.chat(None, raw=raw)
             require(observed == status and isinstance(json.loads(body)["error"], dict), "invalid body escaped OpenAI error handling")
         for path, method, body, status in (("/v1/models", "POST", b"{}", 405), ("/v1/models", "GET", b"x", 400), ("/v1/models?unknown=1", "GET", None, 400)):
             observed, _, raw = self.request(self.origin_url, path, self.client, method, body)
             require(observed == status and isinstance(json.loads(raw)["error"], dict), "early boundary returned native error shape")
-        self.receipt("chat.authentication_and_strict_subset", rejected_cases=len(bad) * 2 + 11, body_limit=1048576)
+        self.receipt("chat.authentication_and_strict_subset", rejected_cases=len(bad) * 2 + 14, body_limit=1048576)
+
+    def openai_compatibility(self):
+        models, _ = self.checked("/v1/models", self.client)
+        require([model["id"] for model in models["data"]] == ["muse-ai"], "public model list differs")
+        body = self.chat_body("aaa-chat:text:compatible")
+        first = self.chat(body)
+        require(self.answer(first)[0] == "compatible", "headerless Chat did not complete")
+        identity = self.answer(first)[1]
+        session = first[1]["X-Muse-Session-Id"]
+        for model in ("muse-ai", "muse-pool-text"):
+            plain = self.chat({**body, "model": model}, session)
+            require(self.answer(plain) == ("compatible", identity) and json.loads(plain[2])["model"] == model, "JSON replay changed the model or completion")
+            stream = self.chat({**body, "model": model, "stream": True, "stream_options": {"include_usage": True}}, session)
+            require(self.answer(stream) == ("compatible", identity), "SSE replay changed the completion")
+            chunks = [json.loads(line[6:]) for line in stream[2].decode().splitlines() if line.startswith("data: ") and line != "data: [DONE]"]
+            require(len(chunks) == 3 and all(chunk["model"] == model and "usage" in chunk and chunk["usage"] is None for chunk in chunks), "SSE model or unknown usage changed")
+            require(chunks[0]["choices"][0]["delta"]["role"] == "assistant" and chunks[2]["choices"][0]["finish_reason"] == "stop", "SSE frame order changed")
+        jobs = [job for bot in self.bots for job in bot.jobs if job["experiment_id"] == identity.removeprefix("chatcmpl-")]
+        require(len(jobs) == 1, "changing the transport preferences dispatched a second job")
+        self.receipt("chat.openai_compatibility", headerless=True, aliases_replayed=True, usage_unavailable=True, jobs=len(jobs))
 
     def sessions(self, second_origin):
         session = "chat-owned-session"
@@ -489,6 +513,7 @@ def main():
             h.new_bot()
         h.sdk_matrix()
         h.boundaries()
+        h.openai_compatibility()
         h.sessions(other_origin)
         h.simultaneous_sessions(other_origin)
         h.linkage_and_capture()

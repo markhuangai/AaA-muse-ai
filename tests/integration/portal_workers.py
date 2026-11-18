@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import base64
 import json
 import os
 from pathlib import Path
@@ -20,11 +21,21 @@ class PortalWorkers(Portal, History):
 
     def activity_fixtures(self):
         offline = self.named_worker('Archive <img src=x onerror="window.__unsafe=1">')
-        offline_peer = self.peer(offline, qualify=False)
+        report_header = "X-Muse-Worker-Model-Report"
+        offline_peer = self.peer(offline, qualify=False, headers={report_header: "!invalid"})
         offline_peer.stop()
         self.until(lambda: self.status(offline)["connection_status"] == "offline", "closed subscriber did not become offline")
+        rejected, _ = self.diagnose(offline_peer.request_id, "worker.model_report_rejected")
+        require(rejected["cause"] == "invalid_model_report_encoding" and rejected["level"] == "WARN"
+                and rejected["worker_id"] == offline["worker"]["id"]
+                and rejected["connection_generation"] == offline_peer.opened["connection_generation"], "invalid report diagnosis lost its connection")
+        require("model_report" not in self.status(offline), "ill-formed report reached the worker projection")
+        self.receipt("portal.worker_model_report_rejection", cause=rejected["cause"], request_id=offline_peer.request_id, corrective_action="Supply a valid setup report on the next connection.")
         transport = self.named_worker("Studio subscriber")
-        self.peer(transport, qualify=False)
+        report = {"model_name": "Controlled Muse", "context_window_tokens": 350000, "reported_at": "2026-11-18T00:00:00Z"}
+        encoded = base64.urlsafe_b64encode(json.dumps(report).encode()).decode().rstrip("=")
+        self.peer(transport, qualify=False, headers={report_header: encoded})
+        require(self.status(transport)["model_report"] == report and self.status(transport)["inference_readiness"] == "unverified", "connection report conferred readiness or changed its values")
         busy = self.named_worker("Research subscriber")
         busy_peer = self.peer(busy, qualify=False)
         self.qualify_worker(busy, busy_peer, tools=False)

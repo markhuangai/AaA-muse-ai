@@ -185,7 +185,8 @@ func (h *Handler) subscribe(w *response, r *http.Request, logger *slog.Logger, w
 		inferenceError(w, err)
 		return
 	}
-	data, err := h.Broker.Open(r.Context(), logger, workerID)
+	report, reportErr := h.readModelReport(r.Header)
+	data, err := h.Broker.Open(r.Context(), logger, workerID, report)
 	if err != nil {
 		inferenceError(w, err)
 		return
@@ -202,6 +203,16 @@ func (h *Handler) subscribe(w *response, r *http.Request, logger *slog.Logger, w
 			logger.Error("worker.disconnect_failed", "cause", err.Error(), "connection_id", connection.ID)
 		}
 	}()
+	reportLogger := logger.With("operation_id", connection.ID, "worker_id", workerID, "connection_id", connection.ID, "connection_generation", connection.Generation)
+	switch {
+	case reportErr != nil:
+		reportLogger.Warn("worker.model_report_rejected", "cause", reportErr.Error(), "outcome", "unavailable")
+	case report != nil:
+		reportLogger.Info("worker.model_report", "outcome", "accepted", "reported_at", report.ReportedAt)
+		reportLogger.Debug("worker.model_report_detail", "model_name", report.ModelName, "context_window", report.ContextWindowTokens)
+	default:
+		reportLogger.Info("worker.model_report", "outcome", "not_reported")
+	}
 	w.capture = false
 	w.stream = true
 	w.Header().Set("Content-Type", "text/event-stream")

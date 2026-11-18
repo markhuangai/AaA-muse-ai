@@ -147,7 +147,7 @@ func inferenceHTTPFixture(t *testing.T) (*Handler, *httpInferenceStore, workerVi
 
 func onlineHTTP(t *testing.T, h *Handler, wid string) inference.Connection {
 	t.Helper()
-	data, err := h.Broker.Open(context.Background(), h.Logger, wid)
+	data, err := h.Broker.Open(context.Background(), h.Logger, wid, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

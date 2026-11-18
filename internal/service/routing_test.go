@@ -352,7 +352,7 @@ func TestRoutingReconnectPreservesWithdrawalAndRevocation(t *testing.T) {
 				t.Fatal(err)
 			}
 			if revoked {
-				_, err := b.Open(ctx, logger, "worker-a")
+				_, err := b.Open(ctx, logger, "worker-a", nil)
 				requireInferenceReason(t, err, "worker_revoked")
 			} else {
 				connectInference(t, b, m, logger, "worker-a")

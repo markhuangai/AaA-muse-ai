@@ -33,6 +33,7 @@ type Handler struct {
 	Authority *auth.Authority
 	Exporter  Exporter
 	Logger    *slog.Logger
+	Redactor  *diagnostics.Redactor
 	Random    io.Reader
 	Now       func() time.Time
 	Failed    <-chan struct{}

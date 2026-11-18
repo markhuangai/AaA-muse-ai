@@ -34,11 +34,11 @@ func decision(r inference.RequestView) (map[string]any, string, error) {
 	return map[string]any{"tool_calls": []any{map[string]any{"id": d.CallID, "type": "function", "function": map[string]any{"name": d.Name, "arguments": string(args)}}}}, "tool_calls", nil
 }
 
-func envelope(r inference.RequestView, object string, choice any) map[string]any {
-	return map[string]any{"id": "chatcmpl-" + r.ID, "object": object, "created": r.CreatedAt.Unix(), "model": Model, "choices": []any{choice}}
+func envelope(r inference.RequestView, model, object string, choice any) map[string]any {
+	return map[string]any{"id": "chatcmpl-" + r.ID, "object": object, "created": r.CreatedAt.Unix(), "model": model, "choices": []any{choice}}
 }
 
-func Completion(r inference.RequestView) ([]byte, error) {
+func Completion(r inference.RequestView, model string) ([]byte, error) {
 	message, reason, err := decision(r)
 	if err != nil {
 		return nil, err
@@ -47,10 +47,10 @@ func Completion(r inference.RequestView) ([]byte, error) {
 	if reason == "tool_calls" {
 		message["content"] = nil
 	}
-	return json.Marshal(envelope(r, "chat.completion", map[string]any{"index": 0, "message": message, "finish_reason": reason, "logprobs": nil}))
+	return json.Marshal(envelope(r, model, "chat.completion", map[string]any{"index": 0, "message": message, "finish_reason": reason, "logprobs": nil}))
 }
 
-func Frames(r inference.RequestView) ([]Frame, error) {
+func Frames(r inference.RequestView, model string, includeUsage bool) ([]Frame, error) {
 	delta, reason, err := decision(r)
 	if err != nil {
 		return nil, err
@@ -68,7 +68,11 @@ func Frames(r inference.RequestView) ([]Frame, error) {
 		{reason, delta, nil},
 		{"finish", map[string]any{}, reason},
 	} {
-		b, err := json.Marshal(envelope(r, "chat.completion.chunk", map[string]any{"index": 0, "delta": event.delta, "finish_reason": event.finish, "logprobs": nil}))
+		chunk := envelope(r, model, "chat.completion.chunk", map[string]any{"index": 0, "delta": event.delta, "finish_reason": event.finish, "logprobs": nil})
+		if includeUsage {
+			chunk["usage"] = nil
+		}
+		b, err := json.Marshal(chunk)
 		if err != nil {
 			return nil, err
 		}

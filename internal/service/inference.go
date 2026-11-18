@@ -76,7 +76,7 @@ func heldJob(s *inference.State) *inference.Job {
 }
 
 func project(s *inference.State) inference.Projection {
-	p := inference.Projection{InferenceReadiness: readiness(s), Qualification: s.Routing.Latest(), QualificationHistory: append([]inference.Qualification{}, s.Routing.Qualifications...), ConnectionStatus: s.Connection.Status(s.Now), WorkStatus: "unknown", LastHeartbeatAt: s.Connection.LastAckAt, WaitingForTool: s.PendingTools}
+	p := inference.Projection{InferenceReadiness: readiness(s), Qualification: s.Routing.Latest(), QualificationHistory: append([]inference.Qualification{}, s.Routing.Qualifications...), ConnectionStatus: s.Connection.Status(s.Now), WorkStatus: "unknown", LastHeartbeatAt: s.Connection.LastAckAt, WaitingForTool: s.PendingTools, ModelReport: s.Connection.ModelReport}
 	if p.ConnectionStatus == "online" {
 		p.WorkStatus = "idle"
 	}
@@ -455,8 +455,8 @@ func connectionMatches(s *inference.State, id string, generation int64) error {
 	return nil
 }
 
-func (b *Broker) Open(ctx context.Context, logger *slog.Logger, workerID string) (json.RawMessage, error) {
-	return b.run(ctx, logger, inference.Ref{WorkerID: workerID, WorkerAuth: workerID}, "connect", nil, func(s *inference.State, events *[]inferenceEvent) (any, error) {
+func (b *Broker) Open(ctx context.Context, logger *slog.Logger, workerID string, report *inference.ModelReport) (json.RawMessage, error) {
+	return b.run(ctx, logger, inference.Ref{WorkerID: workerID, WorkerAuth: workerID}, "connect", report, func(s *inference.State, events *[]inferenceEvent) (any, error) {
 		if s.Connection.Connected {
 			return nil, inference.Reject("subscriber_already_connected", 409)
 		}
@@ -464,7 +464,7 @@ func (b *Broker) Open(ctx context.Context, logger *slog.Logger, workerID string)
 		if err != nil {
 			return nil, err
 		}
-		s.Connection = inference.Connection{ID: id, Generation: s.Connection.Generation + 1, AssignmentGeneration: s.Connection.AssignmentGeneration, Connected: true, OpenedAt: s.Now}
+		s.Connection = inference.Connection{ID: id, Generation: s.Connection.Generation + 1, AssignmentGeneration: s.Connection.AssignmentGeneration, Connected: true, OpenedAt: s.Now, ModelReport: report}
 		if err = b.challenge(s, events); err != nil {
 			return nil, err
 		}

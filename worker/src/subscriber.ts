@@ -65,7 +65,9 @@ export class Subscriber {
           await worker.reconcile(transport, status);
           if (signal.aborted) break;
           phase = 'subscription';
-          for await (const event of transport.events(signal)) {
+          const installed = await worker.state.read('installation.json');
+          const report = installed ? object(parse(installed)).model_report : undefined;
+          for await (const event of transport.events(signal, report)) {
             this.lastEvent = event.id;
             if (event.type === 'connection.opened') {
               connection(event.data);

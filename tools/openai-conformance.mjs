@@ -135,7 +135,7 @@ export async function runConformance({ baseURL, key, fixturePath, read = readFil
     return { value, requestID: response.headers.get('x-request-id') };
   };
   const models = await client.models.list();
-  require(models.data.length === 1 && models.data[0].id === model, 'invalid_model_list');
+  require(models.data.length === 1 && [model, 'muse-ai'].includes(models.data[0].id), 'invalid_model_list');
   for (const mode of ['sdk', 'raw']) for (const stream of [false, true]) {
     const kind = stream ? 'sse' : 'json', label = mode + '-' + kind;
     const marker = 'exact-' + prefix + '-' + label;

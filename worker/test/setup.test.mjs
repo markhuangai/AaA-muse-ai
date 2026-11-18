@@ -21,11 +21,33 @@ async function setupFixture(t) {
     return state.sys.pid;
   }, async emit(runtime, action, message) { emitted.push({ runtime, action, message }); return JSON.stringify({ action, message }) + '\n'; } };
   const setup = new Setup(f.worker, io, VERSION);
-  const install = () => setup.install('https://broker.example.test', CODE, join(f.state.root, 'installed'), SETUP,
+  const install = (input = CODE) => setup.install('https://broker.example.test', input, join(f.state.root, 'installed'), SETUP,
     encode({ level: 'INFO', msg: 'setup.archive_verified', setup_id: SETUP, execution_started: false }));
   const stop = async () => { const lock = await f.state.child('daemon.lock'); await lock.remove('owner.json'); await f.state.io.rmdir(lock.root); };
   return { ...f, setup, io, install, emitted, stop, launches: () => launches };
 }
+
+test('setup saves dated model reports and keeps enrollment working when a report is rejected', async t => {
+  const f = await setupFixture(t);
+  f.state.sys.now = () => Date.parse('2026-11-18T01:02:03Z');
+  const now = new Date(f.state.sys.now()).toISOString();
+  for (const report of [{ model_name: 'Test Muse', context_window_tokens: 350000 }, { model_name: 'Partial' }, { context_window_tokens: 100 }]) {
+    await f.install(CODE + '\n' + encode(report));
+    assert.deepEqual(JSON.parse(await f.state.read('installation.json')).model_report, { ...report, reported_at: now });
+  }
+  for (const value of ['{}', '{', encode({ extra: true }), encode({ context_window_tokens: 0 }),
+    encode({ model_name: '\n' }), encode({ model_name: 'x'.repeat(129) }), encode({ model_name: KEY }), 'x'.repeat(513)]) {
+    const result = await f.install(CODE + '\n' + value);
+    assert.equal(result.worker_id, ID);
+    assert.equal(JSON.parse(await f.state.read('installation.json')).model_report, undefined);
+  }
+  const exported = (await f.logger.capture.export({}, true)).trim().split('\n').map(JSON.parse);
+  assert(exported[0].complete);
+  const warnings = exported.filter(e => e.msg === 'setup.model_report_rejected');
+  assert.equal(warnings.length, 7);
+  assert(warnings.every(e => e.worker_id === ID && e.setup_id === SETUP && e.level === 'WARN'));
+  assert(!JSON.stringify(exported).includes(KEY));
+});
 
 test('setup preserves identity, protects executable assets, and owns one subscriber across repeats', async t => {
   const f = await setupFixture(t);

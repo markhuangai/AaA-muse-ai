@@ -42,7 +42,14 @@ function WorkerDetail({ worker, controller, view, back }: { worker: Worker; cont
         <div><dt>Last contact</dt><dd>{timestamp(worker.last_contact_at)}</dd></div>
         <div><dt>Last heartbeat</dt><dd>{timestamp(worker.last_heartbeat_at)}</dd></div>
         <div><dt>Installed version</dt><dd>Not reported</dd></div>
-      </dl><p className="field-note">Contact and heartbeat describe authenticated transport. They do not establish model readiness.</p></section>
+      </dl><p className="field-note">Contact and heartbeat describe authenticated transport. They do not establish model readiness.</p>
+      <h4>Reported by Muse during setup</h4>
+      <dl className="identity-list">
+        <div><dt>Model</dt><dd>{worker.model_report?.model_name ?? 'Not reported'}</dd></div>
+        <div><dt>Context window</dt><dd>{worker.model_report?.context_window_tokens
+          ? worker.model_report.context_window_tokens.toLocaleString('en-US') + ' tokens' : 'Not reported'}</dd></div>
+        <div><dt>Reported at</dt><dd>{timestamp(worker.model_report?.reported_at ?? null)}</dd></div>
+      </dl></section>
       <section className="data-panel"><h3>Broker activity</h3><dl className="identity-list">
         <div><dt>Work state</dt><dd>{stateName(worker.work_status)}</dd></div>
         <div><dt>Current assignment</dt><dd>{worker.current_job ? <><code>{worker.current_job.job_id}</code> · generation {worker.current_job.generation}</> : 'None observed'}</dd></div>

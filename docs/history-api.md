@@ -135,18 +135,46 @@ The November 12, 2026 issue #13 engineering approval permits this adapter and co
 
 ### Connection and ownership
 
-Configure the client with base URL `https://YOUR_PUBLIC_ORIGIN/v1`, bearer authentication using a distinct named `client-keys` entry, and model `muse-pool-text`. Environment references in YAML must exist inside the service container; arbitrary variables from the operator's `.env` are not automatically forwarded by Compose. Management keys, portal passwords and worker credentials cannot authenticate these endpoints.
+Configure the client with base URL `https://YOUR_PUBLIC_ORIGIN/v1`, bearer authentication using a distinct named `client-keys` entry, and model `muse-ai`. Environment references in YAML must exist inside the service container. Compose forwards the variables declared in its service environment. Use the resolved model-client key.
 
-`GET /v1/models` returns that one alias, owned by `aaa-muse-ai`. Listing the alias makes no inference-readiness claim and does not identify another vendor's model. `POST /v1/chat/completions` waits for one canonical broker decision. Responses include `X-Request-Id` and, after admission, `X-Muse-Session-Id`.
+`GET /v1/models` lists `muse-ai`, owned by `aaa-muse-ai`. Chat Completions and Responses also accept `muse-pool-text` for existing clients and echo the requested alias. The alias identifies the broker route. `POST /v1/chat/completions` waits for one canonical broker decision. Responses include `X-Request-Id` and, after admission, `X-Muse-Session-Id`.
 
-Supply a stable `X-Muse-Session-Id` and resend full history, including returned assistant messages and exact client-tool results, for continuation. The broker owns observed history, retains it without automatic deletion, rejects conflicting prefixes, serializes turns and preserves healthy worker pins. The same session string belongs to different conversations under different named client keys. Without correlation, each HTTP submission is independent; similar text does not establish identity. Exact full-history replays within an identified session return the previously accepted decision and completion ID. No additional client idempotency header is supported.
+`X-Muse-Session-Id` is optional. To keep the same broker session, send a stable value per conversation and resend full history, including returned assistant messages and exact client-tool results. The broker reconciles exact retries, rejects conflicting prefixes, serializes turns and preserves healthy worker pins. A request without a session header starts a new Chat session. The same session string under different named client keys identifies separate conversations.
 
-CLIProxyAPI and cc-switch are prospective gateway consumers. A gateway must preserve the stable session header for cross-request affinity. Neither gateway nor Codex/Claude Code is certified by these controlled protocol tests. A separate forwarding SDK is not required.
+### CLIProxyAPI
+
+Add the following provider to your CLIProxyAPI v8 configuration. Put the broker’s model-client key in the provider. Use your CPA client key when calling CPA. [CPA v8 configuration](https://github.com/router-for-me/CLIProxyAPI/blob/v8.0.77/config.example.yaml)
+
+```yaml
+api-keys:
+  openai-compatibility:
+    - name: aaa-muse-ai
+      base-url: https://YOUR_PUBLIC_ORIGIN/v1
+      request-retry: 0
+      keys:
+        - api-key: "<broker model-client key>"
+      models:
+        - name: muse-ai
+          alias: muse-ai
+```
+
+Use a normal Chat request to check JSON through CPA with `stream:false` or buffered SSE with `stream:true`. `CPA_CLIENT_KEY` is an existing CPA client key. Change the origin and port to match your CPA listener.
+
+```sh
+curl --fail-with-body --no-buffer --max-time 330 \
+  -H "Authorization: Bearer $CPA_CLIENT_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"muse-ai","messages":[{"role":"user","content":"Say hello."}],"stream":true}' \
+  http://127.0.0.1:8317/v1/chat/completions
+```
+
+CPA’s built-in Test sends a generation limit, which the broker rejects. The Chat request above uses the supported subset. For optional worker affinity across CPA requests, forward the caller’s session header. A fixed header would put every request using the same broker key into one session. [CPA Test request](https://github.com/router-for-me/Cli-Proxy-API-Management-Center/blob/706c7c6f3308c1b0cceb880eec092be911bf8a80/src/features/providers/sheets/forms/useConnectivityTest.ts#L261-L275)
 
 ### Supported request subset
 
 | Input | Support |
 |---|---|
+| `stream_options` | Optional on streaming Chat requests. Accepts an object with boolean `include_usage`. Null options act like omission. |
 | `model`, `messages` | Required; exact model alias and nonempty text history |
 | Message roles | `system`, `developer`, `user`, `assistant`, `tool`; strings or nonempty arrays of `{type:"text",text:STRING}` content, joined in order |
 | `tools` | Optional function definitions with name, optional description, object `parameters` schema, and optional `strict:false`; multiple definitions are allowed |
@@ -156,13 +184,13 @@ CLIProxyAPI and cc-switch are prospective gateway consumers. A gateway must pres
 
 Assistant call content may be absent, null or empty. Plain assistant messages require text. Returned `refusal:null` may be replayed; non-null refusals are unsupported. Function names, identifiers, object schemas, local references and argument validation follow the native contract. External schema resources are forbidden. Previously accepted calls retain their linkage even when the current tool-definition snapshot changes.
 
-Unknown fields, participant names, media, custom/hosted tools, legacy function fields, strict generation, forced/required tool choice, parallel calls, multiple choices, generation parameters, storage parameters and streaming usage options are rejected. Fields are never silently discarded. HTTP bodies and normalized canonical context each have a 1-MiB limit. The client decides its own tool permissions; neither the broker nor Muse executes proposed client tools.
+`max_tokens`, `max_completion_tokens`, and `temperature` return `400 unsupported_parameter` with the field name. Other unsupported generation options, storage settings, media, hosted tools, participant names, strict generation, forced tool choice, parallel calls, and multiple choices are also rejected. HTTP bodies and normalized canonical context each have a 1-MiB limit. The client executes proposed tools under its own permissions.
 
 ### JSON, buffered SSE and failures
 
 Non-streaming completions use `object:"chat.completion"`, one choice at index zero, an assistant message and finish reason `stop` or `tool_calls`. Function arguments remain a JSON string. Unknown usage is omitted; token counts are not estimated.
 
-With `stream:true`, the service buffers until the broker accepts a decision, then emits `data:` frames containing `chat.completion.chunk` objects: assistant role, content or indexed function-call delta, an empty delta with the finish reason, and `data: [DONE]`. IDs, creation time and model stay constant across frames. This is buffered protocol streaming; it exposes no incremental Muse tokens or private reasoning. No model-output frame is sent while waiting.
+With `stream:true`, the service buffers until the broker accepts a decision. It emits the assistant role, content or indexed function-call delta, an empty delta with the finish reason, and `data: [DONE]`. IDs, creation time and model stay constant across frames. When `stream_options.include_usage` is true, each JSON chunk has `usage: null`. Muse supplies no measured token totals, so there is no usage summary chunk.
 
 The native turn budget is 300 seconds. Chat adjusts its response deadline independently of other routes' 30-second default and applies a five-second deadline to response writes. Set client and reverse-proxy waiting timeouts above 305 seconds plus network margin. There is no Chat body parameter to extend the turn deadline.
 
@@ -186,7 +214,7 @@ Collect `/api/v1/admin/diagnostics/export?request_id=HTTP_REQUEST_ID` with a pro
 
 ## OpenAI Responses
 
-Use the same `/v1` base URL, named model-client Bearer key and `muse-pool-text` alias as Chat. `POST /v1/responses` implements a text/function subset using Responses items and events. The [official function-calling guide](https://developers.openai.com/api/docs/guides/function-calling), [streaming guide](https://developers.openai.com/api/docs/guides/streaming-responses), and installed OpenAI JS SDK 7.53.0 are the protocol references inspected on November 13, 2026. This subset does not certify Codex, Claude Code, CLIProxyAPI or cc-switch.
+Use the same `/v1` base URL, named model-client Bearer key and `muse-ai` alias as Chat. `POST /v1/responses` implements a text/function subset using Responses items and events. The [official function-calling guide](https://developers.openai.com/api/docs/guides/function-calling), [streaming guide](https://developers.openai.com/api/docs/guides/streaming-responses), and installed OpenAI JS SDK 7.53.0 are the protocol references inspected on November 13, 2026. This subset does not certify Codex, Claude Code, CLIProxyAPI or cc-switch.
 
 ### Inputs and owned continuation
 

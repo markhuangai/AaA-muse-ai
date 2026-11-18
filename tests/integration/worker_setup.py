@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import shutil
 import ssl
+import subprocess
 import threading
 import urllib.parse
 import urllib.request
@@ -110,8 +111,12 @@ class WorkerSetup(Inference):
         self.diagnose(headers["X-Request-Id"], "setup.prompt_created")
         return result
 
-    def install(self, environment, prompt, fallback=False, corrupt=False, bad_node=False, want=0):
+    def install(self, environment, prompt, fallback=False, corrupt=False, bad_node=False, want=0, model_report=None):
         script = prompt["setup_prompt"].split("```bash\n", 1)[1].split("```", 1)[0]
+        if model_report is not None:
+            slot = "\n{}\nAAA_MUSE_ENROLLMENT\n"
+            require(script.count(slot) == 1, "setup report placeholder is missing")
+            script = script.replace(slot, "\n" + model_report + "\nAAA_MUSE_ENROLLMENT\n")
         path = "/fixture/bin:/usr/bin:/bin" if fallback else "/fixture/bin:/usr/local/bin:/usr/bin:/bin"
         extra = ["-e", "PATH=" + path]
         if corrupt:
@@ -129,6 +134,41 @@ class WorkerSetup(Inference):
             self.until(lambda: self.status(environment)["connection_status"] == "online", "installed subscriber did not become online", timeout=30)
         self.assert_private(result.stdout + result.stderr)
         return result
+
+    def report_evidence(self, filter_name, identity):
+        status, _, body = self.api("/api/v1/admin/diagnostics/export?" + filter_name + "=" + identity, self.admin)
+        require(status == 200, "model report broker export unavailable")
+        saved = self.private("setup-report-" + identity + "-" + filter_name + ".ndjson", body.decode())
+        decoder = ("import {readFileSync} from 'node:fs'; import {decodeExport} from './tools/qualification-evidence.mjs';"
+                   "const result=decodeExport(readFileSync(process.argv[1],'utf8'));"
+                   "if (!result.metadata.complete || result.metadata.omissions.length) process.exit(1);"
+                   "console.log(JSON.stringify(result.events));")
+        result = subprocess.run(["node", "--input-type=module", "-e", decoder, str(saved)], capture_output=True, text=True, timeout=15)
+        require(result.returncode == 0, "model report broker export is incomplete")
+        self.assert_private(result.stdout)
+        return json.loads(result.stdout)
+
+    def diagnose_rejected_report(self, records, setup_id, worker_id):
+        rejection = next(e for e in records if e.get("msg") == "setup.model_report_rejected" and e["setup_id"] == setup_id)
+        require(rejection["level"] == "WARN" and rejection["cause"] == "model_name_contains_credential"
+                and rejection["worker_id"] == worker_id, "installer log could not identify the rejected report and setup")
+        opened = next(e for e in records if e.get("msg") == "worker.sse_event" and e.get("event_type") == "connection.opened"
+                      and e.get("setup_id") == setup_id and e.get("worker_id") == worker_id)
+        request_id = opened["request_id"]
+        connection = opened["payload"]
+        connection_id, generation = connection["connection_id"], connection["connection_generation"]
+        request_events = self.report_evidence("request_id", request_id)
+        broker = next(e for e in request_events if e["msg"] == "worker.model_report")
+        require(broker["request_id"] == request_id and broker["worker_id"] == worker_id and broker["connection_id"] == connection_id
+                and broker["connection_generation"] == generation and broker["outcome"] == "not_reported",
+                "broker report outcome does not match the authenticated worker connection")
+        operation_events = self.report_evidence("operation_id", broker["operation_id"])
+        require(broker in operation_events and any(e["msg"] == "worker.connection_changed" and e.get("connection_id") == connection_id
+                and e.get("connection_generation") == generation and e.get("worker_id") == worker_id for e in operation_events),
+                "linked broker operation lost the report outcome or connection evidence")
+        self.receipt("setup.model_report_credential_rejected", capture_complete=True, setup_id=setup_id, worker_id=worker_id,
+                     request_id=request_id, operation_id=broker["operation_id"], connection_id=connection_id, generation=generation,
+                     cause=rejection["cause"], corrective_action="Remove the credential from the optional setup report.")
 
     def cli(self, environment, *args, input_text=None, want=0):
         return self.command(environment, [environment["receipt"]["launcher"], args[0], "--state-dir", "/home/worker/.local/state/aaa-muse-worker", *args[1:]], input_text=input_text, want=want)
@@ -148,18 +188,23 @@ class WorkerSetup(Inference):
         require(status == 401, "client authority generated setup prompt")
         primary = self.environment("primary")
         initial = self.prompt()
-        self.install(primary, initial)
+        self.install(primary, initial, model_report=json.dumps({"model_name": "Controlled Muse", "context_window_tokens": 350000}))
         first_id = primary["worker"]["id"]
         first_pid = json.loads((primary["state"] / "launch.json").read_text())["pid"]
+        status = self.status(primary)
+        report = status["model_report"]
+        require(report["model_name"] == "Controlled Muse" and report["context_window_tokens"] == 350000 and report["reported_at"], "setup report did not reach own worker status")
+        require(status["inference_readiness"] == "unverified", "setup report granted qualification")
+        admin = self.checked("/api/v1/admin/workers", self.admin)[0]["workers"]
+        require(admin[0]["id"] == first_id and admin[0]["model_report"] == report, "admin and worker report snapshots differ")
+        body = {"model": "muse-ai", "messages": [{"role": "user", "content": "A reported model must not qualify a worker."}]}
+        code, _, raw = self.api("/v1/chat/completions", self.client, "POST", body)
+        require(code == 503 and json.loads(raw)["error"]["code"] == "no_ready_worker", "setup report changed dispatch eligibility")
+        body["messages"][0]["content"] = "x" * 1048576
+        code, _, _ = self.api("/v1/chat/completions", self.client, "POST", body)
+        require(code == 413, "reported context window changed the broker body limit")
         for path, mode in [(primary["state"], 0o700), (primary["state"] / "credential.key", 0o600)]:
             require(path.stat().st_mode & 0o777 == mode, "installed credential permissions differ")
-        repeated = [self.prompt(), self.prompt()]
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            list(pool.map(lambda prompt: self.install(dict(primary), prompt), repeated))
-        require(json.loads((primary["state"] / "launch.json").read_text())["pid"] == first_pid, "repeat install duplicated subscriber")
-        workers = self.checked("/api/v1/admin/workers", self.admin)[0]["workers"]
-        require(len(workers) == 1 and workers[0]["id"] == first_id, "repeat install allocated another identity")
-        self.receipt("setup.fresh_repeat_concurrent", worker_id=first_id, package_sha256=self.package["sha256"], one_consumer=True)
 
         self.hook(primary, dry=True)
         require(json.loads(self.hook(primary).stdout)["action"] == "silent", "idle hook woke model")
@@ -178,6 +223,15 @@ class WorkerSetup(Inference):
         second_pid = json.loads((primary["state"] / "launch.json").read_text())["pid"]
         require(second_pid != first_pid and (primary["state"] / "credential.key").read_text().strip() == primary["credential"], "recovery changed identity or failed to restart")
         self.until(lambda: self.status(primary)["connection_status"] == "online", "recovered subscriber not online")
+        require(self.status(primary)["model_report"] == report, "reconnect replaced the original report snapshot")
+        self.receipt("setup.model_report_snapshot", preserved_on_reconnect=True, still_unverified=True)
+        repeated = [self.prompt(), self.prompt()]
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            list(pool.map(lambda prompt: self.install(dict(primary), prompt), repeated))
+        require(json.loads((primary["state"] / "launch.json").read_text())["pid"] == second_pid, "repeat install duplicated subscriber")
+        workers = self.checked("/api/v1/admin/workers", self.admin)[0]["workers"]
+        require(len(workers) == 1 and workers[0]["id"] == first_id, "repeat install allocated another identity")
+        self.receipt("setup.fresh_repeat_concurrent", worker_id=first_id, package_sha256=self.package["sha256"], one_consumer=True)
         key = primary["state"] / "credential.key"
         key.chmod(0o644)
         self.cli(primary, "doctor", want=1)
@@ -210,7 +264,20 @@ class WorkerSetup(Inference):
         require(any(e.get("cause") == "receipt_append_failed" and e.get("stage") == "installer" and e.get("protected_capture_unavailable") for e in events), "installer append failure has no independent emergency diagnostic")
         self.receipt("setup.capture_append_failures", bootstrap_and_installer=True, stopped_before_execution=True)
         fallback = self.environment("fallback")
-        self.install(fallback, self.prompt(), fallback=True)
+        fallback_prompt = self.prompt()
+        self.install(fallback, fallback_prompt, fallback=True, model_report=json.dumps({"model_name": primary["credential"]}))
+        require("model_report" not in self.status(fallback), "unsafe report reached worker status")
+        exported = self.cli(fallback, "diagnostics-export", "--decode").stdout
+        records = [json.loads(line) for line in exported.splitlines()]
+        require(records[0]["complete"], "model report rejection capture incomplete")
+        self.diagnose_rejected_report(records, fallback_prompt["enrollment_id"], fallback["worker"]["id"])
+        invalid_prompt = self.prompt()
+        self.install(fallback, invalid_prompt, fallback=True, model_report="{")
+        require("model_report" not in self.status(fallback), "malformed setup report reached worker status")
+        exported = self.cli(fallback, "diagnostics-export", "--decode").stdout
+        require(any(e.get("msg") == "setup.model_report_rejected" and e.get("setup_id") == invalid_prompt["enrollment_id"]
+                    and e.get("cause") == "invalid_json" for e in map(json.loads, exported.splitlines())),
+                "malformed setup report was omitted without its diagnosis")
         node = json.loads((fallback["state"] / "installation.json").read_text())["node"]
         require(node.startswith('/home/worker/.local/share/aaa-muse-worker/runtime/'), "fallback used preinstalled Node")
         require(self.command(fallback, [node, "--version"]).stdout.strip() == "v24.22.2", "downloaded Node did not execute at exact pinned version")
