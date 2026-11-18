@@ -20,6 +20,52 @@ import (
 
 func hash(data []byte) string { v := sha256.Sum256(data); return hex.EncodeToString(v[:]) }
 
+func TestOpenJobFiles(t *testing.T) {
+	root := t.TempDir()
+	store := New(root)
+	id := strings.Repeat("a", 32)
+	alias := strings.Repeat("b", 32)
+	dir := filepath.Join(root, id)
+	if err := os.Mkdir(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"prompt", "image", "artifact"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(name), 0600); err != nil {
+			t.Fatal(err)
+		}
+		f, err := store.Open(id, name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, err := io.ReadAll(f)
+		f.Close()
+		if err != nil || string(data) != name {
+			t.Fatalf("read %s: %q, %v", name, data, err)
+		}
+	}
+	if err := os.Symlink(id, filepath.Join(root, alias)); err != nil {
+		t.Fatal(err)
+	}
+	for _, input := range [][2]string{{alias, "prompt"}, {".", "prompt"}, {id, "./prompt"}} {
+		if f, err := store.Open(input[0], input[1]); !errors.Is(err, os.ErrInvalid) {
+			if f != nil {
+				f.Close()
+			}
+			t.Fatalf("open %q: got %v, want invalid", input, err)
+		}
+	}
+	if err := os.Rename(filepath.Join(dir, "image"), filepath.Join(root, "saved-image")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("../saved-image", filepath.Join(dir, "image")); err != nil {
+		t.Fatal(err)
+	}
+	if f, err := store.Open(id, "image"); err == nil {
+		f.Close()
+		t.Fatal("read a file outside the job directory")
+	}
+}
+
 func TestVerifiedStorageAndLifecycle(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()

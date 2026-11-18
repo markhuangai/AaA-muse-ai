@@ -229,7 +229,33 @@ func (u *Upload) Commit() error {
 }
 
 func (s *Store) Open(id, name string) (*os.File, error) {
-	return os.Open(filepath.Join(s.Dir, id, name))
+	if !jobDir.MatchString(id) || (name != "artifact" && name != "image" && name != "prompt") {
+		return nil, os.ErrInvalid
+	}
+	volume, err := os.OpenRoot(s.Dir)
+	if err != nil {
+		return nil, err
+	}
+	defer volume.Close()
+	job, err := volume.OpenRoot(id)
+	if err != nil {
+		return nil, err
+	}
+	defer job.Close()
+
+	// A directory alias inside the shared volume must not select a different owner's job.
+	entry, err := volume.Lstat(id)
+	if err != nil {
+		return nil, err
+	}
+	opened, err := job.Stat(".")
+	if err != nil {
+		return nil, err
+	}
+	if !os.SameFile(entry, opened) {
+		return nil, os.ErrInvalid
+	}
+	return job.Open(name)
 }
 func (s *Store) ClearInputs(id string) error {
 	for _, name := range []string{"image", "prompt"} {
