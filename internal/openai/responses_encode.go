@@ -31,7 +31,7 @@ func outputText(text string) map[string]any {
 	return map[string]any{"type": "output_text", "text": text, "annotations": []any{}}
 }
 
-func ResponseObject(r inference.RequestView, status, reason string) (map[string]any, error) {
+func ResponseObject(r inference.RequestView, model, status, reason string) (map[string]any, error) {
 	if r.ID == "" || r.ResponseID == "" {
 		return nil, errors.New("response_identity_unavailable")
 	}
@@ -57,11 +57,11 @@ func ResponseObject(r inference.RequestView, status, reason string) (map[string]
 		}
 		tools = responseTools(r.Response.Tools)
 	}
-	return map[string]any{"id": r.ResponseID, "object": "response", "created_at": r.CreatedAt.Unix(), "status": status, "error": failure, "incomplete_details": nil, "instructions": instructions, "model": Model, "output": output, "parallel_tool_calls": false, "tool_choice": "auto", "tools": tools, "previous_response_id": previous, "usage": nil}, nil
+	return map[string]any{"id": r.ResponseID, "object": "response", "created_at": r.CreatedAt.Unix(), "status": status, "error": failure, "incomplete_details": nil, "instructions": instructions, "model": model, "output": output, "parallel_tool_calls": false, "tool_choice": "auto", "tools": tools, "previous_response_id": previous, "usage": nil}, nil
 }
 
-func ResponseFrames(r inference.RequestView, failure string) ([]Frame, error) {
-	progress, err := ResponseObject(r, "in_progress", "")
+func ResponseFrames(r inference.RequestView, model, failure string) ([]Frame, error) {
+	progress, err := ResponseObject(r, model, "in_progress", "")
 	if err != nil {
 		return nil, err
 	}
@@ -82,7 +82,7 @@ func ResponseFrames(r inference.RequestView, failure string) ([]Frame, error) {
 	emit("response.created", map[string]any{"response": progress})
 	emit("response.in_progress", map[string]any{"response": progress})
 	if failure != "" {
-		failed, err := ResponseObject(r, "failed", failure)
+		failed, err := ResponseObject(r, model, "failed", failure)
 		if err != nil {
 			return nil, err
 		}
@@ -115,7 +115,7 @@ func ResponseFrames(r inference.RequestView, failure string) ([]Frame, error) {
 		emit("response.function_call_arguments.done", map[string]any{"item_id": id, "output_index": 0, "arguments": item["arguments"]})
 	}
 	emit("response.output_item.done", map[string]any{"output_index": 0, "item": item})
-	completed, err := ResponseObject(r, "completed", "")
+	completed, err := ResponseObject(r, model, "completed", "")
 	if err != nil {
 		return nil, err
 	}

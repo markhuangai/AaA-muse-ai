@@ -19,8 +19,9 @@ from worker_auth import WorkerAuth
 
 
 class Peer:
-    def __init__(self, harness, worker, reply=True):
+    def __init__(self, harness, worker, reply=True, headers=None):
         self.harness, self.worker, self.reply = harness, worker, reply
+        self.headers = headers or {}
         self.condition = threading.Condition()
         self.events, self.errors, self.replies = [], [], []
         self.idle_ack = None
@@ -40,9 +41,10 @@ class Peer:
         try:
             origin = urllib.parse.urlsplit(self.harness.origin_url)
             self.connection = http.client.HTTPConnection(origin.hostname, origin.port, timeout=45)
-            self.connection.request("GET", "/api/v1/worker/events", headers={"Authorization": "Bearer " + self.worker["credential"]})
+            self.connection.request("GET", "/api/v1/worker/events", headers={**self.headers, "Authorization": "Bearer " + self.worker["credential"]})
             response = self.connection.getresponse()
             require(response.status == 200, "SSE subscription rejected")
+            self.request_id = response.getheader("X-Request-Id")
             self.socket = self.connection.sock
             event_type, event_id, data = None, None, None
             while not self.stopping:
@@ -135,8 +137,8 @@ class Inference(WorkerAuth):
         require(status == 201, "worker registration failed")
         return worker
 
-    def peer(self, worker, reply=True):
-        peer = Peer(self, worker, reply)
+    def peer(self, worker, reply=True, headers=None):
+        peer = Peer(self, worker, reply, headers)
         self.peers.append(peer)
         return peer.start()
 

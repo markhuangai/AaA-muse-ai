@@ -116,7 +116,7 @@ func TestHealthDeadlinesRevocationAndFailures(t *testing.T) {
 	}
 	b, m, log, _ := inferenceFixture()
 	c := connectInference(t, b, m, log, "worker-a")
-	_, err := b.Open(ctx, log, "worker-a")
+	_, err := b.Open(ctx, log, "worker-a", nil)
 	requireInferenceReason(t, err, "subscriber_already_connected")
 	h := inference.Heartbeat{Version: 1, ConnectionID: c.ID, Generation: c.Generation, ChallengeID: c.Challenges[0].ID}
 	if _, err = b.Heartbeat(ctx, log, "worker-a", h); err != nil {
@@ -217,7 +217,7 @@ func TestEntropyExpiryAndStoredPrefixFailure(t *testing.T) {
 	b, m, log, _ := inferenceFixture()
 	ctx := context.Background()
 	b.random = bytes.NewReader(nil)
-	if _, err := b.Open(ctx, log, "worker-a"); err == nil {
+	if _, err := b.Open(ctx, log, "worker-a", nil); err == nil {
 		t.Fatal("connection entropy failure ignored")
 	}
 	b, m, log, _ = inferenceFixture()

@@ -4,6 +4,8 @@ A self-hosted broker that connects model clients to a Muse worker through outbou
 
 ## Status
 
+The owner-approved OpenAI compatibility work advertises `muse-ai` while accepting the existing alias, supports CPA’s streamed usage request with unknown totals, and carries a dated model and context-window report from Muse setup to the Workers view. The report describes the setup turn. The passing-live release gate remains in effect. See the [OpenAI and CPA configuration](docs/history-api.md#openai-chat-completions).
+
 On November 17 the owner accepted rc.11 functional testing and closed [#18](https://github.com/markhuangai/AaA-muse-ai/issues/18#issuecomment-6947082016). Its final record retains 68 complete exports, 30/35 formal cases and an inconclusive qualification verdict, including unavailable supported-refresh evidence. Both test registrations were permanently revoked. These facts supersede the historical incomplete-task status below without changing its observations or the standing passing-live release gate.
 
 The owner-approved [#19](https://github.com/markhuangai/AaA-muse-ai/issues/19) delivery adds [immutable final-version candidates and release verification](docs/releases.md). Candidate publication follows the owner's merge of the reviewed implementation PR; stable promotion requires separately authorized passing exact-candidate evidence and explicit publication confirmation. The new workflow does not re-enroll the retired workers or rerun the live matrix. Engineering checks cannot qualify Muse. No `0.1.0` artifact has been published by this source change.
@@ -163,6 +165,8 @@ Install the scoped AaA Muse worker for the HTTPS origin below, using exactly the
 
 Use your actual shell, site and hook permissions. Present permission cards to the owner and read their actual scope. If a capability or permission is missing or refused, stop and report the actual result; do not bypass it, rewrite the verified package, or invent a native inference API. No GitHub token or manual owner VM shell is needed. Keep the enrollment code private: it is single-use authority expiring 15 minutes after issuance. Never put a durable worker credential in a prompt, URL, hook, task or log.
 
+Before running the bootstrap, check the model name and total context window your Muse setup status reports. Replace only the {} line below with one JSON object containing the available model_name (string) and context_window_tokens (positive integer). Omit unavailable values. Leave {} when neither value is known. Keep quota, current usage and credentials out of this report. Use JSON string escaping and keep the report on one line. This report describes the setup turn.
+
 Run this Bash bootstrap with tracing disabled. Retain its private evidence directory on failure:
 
 ```bash
@@ -205,6 +209,7 @@ event INFO setup.archive_verified
 tar -xzf "$work/worker.tgz" --no-same-owner --no-same-permissions -C "$work" package/setup/install.sh
 bash "$work/package/setup/install.sh" "$work/worker.tgz" "$version" "$expected" "$origin" "$setup_id" "$receipt" <<'AAA_MUSE_ENROLLMENT'
 <SINGLE_USE_ENROLLMENT_CODE>
+{}
 AAA_MUSE_ENROLLMENT
 ```
 

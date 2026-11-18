@@ -19,7 +19,7 @@ from service import require
 
 class Responses(Chat):
     def body(self, text, stream=False, **fields):
-        return {"model": "muse-pool-text", "input": text, "stream": stream, **fields}
+        return {"model": "muse-ai", "input": text, "stream": stream, **fields}
 
     def response(self, body, session=None, **options):
         return self.chat(body, session, path="/v1/responses", **options)
@@ -47,6 +47,16 @@ class Responses(Chat):
 
     def text(self, result):
         return self.value(result)["output"][0]["content"][0]["text"]
+
+    def response_aliases(self):
+        body = self.body("aaa-chat:text:compatible")
+        session = "responses-model-aliases"
+        first = self.value(self.response(body, session))
+        for model in ("muse-ai", "muse-pool-text"):
+            for stream in (False, True):
+                replay = self.value(self.response({**body, "model": model, "stream": stream}, session))
+                require(replay == {**first, "model": model}, "Responses replay changed the model or accepted output")
+        self.receipt("responses.model_aliases", exact_replay=True)
 
     def diagnose_response(self, request_id, event_name, reason):
         selected, sources = [], []
@@ -417,6 +427,7 @@ def main():
             h.new_bot()
         h.matrix()
         h.boundaries()
+        h.response_aliases()
         h.references_and_instructions(other_origin)
         h.concurrent_admission(other_origin)
         h.capture_and_delay()

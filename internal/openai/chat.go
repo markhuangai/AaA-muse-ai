@@ -9,7 +9,8 @@ import (
 	"github.com/markhuangai/AaA-muse-ai/internal/inference"
 )
 
-const Model = "muse-pool-text"
+const Model = "muse-ai"
+const LegacyModel = "muse-pool-text"
 
 type Error struct {
 	Status      int
@@ -22,9 +23,11 @@ func (e *Error) Error() string { return e.Code }
 func reject(code, path string) error { return &Error{Status: 400, Code: code, Param: path} }
 
 type Chat struct {
-	Input    inference.RequestInput
-	Stream   bool
-	Admitted map[string]any
+	Input        inference.RequestInput
+	Model        string
+	Stream       bool
+	IncludeUsage bool
+	Admitted     map[string]any
 }
 
 func fields(value any, path string, allowed ...string) (map[string]any, error) {
@@ -67,6 +70,17 @@ func stringField(m map[string]any, key, path string) (string, error) {
 	return v, nil
 }
 
+func modelField(m map[string]any) (string, error) {
+	model, err := stringField(m, "model", "")
+	if err != nil {
+		return "", err
+	}
+	if model != Model && model != LegacyModel {
+		return "", &Error{Status: 404, Code: "model_not_found", Param: "model"}
+	}
+	return model, nil
+}
+
 func Normalize(body []byte) (Chat, error) {
 	c := Chat{Input: inference.RequestInput{Version: 1, TimeoutSeconds: 300, Tools: []inference.Tool{}}}
 	var raw map[string]any
@@ -74,21 +88,31 @@ func Normalize(body []byte) (Chat, error) {
 		return c, reject(err.Error(), "")
 	}
 	c.Admitted = raw
-	m, err := fields(raw, "", "model", "messages", "tools", "stream", "n", "parallel_tool_calls", "tool_choice")
+	m, err := fields(raw, "", "model", "messages", "tools", "stream", "stream_options", "n", "parallel_tool_calls", "tool_choice")
 	if err != nil {
 		return c, err
 	}
-	model, err := stringField(m, "model", "")
-	if err != nil {
+	if c.Model, err = modelField(m); err != nil {
 		return c, err
-	}
-	if model != Model {
-		return c, &Error{Status: 404, Code: "model_not_found", Param: "model"}
 	}
 	if v, ok := m["stream"]; ok {
 		c.Stream, ok = v.(bool)
 		if !ok {
 			return c, reject("boolean_required", "stream")
+		}
+	}
+	if v := m["stream_options"]; v != nil {
+		options, err := fields(v, "stream_options", "include_usage")
+		if err != nil {
+			return c, err
+		}
+		if !c.Stream {
+			return c, reject("stream_options_require_stream", "stream_options")
+		}
+		if usage, ok := options["include_usage"]; ok {
+			if c.IncludeUsage, ok = usage.(bool); !ok {
+				return c, reject("boolean_required", "stream_options.include_usage")
+			}
 		}
 	}
 	if v, ok := m["n"]; ok && v != json.Number("1") {

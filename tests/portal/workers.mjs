@@ -105,10 +105,16 @@ async function viewports() {
     await expect(row(fixture.workers.waiting_id)).toContainText('1 client-tool waits');
     await expect(row(fixture.workers.reconnected_id)).toContainText('Approved');
     await screenshot(page, 'list', width);
+    await openWorker(page, fixture.workers.transport_id);
+    await expect(page.getByRole('heading', { name: 'Reported by Muse during setup' })).toBeVisible();
+    await expect(page.getByText('Controlled Muse', { exact: true })).toBeVisible();
+    await expect(page.getByText('350,000 tokens', { exact: true })).toBeVisible();
+    await expect(page.getByText('2026-11-18 00:00:00 UTC', { exact: true })).toBeVisible();
+    await page.getByRole('button', { name: 'All workers', exact: true }).click();
     await openWorker(page, fixture.workers.busy_id);
     await expect(page.getByText(fixture.workers.busy_job_id, { exact: true })).toBeVisible();
     await expect(page.getByText('Controlled software evidence').first()).toBeVisible();
-    await expect(page.getByText('Not reported', { exact: true })).toBeVisible();
+    await expect(page.getByText('Installed version', { exact: true }).locator('..')).toContainText('Not reported');
     await expect(page.getByText('Not independently observed', { exact: true })).toBeVisible();
     const acceptedName = `Research agent ${width} 名称`;
     await page.getByLabel('Display name', { exact: true }).fill(`  ${acceptedName}  `);

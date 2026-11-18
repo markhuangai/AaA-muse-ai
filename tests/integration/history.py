@@ -23,8 +23,8 @@ class History(Inference):
         config["limits"] = {"max-jobs": 16, "in-flight-per-worker": 1}
         return config
 
-    def peer(self, worker, reply=True, qualify=True):
-        peer = super().peer(worker, reply)
+    def peer(self, worker, reply=True, qualify=True, headers=None):
+        peer = super().peer(worker, reply, headers)
         if reply and qualify:
             self.qualify_worker(worker, peer)
         return peer

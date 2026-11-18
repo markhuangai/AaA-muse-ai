@@ -40,10 +40,11 @@ func fixture(t *testing.T) (*Handler, *testDB, *bytes.Buffer, *diagnostics.Store
 		t.Fatal(err)
 	}
 	var out bytes.Buffer
-	logger := diagnostics.NewLogger(&out, store, slog.LevelInfo, diagnostics.NewRedactor(c.Secrets()), time.Now, func(error) { t.Error("capture failed") }).With("instance_id", "instance")
+	redactor := diagnostics.NewRedactor(c.Secrets())
+	logger := diagnostics.NewLogger(&out, store, slog.LevelInfo, redactor, time.Now, func(error) { t.Error("capture failed") }).With("instance_id", "instance")
 	db := &testDB{}
 	svc := service.New(db, c, service.Build{Revision: "revision"}, "instance", time.Now, logger)
-	return &Handler{Service: svc, Authority: auth.New(c), Exporter: store, Logger: logger, Random: rand.Reader, Now: time.Now, Failed: make(chan struct{})}, db, &out, store
+	return &Handler{Service: svc, Authority: auth.New(c), Exporter: store, Logger: logger, Redactor: redactor, Random: rand.Reader, Now: time.Now, Failed: make(chan struct{})}, db, &out, store
 }
 func call(h *Handler, method, path, authorization string, body io.Reader) *httptest.ResponseRecorder {
 	r := httptest.NewRequest(method, path, body)

@@ -142,14 +142,21 @@ type Challenge struct {
 	ReplyHash string    `json:"reply_hash,omitempty"`
 }
 
+type ModelReport struct {
+	ModelName           *string   `json:"model_name,omitempty"`
+	ContextWindowTokens *int64    `json:"context_window_tokens,omitempty"`
+	ReportedAt          time.Time `json:"reported_at"`
+}
+
 type Connection struct {
-	ID                   string      `json:"connection_id"`
-	Generation           int64       `json:"connection_generation"`
-	AssignmentGeneration int64       `json:"assignment_generation"`
-	Connected            bool        `json:"connected"`
-	OpenedAt             time.Time   `json:"opened_at"`
-	LastAckAt            *time.Time  `json:"last_ack_at"`
-	Challenges           []Challenge `json:"challenges"`
+	ID                   string       `json:"connection_id"`
+	Generation           int64        `json:"connection_generation"`
+	AssignmentGeneration int64        `json:"assignment_generation"`
+	Connected            bool         `json:"connected"`
+	OpenedAt             time.Time    `json:"opened_at"`
+	LastAckAt            *time.Time   `json:"last_ack_at"`
+	Challenges           []Challenge  `json:"challenges"`
+	ModelReport          *ModelReport `json:"model_report,omitempty"`
 }
 
 func (c Connection) Status(now time.Time) string {
@@ -177,6 +184,7 @@ type Projection struct {
 	InferenceReadiness   string          `json:"inference_readiness"`
 	Qualification        *Qualification  `json:"qualification,omitempty"`
 	QualificationHistory []Qualification `json:"qualification_history"`
+	ModelReport          *ModelReport    `json:"model_report,omitempty"`
 }
 
 type Receipt struct {

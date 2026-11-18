@@ -177,7 +177,7 @@ func decodeResult[T any](t *testing.T, data json.RawMessage, err error) T {
 
 func connectInference(t *testing.T, b *Broker, m *inferenceMemory, log *slog.Logger, wid string) inference.Connection {
 	t.Helper()
-	data, err := b.Open(context.Background(), log, wid)
+	data, err := b.Open(context.Background(), log, wid, nil)
 	c := decodeResult[inference.Connection](t, data, err)
 	data, err = b.Heartbeat(context.Background(), log, wid, inference.Heartbeat{Version: 1, ConnectionID: c.ID, Generation: c.Generation, ChallengeID: c.Challenges[0].ID})
 	decodeResult[inference.Projection](t, data, err)

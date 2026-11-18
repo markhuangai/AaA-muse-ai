@@ -110,7 +110,8 @@ func Run(ctx context.Context, args []string, build service.Build, d Dependencies
 	}
 	failed := make(chan struct{})
 	var failOnce sync.Once
-	logger := diagnostics.NewLogger(d.Stdout, store, level(c.Diagnostics.Level), diagnostics.NewRedactor(c.Secrets()), d.Now, func(err error) {
+	redactor := diagnostics.NewRedactor(c.Secrets())
+	logger := diagnostics.NewLogger(d.Stdout, store, level(c.Diagnostics.Level), redactor, d.Now, func(err error) {
 		failOnce.Do(func() {
 			fatal("diagnostics.capture_failed", diagnostics.Cause(err), []any{"instance_id", instance})
 			close(failed)
@@ -158,7 +159,7 @@ func Run(ctx context.Context, args []string, build service.Build, d Dependencies
 	authority := auth.New(c)
 	serveCtx, cancelServe := context.WithCancel(ctx)
 	defer cancelServe()
-	handler := &httpapi.Handler{Service: svc, Workers: service.NewWorkers(repo, authority, d.Random, d.Now), Broker: broker, Authority: authority, Exporter: store, Logger: logger, Random: d.Random, Now: d.Now, Failed: failed}
+	handler := &httpapi.Handler{Service: svc, Workers: service.NewWorkers(repo, authority, d.Random, d.Now), Broker: broker, Authority: authority, Exporter: store, Logger: logger, Redactor: redactor, Random: d.Random, Now: d.Now, Failed: failed}
 	handler.Portal = service.NewPortal(authority, d.Random, d.Now)
 	handler.Assets = d.PortalAssets
 	startup.Info("portal.configured", "effective_settings", service.PortalSettings(), "session_scope", "process_memory", "browser_storage", "none")

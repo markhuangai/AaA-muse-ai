@@ -4,6 +4,7 @@ import { Worker } from './worker.js';
 import { digest, type Logger } from './diagnostics.js';
 import { Failure, cause, requireValue } from './errors.js';
 import { encode, parse, object, text, integer, identifier, type ObjectValue, type Value } from './json.js';
+import { maxModelReportBytes } from './protocol.js';
 import type { SetupIO } from './setup-os.js';
 
 const quote = (value: string): string => "'" + value.replaceAll("'", "'\"'\"'") + "'";
@@ -74,7 +75,34 @@ export class Setup {
       }
     });
   }
-  async install(origin: string, code: string, root: string, setupID: string, bootstrap?: string): Promise<ObjectValue> {
+  private async modelReport(raw: string, setupID: string, workerID: string): Promise<ObjectValue | undefined> {
+    if (!raw) return undefined;
+    try {
+      requireValue(Buffer.byteLength(raw) <= maxModelReportBytes, 'model_report_too_large');
+      const report = object(parse(raw));
+      requireValue(Object.keys(report).every(key => key === 'model_name' || key === 'context_window_tokens'), 'unsupported_model_report_fields');
+      const result: ObjectValue = {};
+      if (report.model_name !== undefined) {
+        const name = text(report.model_name);
+        requireValue(name.trim() && Buffer.byteLength(name) <= 128 && !/\p{Cc}/u.test(name), 'invalid_model_name');
+        requireValue(this.worker.logger.redactor.text(name) === name, 'model_name_contains_credential');
+        result.model_name = name;
+      }
+      if (report.context_window_tokens !== undefined) {
+        const window = integer(report.context_window_tokens);
+        requireValue(window > 0, 'invalid_context_window');
+        result.context_window_tokens = window;
+      }
+      if (Object.keys(result).length === 0) return undefined;
+      result.reported_at = new Date(this.state.sys.now()).toISOString();
+      return result;
+    } catch (error) {
+      if (!(error instanceof Failure)) throw error;
+      await this.worker.logger.log('WARN', 'setup.model_report_rejected', { setup_id: setupID, operation_id: setupID, worker_id: workerID, cause: error.code, outcome: 'unavailable' });
+      return undefined;
+    }
+  }
+  async install(origin: string, input: string, root: string, setupID: string, bootstrap?: string): Promise<ObjectValue> {
     requireValue(isAbsolute(root) && isAbsolute(this.io.node) && isAbsolute(this.io.entry), 'absolute_install_paths_required');
     identifier(setupID);
     if (bootstrap) await captureBootstrap(this.worker.logger, setupID, bootstrap);
@@ -84,9 +112,12 @@ export class Setup {
       const owner = await this.owner();
       requireValue(!owner || previous?.package_version === this.version, 'running_version_change_requires_operator_action', { pid: owner ?? null, expected_version: this.version, observed_version: previous?.package_version ?? null });
       await this.worker.configure(origin);
+      const newline = input.indexOf('\n');
+      const code = newline < 0 ? input : input.slice(0, newline).trim();
       const identity = await this.worker.enroll(code);
       const id = identifier(identity.worker_id);
-      const installation = { setup_id: setupID, worker_id: id, origin: this.worker.config.origin, package_version: this.version, node: this.io.node, entry: this.io.entry, root };
+      const report = await this.modelReport(newline < 0 ? '' : input.slice(newline + 1).trim(), setupID, id);
+      const installation = { setup_id: setupID, worker_id: id, origin: this.worker.config.origin, package_version: this.version, node: this.io.node, entry: this.io.entry, root, ...(report && { model_report: report }) };
       await this.state.write('installation.json', encode(installation));
       const bin = await new State(root, this.state.io, this.state.sys).child('bin');
       const launcher = bin.path('aaa-muse-worker');

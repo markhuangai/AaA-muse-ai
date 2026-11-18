@@ -10,6 +10,7 @@ import (
 
 type Responses struct {
 	Input    inference.ResponseInput
+	Model    string
 	Stream   bool
 	Admitted map[string]any
 }
@@ -23,12 +24,8 @@ func NormalizeResponse(body []byte) (Responses, error) {
 	if err != nil {
 		return r, err
 	}
-	model, err := stringField(m, "model", "")
-	if err != nil {
+	if r.Model, err = modelField(m); err != nil {
 		return r, err
-	}
-	if model != Model {
-		return r, &Error{Status: 404, Code: "model_not_found", Param: "model"}
 	}
 	if value, ok := m["stream"]; ok {
 		if r.Stream, ok = value.(bool); !ok {

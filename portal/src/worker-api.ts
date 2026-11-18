@@ -7,6 +7,12 @@ export interface Qualification {
   evidence: { action: string; evidence_kind?: string; evidence_reference: string };
 }
 
+interface ModelReport {
+  model_name?: string;
+  context_window_tokens?: number;
+  reported_at: string;
+}
+
 export interface Worker {
   id: string;
   name: string;
@@ -21,6 +27,7 @@ export interface Worker {
   inference_readiness: string;
   qualification?: Qualification | null;
   qualification_history: Qualification[];
+  model_report?: ModelReport;
 }
 
 export interface Enrollment {
@@ -46,6 +53,13 @@ function qualification(value: unknown): value is Qualification {
     (value.evidence.evidence_kind === undefined || typeof value.evidence.evidence_kind === 'string');
 }
 
+function modelReport(value: unknown): value is ModelReport {
+  return object(value) && date(value.reported_at) &&
+    (value.model_name !== undefined || value.context_window_tokens !== undefined) &&
+    (value.model_name === undefined || typeof value.model_name === 'string' && value.model_name.trim().length > 0) &&
+    (value.context_window_tokens === undefined || integer(value.context_window_tokens) && Number(value.context_window_tokens) > 0);
+}
+
 export function isWorker(value: unknown): value is Worker {
   return object(value) && typeof value.id === 'string' && /^[a-f0-9]{32}$/.test(value.id) && typeof value.name === 'string' &&
     date(value.registered_at) && optionalDate(value.revoked_at) && optionalDate(value.last_contact_at) &&
@@ -53,7 +67,8 @@ export function isWorker(value: unknown): value is Worker {
     (value.current_job === null || (object(value.current_job) && typeof value.current_job.job_id === 'string' && integer(value.current_job.generation))) &&
     integer(value.waiting_for_client_tool) && optionalDate(value.last_heartbeat_at) && typeof value.inference_readiness === 'string' &&
     (value.qualification == null || qualification(value.qualification)) &&
-    Array.isArray(value.qualification_history) && value.qualification_history.every(qualification);
+    Array.isArray(value.qualification_history) && value.qualification_history.every(qualification) &&
+    (value.model_report === undefined || modelReport(value.model_report));
 }
 
 export function isEnrollment(value: unknown, kind: EnrollmentKind): value is Enrollment {

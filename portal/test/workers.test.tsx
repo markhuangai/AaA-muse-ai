@@ -16,11 +16,16 @@ async function fixture() {
 test('actual worker components show facts separately, text-safe names and the server-accepted rename', async () => {
   const { portal, api, controller } = await fixture();
   api.workersWork = async () => ({ value: [{ ...worker(), name: '<img src=x onerror=alert(1)>', work_status: 'busy', current_job: { job_id: 'job-observed', generation: 2 }, waiting_for_client_tool: 1,
+    model_report: { model_name: '<img src=x onerror=alert(2)>', context_window_tokens: 350000, reported_at: '2026-11-18T00:00:00Z' },
     inference_readiness: 'verified', qualification: { id: 'approval', created_at: worker().registered_at, connection_id: 'connection-observed', connection_generation: 3, capabilities: ['text', 'function_tools'], evidence: { action: 'approve', evidence_kind: 'controlled', evidence_reference: 'Controlled trial' } },
     qualification_history: [{ id: 'old-approval', created_at: worker().registered_at, connection_id: 'old-connection', connection_generation: 2, capabilities: [], evidence: { action: 'withdraw', evidence_reference: 'Withdrawn' } }] }], requestID: 'facts-request' });
   await controller.refresh(); render(<Workers controller={controller} />);
   await act(async () => { fireEvent.click(screen.getByRole('button', { name: '<img src=x onerror=alert(1)>' })); });
   expect(document.querySelector('img')).toBeNull();
+  expect(screen.getByRole('heading', { name: 'Reported by Muse during setup' })).toBeTruthy();
+  expect(screen.getByText('<img src=x onerror=alert(2)>')).toBeTruthy();
+  expect(screen.getByText('350,000 tokens')).toBeTruthy();
+  expect(screen.getByText('2026-11-18 00:00:00 UTC')).toBeTruthy();
   expect(screen.getByText('Installed version').parentElement?.textContent).toContain('Not reported'); expect(screen.getByText('Not independently observed')).toBeTruthy();
   expect(screen.getByText('job-observed')).toBeTruthy(); expect(screen.getByText('Controlled software evidence')).toBeTruthy();
   expect(screen.getByText('No automatic expiry; valid until revoked')).toBeTruthy();

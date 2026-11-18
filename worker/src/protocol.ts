@@ -1,6 +1,8 @@
 import { requireValue } from './errors.js';
 import { identifier, integer, object, text, type ObjectValue, type Value } from './json.js';
 
+export const maxModelReportBytes = 512;
+
 export function version(value: Value | undefined): void { requireValue(integer(value) === 1, 'unsupported_protocol_version'); }
 export function job(value: ObjectValue, workerId: string, jobId: string): ObjectValue {
   version(value.protocol_version);
