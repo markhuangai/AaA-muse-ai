@@ -70,7 +70,8 @@ class MediaFlow(Product):
         prompt = "private-motion-" + secrets.token_hex(20)
         jobs = []
         for case, image in [*stills.items(), ("prompt_video", None), *audios.items()]:
-            fields = {"prompt": prompt, "submission_id": secrets.token_hex(16)}
+            motion = "\ufeff" + prompt if case == "prompt_video" else prompt
+            fields = {"prompt": motion, "submission_id": secrets.token_hex(16)}
             route = "/api/v1/media/jobs"
             key = self.client
             if case in audios:
@@ -107,7 +108,7 @@ class MediaFlow(Product):
                 require(shown["action"] == "generate_still_then_animate", "missing native two-step action")
                 (spool / Path(shown["generated_still_path"]).name).write_bytes(stills["image/webp"])
             if case not in audios:
-                require(shown["prompt"] == prompt, "motion text changed")
+                require(shown["prompt"] == motion, "motion text changed")
             again = json.loads(self.cli(worker, "job-show", "--job-id", identity).stdout)
             require(again["action"] == "preserve_existing_generation", "repeat wake can regenerate")
             require(self.api(url, self.other_client)[0] == self.api(url + "/artifact", self.other_client)[0] == 404, "foreign owner read media")

@@ -6,10 +6,10 @@ import (
 	"encoding/hex"
 	"errors"
 	"io"
+	"io/fs"
 	"log/slog"
 	"mime"
 	"net/http"
-	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -192,7 +192,7 @@ func (h *Handler) serveMedia(w *response, r *http.Request, l *slog.Logger, route
 		err = h.submitMedia(w, r, ctx, l, route, owner)
 	case mediaJob, mediaArtifact:
 		var status service.MediaStatus
-		var f *os.File
+		var f fs.File
 		status, f, err = h.Broker.ReadMedia(ctx, l, owner, id, route == mediaArtifact)
 		if err == nil && f == nil {
 			writeJSON(w, 200, status)
@@ -208,7 +208,7 @@ func (h *Handler) serveMedia(w *response, r *http.Request, l *slog.Logger, route
 		if route == workerMediaArtifact {
 			err = h.uploadMedia(w, r, ctx, l, worker, id, f)
 		} else {
-			var file *os.File
+			var file fs.File
 			var kind string
 			file, kind, err = h.Broker.MediaInput(ctx, l, worker, id, strings.TrimPrefix(route, workerMedia), f)
 			if err == nil {
@@ -233,7 +233,7 @@ func (h *Handler) serveMedia(w *response, r *http.Request, l *slog.Logger, route
 	}
 }
 
-func sendFile(w *response, file *os.File, kind string, size int64) error {
+func sendFile(w *response, file fs.File, kind string, size int64) error {
 	defer file.Close()
 	if size < 0 {
 		stat, err := file.Stat()
@@ -315,7 +315,7 @@ func (h *Handler) uploadMedia(w *response, r *http.Request, ctx context.Context,
 			return err
 		}
 		defer func() {
-			if e := os.Remove(u.Path); e != nil && !errors.Is(e, os.ErrNotExist) {
+			if e := u.Close(); e != nil {
 				l.Error("media.cleanup_failed", "stage", "upload", "cause", e.Error())
 			}
 		}()

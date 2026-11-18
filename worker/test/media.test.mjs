@@ -11,16 +11,16 @@ const prompt = 'private-customer-prompt-sentinel';
 const image = Buffer.from('private-image-sentinel');
 const output = Buffer.from('private-original-output-sentinel');
 
-async function setup(t, profile) {
+async function setup(t, profile, motion = prompt) {
   const f = await fixture(t);
   const transport = await enrolled(f);
-  const j = claimed({ media: { profile, input_sha256: sha(image), input_size: image.length, input_type: 'image/png', prompt_sha256: sha(prompt) } });
+  const j = claimed({ media: { profile, input_sha256: sha(image), input_size: image.length, input_type: 'image/png', prompt_sha256: sha(motion) } });
   f.broker.jobs.set(JOB, j);
   const api = f.net.fetch;
   const flags = { interrupt: false, loseAck: false, invalidAck: false, requests: [], wrongImage: false };
   f.net.fetch = async (url, options) => {
     const path = new URL(url).pathname;
-    if (path.endsWith('/media/prompt')) return new Response(prompt);
+    if (path.endsWith('/media/prompt')) return new Response(motion);
     if (path.endsWith('/media/image')) return new Response(flags.wrongImage ? Buffer.from('wrong') : image, { headers: { 'content-type': 'image/png' } });
     if (!path.endsWith('/artifact')) return api(url, options);
     assert.equal(options.method, 'PUT');
@@ -40,12 +40,13 @@ async function setup(t, profile) {
 
 for (const profile of ['image_video', 'prompt_video', 'native_mp3', 'offline_wav']) {
   test('job-bound generation and confirmed cleanup for ' + profile, async t => {
-    const f = await setup(t, profile);
+    const motion = profile === 'prompt_video' ? '\uFEFF' + prompt : prompt;
+    const f = await setup(t, profile, motion);
     await drainMedia(f.worker, f.transport);
     const shown = await f.worker.show(JOB);
     if (profile === 'image_video') assert.deepEqual(await readFile(shown.reference_path), image);
     if (profile === 'prompt_video') await writeFile(shown.generated_still_path, image);
-    if (profile.endsWith('video')) assert.equal(shown.prompt, prompt);
+    if (profile.endsWith('video')) assert.equal(shown.prompt, motion);
     else assert.equal(shown.fixture_sha256, sha(image));
     assert.equal((await f.worker.show(JOB)).action, 'preserve_existing_generation');
     await assert.rejects(f.worker.submit(JOB, JSON.stringify({ type: 'final', text: prompt })), /media_upload_required/);

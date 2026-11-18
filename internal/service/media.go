@@ -4,8 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io/fs"
 	"log/slog"
-	"os"
 	"time"
 
 	"github.com/markhuangai/AaA-muse-ai/internal/auth"
@@ -111,9 +111,9 @@ func mediaAssignment(s *inference.State, id string, f MediaFence, allowReceipt b
 }
 
 // Open the authorized file inside the transaction so cleanup cannot change which file a successful request reads.
-func (b *Broker) ReadMedia(ctx context.Context, l *slog.Logger, owner, id string, download bool) (MediaStatus, *os.File, error) {
+func (b *Broker) ReadMedia(ctx context.Context, l *slog.Logger, owner, id string, download bool) (MediaStatus, fs.File, error) {
 	var result MediaStatus
-	var file *os.File
+	var file fs.File
 	_, err := b.run(ctx, l, inference.Ref{JobID: id, Principal: "media:" + owner}, "media_read", download, func(s *inference.State, _ *[]inferenceEvent) (any, error) {
 		j := s.Jobs[id]
 		if j == nil || j.Media == nil || j.Media.Owner != owner {
@@ -142,8 +142,8 @@ func (b *Broker) ReadMedia(ctx context.Context, l *slog.Logger, owner, id string
 	return result, file, err
 }
 
-func (b *Broker) MediaInput(ctx context.Context, l *slog.Logger, worker, id, name string, f MediaFence) (*os.File, string, error) {
-	var file *os.File
+func (b *Broker) MediaInput(ctx context.Context, l *slog.Logger, worker, id, name string, f MediaFence) (fs.File, string, error) {
+	var file fs.File
 	kind := "text/plain; charset=utf-8"
 	_, err := b.run(ctx, l, workerRef(worker, id, "", false), "media_input", f, func(s *inference.State, _ *[]inferenceEvent) (any, error) {
 		j, err := mediaAssignment(s, id, f, false)

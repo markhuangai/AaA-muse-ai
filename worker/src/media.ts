@@ -104,7 +104,7 @@ export async function prepareMedia(worker: Worker, t: Transport, j: ObjectValue)
       result.action = 'stage_verified_audio_fixture';
       result.fixture_sha256 = m.input_sha256; result.fixture_bytes = m.input_size;
     } else {
-      const prompt = await transfer(t, j, 'media/prompt', {}, async res => await t.body(res, 4096));
+      const prompt = await transfer(t, j, 'media/prompt', {}, res => t.body(res, 4096, { preserveBOM: true }));
       requireValue(digest(prompt) === m.prompt_sha256, 'media_prompt_digest_mismatch');
       result.prompt = prompt;
       if (m.profile === 'image_video') result.reference_path = await writeReference(spool, t, j);

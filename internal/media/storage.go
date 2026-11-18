@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -28,51 +29,49 @@ const (
 type Store struct {
 	Dir     string
 	Inspect func(context.Context, string, string) (inference.MediaProperties, error)
+	files   fileOps
+	run     func(context.Context, string, []string, io.Writer) error
 }
 
-func New(dir string) *Store { return &Store{Dir: dir, Inspect: Inspect} }
+func New(dir string) *Store {
+	s := &Store{Dir: dir, files: localFiles(), run: runProcess}
+	s.Inspect = s.inspect
+	return s
+}
 
 type Stage struct {
 	Path   string
 	Record inference.Media
+	files  *fileOps
 }
 
 func (s *Store) Begin() (*Stage, error) {
-	dir, err := os.MkdirTemp(s.Dir, ".incoming-")
+	dir, err := s.files.mkdirTemp(s.Dir, ".incoming-")
 	if err != nil {
 		return nil, err
 	}
-	return &Stage{Path: dir}, nil
+	return &Stage{Path: dir, files: &s.files}, nil
 }
 
 func (p *Stage) Close() error {
 	if p.Path == "" {
 		return nil
 	}
-	return os.RemoveAll(p.Path)
-}
-
-func syncDir(dir string) error {
-	f, err := os.Open(dir)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	return f.Sync()
+	return p.files.removeAll(p.Path)
 }
 
 func (p *Stage) Install(root, id string) error {
-	if err := syncDir(p.Path); err != nil {
+	if err := p.files.syncDir(p.Path); err != nil {
 		return err
 	}
-	if err := os.Rename(p.Path, filepath.Join(root, id)); err != nil {
+	if err := p.files.rename(p.Path, filepath.Join(root, id)); err != nil {
 		return err
 	}
 	p.Path = ""
-	return syncDir(root)
+	return p.files.syncDir(root)
 }
 
-func writeBounded(dst *os.File, input io.Reader, limit int64) (int64, string, error) {
+func writeBounded(dst stagedFile, input io.Reader, limit int64) (int64, string, error) {
 	h := sha256.New()
 	n, err := io.Copy(io.MultiWriter(dst, h), io.LimitReader(input, limit+1))
 	if err == nil && n > limit {
@@ -98,7 +97,7 @@ func (p *Stage) Prompt(value string) error {
 	if !utf8.ValidString(value) || strings.TrimSpace(value) == "" {
 		return inference.Reject("invalid_media_prompt", 400)
 	}
-	f, err := os.OpenFile(filepath.Join(p.Path, "prompt"), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	f, err := p.files.openFile(filepath.Join(p.Path, "prompt"), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
 	if err != nil {
 		return err
 	}
@@ -113,7 +112,7 @@ func (s *Store) Image(ctx context.Context, p *Stage, input io.Reader, kind strin
 		return inference.Reject("unsupported_reference_type", 415)
 	}
 	name := filepath.Join(p.Path, "image")
-	f, err := os.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	f, err := s.files.openFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
 	if err != nil {
 		return err
 	}
@@ -162,6 +161,7 @@ type Upload struct {
 	Path       string
 	directory  string
 	Properties inference.MediaProperties
+	files      *fileOps
 }
 
 func (s *Store) Receive(ctx context.Context, id, profile, hash string, size int64, r io.Reader) (u *Upload, err error) {
@@ -173,11 +173,11 @@ func (s *Store) Receive(ctx context.Context, id, profile, hash string, size int6
 	}
 
 	directory := filepath.Join(s.Dir, id)
-	if _, err = os.Stat(directory); err != nil {
+	if _, err = s.files.stat(directory); err != nil {
 		return nil, err
 	}
 	// A cancellation may clear the job directory while an authorized stream is still arriving.
-	f, err := os.CreateTemp(s.Dir, ".upload-"+id+"-")
+	f, err := s.files.createTemp(s.Dir, ".upload-"+id+"-")
 	if err != nil {
 		return nil, err
 	}
@@ -199,7 +199,7 @@ func (s *Store) Receive(ctx context.Context, id, profile, hash string, size int6
 		rejected.Fields["expected_bytes"], rejected.Fields["observed_bytes"] = size, n
 		rejected.Fields["expected_sha256"], rejected.Fields["observed_sha256"] = hash, actual
 		rejected.Fields["partial_cleanup"] = "removed"
-		if cleanupErr := os.Remove(f.Name()); cleanupErr != nil && !errors.Is(cleanupErr, os.ErrNotExist) {
+		if cleanupErr := s.files.remove(f.Name()); cleanupErr != nil && !errors.Is(cleanupErr, os.ErrNotExist) {
 			rejected.Fields["partial_cleanup"] = "failed"
 			rejected.Fields["cleanup_cause"] = cleanupErr.Error()
 		}
@@ -217,22 +217,34 @@ func (s *Store) Receive(ctx context.Context, id, profile, hash string, size int6
 		return nil, err
 	}
 	props.Size, props.SHA256, props.MediaType = n, actual, OutputType(profile)
-	return &Upload{Path: f.Name(), directory: directory, Properties: props}, nil
+	return &Upload{Path: f.Name(), directory: directory, Properties: props, files: &s.files}, nil
+}
+
+func (u *Upload) Close() error {
+	err := u.files.remove(u.Path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return err
 }
 
 func (u *Upload) Commit() error {
 	dir := u.directory
-	if err := os.Rename(u.Path, filepath.Join(dir, "artifact")); err != nil {
+	if err := u.files.rename(u.Path, filepath.Join(dir, "artifact")); err != nil {
 		return err
 	}
-	return syncDir(dir)
+	return u.files.syncDir(dir)
 }
 
-func (s *Store) Open(id, name string) (*os.File, error) {
+func (s *Store) Open(id, name string) (fs.File, error) {
 	if !jobDir.MatchString(id) || (name != "artifact" && name != "image" && name != "prompt") {
 		return nil, os.ErrInvalid
 	}
-	volume, err := os.OpenRoot(s.Dir)
+	return s.files.openJob(s.Dir, id, name)
+}
+
+func openJob(dir, id, name string) (fs.File, error) {
+	volume, err := os.OpenRoot(dir)
 	if err != nil {
 		return nil, err
 	}
@@ -255,11 +267,15 @@ func (s *Store) Open(id, name string) (*os.File, error) {
 	if !os.SameFile(entry, opened) {
 		return nil, os.ErrInvalid
 	}
-	return job.Open(name)
+	f, err := job.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	return f, nil
 }
 func (s *Store) ClearInputs(id string) error {
 	for _, name := range []string{"image", "prompt"} {
-		err := os.Remove(filepath.Join(s.Dir, id, name))
+		err := s.files.remove(filepath.Join(s.Dir, id, name))
 		if err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}

@@ -14,7 +14,7 @@ import (
 var jobDir = regexp.MustCompile("^[a-f0-9]{32}$")
 
 func (s *Store) Cleanup(ctx context.Context, logger *slog.Logger, now time.Time, states func(context.Context, []string) (map[string]string, error)) error {
-	files, err := os.ReadDir(s.Dir)
+	files, err := s.files.readDir(s.Dir)
 	if err != nil {
 		return err
 	}
@@ -60,7 +60,7 @@ func (s *Store) Cleanup(ctx context.Context, logger *slog.Logger, now time.Time,
 			}
 			state = "orphan"
 		}
-		if err = os.RemoveAll(filepath.Join(s.Dir, id)); err != nil {
+		if err = s.files.removeAll(filepath.Join(s.Dir, id)); err != nil {
 			return err
 		}
 		logger.Info("media.files_deleted", "operation_id", id, "job_id", id, "reason", state, "outcome", "removed")

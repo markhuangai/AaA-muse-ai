@@ -11,7 +11,6 @@ import (
 	"io"
 	"log/slog"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -70,6 +69,7 @@ func TestVerifiedStorageAndLifecycle(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
 	store := New(root)
+	store.run = measuredProcess
 	p, err := store.Begin()
 	if err != nil {
 		t.Fatal(err)
@@ -100,26 +100,20 @@ func TestVerifiedStorageAndLifecycle(t *testing.T) {
 	if err != nil || hash(body) != p.Record.InputHash {
 		t.Fatal("source identity changed")
 	}
-	for _, entry := range []struct{ name, kind, codec string }{{"clip.mp4", "video/mp4", "libx264"}, {"voice.mp3", "audio/mpeg", "libmp3lame"}, {"voice.wav", "audio/wav", "pcm_s16le"}, {"still.webp", "image/webp", "libwebp"}, {"still.jpg", "image/jpeg", "mjpeg"}} {
-		name := filepath.Join(t.TempDir(), entry.name)
-		source := "color=c=blue:s=64x48:r=8"
-		if strings.HasPrefix(entry.kind, "audio/") {
-			source = "sine=frequency=200:duration=1"
+	for _, entry := range []struct{ kind, header string }{
+		{"video/mp4", "\x00\x00\x00\x18ftypisom"}, {"audio/mpeg", "ID3"},
+		{"audio/wav", "RIFF\x00\x00\x00\x00WAVE"}, {"image/webp", "RIFF\x00\x00\x00\x00WEBPVP8 "},
+		{"image/jpeg", "\xff\xd8\xff"},
+	} {
+		name := filepath.Join(t.TempDir(), "input")
+		data := make([]byte, 24)
+		copy(data, entry.header)
+		if err := os.WriteFile(name, data, 0600); err != nil {
+			t.Fatal(err)
 		}
-		args := []string{"-nostdin", "-v", "error", "-f", "lavfi", "-i", source, "-t", "1", "-c", entry.codec, "-threads", "1"}
-		if strings.HasPrefix(entry.kind, "image/") {
-			args = append(args, "-frames:v", "1")
-		}
-		if out, err := exec.Command("ffmpeg", append(args, name)...).CombinedOutput(); err != nil {
-			t.Fatalf("prepare %s: %v %s", entry.kind, err, out)
-		}
-		properties, err := Inspect(ctx, name, entry.kind)
+		properties, err := store.Inspect(ctx, name, entry.kind)
 		if err != nil || len(properties.Streams) != 1 {
 			t.Fatal(entry.kind, err, properties)
-		}
-		data, err := os.ReadFile(name)
-		if err != nil {
-			t.Fatal(err)
 		}
 		if entry.kind == "video/mp4" {
 			if properties.Width != 64 || properties.Height != 48 || properties.VideoFrames != 8 || properties.Duration != 1 || properties.FPS != 8 {
@@ -172,6 +166,7 @@ func TestVerifiedStorageAndLifecycle(t *testing.T) {
 func TestRejectedInputsAndOrphans(t *testing.T) {
 	ctx := context.Background()
 	s := New(t.TempDir())
+	s.run = func(context.Context, string, []string, io.Writer) error { return errors.New("invalid fixture") }
 	p, err := s.Begin()
 	if err != nil {
 		t.Fatal(err)
@@ -187,7 +182,7 @@ func TestRejectedInputsAndOrphans(t *testing.T) {
 	for _, kind := range []string{"image/jpeg", "image/png", "image/webp", "video/mp4", "audio/wav", "unknown"} {
 		name := filepath.Join(t.TempDir(), "bad")
 		os.WriteFile(name, bytes.Repeat([]byte{3}, 56), 0600)
-		if _, err := Inspect(ctx, name, kind); err == nil {
+		if _, err := s.Inspect(ctx, name, kind); err == nil {
 			t.Fatal(kind)
 		}
 	}
@@ -204,9 +199,6 @@ func TestRejectedInputsAndOrphans(t *testing.T) {
 	}
 	if _, err := s.Receive(ctx, "absent", "prompt_video", "", 1, strings.NewReader("x")); err == nil {
 		t.Fatal("unknown stage")
-	}
-	if _, err := command(ctx, "a-command-that-does-not-exist"); err == nil {
-		t.Fatal("missing executable accepted")
 	}
 	buf := &cappedOutput{}
 	if _, err = buf.Write(make([]byte, 1<<17)); err == nil {

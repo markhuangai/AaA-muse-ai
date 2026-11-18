@@ -8,7 +8,6 @@ import (
 	"errors"
 	"io"
 	"math"
-	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -40,11 +39,15 @@ func (b *cappedOutput) Write(p []byte) (int, error) {
 	}
 	return b.buf.Write(p)
 }
-func command(ctx context.Context, program string, args ...string) ([]byte, error) {
+func runProcess(ctx context.Context, program string, args []string, stdout io.Writer) error {
 	cmd := exec.CommandContext(ctx, program, args...)
+	cmd.Stdout = stdout
+	return cmd.Run()
+}
+
+func (s *Store) command(ctx context.Context, program string, args ...string) ([]byte, error) {
 	var out cappedOutput
-	cmd.Stdout = &out
-	err := cmd.Run()
+	err := s.run(ctx, program, args, &out)
 	if err != nil {
 		var missing *exec.Error
 		if errors.As(err, &missing) {
@@ -58,8 +61,8 @@ func command(ctx context.Context, program string, args ...string) ([]byte, error
 	return out.buf.Bytes(), nil
 }
 
-func imageFormat(path, kind string) (string, error) {
-	data, err := os.Open(path)
+func (s *Store) imageFormat(path, kind string) (string, error) {
+	data, err := s.files.open(path)
 	if err != nil {
 		return "", err
 	}
@@ -117,12 +120,12 @@ func imageFormat(path, kind string) (string, error) {
 	return "", inference.Reject("invalid_media_format", 422)
 }
 
-func probe(ctx context.Context, args []string, count bool) (probeResult, error) {
+func (s *Store) probe(ctx context.Context, args []string, count bool) (probeResult, error) {
 	options := []string{"-show_entries", "stream=codec_type,codec_name,width,height,avg_frame_rate,nb_read_frames:format=duration", "-of", "json"}
 	if count {
 		options = append(options, "-count_frames")
 	}
-	output, err := command(ctx, "ffprobe", append(options, args...)...)
+	output, err := s.command(ctx, "ffprobe", append(options, args...)...)
 	var result probeResult
 	if err == nil {
 		err = json.Unmarshal(output, &result)
@@ -145,16 +148,16 @@ func rate(value string) float64 {
 	return n / d
 }
 
-func Inspect(parent context.Context, path, kind string) (inference.MediaProperties, error) {
+func (s *Store) inspect(parent context.Context, path, kind string) (inference.MediaProperties, error) {
 	var props inference.MediaProperties
-	format, err := imageFormat(path, kind)
+	format, err := s.imageFormat(path, kind)
 	if err != nil {
 		return props, err
 	}
 	ctx, cancel := context.WithTimeout(parent, 30*time.Second)
 	defer cancel()
 	args := []string{"-v", "error", "-max_alloc", "134217728", "-protocol_whitelist", "file", "-threads", "1", "-f", format, "-i", path}
-	first, err := probe(ctx, args, false)
+	first, err := s.probe(ctx, args, false)
 	if err != nil {
 		return props, err
 	}
@@ -177,7 +180,7 @@ func Inspect(parent context.Context, path, kind string) (inference.MediaProperti
 	if wantVideo && video != 1 || image && audio != 0 || !wantVideo && (video != 0 || audio != 1) {
 		return props, inference.Reject("unexpected_media_stream", 422)
 	}
-	full, err := probe(ctx, args, true)
+	full, err := s.probe(ctx, args, true)
 	if err != nil {
 		return props, err
 	}
@@ -198,7 +201,7 @@ func Inspect(parent context.Context, path, kind string) (inference.MediaProperti
 		}
 	}
 	decode := append([]string{"-nostdin", "-xerror"}, args...)
-	_, err = command(ctx, "ffmpeg", append(decode, "-map", "0", "-threads", "1", "-f", "null", "-")...)
+	_, err = s.command(ctx, "ffmpeg", append(decode, "-map", "0", "-threads", "1", "-f", "null", "-")...)
 	props.MediaType = kind
 	return props, err
 }

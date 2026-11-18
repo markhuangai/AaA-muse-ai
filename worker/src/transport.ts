@@ -49,7 +49,7 @@ export class Transport {
     catch (error) { if (!(error instanceof Failure && error.code === 'worker_unauthorized')) throw error; }
   }
   // Final receipts duplicate answer text from the bounded canonical context and add broker metadata.
-  async body(response: Response, limit = 3 * 1024 * 1024): Promise<string> {
+  async body(response: Response, limit = 3 * 1024 * 1024, { preserveBOM = false } = {}): Promise<string> {
     if (!response.body) return '';
     const reader = response.body.getReader();
     const buffers: Uint8Array[] = [];
@@ -62,7 +62,7 @@ export class Transport {
         requireValue(size <= limit, 'response_too_large', { max_bytes: limit, observed_bytes: size });
         buffers.push(item.value);
       }
-      return decoded(new TextDecoder('utf8', { fatal: true }), Buffer.concat(buffers));
+      return decoded(new TextDecoder('utf8', { fatal: true, ignoreBOM: preserveBOM }), Buffer.concat(buffers));
     } finally { await reader.cancel(); reader.releaseLock(); }
   }
   async request(route: string, method = 'GET', input?: string, correlation: Record<string, Value> = {}, attempts = 3): Promise<Reply> {
