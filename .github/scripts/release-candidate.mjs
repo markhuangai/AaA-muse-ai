@@ -102,12 +102,6 @@ export async function publishCandidate({ github, context, prepared, directory, t
     complete('product-release.json');
     operation = 'final_verification';
     const verified = await verifyPublished({ tag: prepared.tag, sourceSHA: prepared.source_sha, manifestSHA256: hash(content), token, fetcher });
-    operation = 'candidate_alias_publication'; destination = 'npm_candidate';
-    const old = (await npmVersion(prepared.version, npmOptions)).tags.candidate;
-    const desired = await verifyCandidateAlias(await listReleases({ github, context }), prepared.version, old, fetcher);
-    if (old !== desired) tagNpm('candidate');
-    need((await npmVersion(prepared.version, npmOptions)).tags.candidate === desired, 'product_release_candidate_distribution_missing');
-    complete('npm_candidate');
     await verifySource();
     destination = 'completion_marker'; operation = 'completion_marker_publication';
     const marker = completionMarker(manifest);
@@ -115,6 +109,12 @@ export async function publishCandidate({ github, context, prepared, directory, t
     need(!markers.length || (markers.length === 1 && markers[0] === marker), 'product_release_completion_conflict');
     if (!markers.length) await github.rest.repos.updateRelease({ ...context.repo, release_id: release.id, body: (release.body ?? '') + '\n\n' + marker + '\n\nCandidate publication complete; live qualification is not established.' });
     complete('completion_marker');
+    operation = 'candidate_alias_publication'; destination = 'npm_candidate';
+    const old = (await npmVersion(prepared.version, npmOptions)).tags.candidate;
+    const desired = await verifyCandidateAlias(await listReleases({ github, context }), prepared.version, old, fetcher);
+    if (old !== desired) tagNpm('candidate');
+    need((await npmVersion(prepared.version, npmOptions)).tags.candidate === desired, 'product_release_candidate_distribution_missing');
+    complete('npm_candidate');
     logEvent(null, 'info', 'product.release.candidate_completed', { ...fields(), ...verified.receipt, outcome: 'complete' });
     return verified.receipt;
   } catch (error) {

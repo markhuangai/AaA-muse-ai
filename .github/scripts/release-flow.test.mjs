@@ -45,6 +45,33 @@ test('partial publication retains its destination ledger and resumes only the mi
     [['npm', 'dist-tag', 'add', '@markhuangai/aaa-muse-worker@0.1.0', 'candidate']]);
 });
 
+test('a failed completion marker keeps the candidate alias usable for a newer stable dispatch', async t => {
+  const earlier = await releaseFixture(t, { version: '0.1.0', rcVersion: '0.1.0-rc.12', source: 'c'.repeat(40) });
+  earlier.seed();
+  const interrupted = await releaseFixture(t, { version: '0.1.1', previous: earlier });
+  const updateRelease = interrupted.github.rest.repos.updateRelease;
+  interrupted.github.rest.repos.updateRelease = async options => {
+    if (options.body?.includes('<!-- aaa-muse-product:verified:')) throw { status: 503 };
+    return updateRelease(options);
+  };
+  const original = await prepareStableRelease(interrupted);
+  await assert.rejects(publish({ ...interrupted, prepared: original }), error =>
+    error.fields.operation === 'completion_marker_publication' && error.fields.http_status === 503);
+  assert.equal(interrupted.state.tags.candidate, earlier.version);
+  assert.equal(interrupted.state.tags.latest, undefined);
+  assert(!interrupted.release.body.includes('<!-- aaa-muse-product:verified:'));
+
+  const source = 'b'.repeat(40), rcVersion = '0.1.0-rc.14';
+  interrupted.addRC(rcVersion, { rcSource: source });
+  await assert.rejects(prepareStableRelease(interrupted), /product_release_stale_rc/);
+  const newer = await releaseFixture(t, { version: '0.2.0', rcVersion, source, previous: interrupted });
+  const prepared = await prepareStableRelease(newer);
+  const published = await publish({ ...newer, prepared });
+  await promote(newer, { prepared, manifestSHA256: published.manifest_sha256 });
+  assert.equal(newer.state.tags.candidate, newer.version);
+  assert.equal(newer.state.tags.latest, newer.version);
+});
+
 test('candidate refusal preserves conflicting image destinations and altered frozen artifacts', async t => {
   const f = await releaseFixture(t);
   const other = jsonBytes({ config: { digest: 'sha256:' + hash('{}') } });
