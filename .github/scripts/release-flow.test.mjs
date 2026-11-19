@@ -5,22 +5,15 @@ import { join } from 'node:path';
 import { releaseFixture } from './test/release-fixture.mjs';
 import { prepareRelease, publishRelease } from './worker-release.mjs';
 import { publishCandidate } from './release-candidate.mjs';
-import { promoteCandidate, verifyQualification } from './release-promote.mjs';
+import { promoteStable } from './release-promote.mjs';
 import { hash, jsonBytes } from './release-manifest.mjs';
-import { prepareCandidate } from './release-control.mjs';
+import { prepareStableRelease } from './release-control.mjs';
+import { latestStableRelease, readProductRelease } from './release-history.mjs';
 import { candidateNpmTag } from './release-versions.mjs';
 import { verifyPublished } from './release-verify.mjs';
 
 const publish = f => publishCandidate({ ...f, publishWorker: options => publishRelease({ ...options, publishNpm: f.publishNpm }) });
-export function qualification(f) {
-  const receipt = { schema_version: 1, kind: 'final_candidate_qualification', manifest_sha256: hash(jsonBytes(f.manifest)),
-    source_sha: f.source, tree_sha: f.tree, version: f.version, protocol_version: 1, image: f.manifest.image, image_config_digest: f.configDigest,
-    worker_sha256: f.worker.sha256, installer_sha256: f.worker.installer_sha256, report_sha256: 'd'.repeat(64), run_id: 'controlled-test-only',
-    finished_at: '2026-11-17T00:00:00Z', evidence_kind: 'live', verdict: 'pass', exports: [{ source: 'broker', sha256: 'f'.repeat(64) }] };
-  const bytes = jsonBytes(receipt), digest = hash(bytes);
-  return { receipt, qualificationBytes: bytes, qualificationSHA256: digest, manifestSHA256: receipt.manifest_sha256,
-    confirmation: `promote ${f.version} ${receipt.manifest_sha256} ${digest}` };
-}
+const promote = (f, options) => promoteStable({ ...f, ...options });
 
 test('candidate publication uses frozen final-version bytes, then retries without building or republishing', async t => {
   const f = await releaseFixture(t);
@@ -92,25 +85,28 @@ test('a version-specific npm candidate tag conflict blocks package publication',
   assert.equal(f.state.tags[tag], '0.1.1');
 });
 
-test('stable promotion requires explicit pinned qualification, preserves candidate bytes and has no build/publish path', async t => {
-  const f = await releaseFixture(t); f.seed(); const q = qualification(f);
+test('stable publication verifies the pinned pair and records no implicit live pass', async t => {
+  const f = await releaseFixture(t); f.seed();
   const before = new Map(f.state.assets);
-  const result = await promoteCandidate({ ...f, ...q });
-  assert.equal(result.outcome, 'complete'); assert.equal(result.live_qualification, 'pass');
+  const result = await promote(f);
+  assert.equal(result.outcome, 'complete'); assert.equal(result.live_qualification, 'not_established');
+  assert.equal(result.schema_version, 2);
+  assert.deepEqual(result.source_rc, f.prepared.source_rc);
+  assert.deepEqual(JSON.parse(f.state.assets.get('promotion.json')), result);
+  assert(!f.release.assets.some(asset => asset.name.startsWith('qualification-')));
   assert.equal(f.state.tags.latest, '0.1.0'); assert(!f.release.prerelease);
   assert(f.state.images.has('0.1.0')); assert(f.state.images.has('latest'));
   for (const [name, bytes] of before) assert.deepEqual(f.state.assets.get(name), bytes);
   assert(!f.state.commands.some(command => command.includes('build') || command.includes('pack') || command.includes('publish') || command.includes('push')));
   const count = f.state.commands.length;
-  await promoteCandidate({ ...f, ...q });
+  await promote(f);
   assert.equal(f.state.commands.length, count);
 });
 
 test('a newer complete RC blocks a fresh promotion before any stable write', async t => {
   const f = await releaseFixture(t); f.seed();
-  const q = qualification(f);
   f.addRC('0.1.0-rc.14', { rcSource: 'b'.repeat(40) });
-  await assert.rejects(promoteCandidate({ ...f, ...q }), error => {
+  await assert.rejects(promote(f), error => {
     assert.equal(error.message, 'product_release_stale_rc');
     assert.equal(error.fields.expected_rc, 'v0.1.0-rc.13');
     assert.equal(error.fields.observed_rc, 'v0.1.0-rc.14');
@@ -122,10 +118,11 @@ test('a newer complete RC blocks a fresh promotion before any stable write', asy
 });
 
 test('two successive candidates advance the verified aliases and keep the old exact release verifiable', async t => {
-  const first = await releaseFixture(t, { version: '0.1.1' });
-  await publish(first);
-  const firstQualification = qualification(first);
-  await promoteCandidate({ ...first, ...firstQualification });
+  const first = await releaseFixture(t, { version: '1.0.0' });
+  const firstPrepared = await prepareStableRelease(first);
+  assert.equal(firstPrepared.candidate_ready, false);
+  const firstPublished = await publish({ ...first, prepared: firstPrepared });
+  await promote(first, { prepared: firstPrepared, manifestSHA256: firstPublished.manifest_sha256 });
 
   const source = 'b'.repeat(40);
   first.state.main = source;
@@ -134,58 +131,78 @@ test('two successive candidates advance the verified aliases and keep the old ex
     id: 4, workflow_id: 7, event: 'push', conclusion: 'success', head_branch: 'main', head_sha: source, repository: repo, head_repository: repo,
   } } };
   const next = await prepareRelease({ ...first, context, paired: true });
-  assert.equal(next.version, '0.1.2-rc.0');
+  assert.equal(next.version, '1.0.1-rc.0');
   first.state.refs.set('tags/' + next.tag, { object: { type: 'commit', sha: source } });
   assert.equal((await prepareRelease({ ...first, context, paired: true })).version, next.version);
-  const second = await releaseFixture(t, { version: '0.1.2', rcVersion: next.version, source, previous: first });
-  assert.equal((await prepareCandidate(second)).version, second.version);
+  const second = await releaseFixture(t, { version: '1.0.1', rcVersion: next.version, source, previous: first });
+  assert.equal((await prepareStableRelease(second)).version, second.version);
   await publish(second);
-  assert.equal(second.state.tags.candidate, '0.1.2');
-  assert.equal(second.state.tags.latest, '0.1.1');
+  assert.equal(second.state.tags.candidate, '1.0.1');
+  assert.equal(second.state.tags.latest, '1.0.0');
   const startingCommands = second.state.commands.length;
-  await promoteCandidate({ ...second, ...qualification(second) });
-  assert.equal(second.state.tags.latest, '0.1.2');
+  await promote(second);
+  assert.equal(second.state.tags.latest, '1.0.1');
   assert.equal(second.state.githubLatest, second.release.id);
   assert.deepEqual(second.state.images.get('latest'), second.state.images.get(second.imageDigest));
-  assert.deepEqual(second.state.images.get('0.1.1'), first.state.images.get(first.imageDigest));
+  assert.deepEqual(second.state.images.get('1.0.0'), first.state.images.get(first.imageDigest));
   assert(!second.state.commands.slice(startingCommands).some(command => command.includes('build') ||
     command.includes('pack') || command.includes('publish') || command.includes('push')));
 
   const commands = second.state.commands.length;
   const before = second.state.uploads;
-  const historical = await verifyPublished({ ...second, tag: first.prepared.tag, sourceSHA: first.source, manifestSHA256: firstQualification.manifestSHA256 });
-  assert.equal(historical.receipt.version, '0.1.1');
-  await promoteCandidate({ ...second, ...firstQualification, version: first.version });
+  const historical = await verifyPublished({ ...second, tag: first.prepared.tag, sourceSHA: first.source, manifestSHA256: firstPublished.manifest_sha256 });
+  assert.equal(historical.receipt.version, '1.0.0');
+  const request = { ...second, prereleaseTag: first.prereleaseTag, version: first.version };
+  const historicalPrepared = await prepareStableRelease(request);
+  assert.equal(historicalPrepared.candidate_ready, true);
+  await promote(second, { prepared: historicalPrepared, manifestSHA256: historicalPrepared.manifest_sha256 });
   assert.equal(second.state.commands.length, commands);
   assert.equal(second.state.uploads, before);
-  assert.equal(second.state.tags.latest, '0.1.2');
+  assert.equal(second.state.tags.latest, '1.0.1');
   assert(second.state.requests.filter(request => request.url.startsWith('https://github.com/')).every(request => !request.authenticated));
 });
 
-test('promotion gates reject missing, inconclusive, synthetic and mismatched receipts before distribution changes', async t => {
+test('stable publication rejects mismatched lineage, manifest digest, and dispatch authority before writing', async t => {
   const f = await releaseFixture(t); f.seed();
-  for (const change of [q => { q.receipt.evidence_kind = 'synthetic'; }, q => { q.receipt.verdict = 'inconclusive'; },
-    q => { q.receipt.manifest_sha256 = 'f'.repeat(64); }, q => { q.receipt.source_sha = 'f'.repeat(40); },
-    q => { q.receipt.worker_sha256 = 'f'.repeat(64); }, q => { q.receipt.exports = []; }, q => { q.receipt.finished_at = ''; }]) {
-    const q = qualification(f); change(q);
-    assert.throws(() => verifyQualification(q.receipt, f.manifest, q.manifestSHA256));
-  }
-  const q = qualification(f);
-  await assert.rejects(promoteCandidate({ ...f, ...q, confirmation: '' }), /confirmation_required/);
-  await assert.rejects(promoteCandidate({ ...f, ...q, qualificationBytes: Buffer.from('wrong') }), /artifact_conflict/);
-  const bad = qualification(f); bad.receipt.verdict = 'inconclusive'; bad.qualificationBytes = jsonBytes(bad.receipt); bad.qualificationSHA256 = hash(bad.qualificationBytes);
-  bad.confirmation = `promote ${f.version} ${bad.manifestSHA256} ${bad.qualificationSHA256}`;
-  await assert.rejects(promoteCandidate({ ...f, ...bad }), /receipt_rejected/);
-  assert.equal(f.state.commands.length, 0); assert(f.release.prerelease);
+  const prepared = await prepareStableRelease(f);
+  assert.equal(prepared.candidate_ready, true);
+  assert.equal(prepared.manifest_sha256, f.manifestSHA256);
+  await assert.rejects(promote(f, { manifestSHA256: 'f'.repeat(64) }), /artifact_conflict/);
+  await assert.rejects(promote(f, { prepared: { ...prepared, source_rc: { ...prepared.source_rc, manifest_sha256: 'f'.repeat(64) } } }), /stale_rc/);
+  await assert.rejects(promote(f, { manifestSHA256: '' }), /identity_required/);
+  f.state.permission = 'write';
+  await assert.rejects(promote(f), /administrator_required/);
+  assert.equal(f.state.commands.length, 0);
+  assert.equal(f.state.uploads, 0);
+  assert(f.release.prerelease);
+});
+
+test('historical qualification receipts verify without asserting a new live pass', async t => {
+  const f = await releaseFixture(t); f.seed();
+  const fresh = await promote(f);
+  const qualification = jsonBytes({ evidence_kind: 'live', verdict: 'pass' });
+  const qualificationSHA256 = hash(qualification);
+  const { source_sha, version, manifest_sha256, image, worker_sha256, outcome, destinations } = fresh;
+  const legacy = { schema_version: 1, source_sha, version, manifest_sha256, qualification_sha256: qualificationSHA256,
+    image, worker_sha256, outcome, live_qualification: 'pass', destinations };
+  const asset = 'qualification-' + qualificationSHA256 + '.json';
+  await f.github.rest.repos.uploadReleaseAsset({ name: asset, data: qualification });
+  f.state.assets.set('promotion.json', jsonBytes(legacy));
+  assert.equal((await latestStableRelease([f.release], f.fetcher)).version, f.version);
+  assert.equal((await promote(f)).live_qualification, 'not_established');
+  assert.deepEqual(JSON.parse(f.state.assets.get('promotion.json')), legacy);
+  f.state.assets.set(asset, Buffer.from('other bytes'));
+  await assert.rejects(promote(f), /artifact_conflict/);
+  assert.equal((await readProductRelease(f.release, f.fetcher)).manifest.version, f.version);
 });
 
 test('promotion stops on distribution conflicts, retains partial progress, and reports causal evidence', async t => {
-  const f = await releaseFixture(t); f.seed(); const q = qualification(f);
-  f.state.tags.latest = '0.2.0'; await assert.rejects(promoteCandidate({ ...f, ...q }), /distribution_conflict/); delete f.state.tags.latest;
-  f.release.immutable = true; await assert.rejects(promoteCandidate({ ...f, ...q }), /release_unavailable/); f.release.immutable = false;
+  const f = await releaseFixture(t); f.seed();
+  f.state.tags.latest = '0.2.0'; await assert.rejects(promote(f), /distribution_conflict/); delete f.state.tags.latest;
+  f.release.immutable = true; await assert.rejects(promote(f), /release_unavailable/); f.release.immutable = false;
   const execute = f.execute;
   f.execute = (command, args, options) => { if (command === 'npm') throw { status: 503, message: 'secret-sentinel' }; return execute(command, args, options); };
-  await assert.rejects(promoteCandidate({ ...f, ...q }), error => {
+  await assert.rejects(promote(f), error => {
     assert(error.fields.completed_destinations.includes('latest')); assert.equal(error.fields.operation, 'npm_distribution_promotion');
     assert.equal(error.fields.uncertain_destination, 'npm_latest'); assert(!error.message.includes('secret-sentinel')); return true;
   });
@@ -195,26 +212,30 @@ test('promotion stops on distribution conflicts, retains partial progress, and r
   f.addRC('0.1.0-rc.14', { rcSource: 'b'.repeat(40) });
   const newer = await releaseFixture(t, { version: '0.1.1', rcVersion: '0.1.0-rc.14', source: 'b'.repeat(40), previous: f });
   newer.seed();
-  await assert.rejects(promoteCandidate({ ...newer, ...qualification(newer) }), /other_promotion_incomplete/);
+  await assert.rejects(promote(newer), /other_promotion_incomplete/);
   f.execute = execute;
-  assert.equal((await promoteCandidate({ ...f, ...q })).outcome, 'complete');
+  const prepared = await prepareStableRelease(f);
+  assert.equal(prepared.candidate_ready, true);
+  const before = f.state.commands.length;
+  assert.equal((await promote(f, { prepared, manifestSHA256: prepared.manifest_sha256 })).outcome, 'complete');
+  assert(!f.state.commands.slice(before).some(command => command.includes('imagetools')));
+  assert(!f.state.commands.slice(before).some(command => command.includes('publish')));
 });
 
 test('a saved intent without an actual stable write does not permit stale promotion', async t => {
   const f = await releaseFixture(t); f.seed();
-  const q = qualification(f);
   const execute = f.execute;
   f.execute = (command, args, options) => {
     if (command === 'docker' && args[0] === 'buildx') throw { status: 1 };
     return execute(command, args, options);
   };
-  await assert.rejects(promoteCandidate({ ...f, ...q }), /required_operation_failed/);
+  await assert.rejects(promote(f), /required_operation_failed/);
   assert(f.state.assets.has('promotion-intent.json'));
   assert(!f.state.images.has(f.version));
   f.addRC('0.1.0-rc.14', { rcSource: 'b'.repeat(40) });
   f.execute = execute;
   const before = { commands: f.state.commands.length, uploads: f.state.uploads };
-  await assert.rejects(promoteCandidate({ ...f, ...q }), /stale_rc/);
+  await assert.rejects(promote(f), /stale_rc/);
   assert.equal(f.state.commands.length, before.commands);
   assert.equal(f.state.uploads, before.uploads);
   assert(f.release.prerelease);

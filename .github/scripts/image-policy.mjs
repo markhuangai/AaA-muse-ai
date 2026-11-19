@@ -2,50 +2,11 @@ import { logEvent } from './ci-log.mjs';
 
 const repository = 'markhuangai/AaA-muse-ai';
 const validSHA = /^[a-f0-9]{40}$/;
-const writers = new Set(['admin', 'maintain', 'write']);
 
 export function imageConfigDigest(inspected) {
   const digest = inspected.Descriptor ? inspected.Descriptor.annotations?.['config.digest'] : inspected.Id;
   if (!/^sha256:[a-f0-9]{64}$/.test(digest ?? '')) throw new Error('image_config_digest_unavailable');
   return digest;
-}
-
-export async function resolveCandidate({ github, context, sourceSHA }) {
-  if (context.eventName !== 'workflow_dispatch' || context.ref !== 'refs/heads/main' ||
-      `${context.repo.owner}/${context.repo.repo}` !== repository || !validSHA.test(sourceSHA)) {
-    throw new Error('candidate_untrusted_trigger_or_source');
-  }
-  const permission = await github.rest.repos.getCollaboratorPermissionLevel({ ...context.repo, username: context.actor });
-  if (!writers.has(permission.data.permission)) throw new Error('candidate_actor_not_authorized');
-  const repo = (await github.rest.repos.get(context.repo)).data;
-  if (repo.default_branch !== 'main') throw new Error('candidate_default_branch_mismatch');
-  const commit = (await github.rest.repos.getCommit({ ...context.repo, ref: sourceSHA })).data;
-  if (commit.sha !== sourceSHA || !validSHA.test(commit.commit.tree.sha)) throw new Error('candidate_source_identity_mismatch');
-  const comparison = (await github.rest.repos.compareCommitsWithBasehead({ ...context.repo, basehead: `${sourceSHA}...main` })).data;
-  let pr = null;
-  if (comparison.merge_base_commit.sha !== sourceSHA) {
-    const pulls = await github.paginate(github.rest.pulls.list, { ...context.repo, state: 'open', base: 'main', per_page: 100 });
-    const matches = pulls.filter(pull => !pull.draft && pull.state === 'open' && pull.base.ref === 'main' &&
-      pull.base.repo.id === repo.id && pull.head.repo?.id === repo.id && pull.head.sha === sourceSHA);
-    if (matches.length !== 1) throw new Error('candidate_requires_unique_current_same_repository_pr');
-    pr = matches[0].number;
-  }
-  const result = { source_sha: sourceSHA, tree_sha: commit.commit.tree.sha, pr, actor: context.actor };
-  logEvent(null, 'info', 'candidate.source_verified', result);
-  return result;
-}
-
-export async function fenceCandidate({ github, context, sourceSHA, pr }) {
-  if (pr) {
-    const pull = (await github.rest.pulls.get({ ...context.repo, pull_number: Number(pr) })).data;
-    if (pull.state !== 'open' || pull.draft || pull.base.ref !== 'main' ||
-        pull.head.sha !== sourceSHA || pull.head.repo.full_name !== repository || pull.base.repo.full_name !== repository) {
-      throw new Error('candidate_head_changed');
-    }
-  } else {
-    const comparison = (await github.rest.repos.compareCommitsWithBasehead({ ...context.repo, basehead: `${sourceSHA}...main` })).data;
-    if (comparison.merge_base_commit.sha !== sourceSHA) throw new Error('candidate_main_ancestry_changed');
-  }
 }
 
 export async function resolvePublication({ github, context }) {

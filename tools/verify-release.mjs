@@ -7,7 +7,7 @@ import { imageConfigDigest } from '../.github/scripts/image-policy.mjs';
 import { verifyPublished } from '../.github/scripts/release-verify.mjs';
 import { logEvent } from '../.github/scripts/ci-log.mjs';
 
-const controlledVersion = '0.1.1';
+const controlledVersion = '1.0.0';
 
 export async function main({ env = process.env, execute = execFileSync, read = readFileSync, write = writeFileSync,
   mkdir = mkdirSync, list = readdirSync, inspect = inspectSource, verify = verifyPublished } = {}) {

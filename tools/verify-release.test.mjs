@@ -13,7 +13,7 @@ test('release verification chooses read-only published mode only with every pinn
 });
 
 test('controlled entry point checks real archive content, image metadata, source drift and scoped cleanup', async t => {
-  const f = await releaseFixture(t, { version: '0.1.1' }), writes = new Map(), commands = [], source = { identity: { sha: f.source, tree_sha256: 'snapshot' } };
+  const f = await releaseFixture(t, { version: '1.0.0' }), writes = new Map(), commands = [], source = { identity: { sha: f.source, tree_sha256: 'snapshot' } };
   const execute = (command, args, options) => {
     commands.push([command, ...args]);
     if (command === 'make' || command === process.execPath || (command === 'docker' && args[1] === 'rm')) return '';
@@ -24,7 +24,7 @@ test('controlled entry point checks real archive content, image metadata, source
   options.read = path => path === '.artifacts/worker-package/latest.json' ? jsonBytes({ ...f.worker, archive: f.directory + '/worker.tgz' }) : f.archive;
   const result = await main(options);
   assert.equal(result.exit_code, 0); assert.equal(result.receipt.cleanup, 'passed');
-  assert.equal(result.receipt.version, '0.1.1');
+  assert.equal(result.receipt.version, '1.0.0');
   assert.equal(JSON.parse(writes.get('.artifacts/ci/release/receipt.json')).worker_sha256, f.worker.sha256);
   assert(commands.some(command => command.includes('--no-prune')));
   let reads = 0;

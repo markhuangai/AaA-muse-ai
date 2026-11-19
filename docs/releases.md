@@ -1,10 +1,9 @@
 # Paired product releases
 
 The service and worker share one full release version and source SHA. A service
-accepts every worker in its product major; minor and patch releases must retain
-that worker contract in both version orders. The existing HTTP routes and
-`protocol_version: 1` are separate wire identities. The current release line allocates `0.1.X-rc.N` and stamps the
-selected final candidate `0.1.X`.
+accepts every worker in its product major. Minor and patch releases keep that
+worker contract in both version orders. Product versions and
+`protocol_version: 1` identify separate contracts.
 
 New workers advertise `X-Muse-Worker-Version` on HTTP and SSE requests. Services
 return `X-Muse-Service-Version`. Incompatible enrollment, subscriptions and
@@ -55,131 +54,99 @@ it skipped service-only changes and could select a version independently.
 Existing legacy releases are retained. Actual publication remains subject to
 the owner's authorization and the repository's human merge gate.
 
-## Final-version candidate
+## Publish stable from a paired prerelease
 
-After the owner merges the reviewed workflow and authorizes candidate publication,
-an administrator dispatches `.github/workflows/release.yml` from `main` with
-`phase=candidate`. The workflow selects the highest-numbered complete paired RC
-in the active series. It verifies the exact release, artifact digests, merged
-main source, successful main CI including `Release / verify`, and CodeQL.
-An incomplete newer RC is ineligible. A verified completion marker with
-conflicting artifacts blocks selection.
+An administrator dispatches **Publish stable release** from `main`. Enter the exact
+latest complete paired RC tag and the stable product version. For example, when
+`v0.1.0-rc.16` is the latest complete RC:
 
-The allocator uses the RC's base as the minimum final version and advances
-above existing final version reservations. The previously published
-`v0.1.0` prerelease consumes that npm version. For example, a new candidate
-selected from rc.13 with only that final reservation would use `0.1.1`.
-The workflow logs the selected RC, version, and source and pins the originating
-RC tag and manifest SHA-256 in the bundle and final manifest. Executable release
-helpers come from the trusted workflow revision. The build uses the exact RC
-commit and tree.
+```sh
+gh workflow run release.yml --repo markhuangai/AaA-muse-ai --ref main \
+  -f prerelease_tag=v0.1.0-rc.16 -f stable_version=0.1.1
+```
 
-The workflow builds and smoke-tests final-version bytes once and checks the
-same worker on Node 22.12.0. It freezes `worker.tgz`, `image.tar`, and
-`bundle.json` in `release-bundle-VERSION-SOURCE_SHA` before publication.
-This immutable workflow artifact is retained for seven days.
+The dispatch authorizes stable publication. The job verifies the named RC,
+commit, tree, main CI including `Release / verify`, CodeQL, and each published
+artifact. If a newer complete RC appears before the first stable write, review
+that RC and dispatch again with its tag. A conflicting marker or artifact blocks
+the run.
 
-| Destination | Example for version 0.1.1 |
-| --- | --- |
-| GitHub Packages | `@markhuangai/aaa-muse-worker@0.1.1` with dist-tag `candidate-0.1.1` |
-| Public GitHub Release | `v0.1.1` marked prerelease with the service's paired installation assets |
-| GHCR | `candidate-0.1.1` and `sha-SOURCE_SHA-0.1.1` with identical manifest digests |
+A stable version can advance one patch, minor, or major, with lower components
+reset. The initial release baseline is `0.1.0`. The historical `v0.1.0` candidate
+already reserves that npm version. The first available targets are `0.1.1`,
+`0.2.0`, and `1.0.0`. Version conflicts require an eligible unused version.
+After a complete `1.0.0` publication, the next eligible merge starts the
+`1.0.1-rc.0` series. A major release requires a manual worker upgrade.
 
-The npm `candidate` alias advances after the exact pair verifies. The candidate
-receipt supplies the final version and manifest SHA-256 for live qualification.
-Existing exact tags and packages are reservations. A fix to published bytes
-requires another version. Historical pairs remain verifiable after aliases move.
+The workflow builds and smoke-tests the requested version from the verified RC
+commit and tree. It checks the same worker on Node 22.12.0 and freezes
+`worker.tgz`, `image.tar`, and `bundle.json` before publication. It stages the
+final pair as a prerelease while the artifacts are being verified. In the same
+run, it gives the existing GHCR image digest the stable version and `latest`
+tags, moves npm `latest` to the verified worker version, and marks the GitHub
+Release stable and latest. `promotion.json` records the verified destinations
+and `live_qualification: not_established`. GitHub Packages and the public
+Release contain identical worker bytes.
 
 ## Verification and incomplete publication
 
-After the independent plan audit, `make verify-release` builds and smoke-tests
-controlled `0.1.1` artifacts and exercises the production release logic against
-replaceable external I/O. It proves conflicts, missing destinations, partial
-recovery, source drift, anonymous downloads, qualification rejection and
-promotion without rebuilding. Its safe receipt is
-`.artifacts/ci/release/receipt.json`; `Release / verify` retains it for seven days.
-These controlled results never qualify live Muse.
+`make verify-release` builds and smoke-tests controlled `1.0.0` artifacts and
+exercises publication against replaceable external I/O. It covers conflicts,
+partial recovery, source drift, anonymous downloads, and promotion of the
+frozen bytes. `Release / verify` retains `.artifacts/ci/release/receipt.json`
+for seven days.
 
 For read-only verification of a published schema-two pair:
 
 ```sh
 RELEASE_TAG=v0.1.1 RELEASE_SOURCE_SHA='<verified-merge-sha>' \
-RELEASE_MANIFEST_SHA256='<trusted-candidate-manifest-sha256>' make verify-release
+RELEASE_MANIFEST_SHA256='<trusted-published-manifest-sha256>' make verify-release
 ```
 
-Set `GH_TOKEN` privately with package-read authority; never pass it as a command
-argument. Worker and receipt Release downloads deliberately use no token.
-The verifier checks every destination, Git source/tree, embedded versions,
-image configuration and archive/installer bytes. All three selectors are
-required together. It does not infer trusted digests from a mutable tag.
+Set `GH_TOKEN` privately with package-read authority. The verifier downloads
+public worker assets anonymously and checks Git source and tree, embedded
+versions, image configuration, and worker and installer bytes against the
+pinned manifest digest.
 
-A failed publication remains incomplete. Re-dispatch `phase=candidate` for
-the same latest RC to recover its original bundle. `resume_run_id` can name
-that trusted run explicitly. The workflow verifies existing destinations and
-publishes only missing identical bytes. Inspect the destination after an
-ambiguous write. Conflicting artifacts, an unrelated reservation, or a missing
-or expired original bundle block recovery. A newer complete RC supersedes
-the earlier candidate for a new promotion.
+For an incomplete publication, re-dispatch with the same inputs. The workflow
+looks up the original `release-bundle-VERSION-SOURCE_SHA` artifact, retained
+for seven days, or verifies the complete published pair. Conflicting
+destinations or missing original bytes stop recovery. Once the versioned stable
+image matches the saved intent, that promotion can finish even if a newer RC
+has shipped. A saved intent by itself still requires the latest RC check.
+Another started and incomplete stable promotion blocks a new one.
+A historical dispatch verifies the exact release and leaves the active
+`latest` tags in place.
 
-Collect the exact job logs with `gh run view RUN_ID --job JOB_ID --log`. Filter
-`worker.release.*` and `product.release.*` JSON events by `operation_id`, source
-and version. INFO records verified boundaries/outcomes, WARN identifies missing
-destinations, and ERROR identifies the failed operation, expected/observed
-digests, causal status, completed destinations, timing and attempt. These fields
-distinguish a credential/transport failure from an immutable conflict and tell
-the operator whether to reconcile, supply the original bundle or stop. Raw
-authentication-bearing output is explicitly omitted. Safe receipts retain no
-credentials. `product.release.runner_cleanup` proves owned local-image cleanup;
-published artifacts and the recovery bundle remain retained.
+Collect the exact job log with `gh run view RUN_ID --job JOB_ID --log` and filter
+`product.release.*` or `worker.release.*` events by `operation_id`. INFO records
+the verified source, version, and outcome. WARN identifies an incomplete
+destination or a resumed promotion. ERROR records the failed operation,
+requested pair, observed identity, completed destinations, causal status,
+timing, and attempt. A stale source lists both RC tags. A conflict identifies the
+destination and digest. A transport failure records the HTTP or process status.
+Authentication-bearing output is omitted. `product.release.runner_cleanup`
+records owned local-image cleanup.
 
-## Qualification and stable promotion
+## Live qualification evidence
 
 The [final #18 record](https://github.com/markhuangai/AaA-muse-ai/issues/18#issuecomment-6947082016)
-is baseline evidence for rc.11's exact source/image/worker/installer identities.
-It retains 30/35 formal cases and an inconclusive verdict. Functional acceptance
-did not waive the passing-live gate. Stamping `0.1.0`, repacking or rebuilding
-creates new identities. Map retained behavior evidence to those changes and
-validate affected final-artifact requirements; do not repeat unrelated live
-cases without a concrete requirement. Both former test credentials are revoked.
-Further account use or live validation needs separate owner authorization.
+retains rc.11's 30/35 formal cases and inconclusive verdict. Exact artifact
+identities bound that evidence. Live trials and deployments require their own
+owner authorization.
 
-When separately authorized complete live evidence exists, generate a safe
-receipt by reopening its protected report and every export:
+When separately authorized complete live evidence exists, the qualification
+tool can produce a safe independent receipt:
 
 ```sh
 node tools/release-qualification.mjs candidate-manifest.json \
   /private/qualification/report.json /private/qualification/final-receipt.json
 ```
 
-The existing validator must return a complete live pass, with exactly matching
-candidate source, version, image, installed workers and installer. Synthetic,
-missing, altered and mismatched evidence fails. Keep the report and exports
-private; the output contains only safe identities/digests. The owner reviews
-the generated receipt and uploads that safe file, without replacement, as an
-asset of the selected final-version prerelease.
-
-Only an explicit owner-authorized administrator dispatch of `phase=promote`
-may publish stable distribution tags. Supply the final version,
-`manifest_sha256`, `qualification_asset_id`, `qualification_sha256`, and exact
-confirmation `promote X.Y.Z MANIFEST_SHA256 QUALIFICATION_SHA256` with the
-candidate's final version substituted for `X.Y.Z`. The pinned manifest supplies
-the source. The current latest complete RC must match before stable publication
-begins. Separate execution authorization covers deployment and live validation.
-
-Promotion records the approved digests and prior stable identity in
-`promotion-intent.json`. It copies the verified image digest to GHCR `X.Y.Z`,
-advances GHCR and npm `latest` from their verified prior targets, and marks
-the same Release stable and latest. It then re-reads every stable destination
-and uploads `promotion.json`. Promotion uses the original verified image and
-worker bytes. Unknown or conflicting stable destinations block writes.
-
-If the versioned stable image tag already verifies against its saved intent,
-retry the same promotion inputs to reconcile the remaining destinations.
-That retry completes the original operation even if a newer RC has since shipped.
-A saved intent alone still requires the latest RC check. Another started and
-incomplete promotion blocks a new one. A completed promotion can be verified
-again by exact version after `latest` moves. Close #19 after the first complete
-stable promotion and passing qualification receipt verify.
+The validator reopens the protected report and exports and requires the exact
+candidate source, version, image, installed workers and installer. Keep the
+report and exports private. Historical promotion receipts retain their original
+qualification evidence.
 
 ## Manual worker upgrade
 
