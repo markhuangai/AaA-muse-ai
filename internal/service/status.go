@@ -30,7 +30,7 @@ type Status struct {
 
 type Service struct {
 	db        Database
-	config    config.Config
+	config    func() *config.Config
 	build     Build
 	instance  string
 	started   time.Time
@@ -41,17 +41,20 @@ type Service struct {
 }
 
 func New(db Database, c config.Config, b Build, instance string, now func() time.Time, logger *slog.Logger) *Service {
-	return &Service{db: db, config: c, build: b.Normalized(), instance: instance, started: now(), now: now, logger: logger, lastReady: true}
+	return &Service{db: db, config: func() *config.Config { return &c }, build: b.Normalized(), instance: instance, started: now(), now: now, logger: logger, lastReady: true}
 }
+
+func (s *Service) UseConfiguration(current func() *config.Config) { s.config = current }
 
 func (s *Service) Status(ctx context.Context, logger *slog.Logger) Status {
 	started := s.now()
 	probe, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 	err := s.db.Ping(probe)
-	target, _ := url.Parse(string(s.config.Database.URL))
+	c := s.config()
+	target, _ := url.Parse(string(c.Database.URL))
 	logger = logger.With("database_host", target.Host, "database_name", target.Path)
-	state := Status{Build: s.build, InstanceID: s.instance, UptimeSeconds: s.now().Sub(s.started).Seconds(), SchemaVersion: postgres.SchemaVersion, Ready: err == nil, Database: "available", Configuration: s.config}
+	state := Status{Build: s.build, InstanceID: s.instance, UptimeSeconds: s.now().Sub(s.started).Seconds(), SchemaVersion: postgres.SchemaVersion, Ready: err == nil, Database: "available", Configuration: *c}
 	if err != nil {
 		failure := postgres.Classify(err)
 		state.Database = failure.Reason

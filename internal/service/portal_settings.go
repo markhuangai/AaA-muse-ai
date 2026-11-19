@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"regexp"
+	"slices"
 	"strconv"
 	"time"
 
@@ -13,20 +14,26 @@ import (
 )
 
 type PortalConfiguration struct {
-	Build         Build    `json:"build"`
-	InstanceID    string   `json:"instance_id"`
-	PublicOrigin  string   `json:"public_origin"`
-	Ready         bool     `json:"ready"`
-	Database      string   `json:"database"`
-	SchemaVersion int      `json:"schema_version"`
-	EffectiveYAML string   `json:"effective_yaml"`
-	Capabilities  []string `json:"capabilities"`
+	Build          Build    `json:"build"`
+	InstanceID     string   `json:"instance_id"`
+	ClientKeyNames []string `json:"client_key_names"`
+	Ready          bool     `json:"ready"`
+	Database       string   `json:"database"`
+	SchemaVersion  int      `json:"schema_version"`
+	EffectiveYAML  string   `json:"effective_yaml"`
+	Capabilities   []string `json:"capabilities"`
 }
 
 func (s *Service) PortalConfiguration(ctx context.Context, logger *slog.Logger) (PortalConfiguration, error) {
 	started := s.now()
 	status := s.Status(ctx, logger)
-	redactor := diagnostics.NewRedactor(s.config.Secrets())
+	redactor := diagnostics.NewRedactor(status.Configuration.Secrets())
+	names := make([]string, 0, len(status.Configuration.ClientKeys))
+	for name := range status.Configuration.ClientKeys {
+		names = append(names, redactor.Text(name))
+	}
+	slices.Sort(names)
+	names = slices.Compact(names)
 	var document yaml.Node
 	var data []byte
 	err := document.Encode(status.Configuration)
@@ -38,7 +45,7 @@ func (s *Service) PortalConfiguration(ctx context.Context, logger *slog.Logger) 
 		logger.Error("portal.settings_failed", "component", "settings", "cause", "yaml_encoding_failed", "outcome", "failed")
 		return PortalConfiguration{}, err
 	}
-	result := PortalConfiguration{Build: status.Build, InstanceID: status.InstanceID, PublicOrigin: redactor.Text(s.config.Server.PublicURL),
+	result := PortalConfiguration{Build: status.Build, InstanceID: status.InstanceID, ClientKeyNames: names,
 		Ready: status.Ready, Database: status.Database, SchemaVersion: status.SchemaVersion, EffectiveYAML: string(data),
 		Capabilities: []string{"Native requests", "OpenAI Chat Completions — text and client function tools", "OpenAI Responses — typed items and linear continuation", "Buffered SSE lifecycle events"}}
 	if !status.Ready {

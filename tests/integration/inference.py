@@ -414,8 +414,7 @@ class Inference(WorkerAuth):
         bounded_job, _, _ = self.claim(worker, peer, continued)
         self.decision(worker, peer, bounded_job, {"type": "final", "text": "bounded"})
         self.export_operation(large["id"])
-        held = [self.create(worker, "admission-" + str(i), tools=False) for i in range(8)]
-        self.create(worker, "queue-full", tools=False, want=429)
+        held = [self.create(worker, "admission-" + str(i), tools=False) for i in range(10)]
         for e in held:
             self.cancel(e["id"])
         secrets_in_input = "credential echoes " + worker["credential"] + " and " + self.admin
@@ -432,7 +431,7 @@ class Inference(WorkerAuth):
         require(event["cause"] and event["transaction_outcome"], "dependency failure lacked cause/outcome")
         self.docker("start", self.db)
         self.ready(self.main_service, self.origin_url)
-        self.receipt("inference.bounds_redaction_storage_failure", max_jobs=8, body_bytes=1048576, log_only_diagnosis=True)
+        self.receipt("inference.bounds_redaction_storage_failure", admitted_jobs=10, body_bytes=1048576, log_only_diagnosis=True)
 
     def key_redaction_and_persistence_failure(self, worker, peer):
         status, headers, _ = self.api("/api/v1/admin/experiments", self.admin, "POST", {worker["credential"]: "unsupported-field-evidence"})
@@ -477,7 +476,6 @@ def main():
         h.baseline()
         h.setup()
         config = h.configuration()
-        config["limits"] = {"max-jobs": 8, "in-flight-per-worker": 1}
         service, h.origin_url, _ = h.launch(config)
         h.main_service = service
         h.ready(service, h.origin_url)

@@ -312,7 +312,7 @@ func assertPortalAssetEvidence(t *testing.T, h *Handler, failed *httptest.Respon
 func TestPortalLargeYAMLReconstruction(t *testing.T) {
 	h, db, _, store := portalHTTPFixture(t)
 	c := config.Defaults()
-	c.Server.PublicURL = "https://example.test"
+
 	c.Database.URL = "postgres://db/muse"
 	c.Portal.Password = "portal-private-sentinel"
 	c.Management.Key = "admin-private-sentinel"

@@ -133,9 +133,6 @@ func (r *Repository) withinRouting(ctx context.Context, ref inference.Ref, apply
 			}
 			s.WorkerID, s.Connection, s.Revoked, s.Routing = w.WorkerID, w.Connection, w.Revoked, w.Routing
 		}
-		if err = tx.QueryRow(ctx, "SELECT count(*) FROM aaa_experiments WHERE state NOT IN ('completed','cancelled','interrupted')").Scan(&s.ActiveCount); err != nil {
-			return err
-		}
 		if ref.SubmissionID != "" {
 			var data []byte
 			err = tx.QueryRow(ctx, "SELECT data FROM aaa_inference_receipts WHERE principal=$1 AND submission_id=$2", ref.Principal, ref.SubmissionID).Scan(&data)

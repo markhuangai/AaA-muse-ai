@@ -182,6 +182,7 @@ export class WorkersController {
       const failure = error instanceof APIError ? error : new APIError('request_failed');
       if (failure.status === 401) { this.denied(); return; }
       this.change({ enrollmentMessage: failure.causeCode === 'worker_package_unconfigured' ? 'Setup text is unavailable. Install a service image with verified paired worker metadata, then try again.' :
+        failure.causeCode === 'https_origin_required' ? 'Open the portal over HTTPS to generate a setup prompt.' :
         failure.status === 403 ? 'The server denied enrollment creation.' : 'Enrollment creation could not be confirmed. No setup text is available. Generate a new enrollment to try again.', actionRequestID: failure.requestID });
     } finally { if (generation === this.#generation) this.change({ pending: '' }); }
   }

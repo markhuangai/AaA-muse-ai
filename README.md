@@ -4,6 +4,12 @@ A self-hosted broker that connects model clients to a Muse worker through outbou
 
 ## Status
 
+The owner approved browser-origin setup prompts, named client-key creation in `config.yaml`, and removal of the global job cap at `cfcb83da92ecfc910fee1a07ac100b76e9abe562`. The portal displays generated values before Save and lists names afterward. Shared configuration needs a writable directory for atomic replacement. One worker still runs one inference job at a time. [Control portal](docs/portal.md)
+
+Controlled validation passed by `2026-11-19T21:04:39Z` at working-source digest `218de390e5822eeae48e0fc6557bd1172d8fe62e843f20880d436d097afef848` before this note, using the broker image `sha256:b190fa3daa43895b167bfbbc0a0c1047b5454b157aa501154688afa8eb8be1a4`. Chromium verified two HTTPS origins, immediate key authentication on both brokers, and persistence across restart. The protected export identified a read-only mount's failed write. Routing admitted ten jobs while each worker retained one assignment. Both product shards and all six unit coverage gates passed. [Portal diagnostics](docs/portal.md#diagnostics) · [Routing](docs/history-api.md#qualification-and-dispatch)
+
+Hosted CI and Codex passed for the first PR head, `d1b9de7552d931c785d30bed1c2611c0e80ea134`. CodeQL flagged the in-memory portal password digest at the changed constructor. The follow-up uses a constant-time byte comparison with the configured secret and checks exact matching for long passwords and passwords containing spaces. The configured AI reviewer timed out at `2026-11-19T21:48:47Z` after completing one of six goals. [CI](https://github.com/markhuangai/AaA-muse-ai/actions/runs/44615733791) · [CodeQL alert](https://github.com/markhuangai/AaA-muse-ai/security/code-scanning/10) · [AI review](https://github.com/markhuangai/AaA-muse-ai/actions/runs/44615733840)
+
 At `2026-11-18T03:07:27Z`, the owner-requested media investigation verified that the Muse login page rendered through the private noVNC portal. Chromium's sandbox failed in the development container and passed in a dedicated browser container. The earlier VNC handshake succeeded while the desktop stayed black. Disabling MIT-SHM for the virtual display and using `x11vnc -noshm` restored rendering with the Chromium sandbox active.
 
 By `2026-11-18T03:43:44Z`, the one-account Muse media spike verified five private chat downloads. Native video produced the requested scene at 720p for ten seconds with audio. FFmpeg normalization produced a four-second silent 640×360 version, and a separate procedural renderer met the exact scene constraints. Native TTS MP3 and offline FFmpeg/libflite WAV both matched the requested transcript under independent speech recognition. One scoped echo destination returned HTTP 402 via Node and timed out via curl. A second returned exact Node HTTPS echoes for 16,384 and 787,707 synthetic bytes after one-time approvals. The proposed post-v0.1.0 API uses the tested producers and requires an enrolled worker-to-client round trip on the actual broker origin. [Media spike receipts](https://github.com/markhuangai/AaA-muse-ai/issues/50) · [Proposed implementation](https://github.com/markhuangai/AaA-muse-ai/issues/51)
@@ -126,19 +132,17 @@ Controlled #18 product validation passed at `2026-11-15T00:29:09Z` for approved 
 Requires Docker and Docker Compose. Copy the [example configuration](config.example.yaml):
 
 ```sh
-cp config.example.yaml config.yaml
+sudo install -d -m 0700 -o 10001 -g 10001 ./config
+sudo install -m 0600 -o 10001 -g 10001 config.example.yaml ./config/config.yaml
 ```
 
 Create a private `.env` with real values:
 
 ```dotenv
 MUSE_SERVICE_IMAGE=ghcr.io/markhuangai/aaa-muse-ai@sha256:<verified-paired-release-digest>
-MUSE_PUBLIC_URL=https://muse.example.com
 POSTGRES_PASSWORD=<database-password>
 MUSE_MANAGEMENT_KEY=<management-key>
 MUSE_PORTAL_PASSWORD=<distinct-portal-password>
-MUSE_CLIENT_KEY_A=<first-model-client-key>
-MUSE_CLIENT_KEY_B=<second-model-client-key>
 ```
 
 Use `compose.yaml` in a separate qualification directory. Its default HTTP binding is `127.0.0.1:8081`; the operator owns reverse-proxy routing and TLS. The example config fixes the database host, user and name and uses the same `POSTGRES_PASSWORD` as PostgreSQL. Go escapes the password; no second URL-encoded secret or `MUSE_DATABASE_URL` setting is needed. Existing complete database URLs remain supported. Do not combine a URL password with `database.password`.
@@ -156,7 +160,9 @@ docker compose config --quiet
 docker compose up -d
 ```
 
-Compose mounts `config.yaml` read-only. The service runs as UID/GID `10001:10001`, so that user must be able to read the mount. Put your own Traefik, Nginx or other HTTPS reverse proxy in front of the single HTTP port; configure `MUSE_PUBLIC_URL` as its HTTPS origin and allow at least 330 seconds for inference responses. No bundled proxy or TLS management is provided.
+Compose mounts `./config` at `/etc/aaa-muse-ai`. The service uses the writable directory to replace `config.yaml` atomically. When upgrading, use the existing `config.yaml` as the source of the `install` command above and keep the environment values it references, including any configured `MUSE_CLIENT_KEY_A` and `MUSE_CLIENT_KEY_B`. Select an image that supports the new mount layout before starting Compose. You can remove the obsolete `server.public-url` and `limits.max-jobs` entries and the `MUSE_PUBLIC_URL` variable. Open the portal through your HTTPS reverse proxy and allow at least 330 seconds for inference responses.
+
+Create keys in **Settings → Client keys**. Copy a generated value before saving or read a saved value directly from the protected host file. Read the configuration directory with the service UID or administrator authority. Brokers sharing that directory pick up the new client keys on their next request.
 
 If `management.key` is empty, startup prints an automatically generated management key once. Keep it local in a protected header file containing `Authorization: Bearer <management-key>` under a `0700` directory, with file mode `0600`. Never send that key to Muse. Liveness is `GET /healthz`; readiness is `GET /readyz`.
 
@@ -168,7 +174,7 @@ Management can revoke a registration through `POST /api/v1/admin/workers/{id}/re
 
 ## One-message Muse setup
 
-`POST /api/v1/admin/setup-prompts` generates the complete installation message: configured origin, pinned worker release, setup ID and a fresh enrollment code. Sign in to the portal and open **Workers** to generate and copy the same complete text, or explicitly select code-only enrollment. Generated authority is kept only in memory and cleared on expiry, replacement, session end or leaving Workers. The portal cannot confirm whether a code has already been used.
+`POST /api/v1/admin/setup-prompts` takes an HTTPS `origin` and generates the complete installation message with the pinned worker release, setup ID and fresh enrollment code. Sign in over HTTPS and open **Workers** to generate a prompt for the browser’s current origin or select code-only enrollment. The portal keeps enrollment text in memory and clears it on expiry, replacement, session end or leaving Workers.
 
 Set `ORIGIN` to your HTTPS service origin and `ADMIN_HEADER_FILE` to the protected header file. Generate a prompt into a private file:
 
@@ -176,6 +182,7 @@ Set `ORIGIN` to your HTTPS service origin and `ADMIN_HEADER_FILE` to the protect
 umask 077
 SETUP_PROMPT_FILE=$(mktemp "${TMPDIR:-/tmp}/aaa-muse-setup-prompt.XXXXXXXX.json")
 curl -fsS --request POST --header @"$ADMIN_HEADER_FILE" \
+  --json "$(jq -nc --arg origin "$ORIGIN" '{origin: $origin}')" \
   "$ORIGIN/api/v1/admin/setup-prompts" --output "$SETUP_PROMPT_FILE"
 ```
 

@@ -10,7 +10,7 @@ import (
 )
 
 const fixture = `server:
-  public-url: https://muse.example.test
+  listen: 0.0.0.0:8080
 database:
   url: postgres://service:database-sentinel@db:5432/muse
 management:
@@ -28,7 +28,7 @@ func TestConfiguration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Server.Listen != "0.0.0.0:8080" || c.Limits.MaxJobs != 1 || c.Diagnostics.MaxBytes != 128*1024*1024 {
+	if c.Server.Listen != "0.0.0.0:8080" || c.Limits.InFlight != 1 || c.Diagnostics.MaxBytes != 128*1024*1024 {
 		t.Fatal("defaults missing")
 	}
 	lookup := func(name string) (string, bool) {
@@ -44,7 +44,7 @@ func TestConfiguration(t *testing.T) {
 		}
 		return []byte(fixture), nil
 	}, absent, "chosen.yaml")
-	if err != nil || loaded.Server.PublicURL != c.Server.PublicURL {
+	if err != nil || loaded.Server.Listen != c.Server.Listen {
 		t.Fatal("load failed")
 	}
 	if _, err = Load(func(string) ([]byte, error) { return nil, errors.New("private-file-value") }, absent, "private-file"); err == nil || strings.Contains(err.Error(), "private-file") {
@@ -73,10 +73,10 @@ func TestRejectedConfiguration(t *testing.T) {
 		"second-invalid":       fixture + "---\n[",
 		"unknown":              fixture + "unknown: portal-sentinel\n",
 		"duplicate":            fixture + "management:\n  key: replacement\n",
-		"type":                 fixture + "limits:\n  max-jobs: invalid\n",
+		"type":                 fixture + "limits:\n  in-flight-per-worker: invalid\n",
 		"missing-env":          strings.ReplaceAll(fixture, "portal-sentinel", "${ABSENT}"),
 		"bad-env":              strings.ReplaceAll(fixture, "portal-sentinel", "${BAD-NAME}"),
-		"alias":                fixture + "limits: &base\n  max-jobs: 1\nother: *base\n",
+		"alias":                fixture + "limits: &base\n  in-flight-per-worker: 1\nother: *base\n",
 		"oversize":             strings.Repeat("#", 1024*1024+1),
 		"removed-worker-limit": fixture + "limits:\n  max-workers: 1\n",
 	}
@@ -101,16 +101,23 @@ func TestRejectedConfiguration(t *testing.T) {
 	}
 }
 
+func TestLegacySettingsAreIgnoredBeforeResolving(t *testing.T) {
+	raw := strings.Replace(fixture, "  listen:", "  public-url: ${LEGACY_ORIGIN}\n  listen:", 1) + "limits:\n  max-jobs: ${OLD_CAP}\n"
+	c, err := Parse([]byte(raw), absent)
+	if err != nil || c.Limits.InFlight != 1 {
+		t.Fatal("obsolete fields affected startup", err)
+	}
+	output, _ := json.Marshal(c)
+	if strings.Contains(string(output), "public_url") || strings.Contains(string(output), "max_jobs") {
+		t.Fatal("obsolete settings reached the effective configuration")
+	}
+}
+
 func TestConfigurationValidation(t *testing.T) {
 	cases := map[string]func(*Config){
 		"listen":             func(c *Config) { c.Server.Listen = "bad" },
 		"port-zero":          func(c *Config) { c.Server.Listen = ":0" },
 		"port-large":         func(c *Config) { c.Server.Listen = ":65536" },
-		"public-http":        func(c *Config) { c.Server.PublicURL = "http://muse.example.test" },
-		"public-credentials": func(c *Config) { c.Server.PublicURL = "https://u:p@example.test" },
-		"public-path":        func(c *Config) { c.Server.PublicURL = "https://example.test/path" },
-		"public-query":       func(c *Config) { c.Server.PublicURL = "https://example.test/?credential=x" },
-		"public-invalid":     func(c *Config) { c.Server.PublicURL = "https://%" },
 		"db-invalid":         func(c *Config) { c.Database.URL = "postgres://%" },
 		"db-scheme":          func(c *Config) { c.Database.URL = "sqlite://db/muse" },
 		"db-name":            func(c *Config) { c.Database.URL = "postgres://db/" },
@@ -125,7 +132,6 @@ func TestConfigurationValidation(t *testing.T) {
 		"client-long":        func(c *Config) { c.ClientKeys = map[string]Secret{strings.Repeat("x", 101): "key"} },
 		"client-empty":       func(c *Config) { c.ClientKeys = map[string]Secret{"client": " "} },
 		"client-reuse":       func(c *Config) { c.ClientKeys = map[string]Secret{"client": c.Management.Key} },
-		"jobs":               func(c *Config) { c.Limits.MaxJobs = 0 },
 		"flight":             func(c *Config) { c.Limits.InFlight = 2 },
 		"level":              func(c *Config) { c.Diagnostics.Level = "trace" },
 		"directory":          func(c *Config) { c.Diagnostics.Directory = "relative" },

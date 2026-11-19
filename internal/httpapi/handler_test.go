@@ -30,7 +30,7 @@ func (d *testDB) Ping(context.Context) error { return d.err }
 func fixture(t *testing.T) (*Handler, *testDB, *bytes.Buffer, *diagnostics.Store) {
 	t.Helper()
 	c := config.Defaults()
-	c.Server.PublicURL = "https://example.test"
+
 	c.Database.URL = "postgres://db/muse"
 	c.Management.Key = "admin-private-sentinel"
 	c.Portal.Password = "portal-private-sentinel"

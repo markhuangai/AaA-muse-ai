@@ -116,14 +116,6 @@ func (m *inferenceMemory) WithinInference(_ context.Context, ref inference.Ref, 
 		}
 	}
 	s.Receipt = m.receipts[ref.Principal+":"+ref.SubmissionID]
-	s.ActiveCount = 0
-	for _, state := range m.states {
-		for _, e := range state.Experiments {
-			if !e.Terminal() {
-				s.ActiveCount++
-			}
-		}
-	}
 	if err = fn(&s); err != nil {
 		return err
 	}
@@ -160,7 +152,7 @@ func inferenceFixture() (*Broker, *inferenceMemory, *slog.Logger, *bytes.Buffer)
 		m.states[id] = &inference.State{WorkerID: id, Experiments: map[string]*inference.Experiment{}, Jobs: map[string]*inference.Job{}}
 	}
 	var out bytes.Buffer
-	return NewBroker(m, rand.Reader, func() time.Time { return m.now }, func(ctx context.Context, _ time.Duration) error { return ctx.Err() }, 2), m, slog.New(slog.NewJSONHandler(&out, &slog.HandlerOptions{Level: slog.LevelDebug})), &out
+	return NewBroker(m, rand.Reader, func() time.Time { return m.now }, func(ctx context.Context, _ time.Duration) error { return ctx.Err() }), m, slog.New(slog.NewJSONHandler(&out, &slog.HandlerOptions{Level: slog.LevelDebug})), &out
 }
 
 func decodeResult[T any](t *testing.T, data json.RawMessage, err error) T {

@@ -161,7 +161,7 @@ func TestQualificationRejectsUnsupportedIncompleteForeignAndStaleEvidence(t *tes
 
 func TestRoutingFairnessQueueIsolationAndAdmissionLimits(t *testing.T) {
 	b, m, logger, logs := inferenceFixture()
-	b.maxJobs = 8
+
 	a := connectNative(t, b, m, logger, "worker-a")
 	z := connectNative(t, b, m, logger, "worker-b")
 	first := admitted(t, b, "alice", "a", autoInput("first"))
@@ -203,10 +203,12 @@ func TestRoutingFairnessQueueIsolationAndAdmissionLimits(t *testing.T) {
 	if err != nil || r.WorkerID != second.WorkerID {
 		t.Fatal("other worker did not progress")
 	}
-	b.maxJobs = 2
-	_, err = b.SubmitRequest(context.Background(), logger, "alice", "full", autoInput("full"))
-	requireInferenceReason(t, err, "queue_full")
-	if !strings.Contains(logs.String(), "dispatch.rejected") || !strings.Contains(logs.String(), "dispatch.assigned") {
+
+	queued = admitted(t, b, "alice", "over-former-cap", autoInput("over-former-cap"))
+	if queued.WorkerID != "" {
+		t.Fatal("busy workers admitted a second assignment")
+	}
+	if !strings.Contains(logs.String(), "dispatch.assigned") {
 		t.Fatal("routing events absent")
 	}
 }
@@ -215,7 +217,7 @@ func TestRoutingSafeOfflineReassignmentAndExposureFence(t *testing.T) {
 	for _, boundary := range []string{"safe", "context", "claimed", "tool-wait", "uncertain"} {
 		t.Run(boundary, func(t *testing.T) {
 			b, m, logger, logs := inferenceFixture()
-			b.maxJobs = 10
+
 			ca := connectNative(t, b, m, logger, "worker-a")
 			connectNative(t, b, m, logger, "worker-b")
 			in := autoInput("start")
@@ -394,7 +396,7 @@ func TestRoutingReconnectKeepsUncertainWorkHeld(t *testing.T) {
 
 func TestRoutingQueueDeadlineCancellationAndConcurrentSession(t *testing.T) {
 	b, m, logger, _ := inferenceFixture()
-	b.maxJobs = 20
+
 	connectNative(t, b, m, logger, "worker-a")
 	v := admitted(t, b, "alice", "busy", autoInput("reserved"))
 	_ = v
@@ -447,7 +449,7 @@ func TestRoutingQueueDeadlineCancellationAndConcurrentSession(t *testing.T) {
 
 func TestRoutingLeastRecentSelectionAndBlockedPinDoesNotStarveAnotherSession(t *testing.T) {
 	b, m, logger, _ := inferenceFixture()
-	b.maxJobs = 10
+
 	ca := connectNative(t, b, m, logger, "worker-a")
 	cz := connectNative(t, b, m, logger, "worker-b")
 	a := admitted(t, b, "alice", "a", autoInput("a"))
@@ -485,7 +487,7 @@ func TestRoutingLeastRecentSelectionAndBlockedPinDoesNotStarveAnotherSession(t *
 
 func TestRoutingFirstAssignmentAndConstrainedWaitDoNotEstablishMovementAuthority(t *testing.T) {
 	b, m, logger, _ := inferenceFixture()
-	b.maxJobs = 8
+
 	connectNative(t, b, m, logger, "worker-a")
 	connectNative(t, b, m, logger, "worker-b")
 	first := admitted(t, b, "alice", "first", autoInput("first"))
@@ -495,10 +497,10 @@ func TestRoutingFirstAssignmentAndConstrainedWaitDoNotEstablishMovementAuthority
 	if waiting.WorkerID != "" || m.states[""].Conversations[waiting.ConversationID].WorkerID != "" || m.states[""].Experiments[waiting.ID].CurrentJobID != "" {
 		t.Fatal("selection constraint became an early pin")
 	}
-	b.maxJobs = 2
+
 	replay := admitted(t, b, "alice", "constrained", constraint)
 	if replay.ID != waiting.ID {
-		t.Fatal("full queue blocked constrained retry")
+		t.Fatal("queued request retry changed identity")
 	}
 	m.states[first.WorkerID].Connection.Connected = false
 	if err := b.Dispatch(context.Background(), logger); err != nil {

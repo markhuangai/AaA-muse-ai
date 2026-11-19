@@ -26,9 +26,9 @@ CLI version and verified archive digest independently of the image's installer
 recommendation; connection health or an absent legacy version header proves
 neither exact installed version nor live readiness.
 
-Configure `limits.max-jobs: 2` and `in-flight-per-worker: 1`. The first setting
-allows two sessions to wait for client tools; it does not permit concurrent
-inference on the worker. Use one reserved account without unrelated messages,
+Keep `limits.in-flight-per-worker` at 1 so the worker runs one inference at a time.
+Two sessions can wait for client tools concurrently. When testing a release that still
+reports a global job cap, set its cap to at least two. Use one reserved account without unrelated messages,
 browser input, or scheduled work during measured windows. Provide a working
 authenticated browser/VNC session for setup and passive observation. Browser
 automation is not the inference transport.

@@ -12,7 +12,7 @@ import (
 
 func safeHistoryConflict(fields map[string]any) map[string]any {
 	safe := map[string]any{}
-	for _, key := range []string{"position", "expected_count", "observed_count", "expected_call_id", "observed_call_id", "expected_session_id", "observed_session_id", "expected_worker_id", "observed_worker_id", "conversation_id", "current_request_id", "expected_state", "observed_state", "expected_generation", "observed_generation", "expected_connection_id", "observed_connection_id", "expected_connection_generation", "observed_connection_generation", "expected_context_receipt", "observed_context_receipt", "transaction_outcome", "active_experiments", "max_jobs", "context_bytes", "max_context_bytes", "observed_response_id", "requested_item_id", "item_id"} {
+	for _, key := range []string{"position", "expected_count", "observed_count", "expected_call_id", "observed_call_id", "expected_session_id", "observed_session_id", "expected_worker_id", "observed_worker_id", "conversation_id", "current_request_id", "expected_state", "observed_state", "expected_generation", "observed_generation", "expected_connection_id", "observed_connection_id", "expected_connection_generation", "observed_connection_generation", "expected_context_receipt", "observed_context_receipt", "transaction_outcome", "context_bytes", "max_context_bytes", "observed_response_id", "requested_item_id", "item_id"} {
 		if value, ok := fields[key]; ok {
 			safe[key] = value
 		}
@@ -105,10 +105,7 @@ func (b *Broker) submitRequest(ctx context.Context, logger *slog.Logger, client,
 		movable := movableConversation(s, c)
 		allowed, evidence := candidates(s, c, input, movable, "")
 		if len(allowed) == 0 {
-			return nil, inference.Reject("no_ready_worker", 503, "candidates", evidence, "required_capabilities", inference.RequiredCapabilities(input.Messages, input.Tools), "max_jobs", b.maxJobs)
-		}
-		if s.ActiveCount >= b.maxJobs {
-			return nil, inference.Reject("queue_full", 429, "active_experiments", s.ActiveCount, "max_jobs", b.maxJobs, "candidates", evidence)
+			return nil, inference.Reject("no_ready_worker", 503, "candidates", evidence, "required_capabilities", inference.RequiredCapabilities(input.Messages, input.Tools))
 		}
 
 		id, err := auth.ID(b.random)
@@ -157,7 +154,7 @@ func (b *Broker) submitRequest(ctx context.Context, logger *slog.Logger, client,
 			return nil, err
 		}
 		event(events, slog.LevelInfo, "history.reconciled", s, &inference.Job{ExperimentID: id, ConversationID: c.ID}, "client_id", client, "session_id", c.SessionID, "request_record_id", id, "matched_from", 0, "matched_to", matched, "appended_from", matched, "appended_to", c.ItemCount, "reason", "new_suffix", "tool_count", len(input.Tools))
-		event(events, slog.LevelInfo, "dispatch.queued", s, &inference.Job{ExperimentID: id, ConversationID: c.ID, DeadlineAt: e.DeadlineAt}, "candidates", evidence, "active_experiments", s.ActiveCount+1, "max_jobs", b.maxJobs, "timeout_seconds", input.TimeoutSeconds, "worker_selection_constraint", input.WorkerID, "reassign_allowed", movable, "prior_decision_type", priorDecision, "required_capabilities", inference.RequiredCapabilities(input.Messages, input.Tools))
+		event(events, slog.LevelInfo, "dispatch.queued", s, &inference.Job{ExperimentID: id, ConversationID: c.ID, DeadlineAt: e.DeadlineAt}, "candidates", evidence, "timeout_seconds", input.TimeoutSeconds, "worker_selection_constraint", input.WorkerID, "reassign_allowed", movable, "prior_decision_type", priorDecision, "required_capabilities", inference.RequiredCapabilities(input.Messages, input.Tools))
 		if err = b.dispatch(s, events); err != nil {
 			return nil, err
 		}

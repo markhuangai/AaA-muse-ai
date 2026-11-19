@@ -2,7 +2,7 @@
 
 Open the operator's public service origin and sign in using `control-portal.password` from the mounted YAML configuration. The existing `${ENVIRONMENT_VARIABLE}` reference mechanism also applies to this password. It must differ from management and model-client keys.
 
-The portal shows resolved effective YAML with credentials redacted, the service/build identity, database health and the software interfaces implemented by that build. The Workers page lists registrations and supports display-name changes, single-use enrollment/setup generation and confirmed revocation through existing management APIs. Requests shows recorded inference history, conversation timelines and confirmed cancellation. Configuration remains read-only. Service readiness does not establish inference readiness.
+Settings shows redacted effective YAML, service and build identity, database health, and named client keys. The Workers page manages registrations and enrollment. Requests shows recorded inference history, conversation timelines, and cancellation. Service readiness describes the broker and database. Verify inference readiness separately.
 
 ## Session boundary
 
@@ -22,12 +22,21 @@ Failed logins are bounded to five per transport peer per minute and sixty global
 |---|---|
 | `POST /api/v1/portal/login` | JSON `password`; returns `session_token` and `expires_at` |
 | `POST /api/v1/portal/logout` | Invalidates the authenticated portal session |
-| `GET /api/v1/portal/settings` | Returns redacted effective YAML, public origin, build/instance identity, service/database health, schema version and implemented capabilities |
+| `GET /api/v1/portal/settings` | Returns redacted effective YAML, `client_key_names`, build and instance identity, service and database health, schema version and implemented capabilities |
+| `POST /api/v1/portal/client-keys` | Takes JSON `{name, key}` and returns HTTP 201 with `{name}` after saving to `config.yaml`. Requires an active portal session. |
 | `POST /api/v1/portal/events` | Accepts authenticated, allowlisted browser reports |
 
 Go serves the compiled React assets at `/`, `/settings`, `/workers`, `/requests` and `/assets/*` on the existing HTTP port. Navigation and browser back/forward retain the in-memory session; reloading requires login. Unknown API paths and missing assets retain errors. Production has no Node server, CORS middleware, bundled reverse proxy or certificate management. The operator's Traefik, Nginx or other proxy owns routing and TLS. The CSP permits only same-origin resources; fonts are bundled with their OFL-1.1 license notices in the image.
 
 The browser uses ten-second request deadlines, refreshes every thirty seconds while visible, and marks snapshots stale after sixty seconds without a successful refresh. Failed refreshes retain the last snapshot with an explicit error and Retry action. Logout and new login generations fence delayed responses. Build mismatches require a reload and fresh login.
+
+## Client keys
+
+In **Settings → Client keys**, enter a name and a key or click **Generate** to create a random `aaa_muse_ai_` key. You can copy the generated value before Save. Save clears the draft and displays the saved name. Read the value afterward from the protected `config.yaml` on the host.
+
+The broker preserves comments, key order, and environment references when it appends a new mapping entry. Brokers sharing the file refresh client keys before processing the next request. Edit the file to rotate a value under its existing name or remove a key. The entry name owns the client's request history. Restart the broker after changing other settings.
+
+Duplicate names and credentials return HTTP 409. When the save outcome is uncertain, inspect the saved names or host configuration before submitting again. A read-only or inaccessible directory prevents saving and leaves the existing configuration active.
 
 ## Worker management
 
@@ -37,7 +46,7 @@ Worker detail comes from the existing `GET /api/v1/admin/workers` projection, se
 
 Connection state, authenticated last contact, heartbeat, broker activity, current assignment and client-tool waits are separate observations. A retained busy assignment can coexist with an offline subscriber. Hidden Muse activity is not observable. Readiness is shown with its recorded qualification, connection generation, capabilities and controlled/live provenance. Controlled approval does not establish live Muse qualification. Installed worker version is `Not reported`; independent background wake is `Not independently observed` because current APIs supply neither fact.
 
-`POST /api/v1/admin/setup-prompts` creates one fifteen-minute single-use enrollment with complete pinned installation/reconnection text. The explicit code-only alternative uses `POST /api/v1/admin/enrollments` and creates its own enrollment. No code is parsed from a prompt in the product. Replacing an output clears the previous text; it does not revoke an earlier code. Expiry, session end and leaving Workers clear the current text and copy control. Clipboard denial leaves selectable text for manual copying. The portal cannot confirm consumption and does not persist enrollment authority. Previously copied text is outside the portal's control; the server enforces single use and expiry.
+`POST /api/v1/admin/setup-prompts` takes `{"origin":"https://host:8443"}` and creates a fifteen-minute single-use enrollment with pinned setup and reconnection instructions. The browser supplies its current HTTPS origin. Use `POST /api/v1/admin/enrollments` for code-only enrollment. Expiry, session end, and leaving Workers clear the current text and copy control. Clipboard denial leaves selectable text, and the broker enforces single use and expiry.
 
 Revocation uses a native confirmation dialog naming the worker and immutable ID, then `POST /api/v1/admin/workers/{id}/revoke`. The server result is shown without optimistic authority changes. Every copy of the credential is rejected after confirmed revocation; registration and history remain. The portal does not claim that remote execution stopped. Worker credentials have no automatic expiry and are never displayed here.
 
@@ -72,6 +81,8 @@ Collect the protected export by the operation ID and associated request IDs show
 ## Diagnostics
 
 Runtime output defaults to INFO JSON. The existing protected capture always retains DEBUG detail independently of stdout filtering, using reconstructable chunks no larger than 6 KiB, seven-day retention and a 128-MiB maximum. Login capture explicitly omits password and session output; credentials are never diagnostic payloads. Redacted settings can be reconstructed from protected DEBUG evidence.
+
+Filter by the request or operation ID displayed after a key save. `client_key.created` at INFO records the saved name. `client_key.rejected` at WARN distinguishes invalid input from conflicts. `client_key.persist_failed` and `client_key.reload_failed` at ERROR record the failing stage and cause. A directory permission error calls for correcting the mount and ownership. A directory sync failure after replacement calls for inspecting the host file to reconcile the uncertain save. Key values are omitted from capture. `setup.prompt_created` records the accepted HTTPS origin at INFO, and `setup.origin_rejected` records a safe cause at WARN before enrollment starts.
 
 `portal.auth_failed` WARN identifies rejected passwords, throttling and invalid/expired sessions. Session lifecycle INFO events identify issuance, logout and expiry through a nonsecret session identifier. `portal.state_stale` WARN identifies database degradation or a browser-reported refresh failure. `portal.render_failed` ERROR is a client report, not proof of a server exception. `portal.assets_unavailable` ERROR identifies an unreadable compiled asset and its safe filesystem cause.
 

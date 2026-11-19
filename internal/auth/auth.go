@@ -1,12 +1,12 @@
 package auth
 
 import (
-	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"io"
+	"maps"
 	"strings"
 
 	"github.com/markhuangai/AaA-muse-ai/internal/config"
@@ -33,21 +33,26 @@ func ID(random io.Reader) (string, error) {
 }
 
 type Authority struct {
-	management    []byte
-	portal        [32]byte
-	portalEnabled bool
-	clients       map[string][]byte
+	management []byte
+	portal     config.Secret
+	clientKeys func() map[string]config.Secret
 }
 
 func New(c config.Config) *Authority {
-	a := &Authority{management: []byte(c.Management.Key), portal: sha256.Sum256([]byte(c.Portal.Password)), portalEnabled: c.Portal.Password != "", clients: map[string][]byte{}}
-	for name, key := range c.ClientKeys {
-		a.clients[name] = []byte(key)
-	}
-	return a
+	c.ClientKeys = maps.Clone(c.ClientKeys)
+	return NewWithConfiguration(func() *config.Config { return &c })
 }
 
-func (a *Authority) HasClient(name string) bool { _, ok := a.clients[name]; return ok }
+func NewWithConfiguration(current func() *config.Config) *Authority {
+	c := current()
+	return &Authority{
+		management: []byte(c.Management.Key),
+		portal:     c.Portal.Password,
+		clientKeys: func() map[string]config.Secret { return current().ClientKeys },
+	}
+}
+
+func (a *Authority) HasClient(name string) bool { _, ok := a.clientKeys()[name]; return ok }
 
 func (a *Authority) Role(header string) string {
 	role, _ := a.Identity(header)
@@ -66,8 +71,8 @@ func (a *Authority) Identity(header string) (string, string) {
 	if subtle.ConstantTimeCompare(credential, a.management) == 1 {
 		return "management", ""
 	}
-	for name, client := range a.clients {
-		if subtle.ConstantTimeCompare(credential, client) == 1 {
+	for name, client := range a.clientKeys() {
+		if subtle.ConstantTimeCompare(credential, []byte(client)) == 1 {
 			return "client", name
 		}
 	}
@@ -75,8 +80,7 @@ func (a *Authority) Identity(header string) (string, string) {
 }
 
 func (a *Authority) PortalPassword(password string) bool {
-	digest := sha256.Sum256([]byte(password))
-	return subtle.ConstantTimeCompare(digest[:], a.portal[:]) == 1 && a.portalEnabled
+	return a.portal != "" && subtle.ConstantTimeCompare([]byte(password), []byte(a.portal)) == 1
 }
 
 func (a *Authority) Reserved(credential string) bool {

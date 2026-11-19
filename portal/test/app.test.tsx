@@ -3,10 +3,55 @@ import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { App, Configuration, Login, RenderBoundary } from '../src/app';
 import { APIError } from '../src/api';
 import { PortalController } from '../src/controller';
-import { TestAPI, TestSystem, settings, settle } from './helpers';
+import { TestAPI, TestSystem, deferred, settings, settle } from './helpers';
 
 afterEach(cleanup);
 const fixture = () => { const system = new TestSystem(); const api = new TestAPI(system); const controller = new PortalController(api, system); return { api, system, controller }; };
+
+test('generated keys can be copied before save and only names appear after save', async () => {
+  const { controller, api } = fixture();
+  await controller.login('password');
+  render(<App controller={controller} />);
+  const key = screen.getByLabelText('Key') as HTMLInputElement;
+  fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'Studio client' } });
+  fireEvent.click(screen.getByRole('button', { name: /^Generate$/ }));
+  expect(key.type).toBe('text');
+  expect(/^aaa_muse_ai_[a-f0-9]{64}$/.test(key.value)).toBe(true);
+  const generated = key.value;
+  await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Copy key' })); await settle(); });
+  expect(screen.getByText(/Clipboard access failed/)).toBeTruthy();
+  const pending = deferred<{ value: string; requestID: string }>();
+  api.createKeyWork = async (name, value) => {
+    expect(value === generated).toBe(true);
+    api.clientNames.push(name);
+    return pending.promise;
+  };
+  await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Save client key' })); await settle(); });
+  expect(key.value).toBe('');
+  expect(screen.queryByRole('button', { name: 'Copy key' })).toBeNull();
+  expect(screen.queryByRole('list', { name: 'Saved client keys' })).toBeNull();
+  await act(async () => { pending.resolve({ value: 'Studio client', requestID: 'client-key-request' }); await settle(); });
+  expect(screen.getByRole('list', { name: 'Saved client keys' }).textContent).toBe('Studio client');
+  expect(screen.getByText('client-key-request')).toBeTruthy();
+  expect(JSON.stringify(controller.snapshot()).includes(generated)).toBe(false);
+  controller.dispose();
+});
+
+test('a manual draft stays masked and an uncertain save clears it', async () => {
+  const { controller, api } = fixture();
+  await controller.login('password');
+  api.createKeyWork = async () => { throw new APIError('client_key_save_uncertain', 503, 'uncertain-save'); };
+  render(<App controller={controller} />);
+  const key = screen.getByLabelText('Key') as HTMLInputElement;
+  fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'External client' } });
+  fireEvent.change(key, { target: { value: 'operator-entered-key' } });
+  expect(key.type).toBe('password');
+  await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Save client key' })); await settle(); });
+  expect(key.value).toBe('');
+  expect(screen.getByText(/The save could not be confirmed/)).toBeTruthy();
+  expect(screen.queryByRole('list', { name: 'Saved client keys' })).toBeNull();
+  controller.dispose();
+});
 
 test('actual React login clears the password, renders text-safe settings and signs out', async () => {
   const { controller, api } = fixture();

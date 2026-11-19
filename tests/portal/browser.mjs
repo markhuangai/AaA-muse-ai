@@ -182,9 +182,104 @@ async function expiryAndDeadline() {
   release(); await second.close(); passed('portal.browser_request_deadline', { deadline_ms: 10000 });
 }
 
+async function clientKeyAndOriginFlows() {
+  const secure = await chromium.launch({ headless: true });
+  const saved = [];
+  const [first, second] = fixture.key_origins;
+  const open = async (width, origin) => {
+    const context = await secure.newContext({ viewport: { width, height: 900 }, serviceWorkers: 'block',
+      ignoreHTTPSErrors: true, permissions: ['clipboard-read', 'clipboard-write'] });
+    const page = await context.newPage();
+    await page.goto(origin);
+    const session = await login(page);
+    return { page, context, session };
+  };
+  const prompt = async (page, origin) => {
+    await page.getByRole('link', { name: 'Workers', exact: true }).click();
+    const pending = page.waitForResponse(response => new URL(response.url()).pathname === '/api/v1/admin/setup-prompts');
+    await page.getByRole('button', { name: 'Generate setup prompt' }).click();
+    const response = await pending;
+    expect(response.status()).toBe(201);
+    expect(response.request().postDataJSON()).toEqual({ origin });
+    const data = await response.json();
+    secrets.push(data.setup_prompt.match(/muse_enroll_[A-Za-z0-9_-]{43}/)[0]);
+    save('browser-session-secrets.json', secrets);
+    expect(data.setup_prompt).toContain(`origin='${origin}'`);
+  };
+  try {
+    for (const width of [1440, 768, 390]) {
+      const { page, context } = await open(width, first);
+      const input = page.getByLabel('Key', { exact: true });
+      const nameInput = page.getByLabel('Name', { exact: true });
+      await page.getByRole('button', { name: 'Generate', exact: true }).click();
+      const generated = await input.inputValue();
+      expect(/^aaa_muse_ai_[a-f0-9]{64}$/.test(generated)).toBe(true);
+      await expect(input).toHaveAttribute('type', 'text');
+      await page.getByRole('button', { name: 'Copy key', exact: true }).click();
+      await expect(page.getByText('Copied.', { exact: true })).toBeVisible();
+      expect((await page.evaluate(() => navigator.clipboard.readText())) === generated).toBe(true);
+      const create = async (name, key) => {
+        secrets.push(key);
+        save('browser-session-secrets.json', secrets);
+        await nameInput.fill(name);
+        expect((await input.inputValue()) === key).toBe(true);
+        const saveButton = page.getByRole('button', { name: 'Save client key' });
+        await expect(saveButton).toBeEnabled();
+        const [response] = await Promise.all([
+          page.waitForResponse(response => new URL(response.url()).pathname === '/api/v1/portal/client-keys'),
+          saveButton.click(),
+        ]);
+        expect(response.status()).toBe(201);
+        expect(await response.json()).toEqual({ name });
+        await expect(input).toHaveValue('');
+        await expect(nameInput).toHaveValue('');
+        await expect(page.getByRole('button', { name: 'Copy key', exact: true })).toHaveCount(0);
+        await expect(page.getByRole('list', { name: 'Saved client keys' })).toContainText(name);
+        for (const origin of [second, first]) {
+          const result = await context.request.get(origin + '/v1/models', { headers: { Authorization: 'Bearer ' + key } });
+          expect(result.status()).toBe(200);
+        }
+        saved.push({ name, key });
+        save('browser-client-key-secrets.json', saved);
+      };
+      await create('Browser client ' + width, generated);
+      if (width === 1440) {
+        await expect(page.getByRole('button', { name: 'Refresh', exact: true })).toBeEnabled();
+        const supplied = 'controlled-manual-client-value';
+        await input.fill(supplied);
+        await expect(input).toHaveAttribute('type', 'password');
+        await create('Manual client', supplied);
+      }
+      await emptyStorage(page, context);
+      expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1)).toBe(true);
+      await screenshot(page, `client-keys-${width}.png`);
+      if (width === 1440) await prompt(page, first);
+      await context.close();
+    }
+    const sibling = await open(390, second);
+    await prompt(sibling.page, second);
+    await sibling.context.close();
+    passed('portal.browser_client_keys_and_origins', { widths: [1440, 768, 390], first_request_authentication: true, https_origins: 2 });
+  } finally { await secure.close(); }
+}
+
+async function httpSetupExplanation() {
+  const context = await browser.newContext({ serviceWorkers: 'block' });
+  try {
+    const page = await context.newPage();
+    await page.goto(transport.origin);
+    await login(page);
+    await page.getByRole('link', { name: 'Workers', exact: true }).click();
+    await page.getByRole('button', { name: 'Generate setup prompt' }).click();
+    await expect(page.getByText('Open the portal over HTTPS to generate a setup prompt.')).toBeVisible();
+    await expect(page.getByLabel('Complete setup prompt')).toHaveCount(0);
+    passed('portal.http_setup_explanation');
+  } finally { await context.close(); }
+}
+
 try {
   browser = await chromium.launch({ headless: true, args: transport.args });
-  await viewports(); await lifecycle(); await expiryAndDeadline();
+  await viewports(); await lifecycle(); await expiryAndDeadline(); await httpSetupExplanation(); await clientKeyAndOriginFlows();
   receipt.outcome = 'passed';
   save('browser-receipt.json', receipt);
   console.log(JSON.stringify({ case: 'portal.browser_conformance', outcome: 'passed', cases: receipt.cases.length, screenshots: receipt.screenshots.length }));

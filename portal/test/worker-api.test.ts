@@ -7,6 +7,7 @@ const json = (value: unknown, status = 200) => new Response(JSON.stringify(value
 
 test('management calls use the real adapter, immutable IDs and accepted backend values', async () => {
   const calls: { path: string; method: string; body: unknown }[] = [];
+  let origin = 'https://muse.example.test:8443';
   const api = new BrowserAPI((async (path, options) => {
     const url = String(path);
     calls.push({ path: url, method: options!.method!, body: options!.body ? JSON.parse(String(options!.body)) : null });
@@ -14,7 +15,7 @@ test('management calls use the real adapter, immutable IDs and accepted backend 
     if (url.endsWith('/setup-prompts')) return json(enrollment());
     if (url.endsWith('/enrollments')) return json(enrollment('code'));
     return json(worker('a'.repeat(32), 'Accepted name'));
-  }) as typeof fetch);
+  }) as typeof fetch, undefined, () => origin);
   expect((await api.workers('list-operation', signal())).value[0].id).toBe(worker().id);
   expect((await api.renameWorker(worker().id, '  Accepted name  ', 'rename-operation', signal())).value.name).toBe('Accepted name');
   expect((await api.revokeWorker(worker().id, 'revoke-operation', signal())).requestID).toBe('worker-api-request');
@@ -22,6 +23,10 @@ test('management calls use the real adapter, immutable IDs and accepted backend 
   expect((await api.enrollment('code', 'code-operation', signal())).value.enrollment_code === enrollment('code').enrollment_code).toBe(true);
   expect(calls.map(value => value.method)).toEqual(['GET', 'PATCH', 'POST', 'POST', 'POST']);
   expect(calls[1].body).toEqual({ name: '  Accepted name  ' });
+  expect(calls[3].body).toEqual({ origin });
+  expect(calls[4].body).toBeNull();
+  origin = 'http://localhost';
+  await expect(api.enrollment('prompt', 'local-operation', signal())).rejects.toMatchObject({ causeCode: 'https_origin_required' });
   expect(calls.every(value => value.path.startsWith('/api/v1/admin/'))).toBe(true);
   await expect(api.renameWorker('../escape', 'name', 'operation', signal())).rejects.toMatchObject({ causeCode: 'invalid_worker_id' });
   expect(calls).toHaveLength(5);
@@ -55,7 +60,8 @@ test('enrollment validation and safe error parsing retain correlation without ar
   for (const kind of ['code', 'prompt'] as const) {
     for (const patch of [null, {}, { enrollment_id: 'invalid' }, { expires_at: 'invalid' }, { expires_at: '2026-11-12T00:00:00Z' },
       kind === 'code' ? { enrollment_code: 'wrong' } : { setup_prompt: '' }, kind === 'code' ? { enrollment_code: null } : { worker_package: {} }]) {
-      const api = new BrowserAPI((async () => json(patch === null ? null : { ...enrollment(kind), ...patch })) as typeof fetch);
+      const api = new BrowserAPI((async () => json(patch === null ? null : { ...enrollment(kind), ...patch })) as typeof fetch,
+        undefined, () => 'https://muse.example.test');
       if (patch && Object.keys(patch).length === 0) expect((await api.enrollment(kind, 'operation', signal())).value.enrollment_id).toBe('e'.repeat(32));
       else await expect(api.enrollment(kind, 'operation', signal())).rejects.toMatchObject({ causeCode: 'invalid_response' });
     }

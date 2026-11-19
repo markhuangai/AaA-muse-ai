@@ -74,9 +74,6 @@ func (b *Broker) Create(ctx context.Context, logger *slog.Logger, c inference.Cr
 		if s.Connection.Status(s.Now) != "online" {
 			return nil, inference.Reject("worker_offline", 409)
 		}
-		if s.ActiveCount >= b.maxJobs {
-			return nil, inference.Reject("queue_full", 429, "active_experiments", s.ActiveCount, "max_jobs", b.maxJobs)
-		}
 		id, err := auth.ID(b.random)
 		if err != nil {
 			return nil, err

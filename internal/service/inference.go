@@ -21,16 +21,15 @@ type InferenceRepository interface {
 }
 
 type Broker struct {
-	Media   *media.Store
-	repo    InferenceRepository
-	random  io.Reader
-	now     func() time.Time
-	Wait    func(context.Context, time.Duration) error
-	maxJobs int
+	Media  *media.Store
+	repo   InferenceRepository
+	random io.Reader
+	now    func() time.Time
+	Wait   func(context.Context, time.Duration) error
 }
 
-func NewBroker(repo InferenceRepository, random io.Reader, now func() time.Time, wait func(context.Context, time.Duration) error, maxJobs int) *Broker {
-	return &Broker{repo: repo, random: random, now: now, Wait: wait, maxJobs: maxJobs}
+func NewBroker(repo InferenceRepository, random io.Reader, now func() time.Time, wait func(context.Context, time.Duration) error) *Broker {
+	return &Broker{repo: repo, random: random, now: now, Wait: wait}
 }
 
 type inferenceEvent struct {
@@ -143,13 +142,9 @@ func expire(s *inference.State, events *[]inferenceEvent) {
 		for _, w := range s.Pool {
 			expire(w, events)
 		}
-		s.ActiveCount = 0
 		for _, e := range s.Experiments {
 			if e.WorkerID == "" && !e.Terminal() && !s.Now.Before(e.DeadlineAt) {
 				finish(s, e, "interrupted", "deadline_exceeded", events)
-			}
-			if !e.Terminal() {
-				s.ActiveCount++
 			}
 		}
 		return
@@ -196,7 +191,7 @@ func (b *Broker) run(ctx context.Context, logger *slog.Logger, ref inference.Ref
 			ref.Principal = "worker:" + ref.WorkerAuth
 		}
 	}
-	logger = logger.With("operation", operation, "protocol_version", inference.Version, "schema_version", postgres.SchemaVersion, "health_interval_seconds", 10, "health_window_seconds", 30, "max_context_bytes", inference.MaxContextBytes, "max_jobs", b.maxJobs)
+	logger = logger.With("operation", operation, "protocol_version", inference.Version, "schema_version", postgres.SchemaVersion, "health_interval_seconds", 10, "health_window_seconds", 30, "max_context_bytes", inference.MaxContextBytes, "in_flight_per_worker", 1)
 	if ref.ClientID != "" {
 		logger = logger.With("client_id", ref.ClientID, "requested_session_id", ref.SessionID)
 	}
@@ -346,7 +341,7 @@ func (b *Broker) run(ctx context.Context, logger *slog.Logger, ref inference.Ref
 			if ref.ClientID != "" {
 				name = "history.conflict"
 			}
-			if rejection.Reason == "no_ready_worker" || rejection.Reason == "queue_full" {
+			if rejection.Reason == "no_ready_worker" {
 				name = "dispatch.rejected"
 			}
 			if rejection.Reason == "session_worker_conflict" {

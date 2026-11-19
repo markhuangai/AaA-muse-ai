@@ -6,6 +6,24 @@ afterEach(() => vi.unstubAllGlobals());
 const signal = () => new AbortController().signal;
 const json = (value: unknown, status = 200, headers: Record<string, string> = {}) => new Response(JSON.stringify(value), { status, headers: { 'X-Request-Id': 'request-api', ...headers } });
 
+test('client key creation submits a named value and accepts only the saved name', async () => {
+  let secretSent = false;
+  let result = json({ name: 'Headless client' }, 201);
+  const api = new BrowserAPI((async (path, options) => {
+    expect(path).toBe('/api/v1/portal/client-keys');
+    expect(options?.method).toBe('POST');
+    expect(new Headers(options?.headers).get('Authorization')).toBe('Bearer ' + token);
+    const body = JSON.parse(options?.body as string);
+    secretSent = body.name === 'Headless client' && body.key === 'private-fixture-value';
+    return result;
+  }) as typeof fetch);
+  api.setSession(token);
+  expect(await api.createClientKey('Headless client', 'private-fixture-value', 'operation-key', signal())).toEqual({ value: 'Headless client', requestID: 'request-api' });
+  expect(secretSent).toBe(true);
+  result = json({ name: 'Headless client', key: 'private-fixture-value' }, 201);
+  await expect(api.createClientKey('Headless client', 'private-fixture-value', 'operation-key', signal())).rejects.toMatchObject({ causeCode: 'invalid_response' });
+});
+
 test('the real API adapter confines credentials to JSON login and authorized same-origin headers', async () => {
   const calls: { path: string; options: RequestInit }[] = [];
   const fetcher = (async (path, options) => {

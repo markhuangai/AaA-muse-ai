@@ -110,7 +110,7 @@ class WorkerSetup(Inference):
         return result
 
     def prompt(self):
-        result, headers = self.checked("/api/v1/admin/setup-prompts", self.admin, "POST", {}, want=201)
+        result, headers = self.checked("/api/v1/admin/setup-prompts", self.admin, "POST", {"origin": self.proxy.origin}, want=201)
         code = re.search(r"muse_enroll_[A-Za-z0-9_-]{43}", result["setup_prompt"])[0]
         self.secrets.append(code)
         require(result["worker_package"]["sha256"] == self.package["sha256"] and result["worker_package"]["version"] == self.package["version"], "setup prompt lost configured artifact identity")
@@ -317,8 +317,7 @@ def run(harness_type=WorkerSetup, suite="worker-setup"):
         h.setup()
         proxy = h.proxy = TLSFixture(h, "http://127.0.0.1:1")
         config = h.configuration()
-        config["server"]["public-url"] = proxy.origin
-        config["limits"] = {"max-jobs": 8, "in-flight-per-worker": 1}
+        config["limits"] = {"in-flight-per-worker": 1}
         h.broker, h.origin_url, _ = h.launch(config)
         proxy.target = urllib.parse.urlsplit(h.origin_url)
         h.ready(h.resources["containers"][-1], h.origin_url)

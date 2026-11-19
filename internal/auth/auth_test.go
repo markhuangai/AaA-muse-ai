@@ -11,7 +11,7 @@ import (
 
 func authConfig() config.Config {
 	c := config.Defaults()
-	c.Server.PublicURL = "https://example.test"
+
 	c.Database.URL = "postgres://db/muse"
 	c.Portal.Password = "portal-fixture"
 	c.Management.Key = "admin-fixture"
@@ -84,7 +84,7 @@ func TestPortalPasswordIsLoginOnlyAndExact(t *testing.T) {
 	if !a.PortalPassword(string(c.Portal.Password)) || a.Role("Bearer "+string(c.Portal.Password)) != "unauthenticated" {
 		t.Fatal("portal password crossed the bearer boundary")
 	}
-	for _, value := range []string{"", "portal", "portal-fixture-extra", string(c.Management.Key), string(c.ClientKeys["local"])} {
+	for _, value := range []string{"", "portal", "portal-fixturX", "portal-fixture-extra", string(c.Management.Key), string(c.ClientKeys["local"])} {
 		if a.PortalPassword(value) {
 			t.Fatal("non-password credential authenticated portal login")
 		}
@@ -95,5 +95,11 @@ func TestPortalPasswordIsLoginOnlyAndExact(t *testing.T) {
 	}
 	if !a.Reserved("portal-fixture") || !a.Reserved("admin-fixture") || !a.Reserved("client-fixture") || a.Reserved("unreserved") {
 		t.Fatal("credential collision reservation changed")
+	}
+	longPassword := " " + strings.Repeat("portal password", 8) + " "
+	c.Portal.Password = config.Secret(longPassword)
+	a = New(c)
+	if !a.PortalPassword(longPassword) || a.PortalPassword(strings.TrimSpace(longPassword)) {
+		t.Fatal("portal password matching changed for long values with spaces")
 	}
 }

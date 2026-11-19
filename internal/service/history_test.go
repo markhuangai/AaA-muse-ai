@@ -191,7 +191,6 @@ func TestNativeCanonicalToolLoopReplayAndSnapshots(t *testing.T) {
 func TestNativeOwnershipIdentityAndBoundaryPersistence(t *testing.T) {
 	b, m, logger, logs := inferenceFixture()
 	ctx := context.Background()
-	b.maxJobs = 16
 	c := connectNative(t, b, m, logger, "worker-a")
 	input := requestInput("owned")
 	v := admitted(t, b, "alice", "shared-name", input)
@@ -385,8 +384,10 @@ func TestNativeValidationAndDependencyErrors(t *testing.T) {
 	b.random = rand.Reader
 	v := admitted(t, b, "alice", "deadline", requestInput("deadline"))
 	admitted(t, b, "alice", "capacity", requestInput("capacity"))
-	_, err = b.SubmitRequest(ctx, logger, "alice", "overflow", requestInput("overflow"))
-	requireInferenceReason(t, err, "queue_full")
+	queued := admitted(t, b, "alice", "additional", requestInput("additional"))
+	if queued.WorkerID != "" {
+		t.Fatal("busy worker accepted another assignment")
+	}
 	if err = b.OutputBoundary(ctx, logger, "alice", v.ID, false, 0, 0, ""); err == nil {
 		t.Fatal("unavailable output exposed")
 	}

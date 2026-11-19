@@ -99,7 +99,8 @@ class Product(WorkerRecovery, History):
 
     def browser(self, phase, request_ids=()):
         pin = self.checked("/api/v1/admin/status", self.admin)[0]["build"]["worker_package"]
-        fixture = self.private("product-browser-" + phase + ".json", json.dumps({"origin": self.origin_url, "password": self.portal,
+        origin = self.proxy.origin if phase == "setup" else self.origin_url
+        fixture = self.private("product-browser-" + phase + ".json", json.dumps({"origin": origin, "password": self.portal,
             "source_sha": self.args.source_sha, "directory": str(self.root.resolve()), "phase": phase, "installer": pin,
             "workers": [{"slot": w["slot"], "worker_id": w["worker"]["id"]} for w in self.workers], "request_ids": list(request_ids)}))
         result = subprocess.run(["node", "tests/portal/product.mjs", "--fixture", str(fixture)], capture_output=True, text=True, timeout=180)
@@ -307,9 +308,7 @@ def main():
         image_id = h.inspect(args.image)["Id"]
         h.setup()
         proxy = h.proxy = TLSFixture(h, "http://127.0.0.1:1")
-        config = h.configuration()
-        config["server"]["public-url"] = proxy.origin
-        h.broker, h.origin_url, _ = h.launch(config)
+        h.broker, h.origin_url, _ = h.launch()
         proxy.target = urllib.parse.urlsplit(h.origin_url)
         h.ready(h.broker, h.origin_url)
         status = h.checked("/api/v1/admin/status", h.admin)[0]

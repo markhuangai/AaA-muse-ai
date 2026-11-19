@@ -4,11 +4,15 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net/netip"
+	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
 
 var ErrWorkerPackageUnconfigured = errors.New("worker_package_unconfigured")
+var ErrSetupOrigin = errors.New("https_origin_required")
 
 type PackagePin struct {
 	Name    string `json:"name"`
@@ -27,15 +31,39 @@ type SetupPrompt struct {
 
 type Setup struct {
 	workers *Workers
-	origin  string
 	pin     PackagePin
 }
 
-func NewSetup(workers *Workers, origin string, pin PackagePin) *Setup {
-	return &Setup{workers: workers, origin: strings.TrimSuffix(origin, "/"), pin: pin}
+func NewSetup(workers *Workers, pin PackagePin) *Setup {
+	return &Setup{workers: workers, pin: pin}
 }
 
-func (s *Setup) Create(ctx context.Context, logger *slog.Logger) (SetupPrompt, error) {
+func validSetupOrigin(origin string) bool {
+	u, err := url.Parse(origin)
+	if err != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil ||
+		u.Path != "" || strings.ContainsAny(origin, "?#") || strings.HasSuffix(u.Host, ":") {
+		return false
+	}
+	if strings.HasPrefix(u.Host, "[") {
+		address, err := netip.ParseAddr(u.Hostname())
+		if err != nil || !address.Is6() || address.Zone() != "" {
+			return false
+		}
+	} else if strings.Contains(u.Hostname(), ":") {
+		return false
+	}
+	if port := u.Port(); port != "" {
+		number, err := strconv.Atoi(port)
+		return err == nil && number >= 1 && number <= 65535
+	}
+	return true
+}
+
+func (s *Setup) Create(ctx context.Context, logger *slog.Logger, origin string) (SetupPrompt, error) {
+	if !validSetupOrigin(origin) {
+		logger.Warn("setup.origin_rejected", "cause", ErrSetupOrigin.Error(), "origin_bytes", len(origin), "outcome", "not_started")
+		return SetupPrompt{}, ErrSetupOrigin
+	}
 	if _, valid := ReleaseMajor(s.pin.Version); !valid || !archiveDigest.MatchString(s.pin.SHA256) {
 		logger.Error("setup.package_unconfigured", "cause", ErrWorkerPackageUnconfigured.Error(), "outcome", "not_started")
 		return SetupPrompt{}, ErrWorkerPackageUnconfigured
@@ -46,10 +74,10 @@ func (s *Setup) Create(ctx context.Context, logger *slog.Logger) (SetupPrompt, e
 	}
 	pin := PairedWorker(s.pin.Version, s.pin.SHA256)
 	quote := func(v string) string { return "'" + strings.ReplaceAll(v, "'", "'\"'\"'") + "'" }
-	prompt := strings.NewReplacer("@ORIGIN@", quote(s.origin), "@URL@", quote(pin.URL), "@VERSION@", quote(pin.Version), "@SHA@", quote(pin.SHA256), "@ID@", quote(e.ID), "@CODE@", code).Replace(setupInstruction)
+	prompt := strings.NewReplacer("@ORIGIN@", quote(origin), "@URL@", quote(pin.URL), "@VERSION@", quote(pin.Version), "@SHA@", quote(pin.SHA256), "@ID@", quote(e.ID), "@CODE@", code).Replace(setupInstruction)
 	result := SetupPrompt{EnrollmentID: e.ID, CreatedAt: e.CreatedAt, ExpiresAt: e.ExpiresAt, WorkerPackage: pin, Prompt: prompt}
 	logger.Debug("setup.prompt_detail", "setup_id", e.ID, "operation_id", e.ID, "worker_package", pin, "setup_prompt", prompt, "expires_at", e.ExpiresAt)
-	logger.Info("setup.prompt_created", "setup_id", e.ID, "operation_id", e.ID, "enrollment_id", e.ID, "worker_package", pin, "expires_at", e.ExpiresAt, "outcome", "issued", "inference_readiness", "unverified")
+	logger.Info("setup.prompt_created", "setup_id", e.ID, "operation_id", e.ID, "enrollment_id", e.ID, "origin", origin, "worker_package", pin, "expires_at", e.ExpiresAt, "outcome", "issued", "inference_readiness", "unverified")
 	return result, nil
 }
 

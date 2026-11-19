@@ -75,7 +75,8 @@ export class Collector {
     const status = await this.api('/api/v1/admin/status');
     const artifact = observations.entries.find(entry => entry.kind === 'artifact_identity');
     need(status.ready === true && status.build?.dirty === false && /^[a-f0-9]{40}$/.test(status.build.revision), 'exact_ready_service_required');
-    need(status.configuration?.limits?.max_jobs >= 2 && status.configuration.limits.in_flight_per_worker === 1, 'interleave_requires_two_jobs_one_inference');
+    const limits = status.configuration?.limits;
+    need(limits?.in_flight_per_worker === 1 && (!Object.hasOwn(limits, 'max_jobs') || limits.max_jobs >= 2), 'interleave_requires_two_jobs_one_inference');
     need(artifact?.service_sha === status.build.revision && /^sha256:[a-f0-9]{64}$/.test(artifact.image_digest ?? ''), 'verified_image_identity_required');
     const pin = status.build?.worker_package ?? status.configuration.worker_package;
     need(pin?.version && /^[a-f0-9]{64}$/.test(pin.sha256 ?? ''), 'published_worker_pin_required');

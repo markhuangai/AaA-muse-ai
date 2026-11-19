@@ -51,13 +51,14 @@ func fixtureDependencies(t *testing.T, generated bool) (Dependencies, *bytes.Buf
 	t.Helper()
 	var stdout, stderr bytes.Buffer
 	repo := &fakeRepository{}
-	data := map[string]any{"server": map[string]any{"public-url": "https://muse.example.test"}, "database": map[string]any{"url": "postgres://db-private-sentinel@db/muse"}, "control-portal": map[string]any{"password": "portal-private-sentinel"}, "diagnostics": map[string]any{"directory": t.TempDir()}}
+	data := map[string]any{"database": map[string]any{"url": "postgres://db-private-sentinel@db/muse"}, "control-portal": map[string]any{"password": "portal-private-sentinel"}, "diagnostics": map[string]any{"directory": t.TempDir()}}
 	if !generated {
 		data["management"] = map[string]any{"key": "management-private-sentinel"}
 	}
 	b, _ := json.Marshal(data)
 	d := Production(&stdout, &stderr)
 	d.MediaDir = ""
+	d.ClientKeyFile = nil
 	d.ReadFile = func(string) ([]byte, error) { return b, nil }
 	d.LookupEnv = func(string) (string, bool) { return "", false }
 	d.Random = bytes.NewReader(bytes.Repeat([]byte{19}, 1024))

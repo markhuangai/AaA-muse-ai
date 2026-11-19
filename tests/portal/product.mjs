@@ -5,7 +5,7 @@ import { browserTransport } from './browser-transport.mjs';
 
 const fixture = JSON.parse(readFileSync(process.argv[process.argv.indexOf('--fixture') + 1], 'utf8'));
 const password = fixture.password ?? readFileSync(fixture.password_file, 'utf8').replace(/\n$/, '');
-const transport = browserTransport(fixture.origin);
+const transport = fixture.phase === 'setup' ? { origin: fixture.origin, args: [] } : browserTransport(fixture.origin);
 const receipt = { outcome: 'failed', phase: fixture.phase, source_sha: fixture.source_sha, cases: [], prompts: [], secrets: [] };
 const save = () => writeFileSync(join(fixture.directory, `product-browser-${fixture.phase}-receipt.json`), JSON.stringify(receipt), { mode: 0o600 });
 const passed = (id, fields = {}) => receipt.cases.push({ id, outcome: 'passed', ...fields });
@@ -21,7 +21,7 @@ async function action(page, path, click, status = 200) {
 
 try {
   browser = await chromium.launch({ headless: true, args: transport.args });
-  const context = await browser.newContext({ viewport: { width: 1440, height: 1000 }, serviceWorkers: 'block' });
+  const context = await browser.newContext({ viewport: { width: 1440, height: 1000 }, serviceWorkers: 'block', ignoreHTTPSErrors: fixture.phase === 'setup' });
   const page = await context.newPage();
   await page.goto(transport.origin + '/workers');
   await page.getByLabel('Portal password').fill(password);
@@ -32,6 +32,7 @@ try {
   if (fixture.phase === 'setup') {
     for (const slot of ['a', 'b']) {
       const prompt = await action(page, '/api/v1/admin/setup-prompts', () => page.getByRole('button', { name: 'Generate setup prompt' }).click(), 201);
+      expect(prompt.data.setup_prompt).toContain(`origin='${fixture.origin}'`);
       expect(await page.getByLabel('Complete setup prompt').inputValue()).toBe(prompt.data.setup_prompt);
       expect(prompt.data.worker_package).toEqual(fixture.installer);
       receipt.prompts.push({ slot, ...prompt.data });

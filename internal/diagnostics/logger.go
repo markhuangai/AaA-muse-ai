@@ -13,13 +13,19 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/markhuangai/AaA-muse-ai/internal/config"
 )
 
-type Redactor struct{ secrets []string }
+type Redactor struct {
+	secrets []string
+	current func() *Redactor
+}
 
-var workerSecrets = regexp.MustCompile(`muse_(?:enroll|worker|portal)_[A-Za-z0-9_-]{43}`)
+var credentialPattern = regexp.MustCompile(`muse_(?:enroll|worker|portal)_[A-Za-z0-9_-]{43}|aaa_muse_ai_[a-f0-9]{64}`)
 
 func RedactWorkerSecrets(value string) string {
 	return (&Redactor{}).text(value)
@@ -37,11 +43,33 @@ func NewRedactor(secrets []string) *Redactor {
 	sort.Slice(values, func(i, j int) bool { return len(values[i]) > len(values[j]) })
 	return &Redactor{secrets: values}
 }
-func (r *Redactor) Text(value string) string { return r.text(value) }
+func NewLiveRedactor(configuration func() *config.Config) *Redactor {
+	type snapshot struct {
+		config   *config.Config
+		redactor *Redactor
+	}
+	var cached atomic.Pointer[snapshot]
+	return &Redactor{current: func() *Redactor {
+		c := configuration()
+		if state := cached.Load(); state != nil && state.config == c {
+			return state.redactor
+		}
+		state := &snapshot{c, NewRedactor(c.Secrets())}
+		cached.Store(state)
+		return state.redactor
+	}}
+}
+
+func (r *Redactor) Text(value string) string {
+	if r.current != nil {
+		return r.current().text(value)
+	}
+	return r.text(value)
+}
 func (r *Redactor) text(value string) string {
 	var spans [][]int
 	for offset := 0; offset < len(value); {
-		match := workerSecrets.FindStringIndex(value[offset:])
+		match := credentialPattern.FindStringIndex(value[offset:])
 		if match == nil {
 			break
 		}
@@ -129,7 +157,10 @@ func (r *Redactor) value(key string, value any) any {
 		return v
 	}
 }
-func (r *Redactor) Replace(_ []string, a slog.Attr) slog.Attr {
+func (r *Redactor) Replace(groups []string, a slog.Attr) slog.Attr {
+	if r.current != nil {
+		return r.current().Replace(groups, a)
+	}
 	if a.Key == slog.TimeKey || a.Key == slog.LevelKey || a.Key == slog.MessageKey {
 		return a
 	}

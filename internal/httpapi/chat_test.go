@@ -349,7 +349,7 @@ func TestChatHTTPAllResponsePathsRenewShortDeadline(t *testing.T) {
 			}
 			if mode == "output-boundary" {
 				c := onlineNativeHTTP(t, h, m, worker.ID)
-				h.Broker = service.NewBroker(chatBoundaryStore{m}, h.Random, time.Now, nil, 2)
+				h.Broker = service.NewBroker(chatBoundaryStore{m}, h.Random, time.Now, nil)
 				completeChatOnWait(t, h, m, c, key, inference.Item{Type: "final", Text: "accepted"})
 			}
 			r := httptest.NewRequest(method, path, bytes.NewReader(body))
