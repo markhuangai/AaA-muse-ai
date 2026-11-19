@@ -5,6 +5,7 @@ import urllib.parse
 import json
 import os
 import secrets
+import stat
 import struct
 import subprocess
 import time
@@ -56,8 +57,20 @@ class MediaFlow(Product):
                   for profile, ext, codec in (("native_mp3", "mp3", "libmp3lame"), ("offline_wav", "wav", "pcm_s16le"))}
         return stills, video, audios
 
+    def worker_media_directory(self, worker, identity, shown):
+        directory = Path(shown["output_dir"])
+        require(directory.parent == Path("/tmp") and directory.name.startswith("aaa-muse-media-" + identity + "-")
+                and Path(shown["output_path"]).parent == directory, "worker media paths are not in the job's system temp directory")
+        hosted = worker["home"] / "tmp" / directory.name
+        info = hosted.lstat()
+        require(stat.S_ISDIR(info.st_mode) and stat.S_IMODE(info.st_mode) == 0o700 and info.st_uid == os.getuid(),
+                "worker media directory is not private")
+        progress = worker["state"] / "media" / identity / "progress.json"
+        require(json.loads(progress.read_text())["temporary_directory"] == str(directory), "durable journal lost the temporary directory")
+        return hosted, progress
+
     def exercise(self):
-        worker = self.environment("media")
+        worker = self.environment("media", mount_system_tmp=True)
         worker["slot"] = "media"
         self.install(worker, self.prompt())
         ready = PackedModel(self, worker).start()
@@ -94,7 +107,7 @@ class MediaFlow(Product):
             self.until(lambda: (worker["state"] / "cues" / (identity + ".json")).exists(), "media claim missing", timeout=30)
             self.hook(worker)
             shown = json.loads(self.cli(worker, "job-show", "--job-id", identity).stdout)
-            spool = worker["state"] / "media" / identity
+            spool, progress = self.worker_media_directory(worker, identity, shown)
             output = spool / Path(shown["output_path"]).name
             expected = audios.get(case, video)
             if case in stills:
@@ -109,6 +122,7 @@ class MediaFlow(Product):
                 (spool / Path(shown["generated_still_path"]).name).write_bytes(stills["image/webp"])
             if case not in audios:
                 require(shown["prompt"] == motion, "motion text changed")
+                (spool / "native-thumbnail.webp").write_bytes(stills["image/webp"])
             again = json.loads(self.cli(worker, "job-show", "--job-id", identity).stdout)
             require(again["action"] == "preserve_existing_generation", "repeat wake can regenerate")
             require(self.api(url, self.other_client)[0] == self.api(url + "/artifact", self.other_client)[0] == 404, "foreign owner read media")
@@ -133,7 +147,11 @@ class MediaFlow(Product):
             require(self.api(url + "/artifact", self.client)[2] == expected and self.api(url + "/artifact", self.other_client)[0] == 404, "owner download integrity or isolation failed")
             if case not in audios:
                 require((properties["width"], properties["height"], properties["fps"], properties["video_frames"]) == (64, 48, 8, 8), "wrong video measurements")
-            self.until(lambda: not output.exists() and not any(spool.glob("reference.*")) and not (spool / "generated.webp").exists(), "worker retained confirmed media", timeout=35)
+            self.until(lambda: not progress.exists(), "worker did not reconcile the confirmed upload", timeout=35)
+            require(sha(output.read_bytes()) == properties["sha256"], "worker did not leave acknowledged media to the system temp lifecycle")
+            if case not in audios:
+                require((spool / "native-thumbnail.webp").read_bytes() == stills["image/webp"],
+                        "worker did not leave native tool files to the system temp lifecycle")
             self.docker("exec", self.broker, "test", "!", "-e", "/var/lib/aaa-muse-ai/media/" + identity + "/prompt")
             self.docker("exec", self.broker, "test", "!", "-e", "/var/lib/aaa-muse-ai/media/" + identity + "/image")
             require(submit() == identity and self.checked(url, self.client)[0]["expires_at"] == status["expires_at"], "retry extended expiry")
@@ -196,7 +214,8 @@ class MediaFlow(Product):
         identity = self.checked("/api/v1/media/jobs", self.client, "POST", {"prompt": prompt, "submission_id": secrets.token_hex(16)}, want=202)[0]["job_id"]
         self.until(lambda: (worker["state"] / "cues" / (identity + ".json")).exists(), "cancellation case lacked claim", timeout=30)
         shown = json.loads(self.cli(worker, "job-show", "--job-id", identity).stdout)
-        output = worker["state"] / "media" / identity / Path(shown["output_path"]).name
+        spool, _ = self.worker_media_directory(worker, identity, shown)
+        output = spool / Path(shown["output_path"]).name
         output.write_bytes(expected)
         self.proxy.media_pause_path = "/api/v1/worker/jobs/" + identity + "/artifact"
         self.cli(worker, "media-finish", "--job-id", identity)

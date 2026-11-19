@@ -85,21 +85,45 @@ async function journal(spool: State): Promise<ObjectValue | undefined> {
   return value === undefined ? undefined : object(parse(value));
 }
 
+function temporaryPrefix(id: string): string {
+  return `/tmp/aaa-muse-media-${id}-`;
+}
+
+async function mediaFiles(spool: State, saved: ObjectValue, id: string): Promise<State> {
+  if (saved.temporary_directory === undefined) return spool;
+  const path = text(saved.temporary_directory);
+  const prefix = temporaryPrefix(id);
+  requireValue(path.startsWith(prefix) && /^[A-Za-z0-9]+$/.test(path.slice(prefix.length)), 'invalid_media_temporary_directory');
+  const directory = new State(path, spool.io, spool.sys);
+  try { await directory.check(directory.root, true); }
+  catch (error) {
+    if (cause(error) === 'ENOENT') throw new Failure('media_temporary_directory_missing');
+    throw error;
+  }
+  return directory;
+}
+
 export async function prepareMedia(worker: Worker, t: Transport, j: ObjectValue): Promise<ObjectValue> {
   requireValue(j.state === 'claimed' && j.held === true, 'assignment_not_active');
   const m = object(j.media);
   const [file] = fileType(j);
-  const spool = await (await worker.state.child('media')).child(identifier(j.id));
+  const id = identifier(j.id);
+  const spool = await (await worker.state.child('media')).child(id);
   return spool.withLock('prepare', async () => {
     const previous = await journal(spool);
     if (previous) {
       requireValue(boundTo(j, previous, t), 'media_assignment_changed');
-      if (previous.state !== 'preparing') return { job_id: j.id, state: previous.state, action: 'preserve_existing_generation' };
-      await clearInputs(spool);
+      if (previous.state !== 'preparing') {
+        await mediaFiles(spool, previous, id);
+        return { job_id: j.id, state: previous.state, action: 'preserve_existing_generation' };
+      }
     }
-    const saved = { ...correlation(j), origin: t.endpoint, lease_id: j.lease_id, profile: m.profile, state: 'preparing' };
-    if (!previous) await spool.write('progress.json', encode(saved));
-    const result: ObjectValue = { job_id: j.id, profile: m.profile, output_path: spool.path(file), output_dir: spool.root, output_name: 'result' };
+    const saved: ObjectValue = { ...correlation(j), origin: t.endpoint, lease_id: j.lease_id, profile: m.profile, state: 'preparing' };
+    if (!previous || previous.temporary_directory !== undefined) saved.temporary_directory = await spool.io.mkdtemp(temporaryPrefix(id));
+    else await clearLegacyInputs(spool);
+    const directory = await mediaFiles(spool, saved, id);
+    await spool.write('progress.json', encode(saved));
+    const result: ObjectValue = { job_id: j.id, profile: m.profile, output_path: directory.path(file), output_dir: directory.root, output_name: 'result' };
     if (m.profile === 'native_mp3' || m.profile === 'offline_wav') {
       result.action = 'stage_verified_audio_fixture';
       result.fixture_sha256 = m.input_sha256; result.fixture_bytes = m.input_size;
@@ -107,8 +131,8 @@ export async function prepareMedia(worker: Worker, t: Transport, j: ObjectValue)
       const prompt = await transfer(t, j, 'media/prompt', {}, res => t.body(res, 4096, { preserveBOM: true }));
       requireValue(digest(prompt) === m.prompt_sha256, 'media_prompt_digest_mismatch');
       result.prompt = prompt;
-      if (m.profile === 'image_video') result.reference_path = await writeReference(spool, t, j);
-      else result.generated_still_path = spool.path('generated.webp');
+      if (m.profile === 'image_video') result.reference_path = await writeReference(directory, t, j);
+      else result.generated_still_path = directory.path('generated.webp');
       result.action = m.profile === 'image_video' ? 'animate_reference' : 'generate_still_then_animate';
     }
     saved.state = 'generating';
@@ -119,7 +143,10 @@ export async function prepareMedia(worker: Worker, t: Transport, j: ObjectValue)
 }
 
 async function openOutput(spool: State, name: string): Promise<FileHandle> {
-  const file = await spool.io.open(spool.path(name), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  const file = await spool.io.open(spool.path(name), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK).catch(error => {
+    if (cause(error) === 'ENOENT') throw new Failure('media_output_missing');
+    throw error;
+  });
   try {
     const st = await file.stat();
     requireValue(st.isFile() && st.uid === spool.sys.uid && st.nlink === 1 && st.size > 0 && st.size <= artifactLimit, 'invalid_media_output');
@@ -163,7 +190,8 @@ export async function finishMedia(worker: Worker, id: string): Promise<ObjectVal
     requireValue(saved && boundTo(j, saved, t), 'media_assignment_changed');
     requireValue(saved.state === 'generating' || saved.state === 'ready', 'media_generation_not_started');
     if (saved.state === 'generating') {
-      const file = await openOutput(spool, name);
+      const directory = await mediaFiles(spool, saved, id);
+      const file = await openOutput(directory, name);
       let receipt;
       try { receipt = await hashFile(file); } finally { await file.close(); }
       Object.assign(saved, receipt, { state: 'ready' });
@@ -174,7 +202,7 @@ export async function finishMedia(worker: Worker, id: string): Promise<ObjectVal
   });
 }
 
-async function clearInputs(spool: State): Promise<void> {
+async function clearLegacyInputs(spool: State): Promise<void> {
   const partials = (await spool.list()).filter(name => name.startsWith('.input-'));
   for (const name of [...Object.values(images), 'generated.webp', ...partials]) {
     try { await spool.io.unlink(spool.path(name)); } catch (error) { if (cause(error) !== 'ENOENT') throw error; }
@@ -187,14 +215,21 @@ async function reconcileJob(worker: Worker, t: Transport, spool: State, id: stri
   const j = await worker.getJob(t, id);
   requireValue(boundTo(j, saved, t), 'media_assignment_changed');
   const [name, kind] = fileType(j);
+  const legacy = saved.temporary_directory === undefined;
   if (j.state === 'cancelled' || j.state === 'interrupted') {
-    await spool.withLock('prepare', () => clearInputs(spool));
+    if (legacy) await spool.withLock('prepare', () => clearLegacyInputs(spool));
+    if (legacy || j.held) return false;
+    await spool.remove('progress.json');
+    return true;
+  }
+  if (saved.state !== 'ready') {
+    if (j.state === 'claimed' && saved.state === 'generating') await mediaFiles(spool, saved, id);
     return false;
   }
-  if (saved.state !== 'ready') return false;
   const size = integer(saved.size), hash = text(saved.sha256);
   if (j.state === 'claimed') {
-    const f = await openOutput(spool, name);
+    const directory = await mediaFiles(spool, saved, id);
+    const f = await openOutput(directory, name);
     try {
       const body = Readable.toWeb(Readable.from(fileChunks(f)));
       const options = {method: 'PUT', duplex: 'half', body: body as BodyInit, headers: { 'Content-Type': kind, 'Content-Length': String(size), 'X-Muse-Artifact-Sha256': hash }};
@@ -207,10 +242,12 @@ async function reconcileJob(worker: Worker, t: Transport, spool: State, id: stri
     const artifact = object(object(j.media).artifact);
     requireValue(j.state === 'accepted' && artifact.sha256 === hash && integer(artifact.size) === size, 'invalid_media_receipt');
   }
-  await clearInputs(spool);
-  try { await spool.io.unlink(spool.path(name)); } catch (error) { if (cause(error) !== 'ENOENT') throw error; }
+  if (legacy) {
+    await clearLegacyInputs(spool);
+    try { await spool.io.unlink(spool.path(name)); } catch (error) { if (cause(error) !== 'ENOENT') throw error; }
+  }
   await worker.publish(j, 'completed', 'media_upload_confirmed');
-  await worker.logger.log('INFO', 'worker.media_upload_confirmed', { ...correlation(j), sha256: hash, bytes: size, local_output: 'deleted' });
+  await worker.logger.log('INFO', 'worker.media_upload_confirmed', { ...correlation(j), sha256: hash, bytes: size, local_output: legacy ? 'deleted' : 'system_tmp' });
   await spool.remove('progress.json');
   return true;
 }
@@ -224,7 +261,9 @@ export async function drainMedia(worker: Worker, t: Transport): Promise<void> {
       const confirmed = await reconcileJob(worker, t, spool, id);
       if (confirmed && !(await spool.list()).length) await root.io.rmdir(spool.root);
     } catch (error) {
-      await worker.logger.log('WARN', 'worker.media_transfer_pending', { job_id: id, operation_id: id, cause: cause(error), ...(error instanceof Failure ? error.fields : {}), local_output: 'preserved' });
+      const reason = cause(error);
+      const missing = reason === 'media_temporary_directory_missing' || reason === 'media_output_missing';
+      await worker.logger.log('WARN', 'worker.media_transfer_pending', { job_id: id, operation_id: id, cause: reason, ...(error instanceof Failure ? error.fields : {}), local_output: missing ? 'missing' : 'preserved' });
     }
   }
 }
