@@ -5,7 +5,8 @@ import { publishRelease, ReleaseFailure } from './worker-release.mjs';
 import { latestCompleteRC, listReleases, releaseOperation, requireCurrentRC, verifyReleaseDispatch } from './release-control.mjs';
 import { completionMarker, hasCompletionMarker, latestStableRelease, readProductRelease } from './release-history.mjs';
 import { candidateNpmTag, compareVersions, isFinalVersion } from './release-versions.mjs';
-import { verifyBundle } from './release-bundle.mjs';
+import { preparedImageTag, verifyBundle } from './release-bundle.mjs';
+import { imageConfigDigest } from './image-policy.mjs';
 import { registryImage, ensureAsset, npmVersion } from './release-io.mjs';
 import { imageName, imageTags, makeManifest, jsonBytes, hash, need, sameDigest } from './release-manifest.mjs';
 import { verifyPublished, verifyImageConfig } from './release-verify.mjs';
@@ -61,6 +62,13 @@ export async function publishCandidate({ github, context, prepared, directory, t
     await verifyCandidateAlias(releases, prepared.version, existingNpmTags.candidate, fetcher);
     destination = scopedTag;
     verifyScopedNpmTag(existingNpmTags[scopedTag], prepared.version);
+    if (!imageDigest) {
+      operation = 'frozen_image_restore'; destination = 'image.tar';
+      runProcess('docker', ['load', '-i', join(directory, 'image.tar')], { stdio: ['ignore', 'ignore', 'pipe'] });
+      const [restored] = JSON.parse(runProcess('docker', ['image', 'inspect', preparedImageTag], { stdio: ['ignore', 'pipe', 'pipe'] }));
+      sameDigest(imageConfigDigest(restored), bundle.image_config_digest, 'restored_image_config');
+      verifyImageConfig({ config: restored.Config }, prepared);
+    }
     operation = 'worker_publication'; destination = 'github_packages_and_release';
     const workerReceipt = { ...bundle.worker, archive: join(directory, 'worker.tgz') };
     await publishWorker({ github, context, prepared, receipt: workerReceipt, archive: read(workerReceipt.archive), token, fetcher, verifySource });
@@ -70,12 +78,12 @@ export async function publishCandidate({ github, context, prepared, directory, t
     verifyScopedNpmTag(scoped, prepared.version);
     if (scoped === undefined) tagNpm(scopedTag);
     need((await npmVersion(prepared.version, npmOptions)).tags[scopedTag] === prepared.version, 'product_release_candidate_distribution_missing');
-    operation = 'image_publication';
     const missingImages = tags.filter(tag => missing.includes(tag));
     if (missingImages.length) {
-      runProcess('docker', ['load', '-i', join(directory, 'image.tar')], { stdio: ['ignore', 'ignore', 'pipe'] });
+      operation = 'image_registry_login'; destination = 'registry_login';
       runProcess('docker', ['login', 'ghcr.io', '--username', context.actor, '--password-stdin'], { input: token, stdio: ['pipe', 'ignore', 'pipe'] });
       for (const tag of missingImages) {
+        operation = 'image_publication';
         destination = tag; await verifySource();
         const raced = await registryImage(tag, imageOptions);
         if (raced.exists) {
@@ -84,7 +92,9 @@ export async function publishCandidate({ github, context, prepared, directory, t
         } else if (imageDigest) {
           runProcess('docker', ['buildx', 'imagetools', 'create', '--prefer-index=false', '--tag', `${imageName}:${tag}`, `${imageName}@${imageDigest}`], { stdio: ['ignore', 'ignore', 'pipe'] });
         } else {
-          runProcess('docker', ['tag', bundle.image_config_digest, `${imageName}:${tag}`]);
+          operation = 'image_tagging';
+          runProcess('docker', ['tag', preparedImageTag, `${imageName}:${tag}`], { stdio: ['ignore', 'ignore', 'pipe'] });
+          operation = 'image_publication';
           runProcess('docker', ['push', `${imageName}:${tag}`], { stdio: ['ignore', 'ignore', 'pipe'] });
         }
         const published = await registryImage(tag, imageOptions);
@@ -122,7 +132,9 @@ export async function publishCandidate({ github, context, prepared, directory, t
     const workerAssets = ['markhuangai-aaa-muse-worker-' + prepared.version + '.tgz', 'SHA256SUMS', 'worker-release.json'];
     if (workerAssets.every(name => completed.includes('public_release/' + name))) complete('public_worker');
     destination = error.fields?.destination ?? destination;
-    const uncertain = Number.isInteger(error.status ?? error.fields?.http_status) && !completed.includes(destination) ? destination : null;
+    const localImageOperations = ['frozen_image_restore', 'image_registry_login', 'image_tagging'];
+    const uncertain = !localImageOperations.includes(operation) && Number.isInteger(error.status ?? error.fields?.http_status) &&
+      !completed.includes(destination) ? destination : null;
     const index = missing.indexOf(uncertain); if (index >= 0) missing.splice(index, 1);
     throw new ReleaseFailure(error instanceof ReleaseFailure ? error.message : 'product_release_required_operation_failed', {
       ...(error instanceof ReleaseFailure ? error.fields : {}), ...fields(), child_operation: error.fields?.operation ?? null,
