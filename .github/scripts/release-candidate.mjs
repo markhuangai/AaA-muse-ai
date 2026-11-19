@@ -80,7 +80,7 @@ export async function publishCandidate({ github, context, prepared, directory, t
     need((await npmVersion(prepared.version, npmOptions)).tags[scopedTag] === prepared.version, 'product_release_candidate_distribution_missing');
     const missingImages = tags.filter(tag => missing.includes(tag));
     if (missingImages.length) {
-      operation = 'image_registry_login'; destination = 'ghcr.io';
+      operation = 'image_registry_login'; destination = 'registry_login';
       runProcess('docker', ['login', 'ghcr.io', '--username', context.actor, '--password-stdin'], { input: token, stdio: ['pipe', 'ignore', 'pipe'] });
       for (const tag of missingImages) {
         operation = 'image_publication';
