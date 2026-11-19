@@ -13,7 +13,7 @@ import (
 func TestPortalWorkerActionsUseManagementLogicAndProtectedDiagnostics(t *testing.T) {
 	h, repository, out, store := workerHTTPFixture(t)
 	h.Portal = service.NewPortal(h.Authority, rand.Reader, h.Now)
-	h.Setup = service.NewSetup(h.Workers, "https://example.test", service.PackagePin{Version: "0.1.0-rc.0", SHA256: strings.Repeat("a", 64)})
+	h.Setup = service.NewSetup(h.Workers, service.PackagePin{Version: "0.1.0-rc.0", SHA256: strings.Repeat("a", 64)})
 	session := portalLogin(t, h)
 	operation := map[string]string{"X-Portal-Operation-Id": "portal-workers-operation"}
 	issued := portalHTTP(h, "POST", "/api/v1/admin/enrollments", session.Token, "", operation)
@@ -33,7 +33,7 @@ func TestPortalWorkerActionsUseManagementLogicAndProtectedDiagnostics(t *testing
 	if portalHTTP(h, "PATCH", path, session.Token, `{"name":"   "}`, operation).Code != 400 {
 		t.Fatal("portal bypassed worker-name validation")
 	}
-	if portalHTTP(h, "POST", "/api/v1/admin/setup-prompts", session.Token, "", operation).Code != 201 {
+	if portalHTTP(h, "POST", "/api/v1/admin/setup-prompts", session.Token, `{"origin":"https://example.test"}`, operation).Code != 201 {
 		t.Fatal("portal setup generation failed")
 	}
 	if portalHTTP(h, "POST", path+"/revoke", session.Token, "", operation).Code != 200 || portalHTTP(h, "GET", "/api/v1/worker/status", key, "", nil).Code != 401 {

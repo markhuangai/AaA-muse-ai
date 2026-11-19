@@ -3,6 +3,7 @@ import { BUILD } from './api';
 import { PortalController, type View } from './controller';
 import { Workers } from './workers';
 import { Requests } from './history';
+import { ClientKeys } from './client-keys';
 
 function Mark() {
   return <span className="wordmark"><svg aria-hidden="true" viewBox="0 0 28 28"><path d="M3 22 9 6l5 12L19 6l6 16M6 15h6m4 0h6" /></svg><span>AaA <span className="wordmark-detail">Muse</span></span></span>;
@@ -28,7 +29,7 @@ export function Login({ controller, view }: { controller: PortalController; view
       <p className="field-note">Use the portal password from your service configuration.</p>
       {view.message && <div className="notice" role="status"><p>{view.message}</p><Correlation view={view} /></div>}
     </section>
-    <p className="login-scope">Worker management and read-only settings · Session expires after 30 minutes</p>
+    <p className="login-scope">Worker and client-key management · Session expires after 30 minutes</p>
   </main>;
 }
 
@@ -45,11 +46,12 @@ export function Configuration({ controller, view }: { controller: PortalControll
     <section className="settings-section" aria-labelledby="identity-title">
       <div className="section-intro"><h2 id="identity-title">This broker</h2><p>The origin and build currently serving this session.</p><p className="scope-note">Service health describes the broker and database. Inference readiness is verified separately.</p></div>
       <div className="data-panel" aria-busy={view.loading}>
-        <dl className="identity-list"><div><dt>Public origin</dt><dd className="origin-value">{settings?.public_origin ?? 'Loading…'}</dd></div><div><dt>Service health</dt><dd>{settings ? <span className={`status ${settings.ready ? 'healthy' : 'degraded'}`}>{settings.ready ? 'Ready' : 'Database unavailable'}</span> : 'Loading…'}</dd></div><div><dt>Source revision</dt><dd><code>{settings?.build.revision ?? '—'}</code>{settings?.build.dirty && <span className="muted"> · working changes</span>}</dd></div><div><dt>Instance</dt><dd><code>{settings?.instance_id ?? '—'}</code></dd></div><div><dt>Schema version</dt><dd className="num">{settings?.schema_version ?? '—'}</dd></div></dl>
+        <dl className="identity-list"><div><dt>Browser origin</dt><dd className="origin-value">{window.location.origin}</dd></div><div><dt>Service health</dt><dd>{settings ? <span className={`status ${settings.ready ? 'healthy' : 'degraded'}`}>{settings.ready ? 'Ready' : 'Database unavailable'}</span> : 'Loading…'}</dd></div><div><dt>Source revision</dt><dd><code>{settings?.build.revision ?? '—'}</code>{settings?.build.dirty && <span className="muted"> · working changes</span>}</dd></div><div><dt>Instance</dt><dd><code>{settings?.instance_id ?? '—'}</code></dd></div><div><dt>Schema version</dt><dd className="num">{settings?.schema_version ?? '—'}</dd></div></dl>
       </div>
     </section>
+    <ClientKeys controller={controller} view={view} />
     <section className="settings-section" aria-labelledby="yaml-title">
-      <div className="section-intro"><h2 id="yaml-title">Effective configuration</h2><p>Resolved values with defaults applied. Credentials are redacted.</p><span className="read-only">Read only</span><p className="scope-note">Changes belong in the mounted YAML configuration and take effect on service restart.</p></div>
+      <div className="section-intro"><h2 id="yaml-title">Effective configuration</h2><p>Resolved values with defaults applied. Credentials are redacted.</p><span className="read-only">Read only</span><p className="scope-note">Edit general settings in config.yaml, then restart the service.</p></div>
       <div className="yaml-panel"><div className="file-heading"><span>config.yaml</span><span>{view.stale ? 'Stale snapshot' : settings ? 'Current snapshot' : 'Waiting for service'}</span></div><pre aria-label="Redacted effective YAML"><code>{settings?.effective_yaml ?? (view.loading ? 'Loading effective configuration…' : 'Configuration is unavailable. Use Refresh to retry.')}</code></pre></div>
     </section>
     <section className="settings-section capabilities-section" aria-labelledby="capabilities-title">

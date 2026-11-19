@@ -106,14 +106,6 @@ func (m *httpInferenceStore) WithinInference(_ context.Context, ref inference.Re
 	}
 	s.Revoked = m.workers.records[wid].RevokedAt != nil
 	s.Receipt = m.receipts[ref.Principal+":"+ref.SubmissionID]
-	s.ActiveCount = 0
-	for _, state := range m.states {
-		for _, e := range state.Experiments {
-			if !e.Terminal() {
-				s.ActiveCount++
-			}
-		}
-	}
 	if err = fn(&s); err != nil {
 		return err
 	}
@@ -141,7 +133,7 @@ func inferenceHTTPFixture(t *testing.T) (*Handler, *httpInferenceStore, workerVi
 	h, workers, output, capture := workerHTTPFixture(t)
 	w, key := enrollHTTP(t, h, issueHTTP(t, h))
 	m := &httpInferenceStore{workers: workers, states: map[string]*inference.State{}, receipts: map[string]*inference.Receipt{}, output: output, capture: capture}
-	h.Broker = service.NewBroker(m, rand.Reader, time.Now, func(context.Context, time.Duration) error { return context.Canceled }, 2)
+	h.Broker = service.NewBroker(m, rand.Reader, time.Now, func(context.Context, time.Duration) error { return context.Canceled })
 	return h, m, w, key
 }
 

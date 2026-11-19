@@ -17,11 +17,6 @@ class Routing(History):
         self.origins = []
         self.admission_headers = {}
 
-    def configuration(self, generated=False):
-        config = super().configuration(generated)
-        config["limits"]["max-jobs"] = 8
-        return config
-
     def request_input(self, text=None, tools=False, timeout=300):
         body = self.input({"worker": {"id": "unused"}}, messages=[{"type": "message", "role": "user", "text": text or secrets.token_hex(20)}],
                           tools=None if tools else [], timeout=timeout)
@@ -97,7 +92,7 @@ class Routing(History):
         evidence = matched[0]["evidence"]
         if reason == "no_ready_worker":
             require(evidence["candidates"] and all(c["eligibility_reason"] for c in evidence["candidates"]), "rejection omitted causal eligibility exclusions")
-        action = "record fresh matching qualification" if reason == "no_ready_worker" else "reduce admitted work or raise the documented max-jobs bound"
+        action = "record matching worker qualification"
         self.private("routing-diagnosis-" + request_id + ".json", json.dumps({"cause": reason, "evidence": matched, "corrective_action": action}))
 
     def diagnose_operation(self, request, event_name, action):
@@ -216,21 +211,21 @@ class Routing(History):
         self.read_native(a, key=self.other_client, want=404)
         self.receipt("routing.concurrent_workers_fifo_and_persistent_pins", worker_count=2, broker_processes=2, contexts_isolated=True)
 
-    def queue_limits(self):
+    def queue_without_global_cap(self):
         self.new_pair()
         requests = []
-        for i in range(8):
+        for i in range(10):
             body = self.request_input("capacity-" + str(i))
-            if i == 7:
+            if i == 9:
                 body["worker_id"] = requests[0]["worker_id"]
             requests.append(self.submit(body, "capacity-" + str(i))[0])
-        _, headers = self.submit(self.request_input(), "over-capacity", want=429)
-        self.diagnose_dispatch(headers["X-Request-Id"], "dispatch.rejected", "queue_full")
+        require(len({r["worker_id"] for r in requests[:2]}) == 2 and all(r["worker_id"] for r in requests[:2]), "independent workers did not each reserve a job")
+        require(not any(r["worker_id"] or self.detail(r)["assignment"] for r in requests[2:]), "a busy worker received another assignment")
         original = self.detail(requests[-1])["request"]["input"]
         require(not requests[-1]["worker_id"] and "worker_id" in original, "constrained queue fixture was not unassigned")
         for origin in self.origins:
-            replay, _ = self.submit(original, "capacity-7", origin=origin)
-            require(replay["id"] == requests[-1]["id"], "full queue blocked constrained retry through another broker")
+            replay, _ = self.submit(original, "capacity-9", origin=origin)
+            require(replay["id"] == requests[-1]["id"], "constrained retry through another broker changed identity")
         cancelled = requests[-1]
         self.native("POST", "/api/v1/requests/" + cancelled["id"] + "/cancel", {"protocol_version": 1, "submission_id": secrets.token_hex(12)})
         deadline, _ = self.submit(self.request_input("deadline", timeout=1), "deadline")
@@ -239,7 +234,7 @@ class Routing(History):
         require(observed["reason"] == "deadline_exceeded", "unassigned deadline reason missing")
         events = self.diagnose_operation(deadline, "job.deadline_exceeded", "deadline expired in the queue; inspect recorded reservations before a fresh admission")
         require(any(e["msg"] == "job.deadline_exceeded" and e.get("operation_id") == deadline["id"] for e in events), "deadline final disposition missing")
-        self.receipt("routing.bounded_queue_retry_cancel_and_deadline", capacity=8, deadline_from_admission=True)
+        self.receipt("routing.queue_retry_cancel_and_deadline", admitted=10, deadline_from_admission=True)
 
     def session_races(self):
         self.new_pair()
@@ -365,7 +360,7 @@ def main():
         h.origins = [h.origin_url, second_origin]
         h.eligibility()
         h.competing_requests()
-        h.queue_limits()
+        h.queue_without_global_cap()
         h.session_races()
         h.adverse_diagnostics()
         h.offline_boundaries()

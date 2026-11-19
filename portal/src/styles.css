@@ -43,6 +43,9 @@ code, pre, .num { font-family: 'Geist Mono', monospace; font-variant-numeric: ta
 .section-intro .scope-note { margin-top: 24px; font-size: 12px; max-width: 36ch; }
 .data-panel { background: #fff; border-radius: 8px; padding: 20px; }
 .identity-list { margin: 0; }
+.client-key-list { max-height: 12rem; overflow: auto; padding-inline-start: 22px; overflow-wrap: anywhere; }
+.client-key-form { display: grid; gap: 8px; }
+.client-key-form .copy-controls { margin-top: 4px; }
 .identity-list > div { display: grid; grid-template-columns: 132px minmax(0, 1fr); align-items: start; gap: var(--gap); padding-block: 8px; }
 .identity-list > div:first-child { padding-top: 0; }
 .identity-list > div:last-child { padding-bottom: 0; }

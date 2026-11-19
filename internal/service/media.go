@@ -43,9 +43,6 @@ func (b *Broker) SubmitMedia(ctx context.Context, l *slog.Logger, p *media.Stage
 		ref.Principal = "media-trial:" + owner
 	}
 	return b.run(ctx, l, ref, "media_create", input, func(s *inference.State, ev *[]inferenceEvent) (any, error) {
-		if s.ActiveCount >= b.maxJobs {
-			return nil, inference.Reject("queue_full", 429)
-		}
 		workers, _ := candidates(s, nil, inference.RequestInput{WorkerID: target}, false, "")
 		var selected *inference.State
 		for _, w := range workers {

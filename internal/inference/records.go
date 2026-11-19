@@ -252,7 +252,6 @@ type State struct {
 	Experiments           map[string]*Experiment
 	Jobs                  map[string]*Job
 	Receipt               *Receipt
-	ActiveCount           int
 	Conversations         map[string]*Conversation
 	Requests              map[string]*Request
 	PendingTools          int

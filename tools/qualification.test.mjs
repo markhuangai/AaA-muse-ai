@@ -219,7 +219,7 @@ test('private inputs and HTTPS origin prevent credential exposure or redirects',
   assert.equal(publicOrigin('https://broker.test/'),'https://broker.test');
 });
 
-async function harness(t,{mode='normal'}={}) {
+async function harness(t,{mode='normal',limits={max_jobs:2,in_flight_per_worker:1}}={}) {
   const root=await temporary(t);let clock=Date.UTC(2026,0,2),sequence=0,exportAttempts=0;
   const logs=[],requests=[],experiments=new Map();
   const observations=join(root,'observations.json'),workerExports=[];
@@ -232,7 +232,7 @@ async function harness(t,{mode='normal'}={}) {
     const body=text?JSON.parse(text):undefined;
     requests.push({path:req.url,method:req.method,body,authorization:req.headers.authorization});
     res.setHeader('Content-Type','application/json');res.setHeader('X-Request-Id',`request-${++sequence}`);
-    if(req.url==='/api/v1/admin/status')return res.end(JSON.stringify({ready:true,echo:req.headers.authorization,build:{revision:'a'.repeat(40),dirty:false},configuration:{worker_package:{version:'0.1.0-rc.0',sha256:'c'.repeat(64)},limits:{max_jobs:2,in_flight_per_worker:1}}}));
+    if(req.url==='/api/v1/admin/status')return res.end(JSON.stringify({ready:true,echo:req.headers.authorization,build:{revision:'a'.repeat(40),dirty:false},configuration:{worker_package:{version:'0.1.0-rc.0',sha256:'c'.repeat(64)},limits}}));
     if(req.url==='/api/v1/admin/workers')return res.end(JSON.stringify({workers:[{id:'worker-1',connection_status:'online',work_status:'idle',current_job:null}]}));
     if(req.url==='/api/v1/admin/experiments'){
       if(body.messages.some(message=>message.type==='tool_call'&&!body.tools.some(tool=>tool.name===message.name))){res.statusCode=400;return res.end('{"error":"unknown_tool"}');}
@@ -520,4 +520,11 @@ test('recorded interventions survive an edited observation file and resumed coll
   assert.equal(result.verdict,'inconclusive');
   assert.ok(h.collector.report.observations.some(entry=>entry.source_ref===intervention.source_ref));
   assert.ok(h.collector.report.evidence_import_failures.some(entry=>entry.source==='observations'));
+});
+
+test('collector admits a broker with one slot per worker and no global cap', async t => {
+  const uncapped = await harness(t, {limits: {in_flight_per_worker: 1}});
+  await uncapped.collector.initialize();
+  const older = await harness(t, {limits: {max_jobs: 1, in_flight_per_worker: 1}});
+  await assert.rejects(older.collector.initialize(), /interleave_requires_two_jobs_one_inference/);
 });

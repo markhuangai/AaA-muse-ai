@@ -20,7 +20,7 @@ class History(Inference):
     def configuration(self, generated=False):
         config = super().configuration(generated)
         config["client-keys"]["other-client"] = self.other_client
-        config["limits"] = {"max-jobs": 16, "in-flight-per-worker": 1}
+        config["limits"] = {"in-flight-per-worker": 1}
         return config
 
     def peer(self, worker, reply=True, qualify=True, headers=None):

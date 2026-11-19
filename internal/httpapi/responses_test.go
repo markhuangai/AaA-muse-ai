@@ -154,7 +154,7 @@ func TestResponsesCancellationAfterAcceptanceRetainsOutputWithoutFallback(t *tes
 			defer cancel()
 			w := &chatWriter{ResponseRecorder: httptest.NewRecorder()}
 			if boundary == "before-exposure" {
-				h.Broker = service.NewBroker(cancelResponseBoundary{m, cancel}, rand.Reader, time.Now, h.Broker.Wait, 16)
+				h.Broker = service.NewBroker(cancelResponseBoundary{m, cancel}, rand.Reader, time.Now, h.Broker.Wait)
 			} else {
 				w.onFlush = cancel
 			}

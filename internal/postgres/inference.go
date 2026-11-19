@@ -138,11 +138,6 @@ func (r *Repository) WithinInference(ctx context.Context, ref inference.Ref, app
 		if err = loadHistory(ctx, tx, ref, s); err != nil {
 			return err
 		}
-		if ref.Admission {
-			if err = tx.QueryRow(ctx, "SELECT count(*) FROM aaa_experiments WHERE state NOT IN ('completed','cancelled','interrupted')").Scan(&s.ActiveCount); err != nil {
-				return err
-			}
-		}
 		if ref.SubmissionID != "" {
 			err = tx.QueryRow(ctx, "SELECT data FROM aaa_inference_receipts WHERE principal=$1 AND submission_id=$2", ref.Principal, ref.SubmissionID).Scan(&data)
 			if err == nil {

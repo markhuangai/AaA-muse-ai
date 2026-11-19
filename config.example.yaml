@@ -1,6 +1,5 @@
 server:
   listen: "0.0.0.0:8080"
-  public-url: "${MUSE_PUBLIC_URL}"
 database:
   url: "postgres://aaa_muse@database:5432/aaa_muse?sslmode=disable"
   password: "${POSTGRES_PASSWORD}"
@@ -8,11 +7,8 @@ management:
   key: "${MUSE_MANAGEMENT_KEY}"
 control-portal:
   password: "${MUSE_PORTAL_PASSWORD}"
-client-keys:
-  qualification-a: "${MUSE_CLIENT_KEY_A}"
-  qualification-b: "${MUSE_CLIENT_KEY_B}"
+client-keys: {}
 limits:
-  max-jobs: 4
   in-flight-per-worker: 1
 diagnostics:
   level: info

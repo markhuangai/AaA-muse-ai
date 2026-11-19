@@ -24,7 +24,7 @@ func routeFor(path string) (string, string) {
 		return route, id
 	}
 	switch path {
-	case "/api/v1/portal/login", "/api/v1/portal/logout", "/api/v1/portal/settings", "/api/v1/portal/events":
+	case "/api/v1/portal/login", "/api/v1/portal/logout", "/api/v1/portal/settings", "/api/v1/portal/events", "/api/v1/portal/client-keys":
 		return path, ""
 	case "/v1/models", "/v1/chat/completions", "/v1/responses", "/healthz", "/readyz", "/api/v1/admin/status", "/api/v1/admin/diagnostics/export", "/api/v1/admin/enrollments", "/api/v1/admin/setup-prompts", "/api/v1/worker/enroll", "/api/v1/admin/workers", "/api/v1/worker/status":
 		return path, ""
@@ -55,7 +55,7 @@ func routeMethod(route string) string {
 		return http.MethodPost
 	case workerMediaArtifact:
 		return http.MethodPut
-	case "/api/v1/portal/login", "/api/v1/portal/logout", "/api/v1/portal/events":
+	case "/api/v1/portal/login", "/api/v1/portal/logout", "/api/v1/portal/events", "/api/v1/portal/client-keys":
 		return http.MethodPost
 	case "/v1/chat/completions", "/v1/responses", "/api/v1/admin/workers/{id}/qualifications", "/api/v1/admin/enrollments", "/api/v1/admin/setup-prompts", "/api/v1/worker/enroll", "/api/v1/admin/workers/{id}/revoke":
 		return http.MethodPost
@@ -69,17 +69,22 @@ func routeMethod(route string) string {
 }
 
 func (h *Handler) setupRequest(w *response, r *http.Request, logger *slog.Logger, body []byte) {
-	if _, err := decodeWorkerInput(body, ""); err != nil {
-		logger.Warn("request.rejected", "reason", err.Error(), "omitted_body_bytes", len(body))
-		writeJSON(w, 400, map[string]any{"error": err.Error()})
+	input, err := decodeWorkerInput(body, "origin")
+	if err != nil {
+		logger.Warn("setup.origin_rejected", "cause", "origin_body_required", "omitted_body_bytes", len(body), "outcome", "not_started")
+		writeJSON(w, 400, map[string]any{"error": service.ErrSetupOrigin.Error()})
 		return
 	}
 	if h.Setup == nil {
 		writeJSON(w, 503, map[string]any{"error": "service_unavailable"})
 		return
 	}
-	result, err := h.Setup.Create(r.Context(), logger)
+	result, err := h.Setup.Create(r.Context(), logger, input["origin"].(string))
 	w.enrollmentID = result.EnrollmentID
+	if errors.Is(err, service.ErrSetupOrigin) {
+		writeJSON(w, 400, map[string]any{"error": err.Error()})
+		return
+	}
 	if errors.Is(err, service.ErrWorkerPackageUnconfigured) {
 		writeJSON(w, 503, map[string]any{"error": err.Error()})
 		return

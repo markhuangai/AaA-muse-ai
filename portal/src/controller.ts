@@ -1,4 +1,4 @@
-import { APIError, BUILD, schedule, type API, type BrowserReport, type Schedule, type Settings } from './api';
+import { APIError, BUILD, randomHex, schedule, type API, type BrowserReport, type Schedule, type Settings } from './api';
 import { Reports } from './reports';
 import { WorkersController } from './worker-controller';
 import { HistoryController } from './history-controller';
@@ -11,7 +11,7 @@ export interface System {
   watchVisibility(callback: () => void): () => void;
 }
 export const browserSystem: System = {
-  now: () => Date.now(), id: () => crypto.randomUUID(), schedule,
+  now: () => Date.now(), id: () => crypto.randomUUID?.() ?? randomHex(16), schedule,
   visible: () => document.visibilityState !== 'hidden',
   watchVisibility: callback => { document.addEventListener('visibilitychange', callback); return () => document.removeEventListener('visibilitychange', callback); },
 };
@@ -26,8 +26,9 @@ export interface View {
   message: string;
   requestID: string;
   operationID: string;
+  keySave: { pending: boolean; message: string; requestID: string; operationID: string } | null;
 }
-const initial = (page: View['page'] = 'settings'): View => ({ page, phase: 'login', settings: null, loading: false, stale: false, lastGood: null, expiresAt: null, message: '', requestID: '', operationID: '' });
+const initial = (page: View['page'] = 'settings'): View => ({ page, phase: 'login', settings: null, loading: false, stale: false, lastGood: null, expiresAt: null, message: '', requestID: '', operationID: '', keySave: null });
 
 export class PortalController {
   #view = initial();
@@ -39,6 +40,7 @@ export class PortalController {
   #freshnessTimer = () => {};
   #visibility = () => {};
   #refreshing = false;
+  #settingsVersion = 0;
   #attempt = 0;
   #loggingOut = false;
   readonly reports: Reports;
@@ -143,25 +145,60 @@ export class PortalController {
     if (this.#refreshing) return;
     this.#refreshing = true;
     const generation = this.#generation;
+    const version = this.#settingsVersion;
     const operation = this.system.id();
     const started = this.system.now();
     this.#attempt++;
     this.change({ loading: true, operationID: operation });
     try {
       const result = await this.api.settings(operation, this.#abort.signal);
-      if (generation !== this.#generation) return;
+      if (generation !== this.#generation || version !== this.#settingsVersion) return;
       const mismatch = result.value.build.revision !== BUILD;
       this.change({ settings: result.value, lastGood: this.system.now(), stale: mismatch, message: mismatch ? 'The service build changed. Reload and sign in again.' : '', requestID: result.requestID });
       this.freshness();
       if (mismatch) this.report('build_mismatch', operation, result.requestID, this.system.now() - started);
       await this.reports.flush();
     } catch (error) {
-      if (generation !== this.#generation) return;
+      if (generation !== this.#generation || version !== this.#settingsVersion) return;
       const failure = error instanceof APIError ? error : new APIError('request_failed');
       if (failure.status === 401) { this.expire(); return; }
       this.change({ stale: true, message: 'Could not refresh settings. Check the connection and retry.', requestID: failure.requestID });
       this.report(failure.causeCode === 'request_timeout' ? 'request_timeout' : failure.causeCode === 'service_unavailable' ? 'service_unavailable' : 'request_failed', operation, failure.requestID, this.system.now() - started);
-    } finally { if (generation === this.#generation) { this.#refreshing = false; this.change({ loading: false }); } }
+    } finally {
+      if (generation === this.#generation) {
+        this.#refreshing = false;
+        this.change({ loading: false });
+        if (version !== this.#settingsVersion) void this.refresh();
+      }
+    }
+  }
+
+  async createClientKey(name: string, key: string) {
+    if (this.#view.phase !== 'authenticated' || this.#view.keySave?.pending) return;
+    if (this.#view.expiresAt !== null && this.system.now() >= this.#view.expiresAt) { this.expire(); return; }
+    const generation = this.#generation;
+    const operationID = this.system.id();
+    this.change({ keySave: { pending: true, message: '', requestID: '', operationID } });
+    try {
+      const result = await this.api.createClientKey(name, key, operationID, this.#abort.signal);
+      if (generation !== this.#generation) return;
+      const settings = this.#view.settings;
+      this.#settingsVersion++;
+      this.change({
+        settings: settings && { ...settings, client_key_names: [...new Set([...settings.client_key_names, result.value])].sort() },
+        keySave: { pending: false, message: 'Client key saved.', requestID: result.requestID, operationID },
+      });
+      void this.refresh();
+    } catch (error) {
+      if (generation !== this.#generation) return;
+      const failure = error instanceof APIError ? error : new APIError('request_failed');
+      if (failure.status === 401) { this.expire(); return; }
+      const message = failure.causeCode === 'client_key_conflict' ? 'The name or key is already in use, or the configuration changed. Review the current client keys.' :
+        failure.causeCode === 'invalid_client_key' ? 'Enter a valid name and bearer key.' :
+        failure.causeCode === 'client_key_save_failed' ? 'The broker could not write config.yaml. Check its configuration directory permissions and broker logs.' :
+        'The save could not be confirmed. Check config.yaml before retrying.';
+      this.change({ keySave: { pending: false, message, requestID: failure.requestID, operationID } });
+    }
   }
 
   private report(cause: BrowserReport['cause'], operation: string, requestID: string, duration: number) {

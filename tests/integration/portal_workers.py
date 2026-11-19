@@ -11,6 +11,7 @@ import subprocess
 from history import History
 from portal import Portal, source_identity
 from service import require
+from worker_tls import TLSFixture
 
 
 class PortalWorkers(Portal, History):
@@ -74,7 +75,7 @@ class PortalWorkers(Portal, History):
         self.receipt("portal.worker_role_and_shell_boundaries")
 
     def worker_browser(self, phase, workers):
-        fixture = self.private("worker-browser-" + phase + ".json", json.dumps({"origin": self.origin_url, "password": self.portal,
+        fixture = self.private("worker-browser-" + phase + ".json", json.dumps({"origin": self.origin_url, "browser_origin": self.browser_proxy.origin, "password": self.portal,
             "source_sha": self.args.source_sha, "container": self.main_service, "database": self.db, "owner": self.owner,
             "directory": str(self.root.resolve()), "phase": phase, "workers": workers, "pin": self.checked("/api/v1/admin/status", self.admin)[0]["build"]["worker_package"]}))
         result = subprocess.run(["node", "tests/portal/workers.mjs", "--fixture", str(fixture)], capture_output=True, text=True, timeout=600)
@@ -190,12 +191,14 @@ def main():
     safe = Path(".artifacts/ci/portal")
     safe.mkdir(parents=True, exist_ok=True, mode=0o700)
     outcome, image_id = "failed", None
+    proxy = None
     try:
         h.baseline()
         image_id = h.inspect(args.image)["Id"]
         h.setup()
         h.main_service, h.origin_url, _ = h.launch()
         h.ready(h.main_service, h.origin_url)
+        proxy = h.browser_proxy = TLSFixture(h, h.origin_url)
         h.worker_browser("empty", {})
         h.expiry_and_role_boundaries()
         workers = h.activity_fixtures()
@@ -204,6 +207,8 @@ def main():
         require(source_identity() == identity, "source changed during worker browser validation")
         outcome = "passed"
     finally:
+        if proxy:
+            proxy.close()
         for peer in h.peers:
             if peer.thread.is_alive():
                 peer.stop()

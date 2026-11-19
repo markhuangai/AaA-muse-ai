@@ -451,7 +451,7 @@ def main():
         h.baseline()
         h.setup()
         config = h.configuration()
-        config["limits"] = {"max-jobs": 8, "in-flight-per-worker": 1}
+        config["limits"] = {"in-flight-per-worker": 1}
         _, h.origin_url, _ = h.launch(config)
         h.ready(h.resources["containers"][-1], h.origin_url)
         proxy = h.proxy = TLSFixture(h, h.origin_url)

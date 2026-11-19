@@ -5,7 +5,7 @@ import type { Execution, HistoryPage, RequestDetail, RequestSummary, TimelineEnt
 import { detail, entry, execution, summary } from './history-fixtures';
 
 export const token = 'muse_portal_' + 'a'.repeat(43);
-export const settings = (): Settings => ({ build: { revision: 'development', dirty: false }, instance_id: 'instance-1', public_origin: 'https://muse.example.test', ready: true, database: 'available', schema_version: 5, effective_yaml: 'control-portal:\n  password: "[REDACTED]"\n', capabilities: ['Native requests', 'Buffered SSE lifecycle events'] });
+export const settings = (): Settings => ({ build: { revision: 'development', dirty: false }, instance_id: 'instance-1', client_key_names: [], ready: true, database: 'available', schema_version: 5, effective_yaml: 'control-portal:\n  password: "[REDACTED]"\n', capabilities: ['Native requests', 'Buffered SSE lifecycle events'] });
 export const settle = async () => { for (let i = 0; i < 100; i++) await Promise.resolve(); };
 export const worker = (id = 'a'.repeat(32), name = 'Studio worker'): Worker => ({ id, name, registered_at: '2026-11-13T00:00:00Z', revoked_at: null, last_contact_at: '2026-11-13T00:00:00Z', connection_status: 'online', work_status: 'idle', current_job: null, waiting_for_client_tool: 0, last_heartbeat_at: '2026-11-13T00:00:00Z', inference_readiness: 'unverified', qualification_history: [] });
 export const enrollment = (kind: EnrollmentKind = 'prompt'): Enrollment => ({ enrollment_id: 'e'.repeat(32), created_at: '2026-11-13T00:00:00Z', expires_at: '2026-11-13T00:15:00Z', ...(kind === 'code' ? { enrollment_code: 'muse_enroll_' + 'e'.repeat(43) } : { setup_prompt: 'Complete pinned Muse setup\nKeep this single-use authority private.\nRegister the supported reconnection hook.\n', worker_package: { version: '0.1.0-rc.0', sha256: 'a'.repeat(64), url: 'https://example.test/worker.tgz' } }) });
@@ -55,7 +55,12 @@ export class TestAPI implements API {
   settingsCalls = 0;
   logoutCalls = 0;
   loginWork: () => Promise<Session>;
-  settingsWork = async () => ({ value: settings(), requestID: 'request-1' });
+  clientNames: string[] = [];
+  settingsWork = async () => ({ value: { ...settings(), client_key_names: this.clientNames.slice() }, requestID: 'request-1' });
+  createKeyWork = async (name: string, _key: string) => {
+    this.clientNames.push(name);
+    return { value: name, requestID: 'saved-key-request' };
+  };
   logoutWork = async () => {};
   reportWork = async (_report: BrowserReport) => {};
   workersCalls = 0;
@@ -72,6 +77,7 @@ export class TestAPI implements API {
   setSession(value: string | null) { this.credential = value; }
   async login() { this.loginCalls++; return this.loginWork(); }
   async settings() { this.settingsCalls++; return this.settingsWork(); }
+  async createClientKey(name: string, key: string) { return this.createKeyWork(name, key); }
   async logout() { this.logoutCalls++; return this.logoutWork(); }
   async report(value: BrowserReport) { this.reports.push(value); return this.reportWork(value); }
   async workers() { this.workersCalls++; return this.workersWork(); }

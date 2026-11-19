@@ -182,7 +182,7 @@ func TestInferenceReadOnlyAndStorageFailures(t *testing.T) {
 				tx.commitErr = errors.New("commit uncertain")
 			case "admission":
 				ref.Admission = true
-				tx.rows = append(tx.rows, workerRow{err: errors.New("count failed")})
+				tx.failStep = 1
 			case "receipt":
 				ref.Principal = "p"
 				ref.SubmissionID = "s"
@@ -244,9 +244,9 @@ func TestInferenceScopeReceiptsAndWorkerDiscovery(t *testing.T) {
 	ref.Admission = true
 	ref.SubmissionID = "s"
 	ref.Principal = "management"
-	tx.rows = append(tx.rows, workerRow{values: []any{1}}, workerRow{values: []any{encoded(t, inference.Receipt{Principal: "management", SubmissionID: "s", Result: json.RawMessage(`{}`)})}})
+	tx.rows = append(tx.rows, workerRow{values: []any{encoded(t, inference.Receipt{Principal: "management", SubmissionID: "s", Result: json.RawMessage(`{}`)})}})
 	if err := repo.WithinInference(context.Background(), ref, func(s *inference.State) error {
-		if s.ActiveCount != 1 || s.Receipt == nil {
+		if s.Receipt == nil {
 			t.Fatal("admission/receipt omitted")
 		}
 		return nil

@@ -11,7 +11,7 @@ test('login, periodic refresh, visibility, absolute expiry and logout change rea
   await controller.refresh(); expect(api.settingsCalls).toBe(0);
   await controller.login('password');
   expect(controller.snapshot().phase).toBe('authenticated');
-  expect(controller.snapshot().settings?.public_origin).toBe('https://muse.example.test');
+  expect(controller.snapshot().settings?.client_key_names).toEqual([]);
   expect(JSON.stringify(controller.snapshot()).includes(token)).toBe(false);
   expect(api.credential === token).toBe(true);
   await system.advance(30_000); expect(api.settingsCalls).toBe(2);

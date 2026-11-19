@@ -11,7 +11,7 @@ import (
 
 func authConfig() config.Config {
 	c := config.Defaults()
-	c.Server.PublicURL = "https://example.test"
+
 	c.Database.URL = "postgres://db/muse"
 	c.Portal.Password = "portal-fixture"
 	c.Management.Key = "admin-fixture"

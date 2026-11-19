@@ -18,6 +18,7 @@ import (
 )
 
 const DefaultPath = "/etc/aaa-muse-ai/config.yaml"
+const maxConfigBytes = 1024 * 1024
 
 type Secret string
 
@@ -28,8 +29,7 @@ func (Secret) MarshalYAML() (any, error)    { return "[REDACTED]", nil }
 
 type Config struct {
 	Server struct {
-		Listen    string `yaml:"listen" json:"listen"`
-		PublicURL string `yaml:"public-url" json:"public_url"`
+		Listen string `yaml:"listen" json:"listen"`
 	} `yaml:"server" json:"server"`
 	Database struct {
 		URL      Secret `yaml:"url" json:"url"`
@@ -43,7 +43,6 @@ type Config struct {
 	} `yaml:"control-portal" json:"control_portal"`
 	ClientKeys map[string]Secret `yaml:"client-keys" json:"client_keys"`
 	Limits     struct {
-		MaxJobs  int `yaml:"max-jobs" json:"max_jobs"`
 		InFlight int `yaml:"in-flight-per-worker" json:"in_flight_per_worker"`
 	} `yaml:"limits" json:"limits"`
 	Diagnostics struct {
@@ -67,7 +66,7 @@ func Defaults() Config {
 	var c Config
 	c.Server.Listen = "0.0.0.0:8080"
 	c.ClientKeys = map[string]Secret{}
-	c.Limits.MaxJobs, c.Limits.InFlight = 1, 1
+	c.Limits.InFlight = 1
 	c.Diagnostics.Level, c.Diagnostics.Directory = "info", "/var/lib/aaa-muse-ai/diagnostics"
 	c.Diagnostics.RetentionDays, c.Diagnostics.MaxBytes = 7, 128*1024*1024
 	return c
@@ -83,29 +82,51 @@ func Load(readFile func(string) ([]byte, error), lookup func(string) (string, bo
 	return Parse(b, lookup)
 }
 
-func Parse(b []byte, lookup func(string) (string, bool)) (Config, error) {
-	fail := func(reason string) (Config, error) { return Config{}, &Error{Field: "configuration", Reason: reason} }
-	if len(b) > 1024*1024 {
+func parseDocument(b []byte) (*yaml.Node, error) {
+	fail := func(reason string) (*yaml.Node, error) { return nil, &Error{Field: "configuration", Reason: reason} }
+	if len(b) > maxConfigBytes {
 		return fail("too_large")
 	}
 	var node yaml.Node
 	d := yaml.NewDecoder(bytes.NewReader(b))
 	if err := d.Decode(&node); err != nil {
 		line, column := parserLocation(err)
-		return Config{}, &Error{Field: "configuration", Reason: "invalid_yaml", Line: line, Column: column}
+		return nil, &Error{Field: "configuration", Reason: "invalid_yaml", Line: line, Column: column}
 	}
 	if node.Kind != yaml.DocumentNode || len(node.Content) != 1 || node.Content[0].Kind != yaml.MappingNode {
 		return fail("mapping_required")
 	}
 	var extra yaml.Node
 	if err := d.Decode(&extra); !errors.Is(err, io.EOF) {
-		return Config{}, &Error{Field: "configuration", Reason: "single_document_required", Line: max(extra.Line, 1), Column: max(extra.Column, 1)}
+		return nil, &Error{Field: "configuration", Reason: "single_document_required", Line: max(extra.Line, 1), Column: max(extra.Column, 1)}
+	}
+	return &node, nil
+}
+
+func Parse(b []byte, lookup func(string) (string, bool)) (Config, error) {
+	node, err := parseDocument(b)
+	if err != nil {
+		return Config{}, err
+	}
+	// Remove obsolete fields before resolving environment references.
+	for i := 0; i < len(node.Content[0].Content); i += 2 {
+		key, section := node.Content[0].Content[i], node.Content[0].Content[i+1]
+		if section.Kind != yaml.MappingNode {
+			continue
+		}
+		for j := 0; j < len(section.Content); j += 2 {
+			field := section.Content[j].Value
+			if (key.Value == "server" && field == "public-url") || (key.Value == "limits" && field == "max-jobs") {
+				section.Content = append(section.Content[:j], section.Content[j+2:]...)
+				j -= 2
+			}
+		}
 	}
 	locations := map[string]*yaml.Node{}
 	if err := inspectMapping(node.Content[0], reflect.TypeFor[Config](), "", locations); err != nil {
 		return Config{}, err
 	}
-	if err := resolve(&node, lookup); err != nil {
+	if err := resolve(node, lookup); err != nil {
 		if ce, ok := err.(*Error); ok {
 			ce.Field = fieldAtPosition(locations, ce.Line, ce.Column)
 		}
@@ -236,10 +257,6 @@ func (c Config) Validate() error {
 	if err != nil || portErr != nil || p < 1 || p > 65535 {
 		return bad("server.listen", "invalid_address")
 	}
-	u, err := url.Parse(c.Server.PublicURL)
-	if err != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || (u.Path != "" && u.Path != "/") {
-		return bad("server.public-url", "https_origin_required")
-	}
 	db, err := url.Parse(string(c.Database.URL))
 	if err != nil || (db.Scheme != "postgres" && db.Scheme != "postgresql") || db.Hostname() == "" || db.Path == "" || db.Path == "/" {
 		return bad("database.url", "postgres_url_required")
@@ -281,8 +298,8 @@ func (c Config) Validate() error {
 		}
 		seen[string(key)] = true
 	}
-	if c.Limits.MaxJobs < 1 || c.Limits.InFlight != 1 {
-		return bad("limits", "positive_limits_and_single_in_flight_required")
+	if c.Limits.InFlight != 1 {
+		return bad("limits.in-flight-per-worker", "single_in_flight_required")
 	}
 	if _, ok := map[string]bool{"debug": true, "info": true, "warn": true, "error": true}[c.Diagnostics.Level]; !ok {
 		return bad("diagnostics.level", "unsupported_level")

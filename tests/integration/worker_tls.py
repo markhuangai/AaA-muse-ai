@@ -10,7 +10,7 @@ import urllib.parse
 
 
 class TLSFixture:
-    def __init__(self, harness, target):
+    def __init__(self, harness, target, name="tls"):
         self.harness = harness
         self.target = urllib.parse.urlsplit(target)
         self.connections = []
@@ -43,8 +43,8 @@ class TLSFixture:
         self.release_claim = threading.Event()
         self.decision_sizes = []
         self.events = []
-        self.cert = harness.root.resolve() / "tls-cert.pem"
-        key = harness.root.resolve() / "tls-key.pem"
+        self.cert = harness.root.resolve() / (name + "-cert.pem")
+        key = harness.root.resolve() / (name + "-key.pem")
         subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
                         "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1",
                         "-keyout", str(key), "-out", str(self.cert)], check=True, capture_output=True, timeout=20)
@@ -61,6 +61,9 @@ class TLSFixture:
                 self.forward()
 
             def do_POST(self):
+                self.forward()
+
+            def do_PATCH(self):
                 self.forward()
 
             def forward(self):
@@ -101,7 +104,7 @@ class TLSFixture:
                         if delayed and delayed[0] == identity:
                             # Expire liveness while leaving time for the final HTTP attempt to receive the broker's refusal.
                             time.sleep(max(0, delayed[1] - time.monotonic()))
-                    headers = {key: self.headers[key] for key in ("Authorization", "Content-Type", "X-Request-Id",
+                    headers = {key: self.headers[key] for key in ("Authorization", "Content-Type", "X-Request-Id", "X-Portal-Operation-Id",
                                "X-Muse-Worker-Version", "X-Muse-Worker-Model-Report", "X-Muse-Media-Jobs",
                                "X-Muse-Artifact-Sha256", "X-Muse-Connection-Id", "X-Muse-Connection-Generation",
                                "X-Muse-Generation", "X-Muse-Lease-Id") if key in self.headers}
@@ -172,7 +175,8 @@ class TLSFixture:
                             self.close_connection = True
                             return
                     self.send_response(response.status)
-                    for key in ("Content-Type", "X-Request-Id", "X-Muse-Service-Version"):
+                    for key in ("Content-Type", "X-Request-Id", "X-Muse-Service-Version", "Cache-Control", "Content-Security-Policy",
+                                "Referrer-Policy", "X-Content-Type-Options", "WWW-Authenticate", "Retry-After", "Allow"):
                         if response.getheader(key):
                             self.send_header(key, response.getheader(key))
                     if not streaming:

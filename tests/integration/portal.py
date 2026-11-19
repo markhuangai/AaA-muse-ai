@@ -11,6 +11,7 @@ import time
 
 from service import require
 from worker_auth import WorkerAuth
+from worker_tls import TLSFixture
 
 
 class Portal(WorkerAuth):
@@ -101,9 +102,9 @@ class Portal(WorkerAuth):
         self.ready(self.main_service, self.origin_url)
         self.receipt("portal.process_local_sessions", sibling_isolation=True, postgres_recovered=True)
 
-    def browser(self):
+    def browser(self, key_origins):
         fixture = self.private("browser-fixture.json", json.dumps({"origin": self.origin_url, "password": self.portal,
-            "source_sha": self.args.source_sha, "container": self.main_service, "owner": self.owner, "directory": str(self.root.resolve())}))
+            "key_origins": key_origins, "source_sha": self.args.source_sha, "container": self.main_service, "owner": self.owner, "directory": str(self.root.resolve())}))
         result = subprocess.run(["node", "tests/portal/browser.mjs", "--fixture", str(fixture)], capture_output=True, text=True, timeout=600)
         self.private("browser-runner.log", result.stdout + result.stderr)
         secrets_path = self.root / "browser-session-secrets.json"
@@ -128,7 +129,7 @@ class Portal(WorkerAuth):
         safe = Path(".artifacts/ci/portal/screens")
         safe.mkdir(parents=True, exist_ok=True, mode=0o700)
         for name in browser["screenshots"]:
-            require(re.fullmatch(r"(login|settings|error)-(1440|768|390)\.png", name), "unexpected screenshot path")
+            require(re.fullmatch(r"(login|settings|error|client-keys)-(1440|768|390)\.png", name), "unexpected screenshot path")
             shutil.copyfile(self.root / name, safe / name)
         self.receipts.extend(browser["cases"])
 
@@ -156,6 +157,68 @@ class Portal(WorkerAuth):
         require('"msg":"portal.settings_detail"' not in logs and '"msg":"portal.browser_report"' not in logs, "DEBUG values escaped INFO filtering")
         require(any(e["msg"] == "request.exchange" and e["response_capture"] == "credentials_omitted" for e in events), "login credential omission not recorded")
         self.receipt("portal.capture_protection", complete=True, info_filter=True, credential_scan=True)
+
+    def client_keys(self):
+        failure_key = "readonly-save-canary"
+        self.secrets.append(failure_key)
+        session, _ = self.login()
+        operation = "read-only-key-save"
+        route = "/api/v1/portal/client-keys"
+        status, headers, body = self.api(route, session["session_token"], "POST", {"name": "Read-only mount", "key": failure_key},
+                                         headers={"X-Portal-Operation-Id": operation})
+        require(status == 503 and json.loads(body) == {"error": "client_key_save_failed"}, "read-only file reported a successful key write")
+        event, evidence = self.diagnose(headers["X-Request-Id"], "client_key.persist_failed")
+        require(event["level"] == "ERROR" and event["outcome"] == "failed" and event["operation_id"] == operation and
+                event["stage"] == "create_temporary" and event["cause"] in ("read-only file system", "permission denied"),
+                "log evidence cannot distinguish the write failure")
+        require(any(item.get("msg") == "request.completed" and item["status"] == 503 for item in evidence), "write failure lost HTTP correlation")
+        require(any(item.get("msg") == "client_key.persist_failed" and item.get("operation_id") == operation
+                    for item in map(json.loads, self.logs(self.main_service).splitlines())), "write failure absent at INFO runtime level")
+        require(self.api("/v1/models", failure_key)[0] == 401, "failed save enabled the client")
+        self.receipt("portal.log_only_config_write_failure", request_id=headers["X-Request-Id"], cause=event["cause"],
+                     corrective_action="Mount the configuration directory writable by service UID 10001.")
+
+        directory = self.root.resolve() / "shared-config"
+        directory.mkdir(mode=0o700)
+        (directory / "config.yaml").write_text("".join(("# shared broker configuration\n", json.dumps(super().configuration()))))
+        mount = "type=bind,source=" + str(directory) + ",target=/fixture"
+        def set_owner(owner):
+            self.docker("run", "--rm", "--user", "0:0", "--entrypoint", "/bin/sh", "--mount", mount, self.args.image,
+                        "-ec", "chmod 700 /fixture; chmod 600 /fixture/config.yaml; chown " + owner + " /fixture /fixture/config.yaml")
+        proxies = []
+        set_owner("10001:10001")
+        try:
+            brokers = [self.launch(config_directory=directory) for _ in range(2)]
+            for index, (container, origin, _) in enumerate(brokers):
+                self.ready(container, origin)
+                proxies.append(TLSFixture(self, origin, "client-keys-tls-" + str(index)))
+            self.browser([proxy.origin for proxy in proxies])
+            keys = json.loads((self.root / "browser-client-key-secrets.json").read_text())
+            self.secrets.extend(item["key"] for item in keys)
+            require(len(keys) == 4, "browser did not save all named clients")
+            first, origin, _ = brokers[0]
+            self.docker("restart", first)
+            origin = self.origin(first)
+            brokers[0] = (first, origin, brokers[0][2])
+            self.ready(first, origin)
+            raw = self.docker("exec", "--user", "0:0", first, "cat", "/etc/aaa-muse-ai/config.yaml").stdout
+            require(raw.startswith("# shared broker configuration"), "YAML comment was lost")
+            require(self.docker("exec", first, "stat", "-c", "%a", "/etc/aaa-muse-ai/config.yaml").stdout.strip() == "600", "file mode changed")
+            for item in keys:
+                require(item["name"] in raw and item["key"] in raw, "persisted config lacks the authored entry")
+                require(self.api("/v1/models", item["key"], origin=origin)[0] == 200, "created key was lost after restart")
+            for container, origin, _ in brokers:
+                status, _, capture = self.api("/api/v1/admin/diagnostics/export", self.admin, origin=origin)
+                require(status == 200, "shared broker diagnostic export failed")
+                metadata, events = self.decode_export(capture)
+                require(metadata["complete"] and not metadata["omissions"], "shared broker diagnostic export incomplete")
+                self.assert_private(self.logs(container))
+                self.assert_private(json.dumps(events))
+            self.receipt("portal.shared_client_keys", broker_count=2, restart_persisted=True, key_values_private=True)
+        finally:
+            for proxy in proxies:
+                proxy.close()
+            set_owner(str(os.getuid()) + ":" + str(os.getgid()))
 
 
 def source_identity():
@@ -191,7 +254,7 @@ def main():
         h.ready(sibling, sibling_origin)
         h.boundaries()
         h.process_scope_and_degradation(sibling_origin)
-        h.browser()
+        h.client_keys()
         h.final_diagnostics()
         require(source_identity() == identity, "source changed during browser validation")
         outcome = "passed"

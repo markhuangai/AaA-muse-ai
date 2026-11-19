@@ -2,6 +2,7 @@
 node_modules/
 .artifacts/
 config.yaml
+/config/
 .env
 worker/dist/
 portal/dist/

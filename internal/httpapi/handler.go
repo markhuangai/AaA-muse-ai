@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/markhuangai/AaA-muse-ai/internal/auth"
+	"github.com/markhuangai/AaA-muse-ai/internal/config"
 	"github.com/markhuangai/AaA-muse-ai/internal/diagnostics"
 	"github.com/markhuangai/AaA-muse-ai/internal/service"
 )
@@ -24,19 +25,20 @@ type Exporter interface {
 	Snapshot(diagnostics.Filter) (diagnostics.Snapshot, error)
 }
 type Handler struct {
-	Service   *service.Service
-	Workers   *service.Workers
-	Setup     *service.Setup
-	Broker    *service.Broker
-	Portal    *service.Portal
-	Assets    fs.FS
-	Authority *auth.Authority
-	Exporter  Exporter
-	Logger    *slog.Logger
-	Redactor  *diagnostics.Redactor
-	Random    io.Reader
-	Now       func() time.Time
-	Failed    <-chan struct{}
+	Service    *service.Service
+	Workers    *service.Workers
+	Setup      *service.Setup
+	Broker     *service.Broker
+	Portal     *service.Portal
+	Assets     fs.FS
+	Authority  *auth.Authority
+	Exporter   Exporter
+	Logger     *slog.Logger
+	Redactor   *diagnostics.Redactor
+	ClientKeys *config.ClientKeyFile
+	Random     io.Reader
+	Now        func() time.Time
+	Failed     <-chan struct{}
 }
 
 type response struct {
@@ -122,11 +124,8 @@ func (h *Handler) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 	if route == "/api/v1/portal/login" {
 		w.captureReason = "credentials_omitted"
 	}
-	role, clientID := h.Authority.Identity(r.Header.Get("Authorization"))
+	role := "unauthenticated"
 	portalSessionID := ""
-	if clientID != "" {
-		logger = logger.With("client_id", clientID)
-	}
 	defer func() {
 		logger = logger.With("worker_id", w.workerID, "enrollment_id", w.enrollmentID)
 		if w.requestRecordID != "" {
@@ -167,6 +166,16 @@ func (h *Handler) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 			return
 		}
 		logger = logger.With("operation_id", operation, "portal_operation_id", operation)
+	}
+	if h.ClientKeys != nil {
+		if err := h.ClientKeys.Refresh(); err != nil {
+			failure := err.(*config.ClientKeyError)
+			logger.Error("client_key.reload_failed", "stage", failure.Stage, "cause", failure.Cause, "outcome", "retained_last_valid")
+		}
+	}
+	role, clientID := h.Authority.Identity(r.Header.Get("Authorization"))
+	if clientID != "" {
+		logger = logger.With("client_id", clientID)
 	}
 	if route == "unmatched" {
 		if h.portalAsset(w, r, logger) {
@@ -266,6 +275,8 @@ func (h *Handler) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 	switch route {
 	case "/api/v1/portal/login", "/api/v1/portal/logout", "/api/v1/portal/settings", "/api/v1/portal/events":
 		h.portalRequest(w, r, logger, route, body)
+	case "/api/v1/portal/client-keys":
+		h.createClientKey(w, r, logger, body)
 	case "/healthz":
 		writeJSON(w, 200, map[string]any{"status": "alive"})
 	case "/readyz":
@@ -276,7 +287,16 @@ func (h *Handler) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, code, map[string]any{"ready": status.Ready, "database": status.Database, "schema_version": status.SchemaVersion})
 	case "/api/v1/admin/status":
-		writeJSON(w, 200, h.Service.Status(r.Context(), logger))
+		status := h.Service.Status(r.Context(), logger)
+		names := make(map[string]config.Secret, len(status.Configuration.ClientKeys))
+		redactor := diagnostics.NewRedactor(status.Configuration.Secrets())
+		for name, key := range status.Configuration.ClientKeys {
+			if redactor.Text(name) == name {
+				names[name] = key
+			}
+		}
+		status.Configuration.ClientKeys = names
+		writeJSON(w, 200, status)
 	case "/api/v1/admin/diagnostics/export":
 		h.export(w, r, logger)
 	case "/api/v1/admin/setup-prompts":

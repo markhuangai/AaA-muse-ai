@@ -2,6 +2,10 @@ import { isEnrollment, isWorker, object, type Enrollment, type EnrollmentKind, t
 import { historyID, historyCursor, isDetail, isExecution, isHistoryPage, isSummary, isTimelineEntry, parseRecordedJSON, type Execution, type HistoryPage, type RequestDetail, type RequestSummary, type TimelineEntry } from './history-api';
 
 export const BUILD = import.meta.env.VITE_SOURCE_SHA || 'development';
+export function randomHex(size: number) {
+  const bytes = crypto.getRandomValues(new Uint8Array(size));
+  return Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('');
+}
 export type Schedule = (callback: () => void, delay: number) => () => void;
 export const schedule: Schedule = (callback, delay) => {
   const timer = globalThis.setTimeout(callback, delay);
@@ -12,7 +16,7 @@ export interface Session { session_token: string; expires_at: string }
 export interface Settings {
   build: { revision: string; dirty: boolean };
   instance_id: string;
-  public_origin: string;
+  client_key_names: string[];
   ready: boolean;
   database: string;
   schema_version: number;
@@ -56,6 +60,7 @@ export interface API {
   login(password: string, operation: string, signal: AbortSignal): Promise<Session>;
   logout(operation: string, signal: AbortSignal): Promise<void>;
   settings(operation: string, signal: AbortSignal): Promise<{ value: Settings; requestID: string }>;
+  createClientKey(name: string, key: string, operation: string, signal: AbortSignal): Promise<{ value: string; requestID: string }>;
   workers(operation: string, signal: AbortSignal): Promise<{ value: Worker[]; requestID: string }>;
   renameWorker(id: string, name: string, operation: string, signal: AbortSignal): Promise<{ value: Worker; requestID: string }>;
   revokeWorker(id: string, operation: string, signal: AbortSignal): Promise<{ value: Worker; requestID: string }>;
@@ -69,7 +74,8 @@ export interface API {
 
 export class BrowserAPI implements API {
   #token: string | null = null;
-  constructor(private fetcher: typeof fetch = globalThis.fetch.bind(globalThis), private timer: Schedule = schedule) {}
+  constructor(private fetcher: typeof fetch = globalThis.fetch.bind(globalThis), private timer: Schedule = schedule,
+    private origin = () => globalThis.location.origin) {}
   setSession(token: string | null) { this.#token = token; }
 
   private async request(path: string, method: string, operation: string, signal: AbortSignal, body?: unknown, authenticated = true, parse: (source: string) => unknown = JSON.parse) {
@@ -89,17 +95,19 @@ export class BrowserAPI implements API {
         let reason = response.status === 401 ? 'unauthorized' : response.status === 429 ? 'throttled' : response.status >= 500 ? 'service_unavailable' : 'request_failed';
         try {
           const data: unknown = await response.json();
-          if (object(data) && ['invalid_worker_name', 'worker_not_found', 'worker_package_unconfigured', 'history_not_found', 'invalid_cursor', 'experiment_already_completed', 'inference_not_found', 'submission_conflict'].includes(String(data.error))) reason = String(data.error);
+          if (object(data) && ['invalid_worker_name', 'worker_not_found', 'worker_package_unconfigured', 'https_origin_required',
+            'invalid_client_key', 'client_key_conflict', 'client_key_save_failed', 'client_key_save_uncertain',
+            'history_not_found', 'invalid_cursor', 'experiment_already_completed', 'inference_not_found', 'submission_conflict'].includes(String(data.error))) reason = String(data.error);
         } catch { /* Error bodies are untrusted; retain the HTTP classification. */ }
         const retry = Number(response.headers.get('Retry-After'));
         throw new APIError(reason, response.status, requestID, Number.isFinite(retry) ? Math.max(0, Math.min(3600, retry)) : 0);
       }
-      if (response.status === 204) return { data: null, requestID };
+      if (response.status === 204) return { data: null, requestID, status: response.status };
       let data: unknown;
       try { data = parse(await response.text()); } catch {
         throw new APIError(abort.signal.aborted ? timedOut ? 'request_timeout' : 'request_aborted' : 'invalid_response', response.status, requestID);
       }
-      return { data, requestID };
+      return { data, requestID, status: response.status };
     } catch (error) {
       if (error instanceof APIError) throw error;
       throw new APIError(timedOut ? 'request_timeout' : signal.aborted ? 'request_aborted' : 'request_failed');
@@ -126,12 +134,20 @@ export class BrowserAPI implements API {
     const result = await this.request('/api/v1/portal/settings', 'GET', operation, signal);
     const data = result.data;
     if (!object(data) || !object(data.build) || typeof data.build.revision !== 'string' || typeof data.build.dirty !== 'boolean' ||
-      typeof data.instance_id !== 'string' || typeof data.public_origin !== 'string' || typeof data.ready !== 'boolean' ||
+      typeof data.instance_id !== 'string' || !Array.isArray(data.client_key_names) || !data.client_key_names.every(value => typeof value === 'string') || typeof data.ready !== 'boolean' ||
       typeof data.database !== 'string' || !Number.isSafeInteger(data.schema_version) || typeof data.effective_yaml !== 'string' ||
       !Array.isArray(data.capabilities) || !data.capabilities.every(value => typeof value === 'string')) {
       throw new APIError('invalid_response', 200, result.requestID);
     }
     return { value: data as unknown as Settings, requestID: result.requestID };
+  }
+
+  async createClientKey(name: string, key: string, operation: string, signal: AbortSignal) {
+    const result = await this.request('/api/v1/portal/client-keys', 'POST', operation, signal, { name, key });
+    if (result.status !== 201 || !object(result.data) || Object.keys(result.data).length !== 1 || typeof result.data.name !== 'string') {
+      throw new APIError('invalid_response', result.status, result.requestID);
+    }
+    return { value: result.data.name, requestID: result.requestID };
   }
 
   async report(value: BrowserReport, signal: AbortSignal) {
@@ -161,7 +177,10 @@ export class BrowserAPI implements API {
   }
 
   async enrollment(kind: EnrollmentKind, operation: string, signal: AbortSignal) {
-    const result = await this.request(kind === 'prompt' ? '/api/v1/admin/setup-prompts' : '/api/v1/admin/enrollments', 'POST', operation, signal);
+    const origin = kind === 'prompt' ? this.origin() : undefined;
+    if (origin !== undefined && !origin.startsWith('https://')) throw new APIError('https_origin_required');
+    const result = await this.request(kind === 'prompt' ? '/api/v1/admin/setup-prompts' : '/api/v1/admin/enrollments', 'POST', operation, signal,
+      origin === undefined ? undefined : { origin });
     if (!isEnrollment(result.data, kind)) throw new APIError('invalid_response', 201, result.requestID);
     return { value: result.data, requestID: result.requestID };
   }

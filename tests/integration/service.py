@@ -105,23 +105,27 @@ class Harness:
         raise RuntimeError("PostgreSQL did not become ready")
 
     def configuration(self, generated=False):
-        return {"server": {"listen": "0.0.0.0:8080", "public-url": "https://muse.example.test"},
+        return {"server": {"listen": "0.0.0.0:8080"},
                 "database": {"url": "postgres://postgres:" + self.database_password + "@db:5432/aaa_muse?sslmode=disable"},
                 "management": {"key": "" if generated else self.admin},
                 "control-portal": {"password": self.portal},
                 "client-keys": {"fixture-client": self.client},
                 "diagnostics": {"level": "info", "directory": "/var/lib/aaa-muse-ai/diagnostics"}}
 
-    def launch(self, config=None, raw=None, diagnostic_volume=None, expect_startup=True, port_binding="127.0.0.1::8080", environment=(), media_volume=None):
+    def launch(self, config=None, raw=None, diagnostic_volume=None, expect_startup=True, port_binding="127.0.0.1::8080", environment=(), media_volume=None, config_directory=None):
         index = len(self.resources["containers"])
-        path = self.private("config-" + str(index) + ".yaml", raw if raw is not None else json.dumps(config or self.configuration()))
-        # The bind source is inside a private directory; the container needs read access to its mounted file.
-        path.chmod(0o644)
+        if config_directory is None:
+            path = self.private("config-" + str(index) + ".yaml", raw if raw is not None else json.dumps(config or self.configuration()))
+            # The bind source is inside a private directory; the container needs read access to its mounted file.
+            path.chmod(0o644)
+            config_mount = "type=bind,source=" + str(path) + ",target=/etc/aaa-muse-ai/config.yaml,readonly"
+        else:
+            config_mount = "type=bind,source=" + str(config_directory) + ",target=/etc/aaa-muse-ai"
         volume = diagnostic_volume or self.volume("diagnostics-" + str(index))
         identity = self.remember("containers", self.docker("run", "-d", "--label", LABEL + "=" + self.owner,
                                   "--network", self.network, "-p", port_binding,
                                   *[argument for name in environment for argument in ("--env", name)],
-                                  "--mount", "type=bind,source=" + str(path) + ",target=/etc/aaa-muse-ai/config.yaml,readonly",
+                                  "--mount", config_mount,
                                   "-v", volume + ":/var/lib/aaa-muse-ai/diagnostics",
                                   *(["-v", media_volume + ":/var/lib/aaa-muse-ai/media"] if media_volume else []), self.args.image).stdout.strip())
         return identity, self.origin(identity) if expect_startup else None, volume

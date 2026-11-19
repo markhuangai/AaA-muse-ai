@@ -10,8 +10,8 @@ import (
 
 func TestSetupPromptUsesIssuedAuthorityAndPinnedMechanics(t *testing.T) {
 	w, m, logger, _ := workerFixture()
-	s := NewSetup(w, "https://example.test/", PackagePin{Version: "0.1.0-rc.0", SHA256: strings.Repeat("a", 64)})
-	result, err := s.Create(context.Background(), logger)
+	s := NewSetup(w, PackagePin{Version: "0.1.0-rc.0", SHA256: strings.Repeat("a", 64)})
+	result, err := s.Create(context.Background(), logger, "https://example.test:8443")
 	if err != nil || result.EnrollmentID == "" || result.ExpiresAt.Sub(result.CreatedAt) != EnrollmentLifetime {
 		t.Fatal("setup issuance failed", err)
 	}
@@ -38,13 +38,13 @@ func TestSetupPromptUsesIssuedAuthorityAndPinnedMechanics(t *testing.T) {
 func TestSetupFailsBeforeIssuanceWithoutPinsAndPreservesDependencyErrors(t *testing.T) {
 	w, m, logger, _ := workerFixture()
 	for _, pin := range []PackagePin{{}, {Version: "0.1.0-rc.0"}, {SHA256: strings.Repeat("a", 64)}} {
-		_, err := NewSetup(w, "https://example.test", pin).Create(context.Background(), logger)
+		_, err := NewSetup(w, pin).Create(context.Background(), logger, "https://example.test:8443")
 		if !errors.Is(err, ErrWorkerPackageUnconfigured) || len(m.enrollments) != 0 {
 			t.Fatal("unconfigured setup issued authority")
 		}
 	}
 	m.fail = errors.New("storage fixture failure")
-	_, err := NewSetup(w, "https://example.test", PackagePin{Version: "0.1.0-rc.0", SHA256: strings.Repeat("a", 64)}).Create(context.Background(), logger)
+	_, err := NewSetup(w, PackagePin{Version: "0.1.0-rc.0", SHA256: strings.Repeat("a", 64)}).Create(context.Background(), logger, "https://example.test:8443")
 	if !errors.Is(err, m.fail) || len(m.enrollments) != 0 {
 		t.Fatal("dependency failure hidden")
 	}

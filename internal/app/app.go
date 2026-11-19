@@ -42,13 +42,14 @@ type Dependencies struct {
 	Wait           func(context.Context, time.Duration) error
 	Files          diagnostics.Files
 	PortalAssets   fs.FS
+	ClientKeyFile  func(string, func(string) (string, bool), config.Config) *config.ClientKeyFile
 	OpenDB         func(context.Context, string) (Repository, error)
 	Listen         func(string, string) (net.Listener, error)
 	Stdout, Stderr io.Writer
 }
 
 func Production(stdout, stderr io.Writer) Dependencies {
-	return Dependencies{MediaDir: "/var/lib/aaa-muse-ai/media", ReadFile: os.ReadFile, LookupEnv: os.LookupEnv, Random: rand.Reader, Now: time.Now, Sleep: sleep, Wait: sleep, Files: diagnostics.OSFiles{}, PortalAssets: os.DirFS("/usr/share/aaa-muse-ai/portal"), OpenDB: func(ctx context.Context, u string) (Repository, error) {
+	return Dependencies{MediaDir: "/var/lib/aaa-muse-ai/media", ReadFile: os.ReadFile, LookupEnv: os.LookupEnv, Random: rand.Reader, Now: time.Now, Sleep: sleep, Wait: sleep, Files: diagnostics.OSFiles{}, PortalAssets: os.DirFS("/usr/share/aaa-muse-ai/portal"), ClientKeyFile: config.NewClientKeyFile, OpenDB: func(ctx context.Context, u string) (Repository, error) {
 		repo, err := postgres.Open(ctx, u)
 		if err != nil {
 			return nil, err
@@ -112,7 +113,13 @@ func Run(ctx context.Context, args []string, build service.Build, d Dependencies
 	}
 	failed := make(chan struct{})
 	var failOnce sync.Once
-	redactor := diagnostics.NewRedactor(c.Secrets())
+	current := func() *config.Config { return &c }
+	var clientKeys *config.ClientKeyFile
+	if d.ClientKeyFile != nil {
+		clientKeys = d.ClientKeyFile(*path, d.LookupEnv, c)
+		current = clientKeys.Current
+	}
+	redactor := diagnostics.NewLiveRedactor(current)
 	logger := diagnostics.NewLogger(d.Stdout, store, level(c.Diagnostics.Level), redactor, d.Now, func(err error) {
 		failOnce.Do(func() {
 			fatal("diagnostics.capture_failed", diagnostics.Cause(err), []any{"instance_id", instance})
@@ -131,7 +138,7 @@ func Run(ctx context.Context, args []string, build service.Build, d Dependencies
 		return 1
 	}
 	defer repo.Close()
-	broker := service.NewBroker(repo, d.Random, d.Now, d.Wait, c.Limits.MaxJobs)
+	broker := service.NewBroker(repo, d.Random, d.Now, d.Wait)
 	if d.MediaDir != "" {
 		broker.Media = media.New(d.MediaDir)
 	}
@@ -165,14 +172,15 @@ func Run(ctx context.Context, args []string, build service.Build, d Dependencies
 		}
 	}
 	svc := service.New(repo, c, build, instance, d.Now, logger)
-	authority := auth.New(c)
+	svc.UseConfiguration(current)
+	authority := auth.NewWithConfiguration(current)
 	serveCtx, cancelServe := context.WithCancel(ctx)
 	defer cancelServe()
-	handler := &httpapi.Handler{Service: svc, Workers: service.NewWorkers(repo, authority, d.Random, d.Now), Broker: broker, Authority: authority, Exporter: store, Logger: logger, Redactor: redactor, Random: d.Random, Now: d.Now, Failed: failed}
+	handler := &httpapi.Handler{Service: svc, Workers: service.NewWorkers(repo, authority, d.Random, d.Now), Broker: broker, Authority: authority, Exporter: store, Logger: logger, Redactor: redactor, ClientKeys: clientKeys, Random: d.Random, Now: d.Now, Failed: failed}
 	handler.Portal = service.NewPortal(authority, d.Random, d.Now)
 	handler.Assets = d.PortalAssets
 	startup.Info("portal.configured", "effective_settings", service.PortalSettings(), "session_scope", "process_memory", "browser_storage", "none")
-	handler.Setup = service.NewSetup(handler.Workers, c.Server.PublicURL, svc.Build().WorkerPackage)
+	handler.Setup = service.NewSetup(handler.Workers, svc.Build().WorkerPackage)
 	server := &http.Server{Handler: handler, BaseContext: func(net.Listener) context.Context { return serveCtx }, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 * 1024, ErrorLog: slog.NewLogLogger(logger.Handler(), slog.LevelError)}
 	brokerDone := make(chan struct{})
 	go func() { defer close(brokerDone); broker.Run(serveCtx, logger) }()
