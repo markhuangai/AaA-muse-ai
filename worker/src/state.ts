@@ -5,7 +5,7 @@ import { randomUUID } from 'node:crypto';
 import { Failure, cause, requireValue } from './errors.js';
 import { encode, parse, object, text, integer } from './json.js';
 
-export type Files = Pick<typeof fs, 'mkdir' | 'lstat' | 'open' | 'rename' | 'unlink' | 'rmdir' | 'readdir'>;
+export type Files = Pick<typeof fs, 'mkdir' | 'mkdtemp' | 'lstat' | 'open' | 'rename' | 'unlink' | 'rmdir' | 'readdir'>;
 export interface System {
   now(): number;
   uuid(): string;

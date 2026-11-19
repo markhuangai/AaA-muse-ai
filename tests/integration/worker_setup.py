@@ -83,13 +83,19 @@ class WorkerSetup(Inference):
         self.fixture_image = "aaa-muse-worker-setup:" + self.owner
         self.fixture_image_created = False
 
-    def environment(self, name):
+    def environment(self, name, *, mount_system_tmp=False):
         home = self.root.resolve() / ("home-" + name)
         home.mkdir(mode=0o700)
+        temp_mount = []
+        if mount_system_tmp:
+            temp = home / "tmp"
+            temp.mkdir(mode=0o700)
+            temp_mount = ["--mount", "type=bind,source=" + str(temp) + ",target=/tmp"]
         identity = self.remember("containers", self.docker("run", "-d", "--init", "--read-only", "--label", LABEL + "=" + self.owner,
             "--network", "host", "--user", str(os.getuid()) + ":" + str(os.getgid()),
             "--mount", "type=bind,source=" + str(home) + ",target=/home/worker",
             "--mount", "type=bind,source=" + str(self.assets.public.resolve()) + ",target=/fixture,readonly",
+            *temp_mount,
             "-e", "HOME=/home/worker", "-e", "TMPDIR=/home/worker/tmp", "-e", "CURL_CA_BUNDLE=/fixture/ca.pem",
             "-e", "NODE_EXTRA_CA_CERTS=/fixture/ca.pem", self.fixture_image, "bash", "-c", "mkdir -m 700 -p /home/worker/tmp; exec sleep infinity").stdout.strip())
         return {"container": identity, "home": home, "state": home / ".local/state/aaa-muse-worker"}
