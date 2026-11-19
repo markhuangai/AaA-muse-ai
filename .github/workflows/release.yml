@@ -1,30 +1,15 @@
-name: Stable release candidate
+name: Publish stable release
 
 on:
   workflow_dispatch:
     inputs:
-      phase:
-        description: Candidate preparation or explicitly gated stable promotion
+      prerelease_tag:
+        description: Exact latest paired prerelease tag (vX.Y.Z-rc.N)
         required: true
-        type: choice
-        options: [candidate, promote]
-      version:
-        description: Exact final package version for promotion
         type: string
-      resume_run_id:
-        description: Original run holding the frozen bundle (otherwise discovered)
-        type: string
-      manifest_sha256:
-        description: Required candidate manifest digest for promotion
-        type: string
-      qualification_asset_id:
-        description: Owner-approved safe qualification receipt asset on the selected final version
-        type: string
-      qualification_sha256:
-        description: Required qualification receipt digest for promotion
-        type: string
-      confirmation:
-        description: 'Promotion only: promote X.Y.Z MANIFEST_SHA256 QUALIFICATION_SHA256'
+      stable_version:
+        description: Stable version to publish (X.Y.Z)
+        required: true
         type: string
 
 permissions:
@@ -46,6 +31,7 @@ jobs:
       version: ${{ steps.resolve.outputs.version }}
       prepared: ${{ steps.resolve.outputs.prepared }}
       resume_run_id: ${{ steps.resolve.outputs.resume_run_id }}
+      candidate_ready: ${{ steps.resolve.outputs.candidate_ready }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -54,44 +40,27 @@ jobs:
       - uses: actions/github-script@v9
         id: resolve
         env:
-          REQUESTED_VERSION: ${{ inputs.version }}
-          REQUESTED_PHASE: ${{ inputs.phase }}
-          RESUME_RUN_ID: ${{ inputs.resume_run_id }}
+          PRERELEASE_TAG: ${{ inputs.prerelease_tag }}
+          STABLE_VERSION: ${{ inputs.stable_version }}
           NODE_AUTH_TOKEN: ${{ github.token }}
         with:
           script: |
-            const { prepareCandidate, verifyReleaseDispatch } = await import(`${process.env.GITHUB_WORKSPACE}/.github/scripts/release-control.mjs`);
+            const { prepareStableRelease } = await import(`${process.env.GITHUB_WORKSPACE}/.github/scripts/release-control.mjs`);
             const { reportReleaseFailure } = await import(`${process.env.GITHUB_WORKSPACE}/.github/scripts/worker-release.mjs`);
-            const { need } = await import(`${process.env.GITHUB_WORKSPACE}/.github/scripts/release-manifest.mjs`);
-            const { isFinalVersion } = await import(`${process.env.GITHUB_WORKSPACE}/.github/scripts/release-versions.mjs`);
-            const started = Date.now();
             try {
-              if (process.env.REQUESTED_PHASE === 'candidate') {
-                const prepared = await prepareCandidate({ github, context, requestedVersion: process.env.REQUESTED_VERSION,
-                  resumeRunID: process.env.RESUME_RUN_ID, token: process.env.NODE_AUTH_TOKEN });
-                core.setOutput('source_sha', prepared.source_sha);
-                core.setOutput('version', prepared.version);
-                core.setOutput('prepared', JSON.stringify(prepared));
-                core.setOutput('resume_run_id', prepared.resume_run_id ?? '');
-              } else {
-                await verifyReleaseDispatch({ github, context });
-                need(process.env.REQUESTED_PHASE === 'promote' && !process.env.RESUME_RUN_ID && isFinalVersion(process.env.REQUESTED_VERSION),
-                  'product_release_promotion_version_required');
-              }
-            } catch (error) {
-              reportReleaseFailure(core, error, {
-                operation_id: 'release-' + context.runId + '-' + (context.runAttempt ?? 1), run_id: context.runId, attempt: context.runAttempt ?? 1,
-                operation: 'dispatch_verification', destination: 'source_repository', expected_version: '0.1.x final version',
-                observed_version: isFinalVersion(process.env.REQUESTED_VERSION) ? process.env.REQUESTED_VERSION : 'invalid_or_omitted',
-                completed_destinations: [], missing_destinations: ['dispatch_verification'], duration_ms: Date.now() - started,
-                raw_output_omitted: true, omission_reason: 'credential_protection'
-              });
-            }
+              const prepared = await prepareStableRelease({ github, context, prereleaseTag: process.env.PRERELEASE_TAG,
+                version: process.env.STABLE_VERSION, token: process.env.NODE_AUTH_TOKEN });
+              core.setOutput('source_sha', prepared.source_sha);
+              core.setOutput('version', prepared.version);
+              core.setOutput('prepared', JSON.stringify(prepared));
+              core.setOutput('resume_run_id', prepared.resume_run_id ?? '');
+              core.setOutput('candidate_ready', String(prepared.candidate_ready));
+            } catch (error) { reportReleaseFailure(core, error); }
 
   build:
     name: Build final candidate ${{ needs.resolve.outputs.version }} from ${{ needs.resolve.outputs.source_sha }}
     needs: resolve
-    if: inputs.phase == 'candidate' && needs.resolve.outputs.resume_run_id == ''
+    if: needs.resolve.outputs.candidate_ready == 'false' && needs.resolve.outputs.resume_run_id == ''
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -154,9 +123,11 @@ jobs:
 
   publish:
     needs: [resolve, build]
-    if: always() && inputs.phase == 'candidate' && needs.resolve.result == 'success' && (needs.build.result == 'success' || needs.build.result == 'skipped')
+    if: ${{ !cancelled() && needs.resolve.result == 'success' && needs.resolve.outputs.candidate_ready == 'false' && (needs.build.result == 'success' || (needs.build.result == 'skipped' && needs.resolve.outputs.resume_run_id != '')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    outputs:
+      manifest_sha256: ${{ steps.publish.outputs.manifest_sha256 }}
     permissions:
       actions: read
       contents: write
@@ -194,6 +165,7 @@ jobs:
               const receipt = await publishCandidate({ github, context, prepared, directory: process.env.BUNDLE_DIR, token: process.env.NODE_AUTH_TOKEN });
               mkdirSync('.artifacts/ci/release', { recursive: true });
               writeFileSync('.artifacts/ci/release/candidate.json', JSON.stringify(receipt));
+            core.setOutput('manifest_sha256', receipt.manifest_sha256);
             } catch (error) { reportReleaseFailure(core, error); }
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -218,8 +190,8 @@ jobs:
           printf '%s\n' '{"level":"INFO","event":"product.release.runner_cleanup","outcome":"removed_or_absent","remote_artifacts_retained":true}'
 
   promote:
-    needs: resolve
-    if: inputs.phase == 'promote'
+    needs: [resolve, publish]
+    if: ${{ !cancelled() && needs.resolve.result == 'success' && (needs.publish.result == 'success' || (needs.publish.result == 'skipped' && needs.resolve.outputs.candidate_ready == 'true')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -236,21 +208,21 @@ jobs:
         with:
           node-version: 24.22.2
           registry-url: https://npm.pkg.github.com
-      - name: Verify human gate and promote existing digests without building
+      - name: Publish stable from the verified final-version pair
         uses: actions/github-script@v9
         env:
-          PRODUCT_VERSION: ${{ inputs.version }}
-          MANIFEST_SHA256: ${{ inputs.manifest_sha256 }}
-          QUALIFICATION_ASSET_ID: ${{ inputs.qualification_asset_id }}
-          QUALIFICATION_SHA256: ${{ inputs.qualification_sha256 }}
-          CONFIRMATION: ${{ inputs.confirmation }}
+          PREPARED_RELEASE: ${{ needs.resolve.outputs.prepared }}
+          MANIFEST_SHA256: ${{ needs.publish.outputs.manifest_sha256 || fromJSON(needs.resolve.outputs.prepared).manifest_sha256 }}
           NODE_AUTH_TOKEN: ${{ github.token }}
         with:
           script: |
-            const { promoteRelease } = await import(`${process.env.GITHUB_WORKSPACE}/.github/scripts/release-promote.mjs`);
+            const { promoteStable } = await import(`${process.env.GITHUB_WORKSPACE}/.github/scripts/release-promote.mjs`);
             const { reportReleaseFailure } = await import(`${process.env.GITHUB_WORKSPACE}/.github/scripts/worker-release.mjs`);
             try {
-              await promoteRelease({ github, context, version: process.env.PRODUCT_VERSION, manifestSHA256: process.env.MANIFEST_SHA256,
-                qualificationAssetID: process.env.QUALIFICATION_ASSET_ID, qualificationSHA256: process.env.QUALIFICATION_SHA256,
-                confirmation: process.env.CONFIRMATION, token: process.env.NODE_AUTH_TOKEN });
+              const prepared = JSON.parse(process.env.PREPARED_RELEASE);
+              await promoteStable({ github, context, prepared, manifestSHA256: process.env.MANIFEST_SHA256,
+                token: process.env.NODE_AUTH_TOKEN });
             } catch (error) { reportReleaseFailure(core, error); }
+      - name: Remove the runner's registry authentication
+        if: always()
+        run: docker logout ghcr.io >/dev/null

@@ -201,5 +201,6 @@ export async function releaseFixture(t, { source = 'a'.repeat(40), tree = 'e'.re
     populate(record());
   };
   return { directory, source, tree, version, archive, worker, manifest, bundle, configDigest, imageDigest, state, context, prepared,
-    github, release, fetcher, execute, publishNpm, seed, addRC, record, token: 'secret-sentinel' };
+    prereleaseTag: source_rc.tag, manifestSHA256: hash(jsonBytes(manifest)), github, release, fetcher, execute,
+    publishNpm, seed, addRC, record, token: 'secret-sentinel' };
 }

@@ -2,9 +2,9 @@ import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { publishRelease, ReleaseFailure } from './worker-release.mjs';
-import { latestCompleteRC, listReleases, requireCurrentRC, verifyReleaseDispatch } from './release-control.mjs';
+import { latestCompleteRC, listReleases, releaseOperation, requireCurrentRC, verifyReleaseDispatch } from './release-control.mjs';
 import { completionMarker, hasCompletionMarker, latestStableRelease, readProductRelease } from './release-history.mjs';
-import { candidateNpmTag, isFinalVersion, releaseVersion } from './release-versions.mjs';
+import { candidateNpmTag, compareVersions, isFinalVersion } from './release-versions.mjs';
 import { verifyBundle } from './release-bundle.mjs';
 import { registryImage, ensureAsset, npmVersion } from './release-io.mjs';
 import { imageName, imageTags, makeManifest, jsonBytes, hash, need, sameDigest } from './release-manifest.mjs';
@@ -18,8 +18,8 @@ export async function publishCandidate({ github, context, prepared, directory, t
   const runProcess = (...args) => { failureChannel = 'process'; const result = execute(...args); failureChannel = 'http'; return result; };
   const complete = value => { if (!completed.includes(value)) completed.push(value); const index = missing.indexOf(value); if (index >= 0) missing.splice(index, 1); };
   let operation = 'frozen_bundle_verification', destination = 'bundle';
-  const fields = () => ({ operation_id: `release-${context.runId}-${context.runAttempt ?? 1}`, run_id: context.runId,
-    attempt: context.runAttempt ?? 1, source_sha: prepared.source_sha, tree_sha: prepared.tree_sha, version: prepared.version, source_rc: prepared.source_rc,
+  const fields = () => ({ ...releaseOperation(context),
+    source_sha: prepared.source_sha, tree_sha: prepared.tree_sha, version: prepared.version, source_rc: prepared.source_rc,
     operation, destination, completed_destinations: [...completed], missing_destinations: [...missing], duration_ms: Date.now() - started });
   const verifySource = async () => {
     const { object } = (await github.rest.git.getRef({ ...context.repo, ref: 'tags/' + prepared.source_rc.tag })).data;
@@ -111,11 +111,9 @@ export async function publishCandidate({ github, context, prepared, directory, t
     complete('completion_marker');
     operation = 'candidate_alias_publication'; destination = 'npm_candidate';
     const old = (await npmVersion(prepared.version, npmOptions)).tags.candidate;
-    if (old !== prepared.version) {
-      await verifyCandidateAlias(await listReleases({ github, context }), prepared.version, old, fetcher);
-      tagNpm('candidate');
-    }
-    need((await npmVersion(prepared.version, npmOptions)).tags.candidate === prepared.version, 'product_release_candidate_distribution_missing');
+    const desired = await verifyCandidateAlias(await listReleases({ github, context }), prepared.version, old, fetcher);
+    if (old !== desired) tagNpm('candidate');
+    need((await npmVersion(prepared.version, npmOptions)).tags.candidate === desired, 'product_release_candidate_distribution_missing');
     complete('npm_candidate');
     logEvent(null, 'info', 'product.release.candidate_completed', { ...fields(), ...verified.receipt, outcome: 'complete' });
     return verified.receipt;
@@ -140,11 +138,12 @@ function verifyScopedNpmTag(observed, version) {
 }
 
 async function verifyCandidateAlias(releases, version, current, fetcher) {
-  if (current === undefined || current === version) return;
-  const previous = isFinalVersion(current) && releaseVersion(current).patch < releaseVersion(version).patch &&
+  if (current === undefined || current === version) return version;
+  const previous = isFinalVersion(current) &&
     releases.find(release => !release.draft && release.tag_name === 'v' + current && hasCompletionMarker(release));
   const fields = { expected_version: version, observed_version: isFinalVersion(current) ? current : 'unknown' };
   need(previous, 'product_release_candidate_distribution_conflict', fields);
   const { manifest } = await readProductRelease(previous, fetcher);
   need(manifest.publication_kind === 'candidate', 'product_release_candidate_distribution_conflict', fields);
+  return compareVersions(current, version) < 0 ? version : current;
 }

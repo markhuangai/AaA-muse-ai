@@ -4,8 +4,8 @@ import { execFileSync } from 'node:child_process';
 import { resolvePublication } from './image-policy.mjs';
 import { logEvent } from './ci-log.mjs';
 import { ReleaseFailure } from './release-manifest.mjs';
-import { candidateNpmTag, isFinalVersion, isRCTag, releaseVersion } from './release-versions.mjs';
-import { latestStableRelease, nextPatch } from './release-history.mjs';
+import { baseVersion, candidateNpmTag, initialVersion, isFinalVersion, isRCTag, releaseVersion } from './release-versions.mjs';
+import { latestStableRelease, nextRCBase } from './release-history.mjs';
 
 const prefix = 'refs/tags/worker-v';
 const rc = /^0\.1\.0-rc\.(0|[1-9][0-9]*)$/;
@@ -19,7 +19,7 @@ export function shippedInput(path) {
   return /^worker\/(src\/|setup\/)/.test(path) || ['worker/package.json', 'worker/tsconfig.json', 'worker/LICENSE', 'worker/README.md', 'worker/scripts/build.mjs', 'worker/scripts/package.mjs', 'package.json', 'package-lock.json', '.nvmrc'].includes(path);
 }
 
-export function chooseVersion(refs, source, paired = false, patch = 0) {
+export function chooseVersion(refs, source, paired = false, activeBase = initialVersion) {
   let next = 0;
   const existing = [];
   for (const ref of refs) {
@@ -27,14 +27,14 @@ export function chooseVersion(refs, source, paired = false, patch = 0) {
     const version = ref.ref.slice(selectedPrefix.length);
     const parsed = releaseVersion(version);
     const pairedTag = selectedPrefix === 'refs/tags/v';
-    if (!selectedPrefix || !parsed || parsed.rc === null || (!pairedTag && parsed.patch !== 0)) continue;
+    if (!selectedPrefix || !parsed || parsed.rc === null || (!pairedTag && !rc.test(version))) continue;
     requireThat(ref.object.type === 'commit' && sha.test(ref.object.sha), 'worker_release_invalid_tag');
-    requireThat(Number.isSafeInteger(parsed.patch) && Number.isSafeInteger(parsed.rc) && parsed.rc < Number.MAX_SAFE_INTEGER, 'worker_release_version_overflow');
-    if (parsed.patch === patch) next = Math.max(next, parsed.rc + 1);
+    requireThat(parsed.rc < Number.MAX_SAFE_INTEGER, 'worker_release_version_overflow');
+    if (baseVersion(parsed) === activeBase) next = Math.max(next, parsed.rc + 1);
     if (ref.object.sha === source && (!paired || pairedTag)) existing.push(version);
   }
   requireThat(existing.length <= 1, 'worker_release_ambiguous_source_tags');
-  return existing[0] ?? ('0.1.' + patch + '-rc.' + next);
+  return existing[0] ?? (activeBase + '-rc.' + next);
 }
 
 function completedRelease(release, refs) {
@@ -65,8 +65,8 @@ export async function prepareRelease({ github, context, paired = false, fetcher 
     relevant = comparison.files.some(file => shippedInput(file.filename) || (file.previous_filename && shippedInput(file.previous_filename)));
   }
   operation = 'version_selection';
-  const patch = paired ? nextPatch(await latestStableRelease(releases, fetcher)) : 0;
-  const version = chooseVersion(refs, source_sha, paired, patch);
+  const activeBase = paired ? nextRCBase(await latestStableRelease(releases, fetcher)) : initialVersion;
+  const version = chooseVersion(refs, source_sha, paired, activeBase);
   const result = { source_sha, version, tag: (paired ? 'v' : 'worker-v') + version, should_publish: paired || relevant || current, ...(paired ? { paired: true } : {}) };
   logEvent(null, 'info', 'worker.release.prepared', result);
   return result;
@@ -165,7 +165,7 @@ export async function publishRelease({ github, context, prepared, receipt, archi
   catch (error) { if (error.status !== 404) throw error; }
   if (!release) {
     at('release_creation', 'github_release');
-    release = (await github.rest.repos.createRelease({ ...context.repo, tag_name: tag, target_commitish: source_sha, name: tag, prerelease: true, draft: false, make_latest: 'false', body: prepared.paired ? 'Paired product candidate: publication incomplete until service and worker verification completes. Live Muse qualification remains a separate gate.' : 'Worker installation candidate. Muse inference and refresh recovery remain unverified; require issue #7 live qualification.' })).data;
+    release = (await github.rest.repos.createRelease({ ...context.repo, tag_name: tag, target_commitish: source_sha, name: tag, prerelease: true, draft: false, make_latest: 'false', body: prepared.paired ? 'Paired service and worker. Publication is complete once both artifacts verify. Live Muse qualification is recorded separately.' : 'Worker installation candidate. Muse inference and refresh recovery remain unverified; require issue #7 live qualification.' })).data;
   }
   requireThat(!release.draft && release.prerelease && release.tag_name === tag, 'worker_release_destination_conflict');
   const name = 'markhuangai-aaa-muse-worker-' + version + '.tgz';
@@ -203,6 +203,11 @@ export async function publishRelease({ github, context, prepared, receipt, archi
 }
 
 export function reportReleaseFailure(core, error, fields = {}) {
-  logEvent(core, 'error', 'worker.release.failed', { ...fields, ...(error instanceof ReleaseFailure ? error.fields : {}), cause: error instanceof ReleaseFailure ? error.message : 'required_api_operation_failed', http_status: Number.isInteger(error.status) ? error.status : error.fields?.http_status ?? null, request_id: error.response?.headers?.['x-github-request-id'] ?? error.fields?.request_id ?? null, outcome: 'incomplete' });
+  const details = error instanceof ReleaseFailure ? error.fields : {};
+  logEvent(core, 'error', 'worker.release.failed', { ...fields, ...details,
+    cause: error instanceof ReleaseFailure ? error.message : 'required_api_operation_failed',
+    http_status: Number.isInteger(error.status) ? error.status : details.http_status ?? null,
+    request_id: error.response?.headers?.['x-github-request-id'] ?? details.request_id ?? null,
+    outcome: details.outcome ?? fields.outcome ?? 'incomplete' });
   core.setFailed('Worker publication failed; inspect worker.release.failed evidence. Existing artifacts were preserved.');
 }
