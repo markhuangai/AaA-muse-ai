@@ -25,11 +25,35 @@ test('candidate publication uses frozen final-version bytes, then retries withou
   assert(f.release.prerelease); assert.match(f.release.body, /aaa-muse-product:verified/);
   assert(f.state.images.has('candidate-0.1.0'));
   assert.deepEqual(f.state.images.get('sha-' + f.source), rcImage);
+  assert(f.state.commands.some(([command, operation, source]) =>
+    command === 'docker' && operation === 'tag' && source === 'aaa-muse-stable:prepared'));
   assert(!f.state.commands.some(command => command.includes('build') || command.includes('pack')));
   const uploads = f.state.uploads, pushes = f.state.commands.filter(command => command.includes('push')).length;
   const second = await publish(f);
   assert.equal(second.manifest_sha256, first.manifest_sha256); assert.equal(f.state.uploads, uploads);
   assert.equal(f.state.commands.filter(command => command.includes('push')).length, pushes);
+});
+
+test('a mismatched restored image blocks candidate writes', async t => {
+  const f = await releaseFixture(t);
+  const observed = 'sha256:' + 'f'.repeat(64);
+  const execute = (command, args, options) => {
+    const result = f.execute(command, args, options);
+    if (command !== 'docker' || args[0] !== 'image' || args[1] !== 'inspect') return result;
+    const [image] = JSON.parse(result);
+    return JSON.stringify([{ ...image, Descriptor: { annotations: { 'config.digest': observed } } }]);
+  };
+  await assert.rejects(publish({ ...f, execute }), error => {
+    assert.equal(error.message, 'product_release_artifact_conflict');
+    assert.equal(error.fields.destination, 'restored_image_config');
+    assert.equal(error.fields.expected_digest, f.configDigest);
+    assert.equal(error.fields.observed_digest, observed);
+    return true;
+  });
+  assert.equal(f.state.npm, null);
+  assert.equal(f.state.uploads, 0);
+  assert(!f.state.refs.has('tags/' + f.prepared.tag));
+  assert(!f.state.images.has('candidate-0.1.0'));
 });
 
 test('partial publication retains its destination ledger and resumes only the missing identical bytes', async t => {

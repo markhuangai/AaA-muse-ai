@@ -5,7 +5,9 @@ import { imageConfigDigest } from './image-policy.mjs';
 import { inspectWorker, need, hash, jsonBytes, sameDigest, sameRC, validRCIdentity } from './release-manifest.mjs';
 import { verifyImageConfig } from './release-verify.mjs';
 
-export function freezeBundle(directory, prepared, { receiptPath = '.artifacts/worker-package/latest.json', image = 'aaa-muse-stable:prepared',
+export const preparedImageTag = 'aaa-muse-stable:prepared';
+
+export function freezeBundle(directory, prepared, { receiptPath = '.artifacts/worker-package/latest.json', image = preparedImageTag,
   read = readFileSync, write = writeFileSync, copy = copyFileSync, mkdir = mkdirSync, execute = execFileSync } = {}) {
   mkdir(directory, { recursive: true, mode: 0o700 });
   need(validRCIdentity(prepared.source_rc), 'product_release_rc_identity_invalid');
