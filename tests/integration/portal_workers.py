@@ -26,6 +26,7 @@ class PortalWorkers(Portal, History):
         offline_peer = self.peer(offline, qualify=False, headers={report_header: "!invalid"})
         offline_peer.stop()
         self.until(lambda: self.status(offline)["connection_status"] == "offline", "closed subscriber did not become offline")
+        self.offline_diagnosis(offline, offline_peer, "stream_closed")
         rejected, _ = self.diagnose(offline_peer.request_id, "worker.model_report_rejected")
         require(rejected["cause"] == "invalid_model_report_encoding" and rejected["level"] == "WARN"
                 and rejected["worker_id"] == offline["worker"]["id"]
@@ -75,15 +76,38 @@ class PortalWorkers(Portal, History):
         self.receipt("portal.worker_role_and_shell_boundaries")
 
     def worker_browser(self, phase, workers):
+        if phase == "actions":
+            reconnecting = self.named_worker("Offline timer fixture")
+            initial = self.peer(reconnecting, qualify=False)
+            initial.stop()
+            self.until(lambda: self.status(reconnecting)["connection_status"] == "offline", "timer fixture did not become offline")
+            workers = {**workers, "reconnect_id": reconnecting["worker"]["id"]}
         fixture = self.private("worker-browser-" + phase + ".json", json.dumps({"origin": self.origin_url, "browser_origin": self.browser_proxy.origin, "password": self.portal,
             "source_sha": self.args.source_sha, "container": self.main_service, "database": self.db, "owner": self.owner,
             "directory": str(self.root.resolve()), "phase": phase, "workers": workers, "pin": self.checked("/api/v1/admin/status", self.admin)[0]["build"]["worker_package"]}))
-        result = subprocess.run(["node", "tests/portal/workers.mjs", "--fixture", str(fixture)], capture_output=True, text=True, timeout=600)
-        self.private("worker-browser-" + phase + ".log", result.stdout + result.stderr)
+        peer = None
+        try:
+            with (self.root / ("worker-browser-" + phase + ".log")).open("w") as log:
+                with subprocess.Popen(["node", "tests/portal/workers.mjs", "--fixture", str(fixture)], stdout=log, stderr=subprocess.STDOUT) as process:
+                    try:
+                        if phase == "actions":
+                            signal = self.root / "worker-browser-resume-subscriber"
+                            self.until(lambda: signal.exists() or process.poll() is not None, "browser did not reach the offline timer check", timeout=300)
+                            if signal.exists():
+                                peer = self.peer(reconnecting, qualify=False)
+                                self.private("worker-browser-subscriber-ready", "")
+                        process.wait(timeout=300)
+                    finally:
+                        if process.poll() is None:
+                            process.kill()
+                            process.wait()
+        finally:
+            if peer is not None:
+                peer.stop()
         secret_path = self.root / ("worker-browser-secrets-" + phase + ".json")
         if secret_path.exists():
             self.secrets.extend(json.loads(secret_path.read_text()))
-        require(result.returncode == 0, "worker browser conformance failed; inspect private worker-browser evidence")
+        require(process.returncode == 0, "worker browser conformance failed; inspect private worker-browser evidence")
         browser = json.loads((self.root / ("worker-browser-receipt-" + phase + ".json")).read_text())
         require(browser["outcome"] == "passed" and browser["source_sha"] == self.args.source_sha, "worker browser source/result mismatch")
         for diagnostic in browser["diagnostics"]:

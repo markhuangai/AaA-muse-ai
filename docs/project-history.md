@@ -2,6 +2,12 @@
 
 These entries record decisions and evidence at the dates shown. See the release guide for the current publication and qualification rules. [Paired product releases](releases.md)
 
+## Worker drawer and offline duration
+
+The owner approved one portal pull request from `c3fb1ca5e20c6716450a49562235d3b2b6d4a2f1` to bring display-name editing to the top of the drawer, support backdrop dismissal, and show observed downtime in the Workers table. The timer starts at a recorded stream close or heartbeat deadline and clears on an accepted heartbeat. Older outages with no recorded start show a dash. The delivery requires independent plan audit, full CI, CodeQL, Codex and the configured AI review. The owner exempted CodeRabbit for this change. [Worker management](portal.md#worker-management)
+
+Controlled checks passed by `2026-11-20T22:52:02Z` with combined image `sha256:cf44fb0ea4806848b98c40653715da4d80f7c7ff7c608b11d3fffac71c9b5bf6`. The independent plan audit passed on round two. The worker portal suite passed 77 cases at 1440, 768 and 390 pixels. Inference passed 18 cases and broker recovery passed 20, including outage continuity across two brokers and a restart. Those runs used working-source digest `18dc15c60d4563fe51f9d4d9893c375df060e264b389458dc3071a4d3bda78f5`. The six coverage components and all 32 product-flow cases passed at digest `4048ad202b151117c38c175254fd0e09da505e26bbad6eb5197add5027b5c5d6`, after correcting a test assertion that counted unrelated timers. The first product flow received SIGTERM before producing its receipt. Its labeled Docker resources were verified and removed before the rerun. Chromium verified pointer and touch dismissal, local ticking, and authenticated reconnect. Protected log exports reproduced both stream-close and heartbeat-expiry durations. [Worker diagnostics](portal.md#worker-diagnostics)
+
 ## Control portal redesign
 
 The November 20 owner approval at `e0151e36c1d23d4b9548b98f3896ddc0c97bc5e3` ends the thirty-minute browser logout policy from #15. The owner chose browser-session cookies by default and remembered sign-in across browser and broker restarts when opted in. The portal defaults to the OS appearance with saved Light and Dark overrides. The worker drawer preserves the list and removes revoked workers from it. Histories retain worker identity and current registered names.

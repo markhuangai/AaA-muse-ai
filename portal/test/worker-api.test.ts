@@ -35,13 +35,16 @@ test('management calls use the real adapter, immutable IDs and accepted backend 
 test('worker boundary validation rejects malformed facts, duplicate identities and mismatched action targets', async () => {
   const qualification = { id: 'qualification', created_at: '2026-11-13T00:00:00Z', connection_id: 'connection', connection_generation: 1, capabilities: ['text'], evidence: { action: 'approve', evidence_kind: 'controlled', evidence_reference: 'Software fixture' } };
   const model_report = { model_name: 'Reported fixture', context_window_tokens: 350000, reported_at: '2026-11-18T00:00:00Z' };
-  const valid = { ...worker(), current_job: { job_id: 'job', generation: 1 }, qualification, qualification_history: [qualification], model_report };
+  const valid = { ...worker(), connection_status: 'offline', offline_for_ms: 0,
+    current_job: { job_id: 'job', generation: 1 }, qualification, qualification_history: [qualification], model_report };
   const good = new BrowserAPI((async () => json({ workers: [valid] })) as typeof fetch);
   expect((await good.workers('operation', signal())).value[0].qualification?.evidence.evidence_kind).toBe('controlled');
   expect((await good.workers('operation', signal())).value[0].model_report).toEqual(model_report);
+  expect((await good.workers('operation', signal())).value[0].offline_for_ms).toBe(0);
   for (const data of [null, {}, { workers: null }, { workers: [worker(), worker()] }, ...[
     { id: 'wrong' }, { name: 1 }, { registered_at: 'wrong' }, { revoked_at: 'wrong' }, { last_contact_at: undefined },
-    { connection_status: 1 }, { work_status: null }, { current_job: {} }, { waiting_for_client_tool: -1 }, { last_heartbeat_at: false },
+    { connection_status: 1 }, { offline_for_ms: -1 }, { offline_for_ms: 0.5 }, { offline_for_ms: null },
+    { work_status: null }, { current_job: {} }, { waiting_for_client_tool: -1 }, { last_heartbeat_at: false },
     { inference_readiness: 1 }, { qualification: {} }, { qualification_history: [{}] }, { qualification_history: null },
     { qualification: { ...qualification, connection_generation: 0.5 } }, { qualification: { ...qualification, capabilities: [1] } },
     { qualification: { ...qualification, evidence: { ...qualification.evidence, evidence_kind: 1 } } },

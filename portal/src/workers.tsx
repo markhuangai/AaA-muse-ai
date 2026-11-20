@@ -1,10 +1,21 @@
-import { useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore, type FormEvent } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore, type FormEvent, type MouseEvent } from 'react';
 import type { Worker, Qualification, EnrollmentKind } from './worker-api';
 import type { WorkersController, WorkersView } from './worker-controller';
 
 export const timestamp = (value: string | null) => value ? new Date(value).toISOString().replace('T', ' ').replace(/\.\d+Z$/, ' UTC') : 'Not observed';
 const states: Record<string, string> = { online: 'Online', offline: 'Offline', connecting: 'Connecting', not_observed: 'Not observed', idle: 'Idle', busy: 'Busy', unknown: 'Unknown', unverified: 'Not yet qualified', verified: 'Approved', withdrawn: 'Withdrawn', stale: 'Stale qualification' };
 const stateName = (value: string) => states[value] ?? value;
+
+function formatOfflineDuration(milliseconds: number) {
+  const seconds = Math.floor(milliseconds / 1000);
+  return `${Math.floor(seconds / 3600)}h ${Math.floor(seconds % 3600 / 60)}m ${seconds % 60}s`;
+}
+
+function onBackdrop(event: MouseEvent<HTMLDialogElement>) {
+  if (event.target !== event.currentTarget) return false;
+  const { left, right, top, bottom } = event.currentTarget.getBoundingClientRect();
+  return event.clientX < left || event.clientX >= right || event.clientY < top || event.clientY >= bottom;
+}
 
 function Correlation({ request, operation }: { request: string; operation: string }) {
   return <>{request && <p className="trace">Request <code>{request}</code></p>}{operation && <p className="trace">Operation <code>{operation}</code></p>}</>;
@@ -47,12 +58,21 @@ function WorkerDetail({ worker, controller, view }: { worker: Worker; controller
   }
   return <section className="worker-detail" aria-label="Worker detail">
     <div className="drawer-heading"><div><h2 id="worker-drawer-title" tabIndex={-1}>{worker.name}</h2><code className="worker-id">{worker.id}</code></div>
-      <button type="button" onClick={() => controller.select('')}>Close worker settings</button></div>
+      <button type="button" className="drawer-close" aria-label="Close" onClick={() => controller.select('')}>×</button></div>
     <div className="drawer-refresh"><button type="button" aria-disabled={refreshDisabled} onClick={() => {
       if (!refreshDisabled) void controller.refresh();
     }}>{view.loading ? 'Refreshing…' : 'Refresh workers'}</button></div>
     {view.selectedID === worker.id && <WorkerNotices view={view} />}
     <div className="worker-fact-grid">
+      <section className="data-panel"><h3>Registration and access</h3>
+        <form className="rename-form" onSubmit={rename}><label htmlFor="worker-name">Display name</label><input id="worker-name" value={name} onChange={event => setName(event.target.value)} autoComplete="off" readOnly={disabled} /><button type="submit" aria-disabled={disabled}>{view.pending === 'rename' ? 'Saving…' : 'Save name'}</button></form>
+        <p className="field-note">Names may be shared. The immutable worker ID determines identity and access.</p>
+        <dl className="identity-list">
+          <div><dt>Registered</dt><dd>{timestamp(worker.registered_at)}</dd></div>
+          <div><dt>Credential expiry</dt><dd>Valid until revoked</dd></div>
+        </dl>
+        <button className="danger-action" aria-disabled={disabled} onClick={() => { if (!disabled) setConfirming(true); }}>Revoke worker</button>
+      </section>
       <section className="data-panel"><h3>Subscriber connection</h3><dl className="identity-list">
         <div><dt>Subscriber</dt><dd>{stateName(worker.connection_status)}</dd></div>
         <div><dt>Last contact</dt><dd>{timestamp(worker.last_contact_at)}</dd></div>
@@ -76,13 +96,6 @@ function WorkerDetail({ worker, controller, view }: { worker: Worker; controller
         {worker.qualification ? <QualificationDetail qualification={worker.qualification} /> : <p>No management-approved evidence is recorded.</p>}
         <p className="field-note">Approval stays with this enrolled worker across authenticated reconnects until withdrawn or revoked. The evidence connection records the original trial. Controlled evidence does not establish live Muse qualification.</p>
         {worker.qualification_history.length > 0 && <details><summary>Qualification history ({worker.qualification_history.length})</summary><ol className="qualification-history">{worker.qualification_history.map(item => <li key={item.id}><QualificationDetail qualification={item} /></li>)}</ol></details>}
-      </section>
-      <section className="data-panel"><h3>Registration and access</h3><dl className="identity-list">
-        <div><dt>Registered</dt><dd>{timestamp(worker.registered_at)}</dd></div>
-        <div><dt>Credential expiry</dt><dd>Valid until revoked</dd></div>
-      </dl><form className="rename-form" onSubmit={rename}><label htmlFor="worker-name">Display name</label><input id="worker-name" value={name} onChange={event => setName(event.target.value)} autoComplete="off" readOnly={disabled} /><button type="submit" aria-disabled={disabled}>{view.pending === 'rename' ? 'Saving…' : 'Save name'}</button></form>
-        <p className="field-note">Names may be shared. The immutable worker ID determines identity and access.</p>
-        <button className="danger-action" aria-disabled={disabled} onClick={() => { if (!disabled) setConfirming(true); }}>Revoke worker</button>
       </section>
     </div>
     <dialog ref={dialog} aria-labelledby="revoke-title" aria-describedby="revoke-description" onCancel={event => { event.stopPropagation(); setConfirming(false); }} onClose={() => setConfirming(false)}>
@@ -121,6 +134,7 @@ export function Workers({ controller }: { controller: WorkersController }) {
   const list = useRef<HTMLHeadingElement>(null);
   const opener = useRef<HTMLButtonElement | null>(null);
   const drawer = useRef<HTMLDialogElement>(null);
+  const backdropPress = useRef<{ pointer: number; released: boolean } | null>(null);
   const lastSelection = useRef<Worker | undefined>(undefined);
   const drawerWorker = selected ?? lastSelection.current;
   useLayoutEffect(() => {
@@ -133,6 +147,7 @@ export function Workers({ controller }: { controller: WorkersController }) {
         dialog.querySelector<HTMLElement>('#worker-drawer-title')?.focus({ preventScroll: true });
       }
     } else if (dialog.open) {
+      backdropPress.current = null;
       for (const confirmation of dialog.querySelectorAll<HTMLDialogElement>('dialog[open]')) confirmation.close();
       dialog.close();
       const target = opener.current?.isConnected ? opener.current : list.current;
@@ -146,19 +161,38 @@ export function Workers({ controller }: { controller: WorkersController }) {
     <section className="worker-list" aria-label="Registered workers" aria-busy={view.loading}>
       <p className="scope-note">Subscriber health, broker activity and inference qualification are independent observations. Hidden Muse activity is not observable here.</p>
       {view.workers === null ? <p className="empty-state">{view.loading ? 'Loading registered workers…' : 'Worker information is unavailable. Use Refresh workers to retry.'}</p> : view.workers.length === 0 ? <p className="empty-state">No workers have access. Use enrollment to add a worker.</p> :
-        <table className="workers-table"><thead><tr><th scope="col">Worker identity</th><th scope="col">Subscriber</th><th scope="col">Broker activity</th><th scope="col">Qualification</th></tr></thead><tbody>{view.workers.map(worker => <tr key={worker.id}>
+        <table className="workers-table"><thead><tr><th scope="col">Worker identity</th><th scope="col">Subscriber</th><th scope="col">Offline for</th><th scope="col">Broker activity</th><th scope="col">Qualification</th></tr></thead><tbody>{view.workers.map(worker => <tr key={worker.id}>
           <td><button className="worker-name" aria-haspopup="dialog" aria-disabled={!!view.pending} onClick={event => {
             if (view.pending) return;
             opener.current = event.currentTarget; controller.select(worker.id);
           }}>{worker.name}</button><code className="worker-id">{worker.id}</code></td>
           <td><span className={`status ${worker.connection_status === 'online' ? 'healthy' : ''}`}>{stateName(worker.connection_status)}</span><span className="row-note">Contact {timestamp(worker.last_contact_at)}</span></td>
+          <td className="offline-duration">
+            <span className="offline-label" aria-hidden="true">Offline for</span>
+            <span className="num">{worker.connection_status === 'online' || worker.offline_for_ms === undefined ? '-' :
+              formatOfflineDuration(worker.offline_for_ms + (view.stale ? 0 : Math.max(0, view.offlineClock - worker.receivedAt)))}</span>
+          </td>
           <td>{stateName(worker.work_status)}<span className="row-note">{worker.waiting_for_client_tool} client-tool waits</span></td><td>{stateName(worker.inference_readiness)}<span className="row-note">{worker.qualification?.evidence.evidence_kind === 'controlled' ? 'Controlled evidence' : worker.qualification?.evidence.evidence_kind === 'live' ? 'Live trial evidence' : 'No evidence reported'}</span></td>
         </tr>)}</tbody></table>}
     </section>
     <EnrollmentPanel controller={controller} view={view} />
-    <dialog ref={drawer} className="worker-drawer" aria-labelledby="worker-drawer-title" onCancel={event => {
-      event.preventDefault(); controller.select('');
-    }}>
+    <dialog ref={drawer} className="worker-drawer" aria-labelledby="worker-drawer-title"
+      onCancel={event => { event.preventDefault(); controller.select(''); }}
+      onPointerDown={event => {
+        if (event.isPrimary) backdropPress.current = event.button === 0 && onBackdrop(event) ? { pointer: event.pointerId, released: false } : null;
+      }}
+      onPointerUp={event => {
+        const press = backdropPress.current;
+        if (press?.pointer === event.pointerId) press.released = onBackdrop(event);
+      }}
+      onPointerCancel={event => {
+        if (backdropPress.current?.pointer === event.pointerId) backdropPress.current = null;
+      }}
+      onClick={event => {
+        const press = backdropPress.current;
+        backdropPress.current = null;
+        if (press?.released && onBackdrop(event)) controller.select('');
+      }}>
       {drawerWorker && <WorkerDetail key={drawerWorker.id} worker={drawerWorker} view={view} controller={controller} />}
     </dialog>
   </main>;

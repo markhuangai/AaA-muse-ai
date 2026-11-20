@@ -3,8 +3,11 @@ import type { System } from './controller';
 import type { Reports } from './reports';
 import type { Enrollment, EnrollmentKind, Worker } from './worker-api';
 
+type ObservedWorker = Worker & { receivedAt: number };
+
 export interface WorkersView {
-  workers: Worker[] | null;
+  workers: ObservedWorker[] | null;
+  offlineClock: number;
   selectedID: string;
   loading: boolean;
   stale: boolean;
@@ -21,7 +24,7 @@ export interface WorkersView {
   enrollmentMessage: string;
 }
 
-const initial = (): WorkersView => ({ workers: null, selectedID: '', loading: false, stale: true, lastGood: null,
+const initial = (): WorkersView => ({ workers: null, offlineClock: 0, selectedID: '', loading: false, stale: true, lastGood: null,
   message: '', requestID: '', operationID: '', pending: '', actionMessage: '', actionRequestID: '', actionOperationID: '',
   enrollment: null, enrollmentKind: 'prompt', enrollmentMessage: '' });
 
@@ -43,13 +46,31 @@ export class WorkersController {
   #freshness = () => {};
   #expiry = () => {};
   #visibility = () => {};
+  #offlineTick: (() => void) | undefined;
   constructor(private api: API, private system: System, private reports: Reports, private authorized: () => boolean,
     private denied: (requestID: string, operationID: string) => void, private clipboard: (text: string) => Promise<void> = browserCopy) {}
 
   snapshot = () => this.#view;
   subscribe = (listener: () => void) => { this.#listeners.add(listener); return () => { this.#listeners.delete(listener); }; };
-  private change(patch: Partial<WorkersView>) { this.#view = { ...this.#view, ...patch }; for (const listener of this.#listeners) listener(); }
+  private change(patch: Partial<WorkersView>) {
+    this.#view = { ...this.#view, ...patch };
+    this.syncOfflineClock();
+    for (const listener of this.#listeners) listener();
+  }
   private available() { return this.#active && this.authorized(); }
+
+  private syncOfflineClock() {
+    if (this.#view.stale || !this.system.visible() ||
+      !this.#view.workers?.some(worker => worker.connection_status !== 'online' && worker.offline_for_ms !== undefined)) {
+      this.#offlineTick?.();
+      this.#offlineTick = undefined;
+    } else if (!this.#offlineTick) {
+      this.#offlineTick = this.system.schedule(() => {
+        this.#offlineTick = undefined;
+        this.change({ offlineClock: this.system.monotonicNow() });
+      }, 1000);
+    }
+  }
 
   reset() {
     this.#unconfirmedRevoke = '';
@@ -66,6 +87,7 @@ export class WorkersController {
     this.#active = true;
     this.#visibility = this.system.watchVisibility(() => {
       this.expireEnrollment();
+      this.syncOfflineClock();
       if (this.system.visible()) void this.refresh();
     });
     this.poll();
@@ -112,10 +134,11 @@ export class WorkersController {
       if (generation !== this.#generation || !this.available()) return;
       if (sequence !== this.#sequence) { this.report('obsolete_response', operation, result.requestID, sequence, this.system.now() - started); return; }
       this.#accepted = sequence;
-      const workers = result.value.filter(worker => !worker.revoked_at);
+      const receivedAt = this.system.monotonicNow();
+      const workers = result.value.filter(worker => !worker.revoked_at).map(worker => ({ ...worker, receivedAt }));
       const reconciled = result.value.find(worker => worker.id === this.#unconfirmedRevoke);
       this.#unconfirmedRevoke = '';
-      this.change({ workers, selectedID: workers.some(worker => worker.id === this.#view.selectedID) ? this.#view.selectedID : '',
+      this.change({ workers, offlineClock: receivedAt, selectedID: workers.some(worker => worker.id === this.#view.selectedID) ? this.#view.selectedID : '',
         stale: false, lastGood: this.system.now(), message: '', requestID: result.requestID,
         ...(reconciled ? { actionMessage: reconciled.revoked_at ? 'The refreshed list shows that worker access is revoked.' : 'The refreshed list shows that the worker still has access.',
           actionRequestID: result.requestID, actionOperationID: operation } : {}) });
@@ -150,8 +173,9 @@ export class WorkersController {
       if (generation !== this.#generation || !this.available()) return;
       if (kind === 'revoke' && !result.value.revoked_at) throw new APIError('invalid_response', 200, result.requestID);
       this.#accepted = sequence;
-      const workers = this.#view.workers!.map(worker => worker.id === id ? result.value : worker).filter(worker => !worker.revoked_at);
-      this.change({ workers, selectedID: result.value.revoked_at && this.#view.selectedID === id ? '' : this.#view.selectedID, actionRequestID: result.requestID,
+      const receivedAt = this.system.monotonicNow();
+      const workers = this.#view.workers!.map(worker => worker.id === id ? { ...result.value, receivedAt } : worker).filter(worker => !worker.revoked_at);
+      this.change({ workers, offlineClock: receivedAt, selectedID: result.value.revoked_at && this.#view.selectedID === id ? '' : this.#view.selectedID, actionRequestID: result.requestID,
         actionMessage: kind === 'rename' ? 'Display name saved. The accepted name is shown above.' : 'The server confirmed revocation. History is retained; remote activity may remain unknown.' });
     } catch (error) {
       if (generation !== this.#generation || !this.available()) return;

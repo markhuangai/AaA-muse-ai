@@ -61,7 +61,7 @@ try {
         await expect(page.getByRole('heading', { name, exact: true })).toBeVisible();
         passed('portal.rename.' + worker.slot, { request_id: result.request_id, worker_id: worker.worker_id, name });
       }
-      if (fixture.phase !== 'revoke') await page.getByRole('button', { name: 'Close worker settings', exact: true }).click();
+      if (fixture.phase !== 'revoke') await page.getByRole('button', { name: 'Close', exact: true }).click();
     }
     if (fixture.phase === 'inspect') {
       await page.getByRole('link', { name: 'Requests', exact: true }).click();

@@ -20,6 +20,7 @@ export interface Worker {
   revoked_at: string | null;
   last_contact_at: string | null;
   connection_status: string;
+  offline_for_ms?: number;
   work_status: string;
   current_job: { job_id: string; generation: number } | null;
   waiting_for_client_tool: number;
@@ -63,7 +64,8 @@ function modelReport(value: unknown): value is ModelReport {
 export function isWorker(value: unknown): value is Worker {
   return object(value) && typeof value.id === 'string' && /^[a-f0-9]{32}$/.test(value.id) && typeof value.name === 'string' &&
     date(value.registered_at) && optionalDate(value.revoked_at) && optionalDate(value.last_contact_at) &&
-    typeof value.connection_status === 'string' && typeof value.work_status === 'string' &&
+    typeof value.connection_status === 'string' && (value.offline_for_ms === undefined || integer(value.offline_for_ms)) &&
+    typeof value.work_status === 'string' &&
     (value.current_job === null || (object(value.current_job) && typeof value.current_job.job_id === 'string' && integer(value.current_job.generation))) &&
     integer(value.waiting_for_client_tool) && optionalDate(value.last_heartbeat_at) && typeof value.inference_readiness === 'string' &&
     (value.qualification == null || qualification(value.qualification)) &&

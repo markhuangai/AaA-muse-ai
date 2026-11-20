@@ -1,5 +1,6 @@
 import { afterEach, expect, test, vi } from 'vitest';
-import { act, cleanup, fireEvent, render, screen } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react';
+import { APIError } from '../src/api';
 import { App } from '../src/app';
 import { PortalController } from '../src/controller';
 import { Workers, timestamp } from '../src/workers';
@@ -100,4 +101,54 @@ test('closing a worker drawer during rename returns focus to the row before and 
   await act(async () => { rename.resolve({ value: worker(undefined, 'Updated worker'), requestID: 'reply' }); await settle(); });
   expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Updated worker' }));
   portal.dispose();
+});
+
+test('offline values age from each accepted row and freeze at the broker sample when stale', async () => {
+  const { portal, controller, api, system } = await fixture();
+  const first = { ...worker(), connection_status: 'offline', offline_for_ms: 0 };
+  const second = { ...worker('b'.repeat(32), 'Second worker'), connection_status: 'connecting', offline_for_ms: 90_123_000 };
+  const legacy = { ...worker('c'.repeat(32), 'Older worker'), connection_status: 'offline' };
+  api.workersWork = async () => ({ value: [first, second, legacy], requestID: 'offline-snapshot' });
+  await controller.refresh();
+  render(<Workers controller={controller} />);
+  function value(name: string) {
+    const row = screen.getByRole('button', { name }).closest('tr')!;
+    return within(row).getAllByRole('cell')[2].querySelector('.num')?.textContent;
+  }
+  expect(value(first.name)).toBe('0h 0m 0s');
+  expect(value(second.name)).toBe('25h 2m 3s');
+  expect(value(legacy.name)).toBe('-');
+  const calls = api.workersCalls;
+  await act(async () => { await system.advance(2_000); });
+  expect(value(first.name)).toBe('0h 0m 2s');
+  expect(value(second.name)).toBe('25h 2m 5s');
+  expect(api.workersCalls).toBe(calls);
+
+  const outdated = deferred<{ value: typeof first[]; requestID: string }>();
+  api.workersWork = () => outdated.promise;
+  let read!: Promise<void>;
+  act(() => { read = controller.refresh(); });
+  const renamed = { ...first, name: 'First renamed', offline_for_ms: 3723000 };
+  api.renameWork = async () => ({ value: renamed, requestID: 'renamed-during-outage' });
+  await act(async () => { await controller.mutate('rename', first.id, renamed.name); });
+  await act(async () => { outdated.resolve({ value: [first], requestID: 'obsolete-outage' }); await read; });
+  expect(value(renamed.name)).toBe('1h 2m 3s');
+  expect(value(second.name)).toBe('25h 2m 5s');
+
+  const scheduledWhileVisible = system.timers.size;
+  await act(async () => { await system.visibility(false); });
+  expect(system.timers.size).toBe(scheduledWhileVisible - 1);
+  await act(async () => { await system.advance(2000); });
+  expect(value(renamed.name)).toBe('1h 2m 3s');
+  api.workersWork = async () => { throw new APIError('service_unavailable', 503, 'outage'); };
+  await act(async () => { await system.visibility(true); await system.advance(2000); });
+  expect(value(renamed.name)).toBe('1h 2m 3s');
+  expect(value(second.name)).toBe('25h 2m 3s');
+
+  api.workersWork = async () => ({ value: [{ ...renamed, connection_status: 'online', offline_for_ms: undefined }, second, legacy], requestID: 'reconnected' });
+  await act(async () => { await controller.refresh(); await system.advance(1000); });
+  expect(value(renamed.name)).toBe('-');
+  expect(value(second.name)).toBe('25h 2m 4s');
+  portal.dispose();
+  expect(system.timers.size).toBe(0);
 });

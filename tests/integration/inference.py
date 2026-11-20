@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
 import http.client
 import json
 import os
@@ -141,6 +142,40 @@ class Inference(WorkerAuth):
 
     def status(self, worker):
         return self.checked("/api/v1/worker/status", worker["credential"])[0]
+
+    def worker_projection(self, worker, origin=None):
+        workers, headers = self.checked("/api/v1/admin/workers", self.admin, origin=origin)
+        return next(item for item in workers["workers"] if item["id"] == worker["worker"]["id"]), headers
+
+    def offline_diagnosis(self, worker, peer, reason):
+        projected, headers = self.worker_projection(worker)
+        require("offline_for_ms" not in self.status(worker), "worker status exposed the management duration")
+        event, _ = self.diagnose(headers["X-Request-Id"], "request.exchange")
+        events = self.export_operation(peer.opened["connection_id"])
+        self.assert_private(json.dumps(events))
+        transition, = [e for e in events if e["msg"] == "worker.connection_changed" and e.get("reason") == reason]
+        stdout = self.logs(self.main_service)
+        self.assert_private(stdout)
+        require(transition["level"] == "INFO" and transition["transaction_outcome"] == "committed"
+                and transition["worker_id"] == worker["worker"]["id"]
+                and transition["connection_id"] == peer.opened["connection_id"]
+                and transition["connection_generation"] == peer.opened["connection_generation"], "offline diagnosis lost its connection or committed outcome")
+        require(any(e.get("connection_id") == transition["connection_id"] and e.get("reason") == reason and e.get("msg") == "worker.connection_changed"
+                    for e in map(json.loads, stdout.splitlines())), "offline transition is missing at INFO")
+        require('"msg":"request.exchange"' not in stdout, "protected DEBUG exchanges escaped INFO filtering")
+        exchange = json.loads(event["response"])
+        from_log = next(item for item in exchange["workers"] if item["id"] == transition["worker_id"])
+        require(from_log == projected and from_log["connection_status"] == "offline" and event["level"] == "DEBUG", "captured list did not reproduce the offline projection")
+        start = datetime.fromisoformat(transition["offline_since"])
+        observed = datetime.fromisoformat(transition["observed_at"])
+        expected = (datetime.fromisoformat(transition["last_heartbeat_at"] or transition["opened_at"]) + timedelta(seconds=30)
+                    if reason == "health_reply_expired" else observed)
+        sample = start + timedelta(milliseconds=from_log["offline_for_ms"])
+        require(start == expected and start <= observed and observed - timedelta(milliseconds=1) <= sample <= datetime.fromisoformat(event["time"]),
+                "effective outage boundary or logged elapsed value is incorrect")
+        self.receipt("worker.offline_log_only_diagnosis", worker_id=transition["worker_id"], connection_generation=transition["connection_generation"],
+                     reason=reason, offline_since=transition["offline_since"], request_id=headers["X-Request-Id"], capture_complete=True,
+                     corrective_action="Restore the worker subscriber and wait for an accepted heartbeat.", business_table_queries=False)
 
     def create(self, worker, marker, tools=True, timeout=300, messages=None, submission=None, want=201):
         request = {"protocol_version": 1, "submission_id": submission or secrets.token_hex(12), "worker_id": worker["worker"]["id"], "messages": messages or [{"type": "message", "role": "system", "text": "Keep exact client tool linkage."}, {"type": "message", "role": "user", "text": marker}], "tools": [{"name": "read_file", "parameters": {"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object", "$defs": {"path": {"type": "string"}}, "properties": {"path": {"$ref": "#/$defs/path"}, "scale": {"type": "number", "maximum": 1e20}}, "required": ["path"], "additionalProperties": False}}] if tools else [], "timeout_seconds": timeout}
@@ -387,8 +422,7 @@ class Inference(WorkerAuth):
         peer = self.peer(worker, reply=False)
         self.until(lambda: self.status(worker)["connection_status"] == "offline", "missing health replies did not mark offline", timeout=35)
         self.create(worker, "offline", want=409)
-        events = self.export_operation(peer.opened["connection_id"])
-        require(any(e["msg"] == "worker.connection_changed" and e.get("reason") == "health_reply_expired" for e in events), "health timeout diagnosis missing")
+        self.offline_diagnosis(worker, peer, "health_reply_expired")
         peer.stop()
         self.receipt("inference.health_timeout", interval_seconds=10, response_window_seconds=30)
 
