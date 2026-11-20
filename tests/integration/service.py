@@ -516,6 +516,9 @@ def main():
     harness = Harness(args)
     try:
         harness.baseline()
+        if args.suite == "image":
+            from compose_smoke import smoke_compose
+            smoke_compose(harness)
         harness.setup()
         service, origin, _ = harness.functional()
         harness.generated_key()

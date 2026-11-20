@@ -166,7 +166,7 @@ class Portal(WorkerAuth):
                     for item in map(json.loads, self.logs(self.main_service).splitlines())), "write failure absent at INFO runtime level")
         require(self.api("/v1/models", failure_key)[0] == 401, "failed save enabled the client")
         self.receipt("portal.log_only_config_write_failure", request_id=headers["X-Request-Id"], cause=event["cause"],
-                     corrective_action="Mount the configuration directory writable by service UID 10001.")
+                     corrective_action="Mount the configuration directory writable by the service UID.")
 
         directory = self.root.resolve() / "shared-config"
         directory.mkdir(mode=0o700)
@@ -235,10 +235,14 @@ def main():
         h.docker("run", "--rm", "--entrypoint", "/bin/sh", args.image, "-ec",
                  '. /etc/os-release; test "$ID" = alpine; test -s /usr/share/aaa-muse-ai/portal/index.html; test -s /usr/share/aaa-muse-ai/licenses/geist-OFL.txt; test -s /usr/share/aaa-muse-ai/licenses/geist-mono-OFL.txt; test ! -e /usr/bin/node')
         h.setup()
-        with socket.socket() as probe:
-            probe.bind(("127.0.0.1", 0))
-            port = probe.getsockname()[1]
-        h.main_service, h.origin_url, _ = h.launch(port_binding=f"127.0.0.1:{port}:8080")
+        if os.environ.get("MUSE_TEST_DIRECT_NETWORK") == "true":
+            h.main_service, h.origin_url, _ = h.launch()
+        else:
+            # The browser reuses the published URL after restarting this container.
+            with socket.socket() as probe:
+                probe.bind(("127.0.0.1", 0))
+                port = probe.getsockname()[1]
+            h.main_service, h.origin_url, _ = h.launch(port_binding=f"127.0.0.1:{port}:8080")
         h.ready(h.main_service, h.origin_url)
         sibling, sibling_origin, _ = h.launch()
         h.ready(sibling, sibling_origin)

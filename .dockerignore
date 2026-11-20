@@ -3,6 +3,10 @@
 .artifacts
 node_modules
 config.yaml
+config.yml
+config/
+sqlite/
+media/
 .env
 **/node_modules
 **/*_test.go

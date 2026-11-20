@@ -66,7 +66,7 @@ test-responses: image
 	python3 -B tests/integration/responses.py --image $(SERVICE_IMAGE) --source-sha $(SOURCE_SHA) --source-dirty $(SOURCE_DIRTY)
 
 smoke-image: image
-	python3 tests/integration/service.py --image $(SERVICE_IMAGE) --suite image --source-sha $(SOURCE_SHA) --source-dirty $(SOURCE_DIRTY)
+	python3 -B tests/integration/service.py --image $(SERVICE_IMAGE) --suite image --source-sha $(SOURCE_SHA) --source-dirty $(SOURCE_DIRTY)
 
 test-portal-shell: image
 	npm run check --workspace portal
