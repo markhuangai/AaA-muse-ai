@@ -156,16 +156,16 @@ digest. Align product majors by upgrading the service or installing its paired
 worker; installing an arbitrary globally latest worker can remain incompatible.
 
 Before changing the installation, inspect current work and retained journals.
-An offline subscriber does not prove native inference stopped. Wait for a known
-idle state; preserve any unresolved work, accepted receipt and worker credential.
-Stop only the identified subscriber using the supported Muse shell controls.
-Run the existing verified installer with the retained state and identity; do not
-delete state, re-enroll, or add another hook. The installer refuses to replace a
-different running version. Terminal-stop markers require diagnosis; never
-remove one simply to restart a revoked or uncertain installation.
+Wait for a known idle state. Preserve unresolved work, accepted receipts and the
+worker credential. Retain the verified IDs and settings of the installation's
+watchdog and hook. Suspend them before stopping the identified subscriber with
+the supported Muse shell controls. Run the verified installer with the retained
+state and identity. A different running version and terminal-stop evidence each
+require operator diagnosis.
 
-Verify the installed CLI version, archive provenance, protected modes, one hook
-and one subscriber. Retain the enrolled worker's approved capability across
-authenticated reconnects; initial approval still requires independent proof.
-This is an operator procedure, not
-an automatic repair command or inference retry.
+Verify the installed CLI version, archive provenance and protected modes.
+Restore and read back the same hook and watchdog. With owner approval, update
+the identified legacy job in place to use the new receipt's `watchdog-check`
+command and exact hook ID and path. Verify one subscriber and its current
+authenticated heartbeat. Retain the worker's approved capability across
+authenticated reconnects. Initial approval still requires independent proof.

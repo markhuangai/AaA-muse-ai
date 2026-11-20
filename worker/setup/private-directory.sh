@@ -4,6 +4,7 @@ set -euo pipefail
 umask 077
 
 target=$1
+kind=${2:-private}
 observed=unavailable
 refuse() {
   printf '%s %s\n' "$1" "$observed"
@@ -28,7 +29,11 @@ physical=$(realpath -m -- "$target") || refuse directory_stat_failed
 lexical=$(realpath -ms -- "$target") || refuse directory_stat_failed
 [[ "$physical" == "$lexical" ]] || refuse directory_path_link
 if [[ -z "$named_identity" ]]; then
-  mkdir -p -m 00700 -- "$target" || refuse directory_creation_failed
+  if [[ "$kind" == shared ]]; then
+    mkdir -p -- "$target" || refuse directory_creation_failed
+  else
+    mkdir -p -m 00700 -- "$target" || refuse directory_creation_failed
+  fi
   inspect "$target"
   named_identity=$identity
 fi
@@ -43,6 +48,16 @@ verify_binding() {
 inspect .
 [[ "$identity" == "$named_identity" ]] || refuse directory_identity_changed
 verify_binding
+if [[ "$kind" == shared ]]; then
+  probe=$(mktemp -d .aaa-muse-preflight.XXXXXXXX) || refuse directory_probe_failed
+  result=0
+  (cd -P -- "$probe" && printf x > before && mv -T -- before after) || result=1
+  rm -f -- "$probe/before" "$probe/after" || refuse directory_probe_cleanup_failed
+  rmdir -- "$probe" || refuse directory_probe_cleanup_failed
+  verify_binding
+  [[ "$result" == 0 ]] || refuse directory_probe_failed
+  exit 0
+fi
 [[ "$uid" == "$EUID" ]] || refuse wrong_directory_owner
 case "$mode" in
   700) ;;

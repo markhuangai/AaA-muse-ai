@@ -14,16 +14,25 @@ async function setupFixture(t) {
   const f = await fixture(t);
   const emitted = [];
   let launches = 0;
+  const pids = new Map();
+  const systemAlive = f.state.sys.alive;
+  f.state.sys.alive = pid => pids.has(pid) ? pids.get(pid) : systemAlive(pid);
   const io = { ...setupIO(f.state.root), async launch(state) {
-    launches++;
+    const pid = 2_000_000_000 + ++launches;
+    pids.set(pid, true);
     const lock = await state.child('daemon.lock');
-    await lock.write('owner.json', encode({ pid: state.sys.pid, owner: 'unit-owned' }));
-    return state.sys.pid;
+    await lock.write('owner.json', encode({ pid, owner: 'unit-owned' }));
+    return pid;
   }, async emit(runtime, action, message) { emitted.push({ runtime, action, message }); return JSON.stringify({ action, message }) + '\n'; } };
   const setup = new Setup(f.worker, io, VERSION);
   const install = (input = CODE) => setup.install('https://broker.example.test', input, join(f.state.root, 'installed'), SETUP,
     encode({ level: 'INFO', msg: 'setup.archive_verified', setup_id: SETUP, execution_started: false }));
-  const stop = async () => { const lock = await f.state.child('daemon.lock'); await lock.remove('owner.json'); await f.state.io.rmdir(lock.root); };
+  const stop = async () => {
+    const lock = await f.state.child('daemon.lock');
+    for (const pid of pids.keys()) pids.set(pid, false);
+    await lock.remove('owner.json');
+    await f.state.io.rmdir(lock.root);
+  };
   return { ...f, setup, io, install, emitted, stop, launches: () => launches };
 }
 
@@ -54,6 +63,8 @@ test('setup preserves identity, protects executable assets, and owns one subscri
   const first = await f.install();
   const key = await f.state.read('credential.key');
   assert.equal(first.worker_id, ID); assert.equal(first.inference_readiness, 'unverified');
+  assert.deepEqual(first.watchdog, { id: 'aaa-muse-worker-watchdog', interval_seconds: 300, timeout_seconds: 300,
+    command: `'${first.launcher}' watchdog-check --state-dir '${f.state.root}'`, registration: 'unverified' });
   for (const path of [first.hook_path, first.launcher]) assert.equal((await fs.stat(path)).mode & 0o777, 0o700);
   assert.equal((await fs.stat(first.skill_path)).mode & 0o777, 0o600);
   assert(!(await fs.readFile(first.skill_path, 'utf8')).includes(KEY));
@@ -113,6 +124,7 @@ test('recovery refuses ambiguous locks, terminal outcomes, unsafe state and unob
   await f.state.write('launch.json', encode({ pid: 1 }));
   await assert.rejects(f.setup.ensureRunning(), /subscriber_owner_ambiguous/);
   await f.stop();
+  await f.state.remove('launch.json');
   await f.state.write('run-stop.json', encode({ cause: 'unauthorized' }));
   await assert.rejects(f.setup.ensureRunning(), /subscriber_terminal_stop/);
   await f.state.remove('run-stop.json');
@@ -125,6 +137,18 @@ test('recovery refuses ambiguous locks, terminal outcomes, unsafe state and unob
   await assert.rejects(f.setup.install('https://broker.example.test', CODE, 'relative', SETUP), /absolute_install_paths_required/);
   await fs.chmod(f.state.path('installation.json'), 0o644);
   await assert.rejects(f.setup.ensureRunning(), /state_unsafe/);
+});
+
+test('preflight checks an existing asset target before reusing enrollment', async t => {
+  const f = await setupFixture(t);
+  const installed = await f.install();
+  const target = installed.skill_path;
+  await fs.chmod(target, 0o644);
+  const before = f.broker.calls.length;
+  await assert.rejects(f.install(), error => error.code === 'state_unsafe' && error.fields.stage === 'pre_enrollment' && error.fields.capability === 'skill_directory');
+  assert.equal(f.broker.calls.length, before);
+  assert.equal((await fs.stat(target)).mode & 0o777, 0o644);
+  await fs.chmod(target, 0o600);
 });
 
 test('setup CLI shares actual setup state and background failures retain a terminal marker', async t => {
