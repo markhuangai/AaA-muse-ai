@@ -26,6 +26,7 @@ export class TestSystem implements System {
   signOutListeners = new Set<Parameters<System['watchSignOut']>[0]>();
   signOutAnnouncements: string[] = [];
   now = () => this.time;
+  monotonicNow = () => this.time;
   id = () => `operation-${++this.sequence}`;
   visible = () => this.showing;
   schedule = (callback: () => void, delay: number) => {

@@ -137,6 +137,15 @@ func finish(s *inference.State, e *inference.Experiment, state, reason string, e
 	*events = append(*events, inferenceEvent{"experiment.outcome", slog.LevelInfo, []any{"operation_id", e.ID, "experiment_id", e.ID, "conversation_id", e.ConversationID, "worker_id", e.WorkerID, "state", e.State, "reason", reason, "remote_outcome", e.RemoteOutcome}})
 }
 
+func markOffline(s *inference.State, events *[]inferenceEvent, reason string, since *time.Time) {
+	s.Connection.Connected = false
+	if s.Connection.OfflineSince == nil {
+		s.Connection.OfflineSince = since
+	}
+	event(events, slog.LevelInfo, "worker.connection_changed", s, nil, "connection_status", "offline", "reason", reason,
+		"offline_since", s.Connection.OfflineSince, "observed_at", s.Now, "opened_at", s.Connection.OpenedAt, "last_heartbeat_at", s.Connection.LastAckAt)
+}
+
 func expire(s *inference.State, events *[]inferenceEvent) {
 	if s.Pool != nil {
 		for _, w := range s.Pool {
@@ -150,12 +159,12 @@ func expire(s *inference.State, events *[]inferenceEvent) {
 		return
 	}
 	if s.Connection.Connected && (s.Revoked || s.Connection.Status(s.Now) == "offline") {
-		s.Connection.Connected = false
-		reason := "health_reply_expired"
 		if s.Revoked {
-			reason = "worker_revoked"
+			markOffline(s, events, "worker_revoked", nil)
+		} else {
+			deadline := s.Connection.HealthDeadline()
+			markOffline(s, events, "health_reply_expired", &deadline)
 		}
-		event(events, slog.LevelInfo, "worker.connection_changed", s, nil, "connection_status", "offline", "reason", reason, "last_heartbeat_at", s.Connection.LastAckAt)
 	}
 	for _, e := range s.Experiments {
 		if !e.Terminal() && !s.Now.Before(e.DeadlineAt) {
@@ -394,7 +403,14 @@ func (b *Broker) Projection(ctx context.Context, logger *slog.Logger, id string,
 		ref.Principal = "worker:" + id
 	}
 	var p inference.Projection
-	_, err := b.run(ctx, logger, ref, "projection", nil, func(s *inference.State, _ *[]inferenceEvent) (any, error) { p = project(s); return p, nil })
+	_, err := b.run(ctx, logger, ref, "projection", nil, func(s *inference.State, _ *[]inferenceEvent) (any, error) {
+		p = project(s)
+		if since := s.Connection.OfflineSince; !workerAuth && !s.Revoked && since != nil {
+			elapsed := max(0, s.Now.Sub(*since).Milliseconds())
+			p.OfflineForMS = &elapsed
+		}
+		return p, nil
+	})
 	return p, err
 }
 
@@ -468,11 +484,14 @@ func (b *Broker) OpenSubscriber(ctx context.Context, logger *slog.Logger, worker
 		if err != nil {
 			return nil, err
 		}
-		s.Connection = inference.Connection{ID: id, Generation: s.Connection.Generation + 1, AssignmentGeneration: s.Connection.AssignmentGeneration, Connected: true, OpenedAt: s.Now, ModelReport: report, MediaJobs: mediaJobs}
+		s.Connection = inference.Connection{
+			ID: id, Generation: s.Connection.Generation + 1, AssignmentGeneration: s.Connection.AssignmentGeneration,
+			Connected: true, OpenedAt: s.Now, OfflineSince: s.Connection.OfflineSince, ModelReport: report, MediaJobs: mediaJobs,
+		}
 		if err = b.challenge(s, events); err != nil {
 			return nil, err
 		}
-		event(events, slog.LevelInfo, "worker.connection_changed", s, nil, "connection_status", "connecting")
+		event(events, slog.LevelInfo, "worker.connection_changed", s, nil, "connection_status", "connecting", "offline_since", s.Connection.OfflineSince)
 		return s.Connection, nil
 	})
 }
@@ -480,8 +499,8 @@ func (b *Broker) OpenSubscriber(ctx context.Context, logger *slog.Logger, worker
 func (b *Broker) Disconnect(ctx context.Context, logger *slog.Logger, workerID, id string, generation int64) error {
 	_, err := b.run(ctx, logger, inference.Ref{WorkerID: workerID}, "disconnect", nil, func(s *inference.State, events *[]inferenceEvent) (any, error) {
 		if s.Connection.ID == id && s.Connection.Generation == generation && s.Connection.Connected {
-			s.Connection.Connected = false
-			event(events, slog.LevelInfo, "worker.connection_changed", s, nil, "connection_status", "offline", "reason", "stream_closed")
+			closedAt := s.Now
+			markOffline(s, events, "stream_closed", &closedAt)
 			expire(s, events)
 		}
 		return project(s), nil
@@ -563,15 +582,18 @@ func (b *Broker) Heartbeat(ctx context.Context, logger *slog.Logger, workerID st
 				event(events, slog.LevelInfo, "worker.idle_confirmed", s, j, "idle_ack", h.IdleAck, "remote_outcome", "worker_reported_finished_or_stopped")
 			}
 			previous := s.Connection.Status(s.Now)
+			offlineSince := s.Connection.OfflineSince
 			s.Connection.Challenges[i].ReplyHash = hash
 			s.Connection.LastAckAt = &s.Now
+			s.Connection.OfflineSince = nil
 			if j := heldJob(s); j != nil && j.State == "claimed" {
 				until := minTime(s.Now.Add(inference.HealthWindow), j.DeadlineAt)
 				j.LeaseExpiresAt = &until
 			}
 			event(events, slog.LevelDebug, "worker.health_reply", s, nil, "challenge_id", h.ChallengeID, "round_trip_ms", s.Now.Sub(c.IssuedAt).Milliseconds(), "projection", project(s))
 			if previous != "online" {
-				event(events, slog.LevelInfo, "worker.connection_changed", s, nil, "connection_status", "online", "previous_status", previous)
+				event(events, slog.LevelInfo, "worker.connection_changed", s, nil, "connection_status", "online", "previous_status", previous,
+					"previous_offline_since", offlineSince, "last_heartbeat_at", s.Connection.LastAckAt)
 			}
 			return project(s), nil
 		}

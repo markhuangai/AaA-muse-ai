@@ -211,6 +211,79 @@ func requireInferenceReason(t *testing.T, err error, reason string) {
 	}
 }
 
+func TestWorkerOfflineDuration(t *testing.T) {
+	b, m, log, _ := inferenceFixture()
+	ctx := t.Context()
+	const id = "worker-a"
+	check := func(status string, elapsed *int64) {
+		t.Helper()
+		p, err := b.Projection(ctx, log, id, false)
+		if err != nil || p.ConnectionStatus != status || !equalDuration(p.OfflineForMS, elapsed) {
+			t.Fatalf("expected %s (elapsed %v), got %+v, %v", status, elapsed, p, err)
+		}
+	}
+	check("not_observed", nil)
+	raw, err := b.Open(ctx, log, id, nil)
+	first := decodeResult[inference.Connection](t, raw, err)
+	check("connecting", nil)
+	m.now = first.OpenedAt.Add(inference.HealthWindow - time.Microsecond)
+	check("connecting", nil)
+	m.now = m.now.Add(time.Microsecond)
+	zero := int64(0)
+	check("offline", &zero)
+	want := int64(2400)
+	m.now = m.now.Add(time.Duration(want) * time.Millisecond)
+	check("offline", &want)
+	raw, err = b.Open(ctx, log, id, nil)
+	second := decodeResult[inference.Connection](t, raw, err)
+	check("connecting", &want)
+	if err = b.Disconnect(ctx, log, id, first.ID, first.Generation); err != nil {
+		t.Fatal(err)
+	}
+	check("connecting", &want)
+	if err = b.Disconnect(ctx, log, id, second.ID, second.Generation); err != nil {
+		t.Fatal(err)
+	}
+	check("offline", &want)
+	third := connectInference(t, b, m, log, id)
+	check("online", nil)
+	m.now = third.OpenedAt.Add(inference.HealthWindow + 3700*time.Millisecond)
+	want = 3700
+	// The close is observed late. Expiry still starts at the health deadline.
+	if err = b.Disconnect(ctx, log, id, third.ID, third.Generation); err != nil {
+		t.Fatal(err)
+	}
+	check("offline", &want)
+	own, err := b.Projection(ctx, log, id, true)
+	if err != nil || own.OfflineForMS != nil || own.ConnectionStatus != "offline" {
+		t.Fatalf("worker status exposed management duration: %+v, %v", own, err)
+	}
+	fourth := connectInference(t, b, m, log, id)
+	m.now = m.now.Add(7 * time.Second)
+	heartbeatInference(t, b, log, fourth, id, nil)
+	m.now = m.now.Add(11 * time.Second)
+	heartbeatInference(t, b, log, fourth, id, nil)
+	m.now = m.now.Add(inference.HealthWindow - time.Microsecond)
+	check("online", nil)
+	m.now = m.now.Add(time.Microsecond)
+	check("offline", &zero)
+	// A persisted pre-change record has no time for an earlier explicit close.
+	m.states[id].Connection.OfflineSince = nil
+	check("offline", nil)
+	fifth := connectInference(t, b, m, log, id)
+	if err = b.Disconnect(ctx, log, id, fifth.ID, fifth.Generation); err != nil {
+		t.Fatal(err)
+	}
+	check("offline", &zero)
+}
+
+func equalDuration(actual, expected *int64) bool {
+	if actual == nil || expected == nil {
+		return actual == expected
+	}
+	return *actual == *expected
+}
+
 func TestInterleavedToolLoopDeltaAndReceipts(t *testing.T) {
 	b, m, log, out := inferenceFixture()
 	ctx := context.Background()

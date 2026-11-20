@@ -32,6 +32,29 @@ class Recovery(Routing):
         self.until(lambda: self.status(worker)["connection_status"] == "offline", "old health lease did not expire", timeout=40)
         return self.peer(worker, qualify=qualify)
 
+    def offline_duration_across_brokers(self):
+        worker = self.new_worker()
+        peer = self.peer(worker, qualify=False)
+        peer.stop()
+        self.until(lambda: self.status(worker)["connection_status"] == "offline", "closed peer did not become offline")
+        before = self.worker_projection(worker)[0]["offline_for_ms"]
+        sibling, origin, _ = self.launch(self.configuration())
+        self.ready(sibling, origin)
+        try:
+            self.restart_broker()
+            after = self.worker_projection(worker)[0]
+            other = self.worker_projection(worker, origin=origin)[0]
+            require(after["connection_status"] == other["connection_status"] == "offline"
+                    and other["offline_for_ms"] >= after["offline_for_ms"] >= before, "offline duration was reset across brokers or restart")
+            current = self.peer(worker, qualify=False)
+            recovered, _ = self.worker_projection(worker, origin=origin)
+            require(current.opened["connection_generation"] > peer.opened["connection_generation"]
+                    and recovered["connection_status"] == "online" and "offline_for_ms" not in recovered, "sibling did not observe the end of the outage")
+            current.stop()
+        finally:
+            self.docker("stop", "--time", "5", sibling)
+        self.receipt("recovery.offline_duration_across_brokers", restart_preserved=True, sibling_observed_reconnect=True)
+
     def restored(self, request, boundary=None):
         events = self.filtered_events("operation_id", request["id"])
         matches = [e for e in events if e["msg"] == "recovery.restored"]
@@ -298,6 +321,7 @@ def main():
         h.origins = [h.origin_url]
         h.ready(h.main_service, h.origin_url)
         h.live_sibling()
+        h.offline_duration_across_brokers()
         h.queue_and_uncertain_crash()
         h.lost_decision_ack()
         h.tool_wait_and_settled_pin()

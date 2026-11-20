@@ -7,6 +7,7 @@ type SignOutNotice = 'started' | 'confirmed';
 
 export interface System {
   now(): number;
+  monotonicNow(): number;
   id(): string;
   schedule: Schedule;
   visible(): boolean;
@@ -16,7 +17,7 @@ export interface System {
 }
 const sessionChannel = 'muse-portal-session';
 export const browserSystem: System = {
-  now: () => Date.now(), id: () => crypto.randomUUID?.() ?? randomHex(16), schedule,
+  now: () => Date.now(), monotonicNow: () => performance.now(), id: () => crypto.randomUUID?.() ?? randomHex(16), schedule,
   visible: () => document.visibilityState !== 'hidden',
   watchVisibility: callback => { document.addEventListener('visibilitychange', callback); return () => document.removeEventListener('visibilitychange', callback); },
   watchSignOut: callback => {

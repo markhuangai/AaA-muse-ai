@@ -1,5 +1,5 @@
 import { chromium, expect } from '@playwright/test';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { inspectTaste } from './taste.mjs';
@@ -94,9 +94,62 @@ async function emptyViews() {
   }
 }
 
+async function verifyDrawerDismissal(page, opener, width, scroll) {
+  const drawer = page.locator('.worker-drawer');
+  const name = drawer.getByLabel('Display name', { exact: true });
+  const close = drawer.getByRole('button', { name: 'Close', exact: true });
+  await expect(drawer.locator('.data-panel').first().getByRole('heading')).toHaveText('Registration and access');
+  await expect(name).toBeInViewport();
+  await expect(drawer.getByRole('button', { name: 'Save name', exact: true })).toBeInViewport();
+  await expect.poll(() => drawer.evaluate(element => Math.abs(new DOMMatrix(getComputedStyle(element).transform).m41))).toBeLessThan(1);
+  const drawerBox = await drawer.boundingBox();
+  expect(drawerBox.x).toBeGreaterThanOrEqual(44);
+  if (width === 390) expect(drawerBox.x + drawerBox.width).toBeCloseTo(width, 0);
+  const rowBox = await opener.boundingBox();
+  const x = rowBox.x + 3;
+  const y = rowBox.y + rowBox.height / 2;
+  expect(x).toBeLessThan(drawerBox.x);
+
+  await page.mouse.click(drawerBox.x + 6, y);
+  await page.mouse.move(drawerBox.x + 6, y);
+  await page.mouse.down();
+  await page.mouse.move(x, y);
+  await page.mouse.up();
+  await expect(drawer).toBeVisible();
+  await page.mouse.move(x, y);
+  await page.mouse.down();
+  await page.mouse.move(drawerBox.x + 6, y);
+  await page.mouse.up();
+  await expect(drawer).toBeVisible();
+  await drawer.getByRole('button', { name: 'Revoke worker', exact: true }).click();
+  const confirm = page.getByRole('dialog', { name: 'Revoke this worker?' });
+  await expect(confirm).toBeVisible();
+  await page.mouse.click(x, y);
+  await expect(confirm).toBeVisible();
+  await page.keyboard.press('Escape');
+  await expect(confirm).not.toBeVisible();
+  await expect(drawer).toBeVisible();
+  await opener.evaluate(element => element.addEventListener('click', () => { element.dataset.backgroundClicked = 'yes'; }, { once: true }));
+  if (width === 390) await page.touchscreen.tap(x, y);
+  else await page.mouse.click(x, y);
+  await expect(drawer).not.toBeVisible();
+  await expect(opener).toBeFocused();
+  expect(await opener.getAttribute('data-background-clicked')).toBeNull();
+  expect(await page.evaluate(() => scrollY)).toBe(scroll);
+  const id = await opener.locator('..').locator('.worker-id').textContent();
+  await openWorker(page, id);
+  await close.click();
+  await expect(drawer).not.toBeVisible();
+  await expect(opener).toBeFocused();
+  expect(await page.evaluate(() => scrollY)).toBe(scroll);
+  passed('portal.worker_drawer_dismissal', { width, rename_in_viewport: true, close: true, backdrop: true, drag_ignored: true,
+    nested_confirmation: true, focus_restored: true, scroll_preserved: true, touch: width === 390 });
+}
+
 async function viewports() {
   for (const width of [1440, 768, 390]) {
-    const context = await browser.newContext({ ignoreHTTPSErrors: true, viewport: { width, height: width === 390 ? 844 : 900 }, serviceWorkers: 'block', permissions: ['clipboard-read', 'clipboard-write'] }); const page = await context.newPage();
+    const context = await browser.newContext({ ignoreHTTPSErrors: true, viewport: { width, height: width === 390 ? 844 : 900 }, hasTouch: width === 390,
+      serviceWorkers: 'block', permissions: ['clipboard-read', 'clipboard-write'] }); const page = await context.newPage();
     const origins = new Set(); const telemetry = []; page.on('request', request => {
       origins.add(new URL(request.url()).origin);
       if (new URL(request.url()).pathname === '/api/v1/portal/events') telemetry.push(request.postData() || '');
@@ -104,6 +157,8 @@ async function viewports() {
     const session = await login(page);
     const row = id => page.locator('tbody tr').filter({ hasText: id });
     await expect(row(fixture.workers.offline_id)).toContainText('Offline');
+    await expect(row(fixture.workers.offline_id).locator('.offline-duration .num')).toHaveText(/^\d+h \d+m \d+s$/);
+    if (width === 390) await expect(row(fixture.workers.offline_id).locator('.offline-label')).toBeVisible();
     expect(await page.evaluate(() => window.__unsafe === undefined && document.querySelector('tbody img') === null)).toBe(true);
     await expect(row(fixture.workers.transport_id)).toContainText('Online');
     await expect(row(fixture.workers.transport_id)).toContainText('Not yet qualified');
@@ -116,12 +171,6 @@ async function viewports() {
     const listScroll = await page.evaluate(() => scrollY);
     expect(listScroll).toBeGreaterThan(0);
     await openWorker(page, fixture.workers.transport_id);
-    if (width === 390) {
-      await expect.poll(() => page.locator('.worker-drawer').evaluate(element => {
-        const { left, right } = element.getBoundingClientRect();
-        return Math.abs(left) < 1 && Math.abs(right - innerWidth) < 1;
-      })).toBe(true);
-    }
     await expect(page.getByRole('heading', { name: 'Reported by Muse during setup' })).toBeVisible();
     await expect(page.getByText('Controlled Muse', { exact: true })).toBeVisible();
     await expect(page.getByText('350,000 tokens', { exact: true })).toBeVisible();
@@ -129,6 +178,8 @@ async function viewports() {
     await page.keyboard.press('Escape');
     await expect(row(fixture.workers.transport_id).getByRole('button')).toBeFocused();
     expect(await page.evaluate(() => scrollY)).toBe(listScroll);
+    await openWorker(page, fixture.workers.transport_id);
+    await verifyDrawerDismissal(page, row(fixture.workers.transport_id).getByRole('button'), width, listScroll);
     await openWorker(page, fixture.workers.busy_id);
     await expect(page.getByText(fixture.workers.busy_job_id, { exact: true })).toBeVisible();
     await expect(page.getByText('Controlled software evidence').first()).toBeVisible();
@@ -150,14 +201,14 @@ async function viewports() {
     await expect(page.getByText(/Name not accepted/)).toBeVisible(); await expect(page.getByText(invalid.response.headers()['x-request-id'], { exact: true })).toBeVisible();
     await expect(page.getByRole('button', { name: 'Save name' })).toBeFocused();
     const drawer = page.locator('.worker-drawer');
-    await expect.poll(() => drawer.evaluate(element => element.scrollTop)).toBeGreaterThan(0);
+    await expect(page.getByLabel('Display name', { exact: true })).toBeInViewport();
     await drawer.evaluate(element => { element.scrollTop = 0; });
     await screenshot(page, 'detail', width);
     await page.emulateMedia({ colorScheme: 'dark', reducedMotion: 'reduce' });
     expect(await drawer.evaluate(element => getComputedStyle(element).transitionDuration)).toBe('0s');
     await screenshot(page, 'detail-dark', width);
     await page.emulateMedia({ colorScheme: 'light', reducedMotion: 'no-preference' });
-    await page.getByRole('button', { name: 'Close worker settings', exact: true }).click(); await expect(row(fixture.workers.busy_id)).toContainText(acceptedName);
+    await page.getByRole('button', { name: 'Close', exact: true }).click(); await expect(row(fixture.workers.busy_id)).toContainText(acceptedName);
     const generated = await action(page, '/api/v1/admin/setup-prompts', () => page.getByRole('button', { name: 'Generate setup prompt' }).click(), 201);
     const code = generated.data.setup_prompt.match(/muse_enroll_[A-Za-z0-9_-]{43}/)?.[0]; expect(!!code).toBe(true); remember(code);
     const text = page.getByLabel('Complete setup prompt', { exact: true });
@@ -209,6 +260,42 @@ async function viewports() {
   }
 }
 
+async function offlineDuration() {
+  const contexts = [];
+  const views = [];
+  try {
+    for (const width of [1440, 768, 390]) {
+      const context = await browser.newContext({ ignoreHTTPSErrors: true, serviceWorkers: 'block', viewport: { width, height: 844 } });
+      contexts.push(context);
+      const page = await context.newPage();
+      await page.clock.install({ time: new Date('2026-11-20T00:00:00Z') });
+      await page.clock.pauseAt(new Date('2026-11-20T00:10:00Z'));
+      let reads = 0;
+      page.on('request', request => { if (new URL(request.url()).pathname === '/api/v1/admin/workers') reads++; });
+      await login(page);
+      const row = page.locator('tbody tr').filter({ hasText: fixture.workers.reconnect_id });
+      const cell = row.locator('.offline-duration .num');
+      await expect(cell).toHaveText(/^\d+h \d+m \d+s$/);
+      const initial = await cell.textContent();
+      const before = reads;
+      await page.clock.runFor(2_100);
+      await expect(cell).not.toHaveText(initial);
+      expect(reads).toBe(before);
+      views.push({ page, row, cell, width });
+    }
+    save('worker-browser-resume-subscriber', {});
+    await expect.poll(() => existsSync(join(fixture.directory, 'worker-browser-subscriber-ready')), { timeout: 25_000 }).toBe(true);
+    for (const { page, row, cell, width } of views) {
+      await page.locator('.page-heading').getByRole('button', { name: 'Refresh workers', exact: true }).click();
+      await expect(row.getByText('Online', { exact: true })).toBeVisible();
+      await expect(cell).toHaveText('-');
+      passed('portal.worker_offline_timer', { width, seconds_advance_locally: true, no_extra_requests: true, authenticated_reconnect: true });
+    }
+  } finally {
+    await Promise.all(contexts.map(context => context.close()));
+  }
+}
+
 async function orderingAndUncertainty(width) {
   const context = await browser.newContext({ ignoreHTTPSErrors: true, viewport: { width, height: 900 }, serviceWorkers: 'block' }); const page = await context.newPage();
   const session = await login(page); await openWorker(page, fixture.workers.busy_id);
@@ -233,7 +320,7 @@ async function orderingAndUncertainty(width) {
   expect(actual.data.workers.find(worker => worker.id === fixture.workers.busy_id).current_job.job_id).toBe(fixture.workers.busy_job_id);
   if (width === 1440) await screenshot(page, 'error', width);
   passed('portal.worker_ordering_and_uncertainty', { width, obsolete_response_discarded: true, committed_response_loss_reconciled: true, automatic_mutation_retry: false });
-  await page.getByRole('button', { name: 'Close worker settings' }).click();
+  await page.getByRole('button', { name: 'Close', exact: true }).click();
   await page.getByLabel('Enrollment format').selectOption('code');
   const registration = await action(page, '/api/v1/admin/enrollments', () => page.getByRole('button', { name: 'Generate enrollment code' }).click(), 201);
   remember(registration.data.enrollment_code);
@@ -374,6 +461,7 @@ try {
   browser = await chromium.launch({ headless: true });
   if (fixture.phase === 'empty') await emptyViews();
   else {
+    await offlineDuration();
     await viewports();
     for (const width of [1440, 768, 390]) await orderingAndUncertainty(width);
     await independentRevocation();

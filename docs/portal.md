@@ -43,7 +43,9 @@ Duplicate names and credentials return HTTP 409. When the save outcome is uncert
 
 ## Worker management
 
-Selecting a worker opens a right-hand drawer and keeps the list in place. Close it with **Close worker settings** or Escape. The list uses the existing `GET /api/v1/admin/workers` projection and selects by immutable worker ID. Names may be shared. Renaming uses `PATCH /api/v1/admin/workers/{id}` and displays the accepted name or safe validation error.
+Selecting a worker opens a right-hand drawer and keeps the list in place. Edit the display name in the first card, **Registration and access**. Dismiss the drawer with the **×** button, Escape, or a click or tap on the backdrop. The list uses `GET /api/v1/admin/workers` and selects by immutable worker ID. Names may be shared. Renaming uses `PATCH /api/v1/admin/workers/{id}` and displays the accepted name or validation error.
+
+**Offline for** shows elapsed time such as `1h 2m 3s` from the broker’s observed stream close or heartbeat deadline. It keeps counting during a reconnect attempt. The first accepted heartbeat clears the timer. The table shows a dash for an online worker or an outage without a recorded start. Between refreshes, the browser advances the broker’s sample locally. A stale snapshot shows the last reported value. The management worker responses carry the optional `offline_for_ms` field in whole milliseconds.
 
 **Reported by Muse during setup** shows the reported model name, total context window, and original report time from the optional `model_report` field. Reconnecting can resend the same report with its original time. Each unavailable value is shown as such. This report describes the setup turn, and the broker applies its existing request limits and readiness policy.
 
@@ -80,6 +82,8 @@ Collect complete protected exports using each displayed portal operation ID and 
 `portal.worker_action` INFO records authenticated portal enrollment/setup, rename and revocation requests with action/resource IDs, portal session, backend request/operation IDs, actual HTTP status, timing and HTTP completion outcome. Existing domain events retain transaction outcomes; HTTP completion alone does not mean a mutation committed. `portal.worker_state_stale` WARN is an authenticated client report with request/accepted sequences, generation, last-good time, safe cause and related backend request ID where a response was received. The endpoint does not accept client assertions of successful actions. Enrollment text/codes and arbitrary exceptions are excluded from browser telemetry.
 
 Collect the protected export by the operation ID and associated request IDs shown in the UI. Use the decoder and completeness checks below to join client ordering evidence with server request exchanges, worker rejections and storage causes. Invalid names require correcting the submitted name; an unreadable SQLite database requires restoring the database and refreshing; obsolete responses require retaining the newer accepted state. Unconfirmed mutations require reading the actual state before another deliberate action. These conclusions require no business-table queries or process attachment.
+
+For an unexpected offline duration, find the worker’s INFO `worker.connection_changed` events and use the connection ID as the export’s `operation_id`. The recorded `offline_since`, observation time, reason and generation distinguish a closed stream from a missed heartbeat observed after its deadline. Export the worker-list request by its `request_id` and compare the protected DEBUG `request.exchange` sample for the same worker ID. A new accepted heartbeat clears the outage. For a stale snapshot, use `portal.worker_state_stale` and the related failed read to identify the problem before refreshing.
 
 ## Diagnostics
 

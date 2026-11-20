@@ -187,28 +187,34 @@ type Connection struct {
 	Connected            bool         `json:"connected"`
 	OpenedAt             time.Time    `json:"opened_at"`
 	LastAckAt            *time.Time   `json:"last_ack_at"`
+	OfflineSince         *time.Time   `json:"offline_since,omitempty"`
 	Challenges           []Challenge  `json:"challenges"`
 	ModelReport          *ModelReport `json:"model_report,omitempty"`
+}
+
+func (c Connection) HealthDeadline() time.Time {
+	if c.LastAckAt != nil {
+		return c.LastAckAt.Add(HealthWindow)
+	}
+	return c.OpenedAt.Add(HealthWindow)
 }
 
 func (c Connection) Status(now time.Time) string {
 	if c.ID == "" {
 		return "not_observed"
 	}
-	if !c.Connected {
+	if !c.Connected || !now.Before(c.HealthDeadline()) {
 		return "offline"
 	}
-	if c.LastAckAt != nil && now.Before(c.LastAckAt.Add(HealthWindow)) {
-		return "online"
-	}
-	if c.LastAckAt == nil && now.Before(c.OpenedAt.Add(HealthWindow)) {
+	if c.LastAckAt == nil {
 		return "connecting"
 	}
-	return "offline"
+	return "online"
 }
 
 type Projection struct {
 	ConnectionStatus     string          `json:"connection_status"`
+	OfflineForMS         *int64          `json:"offline_for_ms,omitempty"`
 	WorkStatus           string          `json:"work_status"`
 	CurrentJob           *Assignment     `json:"current_job"`
 	WaitingForTool       int             `json:"waiting_for_client_tool"`
