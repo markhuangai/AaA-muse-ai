@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import socket
 import subprocess
 import time
 
@@ -234,7 +235,14 @@ def main():
         h.docker("run", "--rm", "--entrypoint", "/bin/sh", args.image, "-ec",
                  '. /etc/os-release; test "$ID" = alpine; test -s /usr/share/aaa-muse-ai/portal/index.html; test -s /usr/share/aaa-muse-ai/licenses/geist-OFL.txt; test -s /usr/share/aaa-muse-ai/licenses/geist-mono-OFL.txt; test ! -e /usr/bin/node')
         h.setup()
-        h.main_service, h.origin_url, _ = h.launch()
+        if os.environ.get("MUSE_TEST_DIRECT_NETWORK") == "true":
+            h.main_service, h.origin_url, _ = h.launch()
+        else:
+            # The browser reuses the published URL after restarting this container.
+            with socket.socket() as probe:
+                probe.bind(("127.0.0.1", 0))
+                port = probe.getsockname()[1]
+            h.main_service, h.origin_url, _ = h.launch(port_binding=f"127.0.0.1:{port}:8080")
         h.ready(h.main_service, h.origin_url)
         sibling, sibling_origin, _ = h.launch()
         h.ready(sibling, sibling_origin)
