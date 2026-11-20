@@ -124,7 +124,8 @@ export class Setup {
       await bin.write('aaa-muse-worker', '#!/usr/bin/env bash\nset -euo pipefail\nexec ' + quote(this.io.node) + ' ' + quote(this.io.entry) + ' "$@"\n', 0o700);
       const hooks = new State(join(this.io.home, 'hooks', 'scripts', 'aaa-muse-worker-' + id), this.state.io, this.state.sys);
       const skill = new State(join(this.io.home, 'workspace', 'skills', 'aaa-muse-worker-' + id), this.state.io, this.state.sys);
-      await hooks.ensure(); await skill.ensure();
+      await this.io.prepareDirectory(hooks.root, 'hook_directory', id);
+      await this.io.prepareDirectory(skill.root, 'skill_directory', id);
       const hook = (await this.io.asset('hook.sh')).replaceAll('@LAUNCHER@', quote(launcher)).replaceAll('@STATE@', quote(this.state.root));
       const instructions = (await this.io.asset('SKILL.md')).replaceAll('@LAUNCHER@', launcher).replaceAll('@STATE@', this.state.root).replaceAll('@WORKER@', id).replaceAll('@ORIGIN@', text(this.worker.config.origin));
       await hooks.write('detector.sh', hook, 0o700);

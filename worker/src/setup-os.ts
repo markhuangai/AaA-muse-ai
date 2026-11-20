@@ -11,6 +11,7 @@ export interface SetupIO {
   node: string;
   entry: string;
   asset(name: string): Promise<string>;
+  prepareDirectory(path: string, capability: 'hook_directory' | 'skill_directory', workerID: string): Promise<void>;
   launch(state: State, node: string, entry: string): Promise<number>;
   emit(runtime: string, action: 'wake' | 'silent', message: string): Promise<string>;
 }
@@ -19,6 +20,17 @@ export function setupIO(home: string): SetupIO {
   return {
     home, node: process.execPath, entry: fileURLToPath(new URL('./main.js', import.meta.url)),
     asset: name => fs.readFile(fileURLToPath(new URL('../setup/' + name, import.meta.url)), 'utf8'),
+    prepareDirectory: (path, capability, workerID) => new Promise((resolve, reject) => {
+      const helper = fileURLToPath(new URL('../setup/private-directory.sh', import.meta.url));
+      execFile('bash', [helper, path], { timeout: 8000, maxBuffer: 4096 }, (error, stdout) => {
+        if (!error) { resolve(); return; }
+        const result = /^([a-z_]+) (unavailable|mode_[0-7]{1,4}_uid_\d+)$/.exec(stdout.trim());
+        reject(new Failure('state_unsafe', {
+          capability, worker_id: workerID, stage: 'worker', expected_state: 'mode_700_uid_' + process.geteuid?.(),
+          observed_state: result?.[2] ?? 'unavailable', cause: result?.[1] ?? 'directory_helper_failed',
+        }));
+      });
+    }),
     async launch(state, node, entry) {
       requireValue(isAbsolute(node) && isAbsolute(entry), 'absolute_launch_paths_required');
       await state.write('daemon.stderr', '');

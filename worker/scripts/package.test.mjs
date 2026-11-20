@@ -8,14 +8,16 @@ function packaging(t, change = {}) {
   const f = fixture(t);
   const source = { source_sha: 'a'.repeat(40), source_dirty: false, package_version: '0.1.0-dev.0' };
   const metadata = { name: '@markhuangai/aaa-muse-worker', version: '0.1.0-dev.0', ...change.metadata };
-  for (const [path, raw] of Object.entries({ 'worker/package.json': JSON.stringify(metadata), 'worker/dist/build.json': JSON.stringify(source), 'worker/dist/main.js': 'compiled-worker', 'worker/setup/install.sh': 'installer', 'worker/setup/hook.sh': 'hook', 'worker/setup/SKILL.md': 'skill', 'worker/LICENSE': 'Apache-2.0', 'worker/README.md': 'worker' })) f.write(path, raw);
+  const assets = ['install.sh', 'private-directory.sh', 'hook.sh', 'SKILL.md'];
+  for (const asset of assets) f.write('worker/setup/' + asset, 'package fixture');
+  for (const [path, raw] of Object.entries({ 'worker/package.json': JSON.stringify(metadata), 'worker/dist/build.json': JSON.stringify(source), 'worker/dist/main.js': 'compiled-worker', 'worker/LICENSE': 'Apache-2.0', 'worker/README.md': 'worker' })) f.write(path, raw);
   const calls = [];
   const execute = (command, args) => {
     calls.push({ command, args });
     if (command === 'npm') {
       const owned = args[args.indexOf('--pack-destination') + 1];
       f.write(relative(f.root, join(owned, 'worker.tgz')), 'archive-bytes');
-      return JSON.stringify([{ name: metadata.name, version: source.package_version, filename: 'worker.tgz', files: ['dist/main.js', 'dist/build.json', 'setup/install.sh', 'setup/hook.sh', 'setup/SKILL.md', 'LICENSE', 'README.md', 'package.json'].map(path => ({ path })), ...change.result }]);
+      return JSON.stringify([{ name: metadata.name, version: source.package_version, filename: 'worker.tgz', files: ['dist/main.js', 'dist/build.json', ...assets.map(asset => 'setup/' + asset), 'LICENSE', 'README.md', 'package.json'].map(path => ({ path })), ...change.result }]);
     }
     if (command === 'tar') {
       const unpacked = args[args.indexOf('-C') + 1];

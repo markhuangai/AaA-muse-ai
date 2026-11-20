@@ -33,12 +33,13 @@ event() {
 }
 trap 'cause=command_failed_exit_$?; event ERROR setup.runtime_unsupported' ERR
 private_dir() {
-  mkdir -p -m 700 "$1"
-  if [[ ! -d "$1" || -L "$1" || ! -O "$1" || $(stat -c '%a' "$1") != 700 ]]; then
-    capability=${2:-private_directory}
-    expected_state=owned_directory_mode_700
-    observed_state="mode_$(stat -c '%a' "$1")_uid_$(stat -c '%u' "$1")"
-    cause=unsafe_private_directory
+  local detail
+  if ! detail=$(bash -s -- "$1" <<< "$directory_helper"); then
+    capability=$2
+    expected_state="mode_700_uid_$EUID"
+    read -r cause observed_state <<< "$detail"
+    cause=${cause:-directory_helper_failed}
+    observed_state=${observed_state:-unavailable}
     event ERROR setup.runtime_unsupported
     exit 1
   fi
@@ -49,6 +50,11 @@ if [[ "$observed" != "$expected" ]]; then event ERROR setup.digest_mismatch; exi
 actual_version=$(tar -xOzf "$archive" package/package.json | sed -nE 's/^  "version": "([A-Za-z0-9.+-]+)",?$/\1/p')
 actual_name=$(tar -xOzf "$archive" package/package.json | sed -nE 's/^  "name": "([@A-Za-z0-9/_-]+)",?$/\1/p')
 if [[ "$actual_version" != "$version" || "$actual_name" != '@markhuangai/aaa-muse-worker' ]]; then event ERROR setup.package_mismatch; exit 1; fi
+if ! directory_helper=$(tar -xOzf "$archive" package/setup/private-directory.sh) || [[ -z "$directory_helper" ]]; then
+  cause=directory_helper_unavailable
+  event ERROR setup.package_mismatch
+  exit 1
+fi
 root="${XDG_DATA_HOME:-$HOME/.local/share}/aaa-muse-worker"
 state="${XDG_STATE_HOME:-$HOME/.local/state}/aaa-muse-worker"
 [[ "$root" == /* && "$state" == /* ]]
@@ -66,7 +72,7 @@ if [[ "$node" == /* ]]; then
 fi
 if [[ "$supported" != true ]]; then
   [[ $(uname -s) == Linux && $(uname -m) == x86_64 ]] || { event ERROR setup.runtime_unsupported; exit 1; }
-  private_dir "$root/runtime"
+  private_dir "$root/runtime" runtime_directory
   runtime=$(mktemp -d "$root/runtime/node.XXXXXXXX")
   node_expected=48cc0e21e048790e54c0cf5749c2725005313d652651c40b7a21feb9697aaf75
   curl -q --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --connect-timeout 10 --max-time 120 https://nodejs.org/dist/v24.22.2/node-v24.22.2-linux-x64.tar.xz --output "$runtime/node.tar.xz"
