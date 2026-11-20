@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
 import argparse
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
 import hashlib
 import json
 import os
-import select
-import subprocess
 import time
 
 from service import Harness, require
@@ -60,27 +57,9 @@ class WorkerAuth(Harness):
         require(any(e["msg"] == "request.completed" for e in events), "final outcome missing")
         return event, events
 
-    @contextmanager
-    def enrollment_lock(self, enrollment_id):
-        process = subprocess.Popen(["docker", "exec", "-i", self.db, "psql", "-X", "-qAt", "-v", "ON_ERROR_STOP=1", "-U", "postgres", "-d", "aaa_muse"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        try:
-            process.stdin.write("BEGIN; SELECT id FROM aaa_worker_enrollments WHERE id='" + enrollment_id + "' FOR UPDATE;\n\\echo LOCKED\n")
-            process.stdin.flush()
-            require(select.select([process.stdout], [], [], 5)[0], "row lock did not become ready")
-            require(process.stdout.readline().strip() == enrollment_id and process.stdout.readline().strip() == "LOCKED", "wrong enrollment locked")
-            yield
-        finally:
-            try:
-                process.communicate("ROLLBACK;\n", timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.communicate()
-                raise RuntimeError("enrollment lock did not stop")
-            require(process.returncode == 0, "row-lock barrier failed")
-
     def rejection_cases(self, other_origin):
         expired = self.issue()
-        self.sql("UPDATE aaa_worker_enrollments SET created_at=clock_timestamp()-interval '2 hours', expires_at=clock_timestamp()-interval '1 hour' WHERE id='" + expired["enrollment_id"] + "';")
+        self.sql("UPDATE aaa_worker_enrollments SET created_at=CAST(unixepoch('subsec') * 1000000 AS INTEGER)-7200000000, expires_at=CAST(unixepoch('subsec') * 1000000 AS INTEGER)-3600000000 WHERE id='" + expired["enrollment_id"] + "';")
         status, headers, _ = self.enroll(expired)
         require(status == 410, "expired code accepted")
         event, _ = self.diagnose(headers["X-Request-Id"], "enrollment.rejected", "enrollment_expired")
@@ -98,23 +77,20 @@ class WorkerAuth(Harness):
         require(self.sql("SELECT count(*) FROM aaa_workers;") == "1", "failed/duplicate redemption left worker rows")
 
         waiting = self.issue()
-        self.sql("UPDATE aaa_worker_enrollments SET created_at=clock_timestamp()-interval '1 minute', expires_at=clock_timestamp()+interval '1 second' WHERE id='" + waiting["enrollment_id"] + "';")
+        expires = time.time() + 1
+        self.sql("UPDATE aaa_worker_enrollments SET created_at=" + str(int((expires - 60) * 1000000))
+                 + ", expires_at=" + str(int(expires * 1000000)) + " WHERE id='" + waiting["enrollment_id"] + "';")
         with ThreadPoolExecutor(max_workers=1) as pool:
-            with self.enrollment_lock(waiting["enrollment_id"]):
+            with self.writer_lock():
                 result = pool.submit(self.enroll, waiting)
-                deadline = time.monotonic() + 2
-                while time.monotonic() < deadline:
-                    if int(self.sql("SELECT count(*) FROM pg_stat_activity WHERE datname='aaa_muse' AND application_name <> 'psql' AND wait_event_type='Lock';")):
-                        break
-                    time.sleep(0.02)
-                else:
-                    raise AssertionError("redemption did not actually wait for the row lock")
-                remaining = float(self.sql("SELECT extract(epoch FROM expires_at-clock_timestamp()) FROM aaa_worker_enrollments WHERE id='" + waiting["enrollment_id"] + "';"))
-                require(remaining > 0, "expiry fixture elapsed before the request waited")
-                time.sleep(remaining + 0.1)
+                require(expires - time.time() > 0.3, "expiry fixture elapsed before the request blocked")
+                time.sleep(0.25)
+                require(result.running(), "redemption did not wait for the SQLite writer")
+                time.sleep(max(0, expires - time.time()) + 0.05)
             status, headers, _ = result.result(timeout=6)
-        require(status == 410, "expiry was evaluated before waiting for the row lock")
-        self.diagnose(headers["X-Request-Id"], "enrollment.rejected", "enrollment_expired")
+        require(status == 410, "expiry was evaluated before acquiring the writer")
+        event, _ = self.diagnose(headers["X-Request-Id"], "enrollment.rejected", "enrollment_expired")
+        require(event["duration_ms"] >= 250, "expiry trace did not include the lock wait")
         self.receipt("enrollment.single_use_expiry_and_race", attempts=8, issued=1, rejected_reuse=7, expiry_after_lock=True)
         return winner
 
@@ -124,7 +100,7 @@ class WorkerAuth(Harness):
             registration = self.issue()
             status, _, value = self.enroll(registration)
             require(status == 201, "implicit worker-count cap prevented enrollment")
-            stored = self.sql("SELECT encode(code_hash,'hex') FROM aaa_worker_enrollments WHERE id='" + registration["enrollment_id"] + "';")
+            stored = self.sql("SELECT lower(hex(code_hash)) FROM aaa_worker_enrollments WHERE id='" + registration["enrollment_id"] + "';")
             require(stored == hashlib.sha256(registration["enrollment_code"].encode()).hexdigest(), "registration code not stored as a hash")
             enrolled.append(value)
         a, b = enrolled[:2]
@@ -132,7 +108,7 @@ class WorkerAuth(Harness):
             record, key = value["worker"], value["credential"]
             require(record["connection_status"] == "not_observed" and record["inference_readiness"] == "unverified" and record["last_contact_at"], "registration invented liveness/readiness")
             require("idle" not in record and "busy" not in record and "current_assignment" not in record, "unimplemented work facts advertised")
-            stored = self.sql("SELECT encode(credential_hash,'hex') FROM aaa_workers WHERE id='" + record["id"] + "';")
+            stored = self.sql("SELECT lower(hex(credential_hash)) FROM aaa_workers WHERE id='" + record["id"] + "';")
             require(stored == hashlib.sha256(key.encode()).hexdigest(), "reconnect credential not stored as a hash")
         status, _, body = self.api("/api/v1/admin/workers", self.admin)
         require(status == 200 and len(json.loads(body)["workers"]) == 4, "list lost workers")
@@ -196,7 +172,7 @@ class WorkerAuth(Harness):
 
     def restart_and_revoke(self, containers, a, b):
         a_id = a["worker"]["id"]
-        self.sql("UPDATE aaa_workers SET registered_at=clock_timestamp()-interval '2 days' WHERE id='" + a_id + "';")
+        self.sql("UPDATE aaa_workers SET registered_at=CAST(unixepoch('subsec') * 1000000 AS INTEGER)-172800000000 WHERE id='" + a_id + "';")
         require(self.api("/api/v1/worker/status", a["credential"])[0] == 200, "credential acquired an automatic lifetime")
         status, headers, body = self.api("/api/v1/admin/workers/" + a_id + "/revoke", self.admin, "POST")
         require(status == 200, "revocation failed")
@@ -221,12 +197,11 @@ class WorkerAuth(Harness):
         _, _, body = self.api("/api/v1/admin/workers", self.admin)
         record = next(w for w in json.loads(body)["workers"] if w["id"] == a_id)
         require(record["name"] == "revoked renamed agent" and record["revoked_at"] == revoked_at, "restart lost identity/name/revocation")
-        self.docker("stop", self.db)
-        status, headers, _ = self.api("/api/v1/worker/status", b["credential"])
-        require(status == 503, "database loss misreported as credential rejection")
-        event, _ = self.diagnose(headers["X-Request-Id"], "worker.operation_failed", "database_unavailable")
-        require(event["attempt"] == 1 and event["transaction_outcome"] == "not_started" and event["duration_ms"] >= 0, "database diagnosis lacks attempts/timing/outcome")
-        self.docker("start", self.db)
+        with self.storage_fault("aaa_workers"):
+            status, headers, _ = self.api("/api/v1/worker/status", b["credential"])
+            require(status == 503, "SQLite failure misreported as credential rejection")
+            event, _ = self.diagnose(headers["X-Request-Id"], "worker.operation_failed", "sqlite_error")
+            require(event["attempt"] == 1 and event["transaction_outcome"] == "rolled_back" and event["duration_ms"] >= 0 and event["sqlite_code"] == "1", "SQLite diagnosis lacks attempts/timing/outcome")
         self.ready(containers[0], self.origin_url)
         require(self.api("/api/v1/worker/status", a["credential"])[0] == 401 and self.api("/api/v1/worker/status", b["credential"])[0] == 200, "database restart lost scoped authority")
         _, _, body = self.api("/api/v1/admin/diagnostics/export", self.admin)
@@ -237,7 +212,7 @@ class WorkerAuth(Harness):
             logs = self.logs(container)
             self.assert_private(logs)
             require('"level":"DEBUG"' not in logs, "DEBUG reached INFO stdout")
-        self.receipt("workers.durable_revocation_reconnect_and_diagnosis", service_restart=True, database_restart=True, credential_lifetime="until_revoked", corrective_action="restore PostgreSQL availability")
+        self.receipt("workers.durable_revocation_reconnect_and_diagnosis", service_restart=True, sqlite_fault_recovered=True, credential_lifetime="until_revoked", corrective_action="restore the SQLite worker table")
 
     def overlapping_secret_diagnosis(self):
         config = self.configuration()

@@ -248,18 +248,18 @@ class Routing(History):
     def adverse_diagnostics(self):
         pair = self.new_pair()
         by_id = {worker["worker"]["id"]: (worker, peer) for worker, peer in pair}
-        self.sql("ALTER TABLE aaa_model_requests ADD CONSTRAINT routing_test_failure CHECK (client_id <> 'fixture-client') NOT VALID;")
+        self.reject_writes("routing_test_failure", "aaa_model_requests", "NEW.client_id='fixture-client'", "INSERT")
         retry_body = self.request_input("storage failure")
         try:
             _, headers = self.submit(retry_body, "storage", want=503)
         finally:
-            self.sql("ALTER TABLE aaa_model_requests DROP CONSTRAINT routing_test_failure;")
+            self.sql("DROP TRIGGER routing_test_failure;")
         events = self.trace_request(headers["X-Request-Id"])
         failures = [e for e in events if e.get("request_id") == headers["X-Request-Id"] and e["msg"] == "inference.operation_failed"]
         details = [e for e in events if e.get("request_id") == headers["X-Request-Id"] and e["msg"] == "inference.storage_exchange"]
-        require(len(failures) == 1 and failures[0]["level"] == "ERROR" and failures[0]["sqlstate"] == "23514" and failures[0]["transaction_outcome"] == "rolled_back", "routing storage failure lacks causal rollback evidence")
+        require(len(failures) == 1 and failures[0]["level"] == "ERROR" and failures[0]["sqlite_code"] == "1811" and failures[0]["transaction_outcome"] == "rolled_back", "routing storage failure lacks causal rollback evidence")
         require(len(details) == 1 and "routing_test_failure" in details[0]["detail"], "protected storage cause missing")
-        self.private("routing-storage-diagnosis.json", json.dumps({"cause": "routing_test_failure", "sqlstate": "23514", "transaction_outcome": "rolled_back", "corrective_action": "repair the failing storage constraint, then retry the original submission"}))
+        self.private("routing-storage-diagnosis.json", json.dumps({"cause": "routing_test_failure", "sqlite_code": "1811", "transaction_outcome": "rolled_back", "corrective_action": "repair the failing storage constraint, then retry the original submission"}))
         admitted, _ = self.submit(retry_body, "storage")
         worker, peer = by_id[admitted["worker_id"]]
         self.deliver(worker, peer, admitted, {"type": "final", "text": "one successful admission"})
@@ -277,7 +277,7 @@ class Routing(History):
             operational = self.logs(container)
             require('"level":"DEBUG"' not in operational, "DEBUG leaked to INFO operational output")
             self.assert_private(operational)
-        self.receipt("routing.storage_rollback_capture_and_withdrawal", sqlstate="23514", protected_debug=True, chunk_reconstruction=True)
+        self.receipt("routing.storage_rollback_capture_and_withdrawal", sqlite_code="1811", protected_debug=True, chunk_reconstruction=True)
 
     def offline_boundaries(self):
         for boundary in ("first-turn", "safe", "context", "claimed", "tool-wait"):

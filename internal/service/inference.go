@@ -12,7 +12,7 @@ import (
 	"github.com/markhuangai/AaA-muse-ai/internal/auth"
 	"github.com/markhuangai/AaA-muse-ai/internal/inference"
 	"github.com/markhuangai/AaA-muse-ai/internal/media"
-	"github.com/markhuangai/AaA-muse-ai/internal/postgres"
+	"github.com/markhuangai/AaA-muse-ai/internal/sqlite"
 )
 
 type InferenceRepository interface {
@@ -191,7 +191,7 @@ func (b *Broker) run(ctx context.Context, logger *slog.Logger, ref inference.Ref
 			ref.Principal = "worker:" + ref.WorkerAuth
 		}
 	}
-	logger = logger.With("operation", operation, "protocol_version", inference.Version, "schema_version", postgres.SchemaVersion, "health_interval_seconds", 10, "health_window_seconds", 30, "max_context_bytes", inference.MaxContextBytes, "in_flight_per_worker", 1)
+	logger = logger.With("operation", operation, "protocol_version", inference.Version, "schema_version", sqlite.SchemaVersion, "health_interval_seconds", 10, "health_window_seconds", 30, "max_context_bytes", inference.MaxContextBytes, "in_flight_per_worker", 1)
 	if ref.ClientID != "" {
 		logger = logger.With("client_id", ref.ClientID, "requested_session_id", ref.SessionID)
 	}
@@ -371,13 +371,13 @@ func (b *Broker) run(ctx context.Context, logger *slog.Logger, ref inference.Ref
 			}
 			logger.Warn(name, "requested_experiment_id", ref.ExperimentID, "requested_job_id", ref.JobID, "reason", rejection.Reason, "evidence", evidence, "observed", observed, "outcome", "rejected", "duration_ms", b.now().Sub(started).Milliseconds())
 		} else {
-			failure := postgres.Classify(err)
-			logger.Debug("inference.storage_exchange", "cause", failure.Reason, "detail", failure.Detail(), "sqlstate", failure.SQLState, "transaction_outcome", failure.Outcome, "attempt", 1)
+			failure := sqlite.Classify(err)
+			logger.Debug("inference.storage_exchange", "cause", failure.Reason, "detail", failure.Detail(), "sqlite_code", failure.Code, "phase", failure.Phase, "transaction_outcome", failure.Outcome, "attempt", 1)
 			name := "inference.operation_failed"
 			if ref.Recovery {
 				name = "recovery.failed"
 			}
-			logger.Error(name, "cause", failure.Reason, "sqlstate", failure.SQLState, "transaction_outcome", failure.Outcome, "attempt", 1, "duration_ms", b.now().Sub(started).Milliseconds(), "outcome", "operation_stopped")
+			logger.Error(name, "cause", failure.Reason, "sqlite_code", failure.Code, "phase", failure.Phase, "transaction_outcome", failure.Outcome, "attempt", 1, "duration_ms", b.now().Sub(started).Milliseconds(), "outcome", "operation_stopped")
 		}
 		return nil, err
 	}
@@ -403,9 +403,9 @@ func (b *Broker) Sweep(ctx context.Context, logger *slog.Logger) error {
 	defer cancel()
 	ids, err := b.repo.InferenceWorkers(bounded)
 	if err != nil {
-		failure := postgres.Classify(err)
-		logger.Debug("inference.storage_exchange", "operation", "sweep", "cause", failure.Reason, "detail", failure.Detail(), "sqlstate", failure.SQLState, "transaction_outcome", failure.Outcome)
-		logger.Error("inference.sweep_failed", "cause", failure.Reason, "sqlstate", failure.SQLState, "retry_delay_seconds", 1)
+		failure := sqlite.Classify(err)
+		logger.Debug("inference.storage_exchange", "operation", "sweep", "cause", failure.Reason, "detail", failure.Detail(), "sqlite_code", failure.Code, "phase", failure.Phase, "transaction_outcome", failure.Outcome)
+		logger.Error("inference.sweep_failed", "cause", failure.Reason, "sqlite_code", failure.Code, "retry_delay_seconds", 1)
 		return err
 	}
 	for _, id := range ids {

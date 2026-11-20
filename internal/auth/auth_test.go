@@ -12,7 +12,6 @@ import (
 func authConfig() config.Config {
 	c := config.Defaults()
 
-	c.Database.URL = "postgres://db/muse"
 	c.Portal.Password = "portal-fixture"
 	c.Management.Key = "admin-fixture"
 	c.ClientKeys = map[string]config.Secret{"local": "client-fixture"}

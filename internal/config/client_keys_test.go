@@ -56,7 +56,7 @@ func TestClientKeyFileConcurrentCreatePreservesDocumentAndReloads(t *testing.T) 
 			t.Fatal("operator YAML lost comments or environment references")
 		}
 	}
-	if strings.Index(string(data), "database:") > strings.Index(string(data), "client-keys:") {
+	if strings.Index(string(data), "management:") > strings.Index(string(data), "client-keys:") {
 		t.Fatal("operator YAML order changed")
 	}
 	info, err := os.Stat(path)

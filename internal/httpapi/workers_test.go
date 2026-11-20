@@ -14,8 +14,8 @@ import (
 
 	"github.com/markhuangai/AaA-muse-ai/internal/auth"
 	"github.com/markhuangai/AaA-muse-ai/internal/diagnostics"
-	"github.com/markhuangai/AaA-muse-ai/internal/postgres"
 	"github.com/markhuangai/AaA-muse-ai/internal/service"
+	"github.com/markhuangai/AaA-muse-ai/internal/sqlite"
 	"github.com/markhuangai/AaA-muse-ai/internal/worker"
 )
 
@@ -258,7 +258,7 @@ func TestWorkerHTTPInputsAndFailures(t *testing.T) {
 	if call(h, "POST", "/api/v1/worker/enroll", "", bytes.NewReader(body)).Code != 409 {
 		t.Fatal("reused enrollment accepted")
 	}
-	repo.fail = &postgres.Failure{Reason: "database_unavailable", Outcome: "not_started"}
+	repo.fail = &sqlite.Failure{Reason: "database_unavailable", Outcome: "not_started"}
 	for _, test := range []struct{ method, path, body string }{{"POST", "/api/v1/admin/enrollments", ""}, {"POST", "/api/v1/worker/enroll", string(body)}, {"GET", "/api/v1/admin/workers", ""}, {"PATCH", path, `{"name":"valid"}`}, {"POST", path + "/revoke", ""}} {
 		if call(h, test.method, test.path, "Bearer admin-private-sentinel", strings.NewReader(test.body)).Code != 503 {
 			t.Fatal("storage failure hidden")

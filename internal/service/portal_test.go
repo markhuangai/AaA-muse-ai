@@ -221,7 +221,6 @@ func TestPortalBrowserReportValidationAndLimits(t *testing.T) {
 func TestPortalEffectiveYAMLAndDegradedSettings(t *testing.T) {
 	c := config.Defaults()
 
-	c.Database.URL = "postgres://owner:database-sentinel@db/muse"
 	c.Management.Key, c.Portal.Password = "management-sentinel", "portal-sentinel"
 	c.ClientKeys = map[string]config.Secret{"<script>alert('unsafe')</script>": "client-sentinel", "alias-portal-sentinel": "other-client-sentinel"}
 	db := &database{}

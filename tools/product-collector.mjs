@@ -195,7 +195,7 @@ export class ReleaseCollector extends Collector {
       const status = await this.api('/api/v1/admin/status');
       this.report.checkpoints.broker = { before_instance: status.instance_id, pending_call_id: item.call_id, cycle_id: item.id, before_status: status,
         qualification: workers.find(worker => worker.id === this.worker('a').worker_id).qualification, prepared_at: this.stamp() };
-      await this.save(); await this.log('INFO', 'e2e.owner_checkpoint', { checkpoint: 'broker_restart', pending_call_id: item.call_id, action: 'Owner restarts the qualification service, retaining PostgreSQL and diagnostics volumes; resume with broker-resume.' });
+      await this.save(); await this.log('INFO', 'e2e.owner_checkpoint', { checkpoint: 'broker_restart', pending_call_id: item.call_id, action: 'Owner restarts the qualification service, retaining SQLite and diagnostics volumes; resume with broker-resume.' });
       return;
     }
     need(saved?.pending_call_id && !saved.completed_request_id, 'pending_broker_checkpoint_required');

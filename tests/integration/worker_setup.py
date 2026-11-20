@@ -117,7 +117,7 @@ class WorkerSetup(Inference):
         self.diagnose(headers["X-Request-Id"], "setup.prompt_created")
         return result
 
-    def install(self, environment, prompt, fallback=False, corrupt=False, bad_node=False, want=0, model_report=None):
+    def install(self, environment, prompt, fallback=False, corrupt=False, bad_node=False, want=0, model_report=None, state_home=None):
         script = prompt["setup_prompt"].split("```bash\n", 1)[1].split("```", 1)[0]
         if model_report is not None:
             slot = "\n{}\nAAA_MUSE_ENROLLMENT\n"
@@ -125,6 +125,8 @@ class WorkerSetup(Inference):
             script = script.replace(slot, "\n" + model_report + "\nAAA_MUSE_ENROLLMENT\n")
         path = "/fixture/bin:/usr/bin:/bin" if fallback else "/fixture/bin:/usr/local/bin:/usr/bin:/bin"
         extra = ["-e", "PATH=" + path]
+        if state_home is not None:
+            extra += ["-e", "XDG_STATE_HOME=" + state_home]
         if corrupt:
             extra += ["-e", "FIXTURE_BAD_WORKER=1"]
         if bad_node:
@@ -300,6 +302,25 @@ class WorkerSetup(Inference):
         workers = self.checked("/api/v1/admin/workers", self.admin)[0]["workers"]
         require(len(workers) == 2, "revoked setup silently enrolled another identity")
         self.receipt("setup.revocation_boundary", no_reenrollment=True)
+
+        old_journals = {file.name: file.read_bytes() for file in (primary["state"] / "journals").glob("*.json")}
+        require(bool(old_journals), "old installation has no durable operation journal")
+        fresh_container, fresh_origin, _ = self.launch(state_volume=self.volume("fresh-sqlite"))
+        self.ready(fresh_container, fresh_origin)
+        self.proxy.target = urllib.parse.urlsplit(fresh_origin)
+        self.origin_url = fresh_origin
+        require(self.checked("/api/v1/admin/workers", self.admin)[0]["workers"] == [], "new SQLite volume retained old workers")
+        require(self.api("/api/v1/worker/status", primary["credential"])[0] == 401, "fresh SQLite accepted an old credential")
+        fresh_prompt = self.prompt()
+        self.install(primary, fresh_prompt, want=1)
+        require(self.checked("/api/v1/admin/workers", self.admin)[0]["workers"] == [], "old state silently used a new code")
+        fresh = {"container": primary["container"], "state": primary["home"] / "sqlite-cutover" / "aaa-muse-worker"}
+        self.install(fresh, fresh_prompt, state_home="/home/worker/sqlite-cutover")
+        workers = self.checked("/api/v1/admin/workers", self.admin)[0]["workers"]
+        require(len(workers) == 1 and workers[0]["id"] == fresh["worker"]["id"] != first_id, "fresh setup did not produce one distinct worker")
+        require({file.name: file.read_bytes() for file in (primary["state"] / "journals").glob("*.json")} == old_journals,
+                "fresh enrollment changed the prior installation's journals")
+        self.receipt("setup.sqlite_fresh_start", old_credential_denied=True, fresh_enrollment=True, journal_preserved=True)
 
 
 def run(harness_type=WorkerSetup, suite="worker-setup"):

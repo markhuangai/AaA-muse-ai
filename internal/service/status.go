@@ -3,12 +3,11 @@ package service
 import (
 	"context"
 	"log/slog"
-	"net/url"
 	"sync"
 	"time"
 
 	"github.com/markhuangai/AaA-muse-ai/internal/config"
-	"github.com/markhuangai/AaA-muse-ai/internal/postgres"
+	"github.com/markhuangai/AaA-muse-ai/internal/sqlite"
 )
 
 type Database interface{ Ping(context.Context) error }
@@ -52,13 +51,12 @@ func (s *Service) Status(ctx context.Context, logger *slog.Logger) Status {
 	defer cancel()
 	err := s.db.Ping(probe)
 	c := s.config()
-	target, _ := url.Parse(string(c.Database.URL))
-	logger = logger.With("database_host", target.Host, "database_name", target.Path)
-	state := Status{Build: s.build, InstanceID: s.instance, UptimeSeconds: s.now().Sub(s.started).Seconds(), SchemaVersion: postgres.SchemaVersion, Ready: err == nil, Database: "available", Configuration: *c}
+	logger = logger.With("database_engine", "sqlite", "database_file", "broker.sqlite3")
+	state := Status{Build: s.build, InstanceID: s.instance, UptimeSeconds: s.now().Sub(s.started).Seconds(), SchemaVersion: sqlite.SchemaVersion, Ready: err == nil, Database: "available", Configuration: *c}
 	if err != nil {
-		failure := postgres.Classify(err)
+		failure := sqlite.Classify(err)
 		state.Database = failure.Reason
-		logger.Debug("db.probe_failed", "cause", failure.Reason, "sqlstate", failure.SQLState, "detail", failure.Detail())
+		logger.Debug("db.probe_failed", "cause", failure.Reason, "sqlite_code", failure.Code, "phase", failure.Phase, "detail", failure.Detail())
 	}
 	s.mu.Lock()
 	changed := s.lastReady != state.Ready

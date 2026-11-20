@@ -1,8 +1,5 @@
 server:
   listen: "0.0.0.0:8080"
-database:
-  url: "postgres://aaa_muse@database:5432/aaa_muse?sslmode=disable"
-  password: "${POSTGRES_PASSWORD}"
 management:
   key: "${MUSE_MANAGEMENT_KEY}"
 control-portal:

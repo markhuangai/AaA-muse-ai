@@ -8,7 +8,6 @@ import (
 	"io"
 	"log/slog"
 	"net"
-	"net/url"
 	"reflect"
 	"regexp"
 	"strconv"
@@ -31,10 +30,6 @@ type Config struct {
 	Server struct {
 		Listen string `yaml:"listen" json:"listen"`
 	} `yaml:"server" json:"server"`
-	Database struct {
-		URL      Secret `yaml:"url" json:"url"`
-		Password Secret `yaml:"password" json:"password"`
-	} `yaml:"database" json:"database"`
 	Management struct {
 		Key Secret `yaml:"key" json:"key"`
 	} `yaml:"management" json:"management"`
@@ -111,6 +106,9 @@ func Parse(b []byte, lookup func(string) (string, bool)) (Config, error) {
 	// Remove obsolete fields before resolving environment references.
 	for i := 0; i < len(node.Content[0].Content); i += 2 {
 		key, section := node.Content[0].Content[i], node.Content[0].Content[i+1]
+		if key.Value == "database" {
+			return Config{}, &Error{Field: "database", Reason: "legacy_database_configuration_remove_section", Line: key.Line, Column: key.Column}
+		}
 		if section.Kind != yaml.MappingNode {
 			continue
 		}
@@ -144,12 +142,6 @@ func Parse(b []byte, lookup func(string) (string, bool)) (Config, error) {
 			}
 		}
 		return Config{}, err
-	}
-	if c.Database.Password != "" {
-		target, _ := url.Parse(string(c.Database.URL))
-		target.User = url.UserPassword(target.User.Username(), string(c.Database.Password))
-		c.Database.URL = Secret(target.String())
-		c.Database.Password = ""
 	}
 	return c, nil
 }
@@ -257,25 +249,6 @@ func (c Config) Validate() error {
 	if err != nil || portErr != nil || p < 1 || p > 65535 {
 		return bad("server.listen", "invalid_address")
 	}
-	db, err := url.Parse(string(c.Database.URL))
-	if err != nil || (db.Scheme != "postgres" && db.Scheme != "postgresql") || db.Hostname() == "" || db.Path == "" || db.Path == "/" {
-		return bad("database.url", "postgres_url_required")
-	}
-	if c.Database.Password != "" {
-		if db.User == nil || db.User.Username() == "" {
-			return bad("database.password", "database_user_required")
-		}
-		if _, exists := db.User.Password(); exists {
-			return bad("database.password", "conflicting_password_sources")
-		}
-		query, err := url.ParseQuery(db.RawQuery)
-		if err != nil {
-			return bad("database.url", "invalid_query")
-		}
-		if _, exists := query["password"]; exists {
-			return bad("database.password", "conflicting_password_sources")
-		}
-	}
 	if strings.TrimSpace(string(c.Portal.Password)) == "" {
 		return bad("control-portal.password", "required")
 	}
@@ -326,19 +299,7 @@ func usableBearerKey(value Secret) bool {
 }
 
 func (c Config) Secrets() []string {
-	values := []string{string(c.Database.URL), string(c.Management.Key), string(c.Portal.Password)}
-	if c.Database.Password != "" {
-		values = append(values, string(c.Database.Password))
-	}
-	if u, err := url.Parse(string(c.Database.URL)); err == nil && u.User != nil {
-		if p, ok := u.User.Password(); ok {
-			values = append(values, p)
-			encoded := strings.TrimPrefix(url.UserPassword("", p).String(), ":")
-			if encoded != p {
-				values = append(values, encoded)
-			}
-		}
-	}
+	values := []string{string(c.Management.Key), string(c.Portal.Password)}
 	for _, key := range c.ClientKeys {
 		values = append(values, string(key))
 	}

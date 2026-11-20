@@ -31,7 +31,6 @@ func fixture(t *testing.T) (*Handler, *testDB, *bytes.Buffer, *diagnostics.Store
 	t.Helper()
 	c := config.Defaults()
 
-	c.Database.URL = "postgres://db/muse"
 	c.Management.Key = "admin-private-sentinel"
 	c.Portal.Password = "portal-private-sentinel"
 	c.ClientKeys = map[string]config.Secret{"client": "client-private-sentinel"}

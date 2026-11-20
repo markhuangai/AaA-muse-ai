@@ -1,4 +1,4 @@
-package postgres
+package sqlite
 
 import (
 	"bytes"
@@ -6,11 +6,11 @@ import (
 	"encoding/json"
 	"errors"
 
-	"github.com/jackc/pgx/v5"
+	"database/sql"
 	"github.com/markhuangai/AaA-muse-ai/internal/inference"
 )
 
-func ownedHistory(ctx context.Context, tx pgx.Tx, ref *inference.Ref) error {
+func ownedHistory(ctx context.Context, tx *sql.Tx, ref *inference.Ref) error {
 	if ref.ClientID == "" {
 		return nil
 	}
@@ -21,8 +21,8 @@ func ownedHistory(ctx context.Context, tx pgx.Tx, ref *inference.Ref) error {
 		if ref.ResponseID != "" {
 			column, id = "response_id", ref.ResponseID
 		}
-		err := tx.QueryRow(ctx, "SELECT data FROM aaa_model_requests WHERE "+column+"=$1 AND client_id=$2", id, ref.ClientID).Scan(&data)
-		if errors.Is(err, pgx.ErrNoRows) {
+		err := tx.QueryRowContext(ctx, "SELECT data FROM aaa_model_requests WHERE "+column+"=?1 AND client_id=?2", id, ref.ClientID).Scan(&data)
+		if errors.Is(err, sql.ErrNoRows) {
 			return inference.Reject("history_owner_denied", 404, "requested_id", id)
 		}
 		if err != nil {
@@ -41,7 +41,7 @@ func ownedHistory(ctx context.Context, tx pgx.Tx, ref *inference.Ref) error {
 		}
 	}
 	if ref.ConversationID != "" {
-		if err := tx.QueryRow(ctx, "SELECT data FROM aaa_conversations WHERE id=$1 AND client_id=$2", ref.ConversationID, ref.ClientID).Scan(&data); err != nil {
+		if err := tx.QueryRowContext(ctx, "SELECT data FROM aaa_conversations WHERE id=?1 AND client_id=?2", ref.ConversationID, ref.ClientID).Scan(&data); err != nil {
 			return err
 		}
 		if err := decodeInference(data, &c); err != nil {
@@ -51,12 +51,12 @@ func ownedHistory(ctx context.Context, tx pgx.Tx, ref *inference.Ref) error {
 			return inference.Reject("session_reference_conflict", 409, "expected_session_id", c.SessionID, "observed_session_id", ref.SessionID)
 		}
 	} else if ref.SessionID != "" {
-		err := tx.QueryRow(ctx, "SELECT data FROM aaa_conversations WHERE client_id=$1 AND session_id=$2", ref.ClientID, ref.SessionID).Scan(&data)
+		err := tx.QueryRowContext(ctx, "SELECT data FROM aaa_conversations WHERE client_id=?1 AND session_id=?2", ref.ClientID, ref.SessionID).Scan(&data)
 		if err == nil {
 			if err = decodeInference(data, &c); err != nil {
 				return err
 			}
-		} else if !errors.Is(err, pgx.ErrNoRows) {
+		} else if !errors.Is(err, sql.ErrNoRows) {
 			return err
 		}
 	}
@@ -68,15 +68,15 @@ func ownedHistory(ctx context.Context, tx pgx.Tx, ref *inference.Ref) error {
 	}
 	ref.WorkerID, ref.ConversationID = c.WorkerID, c.ID
 	if ref.ReplayHash != "" {
-		err := tx.QueryRow(ctx, "SELECT id FROM aaa_model_requests WHERE conversation_id=$1 AND replay_hash=$2", c.ID, ref.ReplayHash).Scan(&ref.ExperimentID)
-		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		err := tx.QueryRowContext(ctx, "SELECT id FROM aaa_model_requests WHERE conversation_id=?1 AND replay_hash=?2", c.ID, ref.ReplayHash).Scan(&ref.ExperimentID)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return err
 		}
 	}
 	return nil
 }
 
-func loadHistory(ctx context.Context, tx pgx.Tx, ref inference.Ref, s *inference.State) error {
+func loadHistory(ctx context.Context, tx *sql.Tx, ref inference.Ref, s *inference.State) error {
 	s.HistoryConversationID = ref.ConversationID
 	s.Conversations, s.Requests = map[string]*inference.Conversation{}, map[string]*inference.Request{}
 	ids := []string{}
@@ -86,8 +86,8 @@ func loadHistory(ctx context.Context, tx pgx.Tx, ref inference.Ref, s *inference
 	if ref.ReferenceRequestID != "" {
 		ids = append(ids, ref.ReferenceRequestID)
 	}
-	rows, err := tx.Query(ctx, `SELECT data FROM aaa_model_requests WHERE id=ANY($1::text[])
-		OR (conversation_id=$2 AND (replay_hash=$3 OR id=(SELECT data->>'current_request_id' FROM aaa_conversations WHERE id=$2)))`, ids, ref.ConversationID, ref.ReplayHash)
+	rows, err := tx.QueryContext(ctx, `SELECT data FROM aaa_model_requests WHERE id IN (SELECT value FROM json_each(?1))
+		OR (conversation_id=?2 AND (replay_hash=?3 OR id=(SELECT current_request_id FROM aaa_conversations WHERE id=?2)))`, idList(ids), ref.ConversationID, ref.ReplayHash)
 	if err != nil {
 		return err
 	}
@@ -105,8 +105,7 @@ func loadHistory(ctx context.Context, tx pgx.Tx, ref inference.Ref, s *inference
 	for _, r := range s.Requests {
 		conversations = append(conversations, r.ConversationID)
 	}
-	// The worker row is the common lock for admission, results, cancellation, and sweeps.
-	rows, err = tx.Query(ctx, "SELECT data FROM aaa_conversations WHERE id=ANY($1::text[]) ORDER BY id FOR UPDATE", conversations)
+	rows, err = tx.QueryContext(ctx, "SELECT data FROM aaa_conversations WHERE id IN (SELECT value FROM json_each(?1)) ORDER BY id", idList(conversations))
 	if err != nil {
 		return err
 	}
@@ -122,7 +121,7 @@ func loadHistory(ctx context.Context, tx pgx.Tx, ref inference.Ref, s *inference
 	}
 	if ref.Full {
 		for _, c := range s.Conversations {
-			rows, err = tx.Query(ctx, "SELECT data FROM aaa_conversation_items WHERE conversation_id=$1 ORDER BY sequence", c.ID)
+			rows, err = tx.QueryContext(ctx, "SELECT data FROM aaa_conversation_items WHERE conversation_id=?1 ORDER BY sequence", c.ID)
 			if err != nil {
 				return err
 			}
@@ -144,12 +143,12 @@ func loadHistory(ctx context.Context, tx pgx.Tx, ref inference.Ref, s *inference
 		}
 	}
 	if ref.CountPendingTools {
-		return tx.QueryRow(ctx, "SELECT count(*) FROM aaa_conversations WHERE worker_id=$1 AND pending_call_id<>''", s.WorkerID).Scan(&s.PendingTools)
+		return tx.QueryRowContext(ctx, "SELECT count(*) FROM aaa_conversations WHERE worker_id=?1 AND pending_call_id<>''", s.WorkerID).Scan(&s.PendingTools)
 	}
 	return nil
 }
 
-func readHistoryRows(rows pgx.Rows, read func([]byte) error) error {
+func readHistoryRows(rows *sql.Rows, read func([]byte) error) error {
 	defer rows.Close()
 	for rows.Next() {
 		var data []byte
@@ -193,15 +192,16 @@ func historySnapshot(s *inference.State) (historyBefore, error) {
 	return b, nil
 }
 
-func saveHistory(ctx context.Context, tx pgx.Tx, s *inference.State, before historyBefore) error {
+func saveHistory(ctx context.Context, tx *sql.Tx, s *inference.State, before historyBefore) error {
 	for id, c := range s.Conversations {
 		data, err := conversationHeader(c)
 		if err != nil {
 			return err
 		}
 		if !bytes.Equal(data, before.conversations[id]) {
-			if _, err = tx.Exec(ctx, `INSERT INTO aaa_conversations(id,client_id,session_id,worker_id,created_at,pending_call_id,data) VALUES($1,$2,$3,$4,$5,$6,$7)
-				ON CONFLICT(id) DO UPDATE SET worker_id=EXCLUDED.worker_id,pending_call_id=EXCLUDED.pending_call_id,data=EXCLUDED.data`, id, c.ClientID, c.SessionID, nullableWorker(c.WorkerID), c.CreatedAt, c.PendingCallID, data); err != nil {
+			if _, err = tx.ExecContext(ctx, `INSERT INTO aaa_conversations(id,client_id,session_id,worker_id,created_at,pending_call_id,current_request_id,data) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
+				ON CONFLICT(id) DO UPDATE SET worker_id=excluded.worker_id,pending_call_id=excluded.pending_call_id,current_request_id=excluded.current_request_id,data=excluded.data`,
+				id, c.ClientID, c.SessionID, nullableWorker(c.WorkerID), c.CreatedAt.UnixMicro(), c.PendingCallID, c.CurrentRequestID, data); err != nil {
 				return err
 			}
 		}
@@ -212,8 +212,11 @@ func saveHistory(ctx context.Context, tx pgx.Tx, s *inference.State, before hist
 			return err
 		}
 		if !bytes.Equal(data, before.requests[id]) {
-			if _, err = tx.Exec(ctx, `INSERT INTO aaa_model_requests(id,conversation_id,client_id,response_id,created_at,replay_hash,data) VALUES($1,$2,$3,$4,$5,$6,$7)
-				ON CONFLICT(id) DO UPDATE SET data=EXCLUDED.data`, id, r.ConversationID, r.ClientID, r.ResponseID, r.CreatedAt, r.ReplayHash, data); err != nil {
+			incomplete := (r.Output != nil && r.OutputCompletedAt == nil) || (r.ContextDeliveryStarted != nil && r.ContextDeliveryWritten == nil)
+			if _, err = tx.ExecContext(ctx, `INSERT INTO aaa_model_requests(id,conversation_id,client_id,response_id,created_at,replay_hash,incomplete_delivery,data)
+				VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
+				ON CONFLICT(id) DO UPDATE SET incomplete_delivery=excluded.incomplete_delivery,data=excluded.data`,
+				id, r.ConversationID, r.ClientID, r.ResponseID, r.CreatedAt.UnixMicro(), r.ReplayHash, incomplete, data); err != nil {
 				return err
 			}
 		}
@@ -227,7 +230,7 @@ func saveHistory(ctx context.Context, tx pgx.Tx, s *inference.State, before hist
 			if err != nil {
 				return err
 			}
-			if _, err = tx.Exec(ctx, "INSERT INTO aaa_conversation_items(conversation_id,sequence,id,request_id,data) VALUES($1,$2,$3,$4,$5)", id, item.Sequence, item.ID, item.RequestID, data); err != nil {
+			if _, err = tx.ExecContext(ctx, "INSERT INTO aaa_conversation_items(conversation_id,sequence,id,request_id,data) VALUES(?1,?2,?3,?4,?5)", id, item.Sequence, item.ID, item.RequestID, data); err != nil {
 				return err
 			}
 		}
@@ -236,7 +239,13 @@ func saveHistory(ctx context.Context, tx pgx.Tx, s *inference.State, before hist
 			if err != nil {
 				return err
 			}
-			if _, err = tx.Exec(ctx, "INSERT INTO aaa_conversation_events(conversation_id,sequence,data) VALUES($1,$2,$3)", id, event.Sequence, data); err != nil {
+			var detail struct {
+				ItemID string `json:"item_id"`
+			}
+			if err = json.Unmarshal(event.Details, &detail); err != nil {
+				return err
+			}
+			if _, err = tx.ExecContext(ctx, "INSERT INTO aaa_conversation_events(conversation_id,sequence,item_id,data) VALUES(?1,?2,?3,?4)", id, event.Sequence, detail.ItemID, data); err != nil {
 				return err
 			}
 		}

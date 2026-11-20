@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 import json
 import os
+import platform
 from pathlib import Path
 import secrets
 import socket
@@ -47,6 +48,122 @@ class Responses(Chat):
 
     def text(self, result):
         return self.value(result)["output"][0]["content"][0]["text"]
+
+    def sqlite_concurrency(self, secondary):
+        before = time.monotonic()
+        expires = before + 180
+        since = datetime.now(timezone.utc)
+        gate = threading.Barrier(11, timeout=10)
+        stop = threading.Event()
+
+        def client(lane):
+            gate.wait()
+            completed = []
+            for turn in range(3):
+                remaining = expires - time.monotonic()
+                require(remaining > 0, "SQLite concurrency exceeded the three-minute budget")
+                marker = f"sqlite-mixed-{lane}-{turn}"
+                prompt = "aaa-chat:delay:5:" + marker
+                options = {"origin": self.origins[(lane + turn // 2) % 2], "timeout": remaining}
+                started = time.monotonic()
+                if (lane + turn) % 2:
+                    result = self.response(self.body(prompt), marker, **options)
+                    value = self.text(result)
+                else:
+                    result = self.chat(self.chat_body(prompt), marker, **options)
+                    value, _ = self.answer(result)
+                require(value == marker, "concurrent request received the wrong worker output")
+                completed.append((result[1]["X-Request-Id"], round((time.monotonic() - started) * 1000)))
+            return completed
+
+        def history_reader():
+            count = 0
+            while not stop.wait(1):
+                value, _ = self.checked("/api/v1/admin/requests?limit=5", self.admin, origin=self.origins[count % 2])
+                require(isinstance(value["items"], list), "history read lost its bounded result")
+                count += 1
+            return count
+
+        with ThreadPoolExecutor(max_workers=11) as workers:
+            clients = [workers.submit(client, lane) for lane in range(10)]
+            reader = workers.submit(history_reader)
+            gate.wait()
+            try:
+                calls = dict(call for future in clients
+                             for call in future.result(timeout=max(0.1, expires - time.monotonic())))
+            finally:
+                stop.set()
+            reads = reader.result(timeout=max(0.1, expires - time.monotonic()))
+        finished = time.monotonic()
+        until = datetime.now(timezone.utc)
+        require(finished < expires and finished - before >= 60 and len(calls) == 30 and reads > 0,
+                "mixed workload did not complete with sustained overlapping storage traffic")
+
+        heartbeat_gaps = []
+        for bot in self.bots:
+            with bot.peer.condition:
+                prior = [reply["at"] for reply in bot.peer.replies if reply["at"] < before and reply["status"] == 200]
+                active = [reply for reply in bot.peer.replies if before <= reply["at"] <= finished]
+                require(prior and active and all(reply["status"] == 200 for reply in active)
+                        and not bot.peer.errors and bot.peer.thread.is_alive(), "a controlled worker missed its real health checks")
+                marks = [prior[-1], *(reply["at"] for reply in active), finished]
+                heartbeat_gaps.extend(right - left for left, right in zip(marks, marks[1:]))
+        require(max(heartbeat_gaps) < 30, "worker crossed its 30-second health window")
+
+        events = [json.loads(line) for container in (self.main_service, secondary)
+                  for line in self.logs(container).splitlines() if line.startswith("{")]
+        window = [event for event in events if since <= datetime.fromisoformat(event["time"]) <= until]
+        errors = [event for event in window if (event["msg"] == "request.completed" and event["status"] >= 400)
+                  or event.get("cause") == "database_busy" or event["msg"] == "worker.stream_closed"]
+        require(not errors, "normal concurrent traffic logged a lock failure, HTTP error or closed worker stream")
+        admissions = [event for event in events if event["msg"] == "history.reconciled"
+                      and event.get("request_id") in calls and event.get("operation") == "request_create"]
+        request_ids = {event["request_record_id"] for event in admissions}
+        require(len(admissions) == len(request_ids) == 30 and len({event["instance_id"] for event in admissions}) == 2,
+                "concurrent admission did not complete once on both brokers")
+        completed = [event for event in events if event["msg"] == "request.completed" and event.get("request_id") in calls]
+        require(len(completed) == 30 and all(event["status"] == 200 for event in completed),
+                "concurrent outputs lacked one successful HTTP completion each")
+        marks = [(datetime.fromisoformat(event["time"]), delta) for group, delta in ((admissions, 1), (completed, -1)) for event in group]
+        active = peak = 0
+        for _, delta in sorted(marks):
+            active += delta
+            peak = max(peak, active)
+        require(peak == 10 and active == 0, "ten accepted requests did not overlap on the real brokers")
+
+        def observations(name):
+            return [event for event in events if event["msg"] == name and event.get("operation_id") in request_ids]
+
+        claims, decisions, queue = (observations(name) for name in ("job.claimed", "decision.accepted", "dispatch.assigned"))
+        require(all(len(items) == 30 and {event["operation_id"] for event in items} == request_ids for items in (claims, decisions, queue))
+                and len({event["worker_id"] for event in claims}) == 2 and {event["job_id"] for event in claims} == {event["job_id"] for event in decisions},
+                "claims, decisions or queue assignments were duplicated, missing, or limited to one worker")
+        by_request = {event["operation_id"]: event for event in claims}
+        windows = {}
+        for identity in request_ids:
+            detail = self.detail_id(identity)
+            job, request = detail["assignment"], detail["request"]
+            require(job["id"] == by_request[identity]["job_id"] and not job["held"] and request["state"] == "completed",
+                    "accepted decision left a held or mismatched assignment")
+            windows.setdefault(job["worker_id"], []).append(
+                (datetime.fromisoformat(job["claimed_at"]), datetime.fromisoformat(request["decision_accepted_at"])))
+        for entries in windows.values():
+            spans = sorted(entries)
+            require(all(left[1] <= right[0] for left, right in zip(spans, spans[1:])), "a worker held simultaneous jobs")
+        require(time.monotonic() < expires, "concurrency evidence exceeded the three-minute case budget")
+
+        def p95(values):
+            return sorted(values)[(95 * len(values) + 99) // 100 - 1]
+
+        self.receipt("responses.sqlite_concurrent_read_write", brokers=2, qualified_workers=2, overlapping_requests=peak,
+                     completed=len(calls), samples_per_timing=len(calls), successful_history_reads=reads,
+                     max_heartbeat_gap_ms=round(1000 * max(heartbeat_gaps)), duration_ms=round(1000 * (finished - before)),
+                     completed_per_second=round(len(calls) / (finished - before), 3),
+                     admission_p95_ms=p95([item["duration_ms"] for item in admissions]),
+                     claim_p95_ms=p95([item["duration_ms"] for item in claims]),
+                     queue_p95_ms=p95([item["queue_wait_ms"] for item in queue]), client_p95_ms=p95(list(calls.values())),
+                     sqlite_busy_errors=0, host_platform=platform.system(), host_arch=platform.machine(),
+                     docker_version=self.docker("version", "--format", "{{.Server.Version}}").stdout.strip())
 
     def response_aliases(self):
         body = self.body("aaa-chat:text:compatible")
@@ -123,9 +240,9 @@ class Responses(Chat):
             if event["output_accepted"]:
                 require(any(e["msg"] == "responses.accepted_decision" and e["decision"] is not None for e in selected), "accepted decision missing from capture")
             if reason == "output_boundary_failed":
-                storage = next(e for e in selected if e["msg"] == "inference.storage_exchange" and e["sqlstate"] == "23514" and "responses_output_fixture" in e["detail"])
+                storage = next(e for e in selected if e["msg"] == "inference.storage_exchange" and e["sqlite_code"] == "1811" and "responses_output_fixture" in e["detail"])
                 require(storage["transaction_outcome"] == "rolled_back" and event["attempted_sequence"] == -1, "failed exposure boundary not proved")
-                action = "repair the recorded storage constraint (SQLSTATE " + storage["sqlstate"] + ") and replay accepted output"
+                action = "repair the recorded storage constraint (SQLite result code " + storage["sqlite_code"] + ") and replay accepted output"
             elif event["output_accepted"]:
                 interrupted = next(e for e in selected if e["msg"] == "request.output_interrupted" and e.get("request_id") == request_id)
                 require(interrupted["cause"] and any(e["msg"] == "request.output_started" for e in selected), "accepted write interruption boundary missing")
@@ -283,7 +400,7 @@ class Responses(Chat):
             pending = pool.submit(self.response, self.body(marker, True), "responses-deadline")
             bot, job = self.job_for(marker)
             expired = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
-            self.sql("BEGIN; UPDATE aaa_experiments SET deadline_at='" + expired + "', data=jsonb_set(data::jsonb,'{deadline_at}',to_jsonb('" + expired + "'::text))::json WHERE id='" + job["experiment_id"] + "'; UPDATE aaa_inference_jobs SET data=jsonb_set(data::jsonb,'{deadline_at}',to_jsonb('" + expired + "'::text))::json WHERE id='" + job["id"] + "'; COMMIT;")
+            self.expire_job(job, expired)
             result = pending.result(timeout=12)
         require(self.value(result, failed=True)["error"]["code"] == "deadline_exceeded", "admitted deadline lacked failure lifecycle")
         self.diagnose_response(result[1]["X-Request-Id"], "responses.stream_terminated", "deadline_exceeded")
@@ -313,12 +430,12 @@ class Responses(Chat):
         with ThreadPoolExecutor(max_workers=1) as pool:
             pending = pool.submit(self.response, body, "responses-storage")
             bot, job = self.job_for(marker)
-            self.sql("ALTER TABLE aaa_model_requests ADD CONSTRAINT responses_output_fixture CHECK(id <> '" + job["experiment_id"] + "' OR data->>'output_started_at' IS NULL);")
+            self.reject_writes("responses_output_fixture", "aaa_model_requests", "NEW.id='" + job["experiment_id"] + "' AND json_extract(CAST(NEW.data AS TEXT),'$.output_started_at') IS NOT NULL")
             self.decision(bot.worker, bot.peer, job, {"type": "final", "text": "retained-storage-answer"})
             result = pending.result(timeout=12)
         require(result[0] == 503 and not result[1]["Content-Type"].startswith("text/event-stream"), "failed exposure boundary emitted lifecycle")
         self.diagnose_response(result[1]["X-Request-Id"], "responses.stream_terminated", "output_boundary_failed")
-        self.sql("ALTER TABLE aaa_model_requests DROP CONSTRAINT responses_output_fixture;")
+        self.sql("DROP TRIGGER responses_output_fixture;")
         require(self.text(self.response(body, "responses-storage")) == "retained-storage-answer", "storage retry lost accepted output")
         self.receipt("responses.deadline_abort_storage", uncertain_holds_retained=True, no_inference_retry=True)
 
@@ -425,6 +542,7 @@ def main():
         h.origins = [h.origin_url, other_origin]
         for _ in range(2):
             h.new_bot()
+        h.sqlite_concurrency(secondary)
         h.matrix()
         h.boundaries()
         h.response_aliases()

@@ -313,7 +313,6 @@ func TestPortalLargeYAMLReconstruction(t *testing.T) {
 	h, db, _, store := portalHTTPFixture(t)
 	c := config.Defaults()
 
-	c.Database.URL = "postgres://db/muse"
 	c.Portal.Password = "portal-private-sentinel"
 	c.Management.Key = "admin-private-sentinel"
 	for i := 0; i < 300; i++ {

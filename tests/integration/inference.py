@@ -1,15 +1,12 @@
 #!/usr/bin/env python3
 import argparse
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
 import http.client
 import json
 import os
 from pathlib import Path
 import secrets
 import socket
-import select
-import subprocess
 import threading
 import time
 import urllib.parse
@@ -278,25 +275,6 @@ class Inference(WorkerAuth):
         peer.acknowledge_idle(exp_job)
         self.receipt("inference.cancellation_deadline_idle_hold", cancelled=e["id"], expired=expired["id"], automatic_retries=0)
 
-    @contextmanager
-    def submission_barrier(self, principal, submission):
-        lock_name = (principal + ":" + submission).replace("'", "''")
-        process = subprocess.Popen(["docker", "exec", "-i", self.db, "psql", "-X", "-qAt", "-v", "ON_ERROR_STOP=1", "-U", "postgres", "-d", "aaa_muse"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        try:
-            process.stdin.write("BEGIN; SELECT pg_advisory_xact_lock(hashtextextended('" + lock_name + "',0));\n\\echo LOCKED\n")
-            process.stdin.flush()
-            require(select.select([process.stdout], [], [], 5)[0], "submission barrier did not start")
-            require(process.stdout.readline().strip() == "" and process.stdout.readline().strip() == "LOCKED", "submission barrier did not acquire the lock")
-            yield
-        finally:
-            try:
-                process.communicate("ROLLBACK;\n", timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.communicate()
-                raise RuntimeError("submission barrier did not stop")
-            require(process.returncode == 0, "submission barrier failed")
-
     def revocation_races(self):
         for operation in ("claim", "decisions"):
             worker = self.new_worker()
@@ -308,12 +286,26 @@ class Inference(WorkerAuth):
                 job, _, _ = self.claim(worker, peer, experiment)
                 request.update({"conversation_id": job["conversation_id"], "generation": job["generation"], "lease_id": job["lease_id"], "context_receipt_id": job["context"]["receipt_id"], "decision": {"type": "final", "text": "must not be accepted"}})
             route = "/api/v1/worker/jobs/" + experiment["current_job_id"] + "/" + operation
-            with ThreadPoolExecutor(max_workers=1) as pool:
-                with self.submission_barrier("worker:" + worker["worker"]["id"], submission):
-                    response = pool.submit(self.api, route, worker["credential"], "POST", request)
-                    self.until(lambda: int(self.sql("SELECT count(*) FROM pg_stat_activity WHERE datname='aaa_muse' AND application_name <> 'psql' AND wait_event='advisory';")) >= 1, "authenticated request did not wait at the mutation barrier", timeout=3)
-                    self.checked("/api/v1/admin/workers/" + worker["worker"]["id"] + "/revoke", self.admin, "POST")
-                status, headers, _ = response.result(timeout=7)
+            target = urllib.parse.urlsplit(self.origin_url)
+            body = json.dumps(request).encode()
+            connection = http.client.HTTPConnection(target.hostname, target.port, timeout=5)
+            try:
+                connection.putrequest("POST", route)
+                connection.putheader("Authorization", "Bearer " + worker["credential"])
+                connection.putheader("Content-Type", "application/json")
+                connection.putheader("Content-Length", str(len(body)))
+                connection.putheader("Expect", "100-continue")
+                connection.endheaders()
+                with connection.sock.makefile("rb") as interim:
+                    require(interim.readline() == b"HTTP/1.1 100 Continue\r\n" and interim.readline() == b"\r\n",
+                            "worker authentication did not precede the request body")
+                self.checked("/api/v1/admin/workers/" + worker["worker"]["id"] + "/revoke", self.admin, "POST")
+                connection.send(body)
+                with connection.getresponse() as response:
+                    status, headers = response.status, response.headers
+                    response.read()
+            finally:
+                connection.close()
             require(status == 401, "request authenticated before revocation bypassed durable authority")
             count = self.sql("SELECT count(*) FROM aaa_inference_receipts WHERE principal='worker:" + worker["worker"]["id"] + "' AND submission_id='" + submission + "'; SELECT count(*) FROM aaa_inference_history WHERE experiment_id='" + experiment["id"] + "';").splitlines()
             require(count == ["0", "2"], "revocation race committed a receipt or appended history")
@@ -425,11 +417,11 @@ class Inference(WorkerAuth):
         logs = self.logs(self.main_service)
         require('"msg":"inference.exchange"' not in logs, "DEBUG exchanges reached INFO stdout")
         self.assert_private(logs)
-        self.docker("stop", self.db)
-        _, headers, _ = self.api("/api/v1/admin/experiments/" + e["id"], self.admin)
-        event, _ = self.diagnose(headers["X-Request-Id"], "inference.operation_failed")
-        require(event["cause"] and event["transaction_outcome"], "dependency failure lacked cause/outcome")
-        self.docker("start", self.db)
+        with self.storage_fault("aaa_experiments"):
+            status, headers, _ = self.api("/api/v1/admin/experiments/" + e["id"], self.admin)
+            event, _ = self.diagnose(headers["X-Request-Id"], "inference.operation_failed")
+            require(status == 503 and event["sqlite_code"] == "1" and event["transaction_outcome"] == "rolled_back",
+                    "dependency failure lacked causal SQLite outcome")
         self.ready(self.main_service, self.origin_url)
         self.receipt("inference.bounds_redaction_storage_failure", admitted_jobs=10, body_bytes=1048576, log_only_diagnosis=True)
 
@@ -450,15 +442,15 @@ class Inference(WorkerAuth):
         self.cancel(e["id"])
         failure = self.create(worker, "persistence failure after claim callback", tools=False)
         submission = "persistence-fault-" + secrets.token_hex(8)
-        self.sql("CREATE FUNCTION inference_test_fail_receipt() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.submission_id='" + submission + "' THEN RAISE EXCEPTION 'controlled inference persistence failure' USING ERRCODE='23514'; END IF; RETURN NEW; END $$; CREATE TRIGGER inference_test_receipt BEFORE INSERT ON aaa_inference_receipts FOR EACH ROW EXECUTE FUNCTION inference_test_fail_receipt();")
+        self.reject_writes("inference_test_receipt", "aaa_inference_receipts", "NEW.submission_id='" + submission + "'", "INSERT")
         try:
             _, headers, _ = self.claim(worker, peer, failure, submission=submission, want=503)
         finally:
-            self.sql("DROP TRIGGER inference_test_receipt ON aaa_inference_receipts; DROP FUNCTION inference_test_fail_receipt();")
+            self.sql("DROP TRIGGER inference_test_receipt;")
         events = self.export_operation(failure["id"])
         failed = [event for event in events if event.get("request_id") == headers["X-Request-Id"] and event["msg"] in ("inference.storage_exchange", "inference.operation_failed")]
         require(len(failed) == 2 and {event["level"] for event in failed} == {"ERROR", "DEBUG"}, "experiment export omitted persistence failure")
-        require(all(event["sqlstate"] == "23514" and event["transaction_outcome"] == "rolled_back" and event["conversation_id"] == failure["conversation_id"] and event["job_id"] == failure["current_job_id"] for event in failed), "persistence failure lost cause/transaction/correlation")
+        require(all(event["sqlite_code"] == "1811" and event["transaction_outcome"] == "rolled_back" and event["conversation_id"] == failure["conversation_id"] and event["job_id"] == failure["current_job_id"] for event in failed), "persistence failure lost cause/transaction/correlation")
         require(self.experiment(failure["id"])["state"] == "queued" and self.status(worker)["work_status"] == "idle", "failed persistence left a claimed turn")
         self.cancel(failure["id"])
         self.receipt("inference.object_key_redaction_and_persistence_failure", log_only_diagnosis=True, rollback_verified=True)

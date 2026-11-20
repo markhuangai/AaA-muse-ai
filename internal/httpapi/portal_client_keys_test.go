@@ -22,7 +22,7 @@ func TestPortalClientKeyCreationAndDiagnosticBoundaries(t *testing.T) {
 		return w.Code, w.Body.String()
 	}
 	path := filepath.Join(t.TempDir(), "config.yaml")
-	raw := []byte("database:\n  url: postgres://db/muse\nmanagement:\n  key: admin-private-sentinel\ncontrol-portal:\n  password: portal-private-sentinel\nclient-keys:\n  client: client-private-sentinel\n")
+	raw := []byte("management:\n  key: admin-private-sentinel\ncontrol-portal:\n  password: portal-private-sentinel\nclient-keys:\n  client: client-private-sentinel\n")
 	if err := os.WriteFile(path, raw, 0600); err != nil {
 		t.Fatal(err)
 	}
