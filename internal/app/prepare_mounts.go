@@ -25,9 +25,25 @@ type mountMetadata struct {
 	Mode string `json:"mode"`
 }
 
+type mountFile interface {
+	Fd() uintptr
+	Stat() (fs.FileInfo, error)
+	Readdirnames(int) ([]string, error)
+	Chmod(fs.FileMode) error
+	Chown(int, int) error
+	Close() error
+}
+
+type mountFilesystem interface {
+	openDirectory(string) (mountFile, error)
+	openAt(mountFile, string, int) (mountFile, error)
+	entryMode(mountFile, string) (uint32, error)
+	openPinnedFile(mountFile) (mountFile, error)
+}
+
 type mountTarget struct {
 	path     string
-	file     *os.File
+	file     mountFile
 	mode     fs.FileMode
 	info     fs.FileInfo
 	observed *mountMetadata
@@ -50,7 +66,7 @@ func runMountPreparation(args []string, revision, configPath string, dataDirs []
 			append(attrs, "target", "MUSE_SERVICE_USER", "reason", "invalid_service_user", "expected", "positive numeric UID:GID"))
 		return 1
 	}
-	targets, failure := prepareMountedPaths(configPath, dataDirs, owner)
+	targets, failure := prepareMountedPaths(d.mounts, configPath, dataDirs, owner)
 	if failure != nil {
 		emergency(d.Stderr, "mounts.prepare_failed", failure.reason,
 			append(attrs, "stage", failure.stage, "reason", failure.reason, "target", failure.target.path,
@@ -78,7 +94,7 @@ func parseMountOwner(value string) mountOwner {
 	return mountOwner{int(uid), int(gid)}
 }
 
-func prepareMountedPaths(configPath string, dataDirs []string, owner mountOwner) ([]mountTarget, *mountFailure) {
+func prepareMountedPaths(files mountFilesystem, configPath string, dataDirs []string, owner mountOwner) ([]mountTarget, *mountFailure) {
 	targets := make([]mountTarget, 0, len(dataDirs)+2)
 	defer func() {
 		for _, target := range targets {
@@ -87,7 +103,7 @@ func prepareMountedPaths(configPath string, dataDirs []string, owner mountOwner)
 	}()
 	for _, path := range append([]string{filepath.Dir(configPath)}, dataDirs...) {
 		target := mountTarget{path: path, mode: 0700}
-		file, err := os.OpenFile(path, os.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW, 0)
+		file, err := files.openDirectory(path)
 		if err != nil {
 			return nil, &mountFailure{target, "open_directory", fileErrorReason(err)}
 		}
@@ -98,7 +114,7 @@ func prepareMountedPaths(configPath string, dataDirs []string, owner mountOwner)
 		}
 	}
 
-	yaml, failure := openMountYAML(targets[0].file, configPath)
+	yaml, failure := openMountYAML(files, targets[0].file, configPath)
 	if failure != nil {
 		return nil, failure
 	}
@@ -108,7 +124,7 @@ func prepareMountedPaths(configPath string, dataDirs []string, owner mountOwner)
 	}
 
 	for i, target := range targets[:len(targets)-1] {
-		populated, err := inspectMountEntries(target.file)
+		populated, err := inspectMountEntries(files, target.file)
 		if err != nil {
 			return nil, &mountFailure{target, "validate_entries", fileErrorReason(err)}
 		}
@@ -132,7 +148,7 @@ func prepareMountedPaths(configPath string, dataDirs []string, owner mountOwner)
 	return targets, nil
 }
 
-func inspectMountEntries(dir *os.File) (bool, error) {
+func inspectMountEntries(files mountFilesystem, dir mountFile) (bool, error) {
 	populated := false
 	for {
 		names, readErr := dir.Readdirnames(128)
@@ -140,27 +156,25 @@ func inspectMountEntries(dir *os.File) (bool, error) {
 			populated = true
 		}
 		for _, name := range names {
-			var info unix.Stat_t
-			err := unix.Fstatat(int(dir.Fd()), name, &info, unix.AT_SYMLINK_NOFOLLOW)
+			mode, err := files.entryMode(dir, name)
 			if errors.Is(err, fs.ErrNotExist) {
 				continue
 			}
 			if err != nil {
 				return populated, err
 			}
-			switch info.Mode & unix.S_IFMT {
+			switch mode & unix.S_IFMT {
 			case unix.S_IFLNK:
 				return populated, unix.ELOOP
 			case unix.S_IFDIR:
-				fd, err := unix.Openat(int(dir.Fd()), name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+				child, err := files.openAt(dir, name, unix.O_RDONLY|unix.O_DIRECTORY)
 				if errors.Is(err, fs.ErrNotExist) {
 					continue
 				}
 				if err != nil {
 					return populated, err
 				}
-				child := os.NewFile(uintptr(fd), name)
-				_, err = inspectMountEntries(child)
+				_, err = inspectMountEntries(files, child)
 				_ = child.Close()
 				if err != nil {
 					return populated, err
@@ -176,14 +190,13 @@ func inspectMountEntries(dir *os.File) (bool, error) {
 	}
 }
 
-func openMountYAML(dir *os.File, path string) (mountTarget, *mountFailure) {
+func openMountYAML(files mountFilesystem, dir mountFile, path string) (mountTarget, *mountFailure) {
 	target := mountTarget{path: path, mode: 0600}
 	// O_PATH pins the inode before opening it for metadata changes, even if the entry is a FIFO or device.
-	fd, err := unix.Openat(int(dir.Fd()), filepath.Base(path), unix.O_PATH|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	pinned, err := files.openAt(dir, filepath.Base(path), unix.O_PATH)
 	if err != nil {
 		return target, &mountFailure{target, "open_config", fileErrorReason(err)}
 	}
-	pinned := os.NewFile(uintptr(fd), path)
 	defer pinned.Close()
 	target.file = pinned
 	if err = target.stat(); err != nil {
@@ -199,7 +212,7 @@ func openMountYAML(dir *os.File, path string) (mountTarget, *mountFailure) {
 	case target.info.Sys().(*syscall.Stat_t).Nlink != 1:
 		return target, &mountFailure{target, "validate_config", "multiple_links"}
 	}
-	target.file, err = os.Open("/proc/self/fd/" + strconv.Itoa(fd))
+	target.file, err = files.openPinnedFile(pinned)
 	if err != nil {
 		return target, &mountFailure{target, "open_config", fileErrorReason(err)}
 	}
@@ -215,6 +228,30 @@ func (target *mountTarget) stat() error {
 	target.info = info
 	target.observed = &mountMetadata{mountOwner{int(stat.Uid), int(stat.Gid)}, modeString(uint32(stat.Mode))}
 	return nil
+}
+
+type osMountFilesystem struct{}
+
+func (osMountFilesystem) openDirectory(path string) (mountFile, error) {
+	return os.OpenFile(path, os.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW, 0)
+}
+
+func (osMountFilesystem) openAt(dir mountFile, name string, flags int) (mountFile, error) {
+	fd, err := unix.Openat(int(dir.Fd()), name, flags|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, err
+	}
+	return os.NewFile(uintptr(fd), name), nil
+}
+
+func (osMountFilesystem) entryMode(dir mountFile, name string) (uint32, error) {
+	var info unix.Stat_t
+	err := unix.Fstatat(int(dir.Fd()), name, &info, unix.AT_SYMLINK_NOFOLLOW)
+	return uint32(info.Mode), err
+}
+
+func (osMountFilesystem) openPinnedFile(file mountFile) (mountFile, error) {
+	return os.Open("/proc/self/fd/" + strconv.FormatUint(uint64(file.Fd()), 10))
 }
 
 func modeString(mode uint32) string { return fmt.Sprintf("%04o", mode&07777) }

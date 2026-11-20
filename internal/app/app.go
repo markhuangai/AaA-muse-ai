@@ -42,6 +42,7 @@ type Dependencies struct {
 	Sleep          func(context.Context, time.Duration) error
 	Wait           func(context.Context, time.Duration) error
 	Files          diagnostics.Files
+	mounts         mountFilesystem
 	PortalAssets   fs.FS
 	ClientKeyFile  func(string, func(string) (string, bool), config.Config) *config.ClientKeyFile
 	OpenDB         func(context.Context, string) (Repository, error)
@@ -50,7 +51,7 @@ type Dependencies struct {
 }
 
 func Production(stdout, stderr io.Writer) Dependencies {
-	return Dependencies{DatabasePath: sqlite.Path, MediaDir: "/var/lib/aaa-muse-ai/media", ReadFile: os.ReadFile, LookupEnv: os.LookupEnv, Random: rand.Reader, Now: time.Now, Sleep: sleep, Wait: sleep, Files: diagnostics.OSFiles{}, PortalAssets: os.DirFS("/usr/share/aaa-muse-ai/portal"), ClientKeyFile: config.NewClientKeyFile, OpenDB: func(ctx context.Context, u string) (Repository, error) {
+	return Dependencies{DatabasePath: sqlite.Path, MediaDir: "/var/lib/aaa-muse-ai/media", ReadFile: os.ReadFile, LookupEnv: os.LookupEnv, Random: rand.Reader, Now: time.Now, Sleep: sleep, Wait: sleep, Files: diagnostics.OSFiles{}, mounts: osMountFilesystem{}, PortalAssets: os.DirFS("/usr/share/aaa-muse-ai/portal"), ClientKeyFile: config.NewClientKeyFile, OpenDB: func(ctx context.Context, u string) (Repository, error) {
 		repo, err := sqlite.Open(ctx, u)
 		if err != nil {
 			return nil, err
