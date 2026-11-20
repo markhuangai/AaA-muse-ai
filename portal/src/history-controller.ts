@@ -37,7 +37,7 @@ export class HistoryController {
   #freshness = () => {};
   #visibility = () => {};
   #pendingReads = new Map<number, { resource: Resource; operation: string; started: number; cursor: string; conversation: string; id: string }>();
-  constructor(private api: API, private system: System, private reports: Reports, private authorized: () => boolean, private denied: () => void) {}
+  constructor(private api: API, private system: System, private reports: Reports, private authorized: () => boolean, private denied: (requestID: string, operationID: string) => void) {}
   snapshot = () => this.#view;
   subscribe = (listener: () => void) => { this.#listeners.add(listener); return () => { this.#listeners.delete(listener); }; };
   private change(patch: Partial<HistoryView>) { this.#view = { ...this.#view, ...patch }; for (const listener of this.#listeners) listener(); }
@@ -126,7 +126,7 @@ export class HistoryController {
       if (generation !== this.#generation || !this.available()) return;
       const failure = error instanceof APIError ? error : new APIError('request_failed');
       if (!current()) { this.report('portal.history_load_failed', 'obsolete_response', resource, operation, failure.requestID, sequence, this.system.now() - started, cursor, conversation, id); return; }
-      if (failure.status === 401) { this.denied(); return; }
+      if (failure.status === 401) { this.denied(failure.requestID, operation); return; }
       const message = failure.status === 404 ? 'The recorded request was not found.' : failure.causeCode === 'invalid_cursor' ? 'The page cursor was rejected. Return to the first page.' :
         failure.causeCode === 'invalid_response' ? 'The history response was invalid. Refresh or reload the matching portal build.' : 'Could not load request history. Check the connection and retry.';
       this.changeRead(resource, { stale: true, message, requestID: failure.requestID });
@@ -156,7 +156,7 @@ export class HistoryController {
     } catch (error) {
       if (generation !== this.#generation || !this.available() || sequence !== this.#latest.workers) return;
       const failure = error instanceof APIError ? error : new APIError('request_failed');
-      if (failure.status === 401) { this.denied(); return; }
+      if (failure.status === 401) { this.denied(failure.requestID, operation); return; }
       this.change({ namesStale: true });
       this.report('portal.history_load_failed', 'request_failed', 'workers', operation, failure.requestID, sequence, this.system.now() - started);
     }
@@ -218,7 +218,7 @@ export class HistoryController {
     } catch (error) {
       if (generation !== this.#generation || !this.available()) return;
       const failure = error instanceof APIError ? error : new APIError('request_failed');
-      if (failure.status === 401) { this.denied(); return; }
+      if (failure.status === 401) { this.denied(failure.requestID, operation); return; }
       const rejected = failure.status >= 400 && failure.status < 500;
       this.change({ actionMessage: rejected ? 'The server rejected cancellation. Refresh to see its current state.' : 'Cancellation could not be confirmed. It may have completed. Refresh to reconcile; do not retry the action automatically.', actionRequestID: failure.requestID, unconfirmed: !rejected });
       this.changeRead('detail', { stale: true });

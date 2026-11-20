@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/markhuangai/AaA-muse-ai/internal/auth"
 	"github.com/markhuangai/AaA-muse-ai/internal/config"
 	"github.com/markhuangai/AaA-muse-ai/internal/diagnostics"
 	"github.com/markhuangai/AaA-muse-ai/internal/inference"
@@ -28,6 +29,7 @@ import (
 type fakeRepository struct {
 	service.WorkerRepository
 	service.InferenceRepository
+	service.PortalBrowserRepository
 	bootErr     error
 	recoveryErr error
 	recovered   atomic.Bool
@@ -38,6 +40,12 @@ func (r *fakeRepository) Bootstrap(context.Context) error                    { r
 func (r *fakeRepository) Ping(context.Context) error                         { return nil }
 func (r *fakeRepository) Close()                                             { r.closed.Store(true) }
 func (r *fakeRepository) InferenceWorkers(context.Context) ([]string, error) { return nil, nil }
+func (r *fakeRepository) PortalPassword(context.Context) (auth.PortalPasswordState, error) {
+	return auth.PortalPasswordState{}, nil
+}
+func (r *fakeRepository) ReplacePortalPassword(context.Context, auth.PortalPasswordState) (bool, error) {
+	return true, nil
+}
 func (r *fakeRepository) WithinInference(_ context.Context, ref inference.Ref, apply func(*inference.State) error) error {
 	if ref.Recovery {
 		if r.recoveryErr != nil {
@@ -87,8 +95,10 @@ func TestRunRealHTTPAndGeneratedKey(t *testing.T) {
 			var origin string
 			select {
 			case origin = <-address:
-			case <-time.After(3 * time.Second):
-				t.Fatal("startup stalled")
+			case code := <-result:
+				t.Fatalf("startup exited before listening (status %d)", code)
+			case <-time.After(10 * time.Second):
+				t.Fatal("startup did not listen within 10 seconds")
 			}
 			client := &http.Client{Timeout: time.Second}
 			response, err := client.Get("http://" + origin + "/healthz")

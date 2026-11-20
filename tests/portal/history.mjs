@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { inspectTaste } from './taste.mjs';
+import { browserSessionHeaders, checkBrowserSession } from './session.mjs';
 
 const fixture = JSON.parse(readFileSync(process.argv[process.argv.indexOf('--fixture') + 1], 'utf8'));
 const transport = browserTransport(fixture.origin);
@@ -16,8 +17,9 @@ const remember = value => { secrets.push(value); save(`history-browser-secrets-$
 const pause = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
 let browser;
 
-async function control(path, { key, method = 'GET', body } = {}) {
+async function control(path, { key, method = 'GET', body, cookie } = {}) {
   const headers = { 'Content-Type': 'application/json' };
+  if (cookie) Object.assign(headers, browserSessionHeaders(cookie, fixture.origin));
   if (key) headers.Authorization = `Bearer ${key}`;
   const response = await fetch(fixture.origin + path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(10_000) });
   const value = response.status === 204 ? null : await response.json();
@@ -29,20 +31,20 @@ async function login(page) {
   const sessionResponse = page.waitForResponse(response => new URL(response.url()).pathname === '/api/v1/portal/login' && response.status() === 200);
   const listResponse = page.waitForResponse(response => new URL(response.url()).pathname === '/api/v1/admin/requests' && response.status() === 200);
   await page.getByRole('button', { name: 'Sign in', exact: true }).click();
-  const session = await (await sessionResponse).json(); remember(session.session_token);
+  const session = await checkBrowserSession(page, await sessionResponse); remember(session.value);
   await listResponse;
   await expect(page.getByRole('heading', { name: 'Requests', exact: true })).toBeVisible();
   return session;
 }
-async function privateStorage(page, context) {
+async function privateStorage(page, context, cookieCount = 1) {
   const state = await page.evaluate(async () => ({ local: Object.keys(localStorage), session: Object.keys(sessionStorage), databases: typeof indexedDB.databases === 'function' ? (await indexedDB.databases()).length : 0,
     caches: typeof caches === 'undefined' ? [] : await caches.keys(), workers: 'serviceWorker' in navigator ? (await navigator.serviceWorker.getRegistrations()).length : 0 }));
-  expect(state).toEqual({ local: [], session: [], databases: 0, caches: [], workers: 0 }); expect(await context.cookies()).toEqual([]);
+  expect(state).toEqual({ local: [], session: [], databases: 0, caches: [], workers: 0 }); expect((await context.cookies()).length).toBe(cookieCount); expect(await page.evaluate(() => document.cookie)).toBe('');
 }
 async function screenshot(page, kind, width) {
   const text = await page.locator('body').innerText(); expect([fixture.password, ...secrets].some(value => text.includes(value))).toBe(false);
   expect(await page.locator('[data-sensitive]').count()).toBe(0); expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1)).toBe(true);
-  const name = `history-${kind}-${width}.png`; await page.screenshot({ path: join(fixture.directory, name), fullPage: true });
+  const name = `history-${kind}-${width}.png`; await page.screenshot({ path: join(fixture.directory, name), fullPage: true, animations: 'disabled' });
   receipt.design.push(await inspectTaste(page, fixture.directory, name.replace('.png', ''))); receipt.screenshots.push(name);
 }
 async function open(page, id) {
@@ -268,7 +270,7 @@ function fixtureSQL(sql) {
     '/var/lib/aaa-muse-ai/state/broker.sqlite3'], { input: sql, stdio: ['pipe', 'pipe', 'pipe'] });
 }
 
-async function failuresAndExpiry() {
+async function failuresAndSessionContinuity() {
   const context = await browser.newContext({ serviceWorkers: 'block' }); const page = await context.newPage(); await page.clock.install(); const session = await login(page);
   const target = fixture.fixtures.cancellation.queued[4]; await open(page, target.id);
   fixtureSQL('ALTER TABLE aaa_experiments RENAME TO hidden_aaa_experiments;');
@@ -291,25 +293,25 @@ async function failuresAndExpiry() {
   await expect(page.getByRole('button', { name: 'Cancel request', exact: true })).toBeEnabled(); await page.waitForLoadState('networkidle');
   await page.evaluate(() => { Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'hidden' }); document.dispatchEvent(new Event('visibilitychange')); });
   const stale = waitReport(page, 'portal.history_load_failed', 'stale_data', 'request'); await page.clock.fastForward(60_001); await stale; await expect(page.getByRole('button', { name: 'Cancel request', exact: true })).toBeDisabled();
-  await page.clock.fastForward(1_800_001); await expect(page.getByText('Your session ended. Sign in again.')).toBeVisible(); expect(await page.getByRole('region', { name: 'Request detail' }).count()).toBe(0); await privateStorage(page, context);
-  const actual = await control('/api/v1/portal/logout', { key: session.session_token, method: 'POST' }); expect(actual.response.status).toBe(204);
-  passed('portal.history_outage_malformed_timeout_stale_and_browser_expiry', { actual_sqlite_fault: true, browser_clock_is_not_server_expiry: true, render_source_correlated: true }); await context.close();
+  await page.clock.fastForward(1_800_001); await expect(page.getByRole('region', { name: 'Request detail' })).toBeVisible(); await privateStorage(page, context);
+  const actual = await control('/api/v1/portal/logout', { cookie: session, method: 'POST' }); expect(actual.response.status).toBe(204);
+  passed('portal.history_outage_malformed_timeout_stale_and_session_continuity', { actual_sqlite_fault: true, browser_clock_past_thirty_minutes: true, render_source_correlated: true }); await context.close();
   const deniedContext = await browser.newContext({ serviceWorkers: 'block' }); const deniedPage = await deniedContext.newPage(); const deniedSession = await login(deniedPage);
-  expect((await control('/api/v1/portal/logout', { key: deniedSession.session_token, method: 'POST' })).response.status).toBe(204);
+  expect((await control('/api/v1/portal/logout', { cookie: deniedSession, method: 'POST' })).response.status).toBe(204);
   // The first denied parallel read clears the session and can abort its sibling.
   const denied = deniedPage.waitForResponse(response => ['/api/v1/admin/requests', '/api/v1/admin/workers'].includes(new URL(response.url()).pathname) && response.status() === 401); await deniedPage.getByRole('button', { name: 'Refresh history', exact: true }).click(); const deniedResponse = await denied; receipt.diagnostics.push({ request_id: deniedResponse.headers()['x-request-id'] });
   await expect(deniedPage.getByText('Your session ended. Sign in again.')).toBeVisible(); await deniedContext.close();
   const lateContext = await browser.newContext({ serviceWorkers: 'block' }); const late = await lateContext.newPage(); await login(late);
   let finish, seenLate; const pending = new Promise(resolve => { finish = resolve; }), observed = new Promise(resolve => { seenLate = resolve; });
   await late.route('**/api/v1/admin/requests?*', async route => { const response = await transport.fetch(route); seenLate(); await pending; try { await route.fulfill({ response }); } catch (error) { if (!route.request().failure()) throw error; } });
-  await late.getByRole('button', { name: 'Refresh history', exact: true }).click(); await observed; const abandoned = waitReport(late, 'portal.history_load_failed', 'obsolete_response', 'requests'); await late.getByRole('button', { name: 'Sign out', exact: true }).click(); await abandoned; finish(); await expect(late.getByRole('heading', { name: 'Service access' })).toBeVisible(); expect(await late.getByRole('region', { name: 'Recorded requests' }).count()).toBe(0); await privateStorage(late, lateContext);
+  await late.getByRole('button', { name: 'Refresh history', exact: true }).click(); await observed; const abandoned = waitReport(late, 'portal.history_load_failed', 'obsolete_response', 'requests'); await late.getByRole('button', { name: 'Sign out', exact: true }).click(); await abandoned; finish(); await expect(late.getByRole('heading', { name: 'Service access' })).toBeVisible(); expect(await late.getByRole('region', { name: 'Recorded requests' }).count()).toBe(0); await privateStorage(late, lateContext, 0);
   passed('portal.history_invalid_session_and_late_logout', { server_authority_denied: true, late_response_cannot_restore_content: true }); await lateContext.close();
 }
 
 try {
   browser = await chromium.launch({ headless: true, args: transport.args });
   if (fixture.phase === 'empty') await emptyViews();
-  else { await viewports(); await boundaries(); await pagingAndOrdering(); await selectionAndCancellationOrdering(); await cancellationOutcomes(); await actualRenderFailure(); await failuresAndExpiry(); }
+  else { await viewports(); await boundaries(); await pagingAndOrdering(); await selectionAndCancellationOrdering(); await cancellationOutcomes(); await actualRenderFailure(); await failuresAndSessionContinuity(); }
   receipt.outcome = 'passed';
 } finally {
   if (browser) await browser.close(); save(`history-browser-receipt-${fixture.phase}.json`, receipt);

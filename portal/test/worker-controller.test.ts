@@ -49,7 +49,7 @@ test('late list results cannot overwrite newer reads or mutations and report the
   api.workersWork = async () => ({ value: [renamed], requestID: 'new-list' }); await controller.refresh();
   failure.reject(new APIError('service_unavailable', 503, 'old-error')); await olderFailure;
   expect(controller.snapshot().stale).toBe(false); expect(controller.snapshot().requestID).toBe('new-list');
-  await controller.mutate('revoke', worker().id); expect(controller.snapshot().workers?.[0].revoked_at).not.toBeNull();
+  await controller.mutate('revoke', worker().id); expect(controller.snapshot().workers).toEqual([]);
   expect(controller.snapshot().actionMessage).toContain('server confirmed revocation');
   controller.reset();
 });
@@ -137,13 +137,13 @@ test('enrollment errors, expired responses, logout races and clipboard failures 
   let actual = ''; vi.stubGlobal('navigator', { clipboard: { writeText: async (text: string) => { actual = text; } } }); await browserCopy('exact text'); expect(actual).toBe('exact text'); vi.unstubAllGlobals();
 });
 
-test('portal ownership activates the worker page and clears it across logout, expiry and navigation', async () => {
+test('portal ownership activates the worker page and clears it across logout, denied requests and navigation', async () => {
   const system = new TestSystem(); const api = new TestAPI(system); const portal = new PortalController(api, system);
   portal.navigate('workers'); await portal.login('password'); await settle();
   expect(portal.workers.snapshot().workers).not.toBeNull(); await portal.workers.createEnrollment('code');
   portal.navigate('settings'); expect(portal.workers.snapshot().enrollment).toBeNull(); portal.navigate('settings');
   portal.navigate('workers'); await settle(); await portal.logout(); expect(portal.workers.snapshot().workers).toBeNull();
-  await portal.login('password'); await settle(); system.time += 1_800_000; await portal.workers.refresh();
+  await portal.login('password'); await settle(); api.workersWork = async () => { throw new APIError('unauthorized', 401); }; await portal.workers.refresh();
   expect(portal.snapshot().phase).toBe('login'); expect(portal.workers.snapshot().enrollment).toBeNull(); portal.dispose();
 });
 

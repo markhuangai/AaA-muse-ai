@@ -112,7 +112,7 @@ class PortalWorkers(Portal, History):
         safe = Path(".artifacts/ci/portal/screens")
         safe.mkdir(parents=True, exist_ok=True, mode=0o700)
         for name in browser["screenshots"]:
-            require(re.fullmatch(r"workers-(empty|list|detail|revoke|error)-(1440|768|390)\.png", name), "unsafe worker screenshot name")
+            require(re.fullmatch(r"workers-(empty|list|detail(?:-dark)?|revoke|error)-(1440|768|390)\.png", name), "unsafe worker screenshot name")
             shutil.copyfile(self.root / name, safe / name)
         self.receipts.extend(browser["cases"])
 
@@ -153,12 +153,19 @@ class PortalWorkers(Portal, History):
         elif diagnostic["event"] == "portal.auth_failed":
             require(status == 401 and event["cause"] in ("invalid_session", "session_expired") and event["expected_state"] == "authenticated" and event["observed_state"] == "unauthenticated", "denied-session cause cannot be reconstructed")
             require(completion[0]["role"] == "unauthenticated" and not any(item["msg"] == "request.admitted" for item in requested), "denied request reached an admitted operation")
+            selected = self.operation_events(diagnostic["operation_id"])
+            require(any(item["msg"] == "portal.auth_failed" and item["request_id"] == diagnostic["request_id"] and
+                        item["instance_id"] and item["portal_session_id"] for item in selected), "displayed session diagnosis did not correlate")
             cause = event["cause"]
             action = "Sign in again using the portal password; do not use worker or client credentials."
         else:
-            require(diagnostic["event"] == "worker.renamed" and diagnostic.get("client_unconfirmed") and status == 200 and event["transaction_outcome"] == "committed", "response-loss scenario lacks a backend commit")
-            exchanges = [item for item in requested if item["msg"] == "worker.rename_exchange"]
-            require(len(exchanges) == 1 and exchanges[0]["before"]["id"] == exchanges[0]["after"]["id"] and exchanges[0]["before"]["name"] != exchanges[0]["after"]["name"], "committed response-loss state exchange missing")
+            field = "revoked_at" if diagnostic["event"] == "worker.revoked" else "name"
+            exchange = "worker.revoke_exchange" if field == "revoked_at" else "worker.rename_exchange"
+            require(diagnostic["event"] in ("worker.renamed", "worker.revoked") and diagnostic.get("client_unconfirmed") and status == 200 and
+                    event["transaction_outcome"] == "committed", "response-loss scenario lacks a backend commit")
+            exchanges = [item for item in requested if item["msg"] == exchange]
+            require(len(exchanges) == 1 and exchanges[0]["before"]["id"] == exchanges[0]["after"]["id"] and
+                    exchanges[0]["before"].get(field) != exchanges[0]["after"].get(field), "committed response-loss state exchange missing")
             joined = self.operation_events(event["operation_id"])
             require(any(item["msg"] == "portal.worker_state_stale" and item.get("client_report") is True and item["cause"] == "request_failed" for item in joined), "backend commit was not joined to the browser's unconfirmed result")
             cause, transaction = "backend_committed_client_unconfirmed", event["transaction_outcome"]

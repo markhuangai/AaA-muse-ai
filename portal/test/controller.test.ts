@@ -5,7 +5,7 @@ import { TestAPI, TestSystem, deferred, settings, settle, token } from './helper
 
 const fixture = () => { const system = new TestSystem(); const api = new TestAPI(system); return { system, api, controller: new PortalController(api, system) }; };
 
-test('login, periodic refresh, visibility, absolute expiry and logout change real controller state', async () => {
+test('login, periodic refresh, visibility, remaining signed in past thirty minutes and logout change real controller state', async () => {
   const { system, api, controller } = fixture();
   let updates = 0; const unsubscribe = controller.subscribe(() => { updates++; });
   await controller.refresh(); expect(api.settingsCalls).toBe(0);
@@ -13,19 +13,16 @@ test('login, periodic refresh, visibility, absolute expiry and logout change rea
   expect(controller.snapshot().phase).toBe('authenticated');
   expect(controller.snapshot().settings?.client_key_names).toEqual([]);
   expect(JSON.stringify(controller.snapshot()).includes(token)).toBe(false);
-  expect(api.credential === token).toBe(true);
   await system.advance(30_000); expect(api.settingsCalls).toBe(2);
   await system.visibility(false); await system.advance(60_000);
   expect(controller.snapshot().stale).toBe(true);
   expect(api.reports.some(value => value.cause === 'stale_data')).toBe(true);
   await system.visibility(true); expect(controller.snapshot().stale).toBe(false);
-  const firstExpiry = controller.snapshot().expiresAt;
-  await system.advance(1_710_000);
-  expect(system.now()).toBe(firstExpiry);
-  expect(controller.snapshot().phase).toBe('login');
-  expect(api.credential).toBeNull();
+  await system.advance(1_800_001);
+  expect(controller.snapshot().phase).toBe('authenticated');
+  await controller.logout();
   expect(system.timers.size).toBe(0);
-  await controller.login('password'); await controller.logout();
+  expect(system.signOutAnnouncements).toEqual(['started', 'confirmed']);
   expect(controller.snapshot().message).toBe('Signed out.');
   expect(controller.snapshot().settings).toBeNull();
   expect(api.logoutCalls).toBe(1);
@@ -40,7 +37,7 @@ test('failed login and refresh show actionable states without retaining credenti
     await controller.login('password');
     expect(controller.snapshot().phase).toBe('login');
     expect(controller.snapshot().message.length).toBeGreaterThan(0);
-    expect(api.credential).toBeNull(); controller.dispose();
+    controller.dispose();
   }
   const { api, controller } = fixture();
   await controller.login('password');
@@ -61,15 +58,15 @@ test('failed login and refresh show actionable states without retaining credenti
 
 test('logout and a new authentication generation discard late successes and failures', async () => {
   const { api, controller } = fixture();
-  const login = deferred<{ session_token: string; expires_at: string }>();
+  const login = deferred<void>();
   api.loginWork = () => login.promise;
   const pendingLogin = controller.login('password');
   await controller.logout();
-  login.resolve({ session_token: token, expires_at: '2026-11-13T00:30:00Z' });
-  await pendingLogin; expect(controller.snapshot().phase).toBe('login'); expect(api.credential).toBeNull();
-  const lateLogin = deferred<{ session_token: string; expires_at: string }>(); api.loginWork = () => lateLogin.promise;
+  login.resolve();
+  await pendingLogin; expect(controller.snapshot().phase).toBe('login');
+  const lateLogin = deferred<void>(); api.loginWork = () => lateLogin.promise;
   const denied = controller.login('password'); await controller.logout(); lateLogin.reject(new Error('late failure')); await denied;
-  api.loginWork = async () => ({ session_token: token, expires_at: '2026-11-13T00:30:00Z' });
+  api.loginWork = async () => {};
   await controller.login('password');
   const response = deferred<{ value: ReturnType<typeof settings>; requestID: string }>(); api.settingsWork = () => response.promise;
   const pending = controller.refresh(); const duplicate = controller.refresh();
@@ -82,13 +79,19 @@ test('logout and a new authentication generation discard late successes and fail
   controller.dispose();
 });
 
-test('expiry, first-load failure, unconfirmed logout and render reports preserve useful evidence', async () => {
+test('restore, first-load failure, unconfirmed logout and render reports preserve useful evidence', async () => {
   const { api, controller, system } = fixture();
-  api.loginWork = async () => ({ session_token: token, expires_at: new Date(system.now()).toISOString() });
-  await controller.login('password'); expect(controller.snapshot().phase).toBe('login');
-  api.loginWork = async () => ({ session_token: token, expires_at: new Date(system.now() + 1_800_000).toISOString() });
+  await controller.restore(); expect(controller.snapshot().phase).toBe('login');
+  api.restoreWork = async () => { throw new APIError('invalid_session', 401, 'denied-session'); };
+  await controller.restore();
+  expect(controller.snapshot()).toMatchObject({ phase: 'login', requestID: 'denied-session', settings: null });
+  expect(controller.snapshot().operationID).toMatch(/^operation-/);
+  api.restoreWork = async () => { throw new APIError('portal_session_unavailable', 503, 'store-outage'); };
+  await controller.restore();
+  expect(controller.snapshot()).toMatchObject({ phase: 'restore_failed', requestID: 'store-outage', settings: null });
+  api.restoreWork = async () => {};
   api.settingsWork = async () => { throw new APIError('service_unavailable', 503); };
-  await controller.login('password');
+  await controller.restore();
   expect(controller.snapshot().lastGood).toBeNull(); expect(controller.snapshot().loading).toBe(false);
   controller.renderFailed(); await settle();
   expect(api.reports.at(-1)?.event).toBe('portal.render_failed');
@@ -96,11 +99,14 @@ test('expiry, first-load failure, unconfirmed logout and render reports preserve
   api.logoutWork = async () => { throw new Error('private response'); };
   await controller.logout(); expect(controller.snapshot().message).toContain('could not be confirmed');
   controller.renderFailed();
-  api.logoutWork = async () => { throw new APIError('unauthorized', 401); };
+  expect(controller.snapshot()).toMatchObject({ phase: 'logout_unconfirmed', settings: null });
+  expect(system.signOutAnnouncements).toEqual(['started']);
+  api.logoutWork = async () => {};
   await controller.logout(); expect(controller.snapshot().message).toBe('Signed out.');
   api.settingsWork = async () => ({ value: settings(), requestID: 'latest' }); await controller.login('password');
   controller.renderFailed(); await settle(); expect(api.reports.at(-1)?.last_good_at).not.toBeNull();
-  system.time += 1_800_000; await controller.refresh(); expect(controller.snapshot().phase).toBe('login');
+  for (const signedOut of system.signOutListeners) signedOut('confirmed');
+  expect(controller.snapshot().phase).toBe('login');
   controller.dispose();
 });
 

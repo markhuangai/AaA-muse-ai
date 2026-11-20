@@ -213,7 +213,7 @@ func TestPortalBrowserReportValidationAndLimits(t *testing.T) {
 	if strings.Contains(out.String(), session.Token) || !strings.Contains(out.String(), `"client_report":true`) || !strings.Contains(out.String(), `"level":"ERROR","msg":"portal.render_failed"`) || !strings.Contains(out.String(), `"level":"WARN","msg":"portal.state_stale"`) {
 		t.Fatal("browser report evidence is unsafe or incomplete")
 	}
-	if PortalSettings()["session_lifetime_seconds"] != 1800 {
+	if PortalSettings()["bearer_session_lifetime_seconds"] != 1800 {
 		t.Fatal("effective settings missing lifetime")
 	}
 }

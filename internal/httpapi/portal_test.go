@@ -38,7 +38,11 @@ func portalHTTP(h *Handler, method, path, credential, body string, headers map[s
 		r.Header.Set(key, value)
 	}
 	w := httptest.NewRecorder()
-	h.ServeHTTP(w, r)
+	if chatRoute(path) {
+		h.ServeHTTP(&chatWriter{ResponseRecorder: w}, r)
+	} else {
+		h.ServeHTTP(w, r)
+	}
 	return w
 }
 

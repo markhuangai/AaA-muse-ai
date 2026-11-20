@@ -12,12 +12,12 @@ test('client key creation submits a named value and accepts only the saved name'
   const api = new BrowserAPI((async (path, options) => {
     expect(path).toBe('/api/v1/portal/client-keys');
     expect(options?.method).toBe('POST');
-    expect(new Headers(options?.headers).get('Authorization')).toBe('Bearer ' + token);
+    expect(new Headers(options?.headers).has('Authorization')).toBe(false);
+    expect(options?.credentials).toBe('same-origin');
     const body = JSON.parse(options?.body as string);
     secretSent = body.name === 'Headless client' && body.key === 'private-fixture-value';
     return result;
   }) as typeof fetch);
-  api.setSession(token);
   expect(await api.createClientKey('Headless client', 'private-fixture-value', 'operation-key', signal())).toEqual({ value: 'Headless client', requestID: 'request-api' });
   expect(secretSent).toBe(true);
   result = json({ name: 'Headless client', key: 'private-fixture-value' }, 201);
@@ -28,35 +28,36 @@ test('the real API adapter confines credentials to JSON login and authorized sam
   const calls: { path: string; options: RequestInit }[] = [];
   const fetcher = (async (path, options) => {
     calls.push({ path: String(path), options: options! });
-    if (String(path).endsWith('/login')) return json({ session_token: token, expires_at: '2026-11-13T00:30:00Z' });
+    if (['/login', '/session'].some(route => String(path).endsWith(route))) return json({ authenticated: true });
     if (String(path).endsWith('/settings')) return json(settings());
     return new Response(null, { status: 204 });
   }) as typeof fetch;
   const api = new BrowserAPI(fetcher);
-  const login = await api.login('password-canary', 'login-operation', signal());
-  expect(login.session_token === token).toBe(true);
-  expect(JSON.parse(calls[0].options.body as string).password === 'password-canary').toBe(true);
+  await api.login('password-canary', true, 'login-operation', signal());
+  expect(JSON.parse(calls[0].options.body as string)).toEqual({ password: 'password-canary', remember_me: true });
   expect(new Headers(calls[0].options.headers).has('Authorization')).toBe(false);
-  api.setSession(login.session_token);
+  await api.restore('restore-operation', signal());
+  expect(calls[1].path).toBe('/api/v1/portal/session');
   const result = await api.settings('settings-operation', signal());
   expect(result.value).toEqual(settings());
   expect(result.requestID).toBe('request-api');
-  expect(new Headers(calls[1].options.headers).get('Authorization') === `Bearer ${token}`).toBe(true);
+  expect(new Headers(calls[2].options.headers).has('Authorization')).toBe(false);
   await api.report({ event: 'portal.state_stale', build: 'development', component: 'settings', cause: 'request_failed', request_id: 'request-api', operation_id: 'settings-operation', expected_state: 'fresh', observed_state: 'stale', last_good_at: null, duration_ms: 0, attempt: 1, omitted_reports: 0 }, signal());
   await api.logout('logout-operation', signal());
-  api.setSession(null);
   await api.settings('new-operation', signal());
   expect(new Headers(calls[4].options.headers).has('Authorization')).toBe(false);
-  expect(calls.every(call => call.path.startsWith('/api/v1/portal/') && call.options.credentials === 'omit' && call.options.cache === 'no-store' && call.options.redirect === 'error')).toBe(true);
+  expect(calls.every(call => call.path.startsWith('/api/v1/portal/') && call.options.credentials === 'same-origin' && call.options.cache === 'no-store' && call.options.redirect === 'error')).toBe(true);
   expect(calls.every(call => !call.path.includes(token) && !call.path.includes('password-canary'))).toBe(true);
   vi.stubGlobal('fetch', fetcher);
   expect((await new BrowserAPI().settings('default-api', signal())).value.ready).toBe(true);
 });
 
 test('invalid responses and HTTP failures expose only safe causes and bounded retry metadata', async () => {
+  const unconfirmedLogout = new BrowserAPI((async () => json({ authenticated: true })) as typeof fetch);
+  await expect(unconfirmedLogout.logout('operation', signal())).rejects.toMatchObject({ causeCode: 'invalid_response' });
   for (const data of [null, [], {}, { session_token: 'bad', expires_at: 'invalid' }, { session_token: token, expires_at: 'invalid' }]) {
     const api = new BrowserAPI((async () => json(data)) as typeof fetch);
-    await expect(api.login('not-logged', 'operation', signal())).rejects.toMatchObject({ causeCode: 'invalid_response' });
+    await expect(api.login('not-logged', false, 'operation', signal())).rejects.toMatchObject({ causeCode: 'invalid_response' });
   }
   const invalidSettings = new BrowserAPI((async () => json({ ...settings(), capabilities: [1] })) as typeof fetch);
   await expect(invalidSettings.settings('operation', signal())).rejects.toMatchObject({ causeCode: 'invalid_response' });

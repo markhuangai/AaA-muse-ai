@@ -92,9 +92,92 @@ class Portal(WorkerAuth):
         self.ready(self.main_service, self.origin_url)
         self.receipt("portal.process_local_sessions", sibling_isolation=True, sqlite_recovered=True)
 
+    def browser_login(self, origin=None, password=None, operation="browser-issue"):
+        origin = origin or self.origin_url
+        status, headers, body = self.api("/api/v1/portal/login", method="POST", origin=origin,
+                                         data={"password": password or self.portal, "remember_me": True},
+                                         headers={"Origin": origin, "X-Portal-Operation-Id": operation})
+        require(status == 200 and json.loads(body) == {"authenticated": True}, "browser login failed")
+        cookie = headers["Set-Cookie"].split(";", 1)[0]
+        require(re.fullmatch(r"__Host-muse_portal=muse_portal_[A-Za-z0-9_-]{43}", cookie), "browser cookie missing")
+        self.secrets.append(cookie.split("=", 1)[1])
+        return {"Cookie": cookie, "Origin": origin}
+
+    def browser_session_storage(self, sibling_origin):
+        route = "/api/v1/portal/session"
+        browser = self.browser_login()
+        require(self.api(route, origin=sibling_origin, headers=browser)[0] == 200, "browser authority is broker-local")
+        for key in (self.client, self.admin, "controlled-invalid-authorization"):
+            require(self.api(route, key, headers=browser)[0] == 401, "explicit Authorization fell back to ambient cookie")
+        workers = json.loads(self.api("/api/v1/admin/workers", headers=browser)[2])["workers"]
+        worker = workers[0]
+        foreign = {**browser, "Origin": "https://independent-origin.invalid", "Sec-Fetch-Site": "same-site",
+                   "X-Portal-Operation-Id": "browser-rejected-origin"}
+        for path, method, data in (
+                ("/api/v1/portal/login", "POST", {"password": self.portal, "remember_me": False}),
+                ("/api/v1/portal/logout", "POST", None),
+                ("/api/v1/admin/workers/" + worker["id"], "PATCH", {"name": "Cross-origin change"})):
+            status, headers, _ = self.api(path, method=method, data=data, headers=foreign)
+            require(status == 403 and headers.get("Set-Cookie") is None, "cross-origin browser write was admitted")
+        after = json.loads(self.api("/api/v1/admin/workers", headers=browser)[2])["workers"]
+        require(any(item["id"] == worker["id"] and item["name"] == worker["name"] for item in after), "rejected write changed worker state")
+        require(self.api(route, headers=browser)[0] == 200, "rejected browser write changed session state")
+        require(self.api("/api/v1/portal/logout", method="POST", origin=sibling_origin,
+                         headers={**browser, "Origin": sibling_origin, "X-Portal-Operation-Id": "browser-shared-logout"})[0] == 204,
+                "sibling did not revoke browser authority")
+        code, headers, _ = self.api(route, headers={**browser, "X-Portal-Operation-Id": "browser-denied-after-logout"})
+        require(code == 401, "browser retained authority after confirmed sign-out")
+        event, _ = self.diagnose(headers["X-Request-Id"], "portal.auth_failed", "invalid_session")
+        require(event["level"] == "WARN" and event["portal_session_id"] and event["expected_state"] == "authenticated" and
+                event["observed_state"] == "unauthenticated", "session denial lacks a safe cause or correlation")
+        self.receipt("portal.cookie_authority_shared_and_revocable", request_id=headers["X-Request-Id"], same_host_brokers=2)
+
+    def session_store_diagnosis(self, operation, request_id):
+        code, _, body = self.api("/api/v1/admin/diagnostics/export?operation_id=" + operation, self.admin)
+        require(code == 200, "protected session export unavailable")
+        metadata, events = self.decode_export(body)
+        require(metadata["complete"] and not metadata["omissions"], "session failure export incomplete")
+        failure = next(event for event in events if event["msg"] == "portal.session_store_failed")
+        detail = next(event for event in events if event["msg"] == "portal.session_store_detail")
+        require(failure["request_id"] == request_id == detail["request_id"] and failure["instance_id"] and
+                failure["portal_session_id"] and failure["level"] == "ERROR" and failure["stage"] == "authenticate" and failure["cause"] == "sqlite_error",
+                "session failure lacks cause or correlation")
+        require(detail["level"] == "DEBUG" and "no such table: aaa_portal_grants" in detail["detail"], "dependency detail did not identify the missing session table")
+        logs = self.logs(self.main_service)
+        self.assert_private(logs)
+        require(any(event.get("msg") == "portal.session_store_failed" and event.get("operation_id") == operation
+                    for event in map(json.loads, logs.splitlines())) and "portal.session_store_detail" not in logs, "session failure or INFO filtering missing")
+        self.receipt("portal.cookie_log_only_store_failure", operation_id=operation, request_id=request_id,
+                     corrective_action="Restore the SQLite portal grant table, then retry session restoration.")
+
+    def browser_password_rotation(self):
+        route = "/api/v1/portal/session"
+        old = self.browser_login(operation="password-rotation-before")
+        password = "controlled rotated portal password "
+        self.secrets.append(password)
+        config = self.configuration()
+        config["control-portal"]["password"] = password
+        rotated, origin, _ = self.launch(config=config)
+        self.ready(rotated, origin)
+        stale_operation = "password-rotation-fenced-broker"
+        status, headers, _ = self.api(route, headers={**old, "X-Portal-Operation-Id": stale_operation})
+        require(status == 503, "stale-password broker retained authority")
+        event, _ = self.diagnose(headers["X-Request-Id"], "portal.session_generation_stale", "portal_password_generation_changed")
+        require(event["level"] == "WARN" and event["operation_id"] == stale_operation and event["portal_session_id"] and event["instance_id"] and
+                event["observed_state"] == "stale_generation", "stale-generation fence lacks WARN evidence and safe correlation")
+        require(self.api(route, origin=origin, headers=old)[0] == 401, "password rotation retained a browser grant")
+        middle = self.browser_login(origin=origin, password=password, operation="password-rotation-middle")
+        reused, origin, _ = self.launch()
+        self.ready(reused, origin)
+        require(self.api(route, origin=origin, headers=old)[0] == 401 and self.api(route, origin=origin, headers=middle)[0] == 401,
+                "reusing the earlier password revived a browser grant")
+        for container in (rotated, reused):
+            self.assert_private(self.logs(container))
+        self.receipt("portal.password_rotation_invalidates_browser_grants", old_broker_fenced=True, former_password_reuse_checked=True)
+
     def browser(self, key_origins):
         fixture = self.private("browser-fixture.json", json.dumps({"origin": self.origin_url, "password": self.portal,
-            "key_origins": key_origins, "source_sha": self.args.source_sha, "container": self.main_service, "owner": self.owner, "directory": str(self.root.resolve())}))
+            "key_origins": key_origins, "source_sha": self.args.source_sha, "container": self.main_service, "database": self.db, "owner": self.owner, "directory": str(self.root.resolve())}))
         result = subprocess.run(["node", "tests/portal/browser.mjs", "--fixture", str(fixture)], capture_output=True, text=True, timeout=600)
         self.private("browser-runner.log", result.stdout + result.stderr)
         secrets_path = self.root / "browser-session-secrets.json"
@@ -103,6 +186,8 @@ class Portal(WorkerAuth):
         require(result.returncode == 0, "built-image browser checks failed; inspect private browser evidence")
         browser = json.loads((self.root / "browser-receipt.json").read_text())
         require(browser["source_sha"] == self.args.source_sha and browser["outcome"] == "passed", "browser source receipt mismatch")
+        for item in browser["session_store_diagnostics"]:
+            self.session_store_diagnosis(item["operation_id"], item["request_id"])
         for item in browser["diagnostics"]:
             status, _, body = self.api("/api/v1/admin/diagnostics/export?operation_id=" + item["operation_id"], self.admin)
             require(status == 200, "browser operation export unavailable")
@@ -119,7 +204,7 @@ class Portal(WorkerAuth):
         safe = Path(".artifacts/ci/portal/screens")
         safe.mkdir(parents=True, exist_ok=True, mode=0o700)
         for name in browser["screenshots"]:
-            require(re.fullmatch(r"(login|settings|error|client-keys)-(1440|768|390)\.png", name), "unexpected screenshot path")
+            require(re.fullmatch(r"(login(?:-dark)?|settings(?:-dark)?|error|client-keys)-(1440|768|390)\.png", name), "unexpected screenshot path")
             shutil.copyfile(self.root / name, safe / name)
         self.receipts.extend(browser["cases"])
 
@@ -248,7 +333,9 @@ def main():
         h.ready(sibling, sibling_origin)
         h.boundaries()
         h.process_scope_and_degradation(sibling_origin)
+        h.browser_session_storage(sibling_origin)
         h.client_keys()
+        h.browser_password_rotation()
         h.final_diagnostics()
         require(source_identity() == identity, "source changed during browser validation")
         outcome = "passed"

@@ -37,13 +37,14 @@ export class WorkersController {
   #generation = 0;
   #sequence = 0;
   #accepted = 0;
+  #unconfirmedRevoke = '';
   #abort = new AbortController();
   #poll = () => {};
   #freshness = () => {};
   #expiry = () => {};
   #visibility = () => {};
   constructor(private api: API, private system: System, private reports: Reports, private authorized: () => boolean,
-    private denied: () => void, private clipboard: (text: string) => Promise<void> = browserCopy) {}
+    private denied: (requestID: string, operationID: string) => void, private clipboard: (text: string) => Promise<void> = browserCopy) {}
 
   snapshot = () => this.#view;
   subscribe = (listener: () => void) => { this.#listeners.add(listener); return () => { this.#listeners.delete(listener); }; };
@@ -51,6 +52,7 @@ export class WorkersController {
   private available() { return this.#active && this.authorized(); }
 
   reset() {
+    this.#unconfirmedRevoke = '';
     this.#active = false;
     this.#generation++;
     this.#abort.abort(); this.#abort = new AbortController();
@@ -110,22 +112,27 @@ export class WorkersController {
       if (generation !== this.#generation || !this.available()) return;
       if (sequence !== this.#sequence) { this.report('obsolete_response', operation, result.requestID, sequence, this.system.now() - started); return; }
       this.#accepted = sequence;
-      this.change({ workers: result.value, selectedID: result.value.some(worker => worker.id === this.#view.selectedID) ? this.#view.selectedID : '',
-        stale: false, lastGood: this.system.now(), message: '', requestID: result.requestID });
+      const workers = result.value.filter(worker => !worker.revoked_at);
+      const reconciled = result.value.find(worker => worker.id === this.#unconfirmedRevoke);
+      this.#unconfirmedRevoke = '';
+      this.change({ workers, selectedID: workers.some(worker => worker.id === this.#view.selectedID) ? this.#view.selectedID : '',
+        stale: false, lastGood: this.system.now(), message: '', requestID: result.requestID,
+        ...(reconciled ? { actionMessage: reconciled.revoked_at ? 'The refreshed list shows that worker access is revoked.' : 'The refreshed list shows that the worker still has access.',
+          actionRequestID: result.requestID, actionOperationID: operation } : {}) });
       this.freshness();
       await this.reports.flush();
     } catch (error) {
       if (generation !== this.#generation || !this.available()) return;
       const failure = error instanceof APIError ? error : new APIError('request_failed');
       if (sequence !== this.#sequence) { this.report('obsolete_response', operation, failure.requestID, sequence, this.system.now() - started); return; }
-      if (failure.status === 401) { this.denied(); return; }
+      if (failure.status === 401) { this.denied(failure.requestID, operation); return; }
       this.change({ stale: true, message: failure.status === 403 ? 'Access to worker management was denied.' : 'Could not refresh workers. Check the connection and retry.', requestID: failure.requestID });
       this.report(failure.causeCode === 'request_timeout' ? 'request_timeout' : failure.status >= 500 ? 'service_unavailable' : 'request_failed', operation, failure.requestID, sequence, this.system.now() - started);
     } finally { if (generation === this.#generation && sequence === this.#sequence) this.change({ loading: false }); }
   }
 
   select(id: string) {
-    if (this.#view.pending || (id && !this.#view.workers?.some(worker => worker.id === id))) return;
+    if (id && (this.#view.pending || !this.#view.workers?.some(worker => worker.id === id))) return;
     this.change({ selectedID: id, actionMessage: '', actionRequestID: '', actionOperationID: '' });
   }
 
@@ -141,14 +148,17 @@ export class WorkersController {
     try {
       const result = kind === 'rename' ? await this.api.renameWorker(id, name, operation, this.#abort.signal) : await this.api.revokeWorker(id, operation, this.#abort.signal);
       if (generation !== this.#generation || !this.available()) return;
+      if (kind === 'revoke' && !result.value.revoked_at) throw new APIError('invalid_response', 200, result.requestID);
       this.#accepted = sequence;
-      this.change({ workers: this.#view.workers!.map(worker => worker.id === id ? result.value : worker), actionRequestID: result.requestID,
+      const workers = this.#view.workers!.map(worker => worker.id === id ? result.value : worker).filter(worker => !worker.revoked_at);
+      this.change({ workers, selectedID: result.value.revoked_at && this.#view.selectedID === id ? '' : this.#view.selectedID, actionRequestID: result.requestID,
         actionMessage: kind === 'rename' ? 'Display name saved. The accepted name is shown above.' : 'The server confirmed revocation. History is retained; remote activity may remain unknown.' });
     } catch (error) {
       if (generation !== this.#generation || !this.available()) return;
       const failure = error instanceof APIError ? error : new APIError('request_failed');
-      if (failure.status === 401) { this.denied(); return; }
+      if (failure.status === 401) { this.denied(failure.requestID, operation); return; }
       const rejected = failure.status >= 400 && failure.status < 500;
+      if (kind === 'revoke' && !rejected) this.#unconfirmedRevoke = id;
       const message = failure.causeCode === 'invalid_worker_name' ? 'Name not accepted. Use 1–100 Unicode characters, with no control characters; surrounding spaces are trimmed.' :
         failure.status === 403 ? 'The server denied this action.' : failure.status === 404 ? 'The worker was not found. Refresh the list.' :
         rejected ? 'The server rejected this action. Refresh before trying again.' : 'The action could not be confirmed. It may have completed. Refresh to reconcile the server state before trying again.';
@@ -180,7 +190,7 @@ export class WorkersController {
     } catch (error) {
       if (generation !== this.#generation || !this.available()) return;
       const failure = error instanceof APIError ? error : new APIError('request_failed');
-      if (failure.status === 401) { this.denied(); return; }
+      if (failure.status === 401) { this.denied(failure.requestID, operation); return; }
       this.change({ enrollmentMessage: failure.causeCode === 'worker_package_unconfigured' ? 'Setup text is unavailable. Install a service image with verified paired worker metadata, then try again.' :
         failure.causeCode === 'https_origin_required' ? 'Open the portal over HTTPS to generate a setup prompt.' :
         failure.status === 403 ? 'The server denied enrollment creation.' : 'Enrollment creation could not be confirmed. No setup text is available. Generate a new enrollment to try again.', actionRequestID: failure.requestID });

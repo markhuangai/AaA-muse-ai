@@ -59,9 +59,12 @@ test('actual React login clears the password, renders text-safe settings and sig
   render(<App controller={controller} />);
   const input = screen.getByLabelText('Portal password') as HTMLInputElement;
   expect((screen.getByRole('button', { name: 'Sign in' }) as HTMLButtonElement).disabled).toBe(true);
+  expect((screen.getByRole('checkbox', { name: 'Remember me' }) as HTMLInputElement).checked).toBe(false);
+  fireEvent.click(screen.getByRole('checkbox', { name: 'Remember me' }));
   fireEvent.change(input, { target: { value: 'private-password' } });
   await act(async () => { fireEvent.submit(input.closest('form')!); await settle(); });
   expect(input.value).toBe('');
+  expect(api.remember).toBe(true);
   expect(screen.getByRole('heading', { name: 'Service settings' })).toBeTruthy();
   expect(screen.getByLabelText('Redacted effective YAML').textContent).toContain('<img src=x');
   expect(document.querySelector('img')).toBeNull();
@@ -80,7 +83,7 @@ test('login failure and initial settings outage retain controls and show correla
   await act(async () => { fireEvent.submit(screen.getByLabelText('Portal password').closest('form')!); await settle(); });
   expect(screen.getByText('Password not accepted. Try again.')).toBeTruthy();
   expect(screen.getByText('login-request')).toBeTruthy();
-  api.loginWork = async () => ({ session_token: 'muse_portal_'+'a'.repeat(43), expires_at: '2026-11-13T00:30:00Z' });
+  api.loginWork = async () => {};
   api.settingsWork = async () => { throw new APIError('service_unavailable', 503, 'failed-settings'); };
   await act(async () => { await controller.login('password'); });
   expect(screen.getByText('No successful refresh yet')).toBeTruthy();
@@ -116,6 +119,6 @@ test('the actual error boundary reports the failure and offers reload', async ()
   function Failure(): never { throw new Error('controlled-render-failure'); }
   render(<RenderBoundary controller={controller} reload={() => { reloads++; }}><Failure /></RenderBoundary>);
   expect(screen.getByRole('heading', { name: 'Portal view could not be rendered' })).toBeTruthy();
-  fireEvent.click(screen.getByRole('button', { name: 'Reload and sign in' })); await settle();
+  fireEvent.click(screen.getByRole('button', { name: 'Reload portal' })); await settle();
   expect(reloads).toBe(1); expect(api.reports.at(-1)?.cause).toBe('render_exception'); controller.dispose();
 });

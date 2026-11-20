@@ -20,14 +20,23 @@ import (
 //go:embed migrations/001_schema.sql
 var schema string
 
+//go:embed migrations/002_portal_sessions.sql
+var portalSchema string
+
 const (
-	SchemaVersion = 1
+	SchemaVersion = 2
 	Path          = "/var/lib/aaa-muse-ai/state/broker.sqlite3"
 	BusyTimeoutMS = 2000
 	EngineVersion = "3.54.1"
 )
 
-var checksum = fmt.Sprintf("%x", sha256.Sum256([]byte(schema)))
+var migrations = [SchemaVersion]string{schema, portalSchema}
+var migrationChecksums = func() (result [SchemaVersion]string) {
+	for index, migration := range migrations {
+		result[index] = fmt.Sprintf("%x", sha256.Sum256([]byte(migration)))
+	}
+	return
+}()
 
 type Repository struct {
 	db  *sql.DB
@@ -125,7 +134,10 @@ func (r *Repository) Close() { _ = r.db.Close() }
 func (r *Repository) databaseTime() time.Time { return r.now().UTC().Truncate(time.Microsecond) }
 
 func (r *Repository) Ping(ctx context.Context) error {
-	err := verifySchema(r.db.QueryRowContext(ctx, "SELECT count(*), max(version), max(checksum) FROM aaa_schema_migrations"))
+	version, err := verifySchema(r.db.QueryContext(ctx, "SELECT version, checksum FROM aaa_schema_migrations ORDER BY version"))
+	if err == nil && version != SchemaVersion {
+		err = incompatibleSchema(version)
+	}
 	if err == nil {
 		return nil
 	}
@@ -134,20 +146,31 @@ func (r *Repository) Ping(ctx context.Context) error {
 	return failure
 }
 
-func verifySchema(row scanner) error {
-	var count int
-	var version sql.NullInt64
-	var hash sql.NullString
-	if err := row.Scan(&count, &version, &hash); err != nil {
-		return err
+func incompatibleSchema(version int) *Failure {
+	return &Failure{Reason: "schema_version_incompatible", Expected: strconv.Itoa(SchemaVersion), Observed: strconv.Itoa(version)}
+}
+
+func verifySchema(rows *sql.Rows, err error) (int, error) {
+	if err != nil {
+		return 0, err
 	}
-	if count != 1 || version.Int64 != SchemaVersion {
-		return &Failure{Reason: "schema_version_incompatible", Expected: strconv.Itoa(SchemaVersion), Observed: strconv.FormatInt(version.Int64, 10)}
+	defer rows.Close()
+	current := 0
+	for rows.Next() {
+		var version int
+		var checksum string
+		if err := rows.Scan(&version, &checksum); err != nil {
+			return 0, err
+		}
+		if version != current+1 || version > SchemaVersion {
+			return 0, incompatibleSchema(version)
+		}
+		if expected := migrationChecksums[version-1]; checksum != expected {
+			return 0, &Failure{Reason: "migration_checksum_mismatch", Expected: expected, Observed: checksum}
+		}
+		current = version
 	}
-	if hash.String != checksum {
-		return &Failure{Reason: "migration_checksum_mismatch", Expected: checksum, Observed: hash.String}
-	}
-	return nil
+	return current, rows.Err()
 }
 
 func (r *Repository) Bootstrap(ctx context.Context) error {
@@ -157,17 +180,29 @@ func (r *Repository) Bootstrap(ctx context.Context) error {
 			FROM sqlite_schema WHERE name NOT LIKE 'sqlite\_%' ESCAPE '\'`).Scan(&objects, &ledger); err != nil {
 			return err
 		}
-		if objects == 0 {
-			if _, err := tx.ExecContext(ctx, schema); err != nil {
-				return err
-			}
-			_, err := tx.ExecContext(ctx, "INSERT INTO aaa_schema_migrations(version,checksum) VALUES(?1,?2)", SchemaVersion, checksum)
-			return err
-		}
-		if ledger == 0 {
+		if objects != 0 && ledger == 0 {
 			return &Failure{Reason: "database_schema_unrecognized", Expected: "SQLite schema ledger", Observed: "missing"}
 		}
-		return verifySchema(tx.QueryRowContext(ctx, "SELECT count(*), max(version), max(checksum) FROM aaa_schema_migrations"))
+		current := 0
+		if ledger != 0 {
+			var err error
+			current, err = verifySchema(tx.QueryContext(ctx, "SELECT version, checksum FROM aaa_schema_migrations ORDER BY version"))
+			if err != nil {
+				return err
+			}
+			if current == 0 {
+				return incompatibleSchema(current)
+			}
+		}
+		for index := current; index < SchemaVersion; index++ {
+			if _, err := tx.ExecContext(ctx, migrations[index]); err != nil {
+				return err
+			}
+			if _, err := tx.ExecContext(ctx, "INSERT INTO aaa_schema_migrations(version,checksum) VALUES(?1,?2)", index+1, migrationChecksums[index]); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 	if err != nil {
 		return err

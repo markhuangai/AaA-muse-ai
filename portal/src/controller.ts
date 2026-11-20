@@ -3,39 +3,54 @@ import { Reports } from './reports';
 import { WorkersController } from './worker-controller';
 import { HistoryController } from './history-controller';
 
+type SignOutNotice = 'started' | 'confirmed';
+
 export interface System {
   now(): number;
   id(): string;
   schedule: Schedule;
   visible(): boolean;
   watchVisibility(callback: () => void): () => void;
+  watchSignOut(callback: (notice: SignOutNotice) => void): () => void;
+  announceSignOut(notice: SignOutNotice): void;
 }
+const sessionChannel = 'muse-portal-session';
 export const browserSystem: System = {
   now: () => Date.now(), id: () => crypto.randomUUID?.() ?? randomHex(16), schedule,
   visible: () => document.visibilityState !== 'hidden',
   watchVisibility: callback => { document.addEventListener('visibilitychange', callback); return () => document.removeEventListener('visibilitychange', callback); },
+  watchSignOut: callback => {
+    if (!window.BroadcastChannel) return () => {};
+    const channel = new BroadcastChannel(sessionChannel);
+    channel.onmessage = event => { if (event.data === 'started' || event.data === 'confirmed') callback(event.data); };
+    return () => channel.close();
+  },
+  announceSignOut: notice => {
+    if (!window.BroadcastChannel) return;
+    const channel = new BroadcastChannel(sessionChannel);
+    channel.postMessage(notice);
+    channel.close();
+  },
 };
 export interface View {
   page: 'settings' | 'workers' | 'requests';
-  phase: 'login' | 'signing_in' | 'authenticated';
+  phase: 'login' | 'signing_in' | 'restoring' | 'restore_failed' | 'authenticated' | 'signing_out' | 'logout_unconfirmed';
   settings: Settings | null;
   loading: boolean;
   stale: boolean;
   lastGood: number | null;
-  expiresAt: number | null;
   message: string;
   requestID: string;
   operationID: string;
   keySave: { pending: boolean; message: string; requestID: string; operationID: string } | null;
 }
-const initial = (page: View['page'] = 'settings'): View => ({ page, phase: 'login', settings: null, loading: false, stale: false, lastGood: null, expiresAt: null, message: '', requestID: '', operationID: '', keySave: null });
+const initial = (page: View['page'] = 'settings'): View => ({ page, phase: 'login', settings: null, loading: false, stale: false, lastGood: null, message: '', requestID: '', operationID: '', keySave: null });
 
 export class PortalController {
   #view = initial();
   #listeners = new Set<() => void>();
   #generation = 0;
   #abort = new AbortController();
-  #expiry = () => {};
   #refreshTimer = () => {};
   #freshnessTimer = () => {};
   #visibility = () => {};
@@ -43,21 +58,25 @@ export class PortalController {
   #settingsVersion = 0;
   #attempt = 0;
   #loggingOut = false;
+  #stopSignOut: () => void;
   readonly reports: Reports;
   readonly workers: WorkersController;
   readonly history: HistoryController;
   constructor(private api: API, private system: System = browserSystem) {
     this.reports = new Reports(api);
-    this.workers = new WorkersController(api, system, this.reports, () => {
-      if (this.#view.phase !== 'authenticated') return false;
-      if (this.#view.expiresAt !== null && system.now() >= this.#view.expiresAt) { this.expire(); return false; }
-      return true;
-    }, () => this.expire());
-    this.history = new HistoryController(api, system, this.reports, () => {
-      if (this.#view.phase !== 'authenticated') return false;
-      if (this.#view.expiresAt !== null && system.now() >= this.#view.expiresAt) { this.expire(); return false; }
-      return true;
-    }, () => this.expire());
+    const authenticated = () => this.#view.phase === 'authenticated';
+    const denied = (requestID: string, operationID: string) => this.endSession('Your session ended. Sign in again.', requestID, operationID);
+    this.workers = new WorkersController(api, system, this.reports, authenticated, denied);
+    this.history = new HistoryController(api, system, this.reports, authenticated, denied);
+    this.#stopSignOut = system.watchSignOut(notice => {
+      if (notice === 'confirmed') {
+        this.endSession('Signed out.');
+      } else if (['authenticated', 'restoring', 'signing_in'].includes(this.#view.phase) && !this.#loggingOut) {
+        this.cancel();
+        this.#view = initial(this.#view.page);
+        this.change({ phase: 'logout_unconfirmed', message: 'Sign-out started in another tab. Retry to confirm this browser’s session ended.' });
+      }
+    });
   }
   snapshot = () => this.#view;
   subscribe = (listener: () => void) => { this.#listeners.add(listener); return () => { this.#listeners.delete(listener); }; };
@@ -66,47 +85,69 @@ export class PortalController {
     this.#generation++;
     this.#abort.abort();
     this.#abort = new AbortController();
-    this.#expiry(); this.#refreshTimer(); this.#freshnessTimer(); this.#visibility();
+    this.#refreshTimer(); this.#freshnessTimer(); this.#visibility();
     this.#refreshing = false;
     this.reports.clear();
     this.workers.reset();
     this.history.reset();
   }
-  dispose() { this.cancel(); this.api.setSession(null); this.#listeners.clear(); }
+  dispose() { this.cancel(); this.#stopSignOut(); this.#listeners.clear(); }
 
-  async login(password: string) {
+  private async enterSession() {
+    this.change({ phase: 'authenticated', message: '', requestID: '' });
+    this.#visibility = this.system.watchVisibility(() => { if (this.system.visible()) void this.refresh(); });
+    this.tick();
+    if (this.#view.page === 'workers') this.workers.activate();
+    if (this.#view.page === 'requests') this.history.activate();
+    await this.refresh();
+  }
+
+  async restore() {
+    if (this.#view.phase !== 'login' && this.#view.phase !== 'restore_failed') return;
     this.cancel();
-    this.api.setSession(null);
+    const generation = this.#generation;
+    const operation = this.system.id();
+    this.change({ phase: 'restoring', message: 'Checking your session…', requestID: '', operationID: operation });
+    try {
+      await this.api.restore(operation, this.#abort.signal);
+      if (generation === this.#generation) await this.enterSession();
+    } catch (error) {
+      if (generation !== this.#generation) return;
+      const failure = error instanceof APIError ? error : new APIError('request_failed');
+      if (failure.status === 401 && failure.causeCode === 'invalid_session') {
+        this.endSession('Your session ended. Sign in again.', failure.requestID, operation);
+      } else if (failure.status === 401) {
+        this.change({ phase: 'login', message: '', operationID: '' });
+      } else {
+        this.change({ phase: 'restore_failed', message: 'Could not check your session. Check the connection and retry.', requestID: failure.requestID });
+      }
+    }
+  }
+
+  async login(password: string, remember = false) {
+    this.cancel();
     const generation = this.#generation;
     const operation = this.system.id();
     this.#view = initial(this.#view.page);
     this.change({ phase: 'signing_in', operationID: operation });
     try {
-      const session = await this.api.login(password, operation, this.#abort.signal);
-      if (generation !== this.#generation) return;
-      const expiresAt = Date.parse(session.expires_at);
-      if (expiresAt <= this.system.now()) { this.expire(); return; }
-      this.api.setSession(session.session_token);
-      this.change({ phase: 'authenticated', expiresAt });
-      this.#expiry = this.system.schedule(() => this.expire(), expiresAt - this.system.now());
-      this.#visibility = this.system.watchVisibility(() => { if (this.system.visible()) void this.refresh(); });
-      this.tick();
-      if (this.#view.page === 'workers') this.workers.activate();
-      if (this.#view.page === 'requests') this.history.activate();
-      await this.refresh();
+      await this.api.login(password, remember, operation, this.#abort.signal);
+      if (generation === this.#generation) await this.enterSession();
     } catch (error) {
       if (generation !== this.#generation) return;
       const failure = error instanceof APIError ? error : new APIError('request_failed');
-      const message = failure.status === 401 ? 'Password not accepted. Try again.' : failure.status === 429 ? `Too many attempts. Try again in ${failure.retryAfter || 60} seconds.` : 'Could not sign in. Check the service connection and try again.';
+      const message = failure.status === 401 ? 'Password not accepted. Try again.' :
+        failure.status === 429 ? `Too many attempts. Try again in ${failure.retryAfter || 60} seconds.` :
+        failure.causeCode === 'session_capacity_exhausted' ? 'The portal has reached its session limit. Sign out another browser or rotate the portal password.' :
+        'Could not sign in. Check the service connection and try again.';
       this.change({ phase: 'login', message, requestID: failure.requestID });
     }
   }
 
-  private expire() {
+  private endSession(message: string, requestID = '', operationID = '') {
     this.cancel();
-    this.api.setSession(null);
     this.#view = initial(this.#view.page);
-    this.change({ message: 'Your session ended. Sign in again.' });
+    this.change({ message, requestID, operationID });
   }
 
   navigate(page: View['page']) {
@@ -140,7 +181,6 @@ export class PortalController {
 
   async refresh() {
     if (this.#view.phase !== 'authenticated') return;
-    if (this.#view.expiresAt !== null && this.system.now() >= this.#view.expiresAt) { this.expire(); return; }
     this.freshness();
     if (this.#refreshing) return;
     this.#refreshing = true;
@@ -154,14 +194,14 @@ export class PortalController {
       const result = await this.api.settings(operation, this.#abort.signal);
       if (generation !== this.#generation || version !== this.#settingsVersion) return;
       const mismatch = result.value.build.revision !== BUILD;
-      this.change({ settings: result.value, lastGood: this.system.now(), stale: mismatch, message: mismatch ? 'The service build changed. Reload and sign in again.' : '', requestID: result.requestID });
+      this.change({ settings: result.value, lastGood: this.system.now(), stale: mismatch, message: mismatch ? 'The service build changed. Reload the portal.' : '', requestID: result.requestID });
       this.freshness();
       if (mismatch) this.report('build_mismatch', operation, result.requestID, this.system.now() - started);
       await this.reports.flush();
     } catch (error) {
       if (generation !== this.#generation || version !== this.#settingsVersion) return;
       const failure = error instanceof APIError ? error : new APIError('request_failed');
-      if (failure.status === 401) { this.expire(); return; }
+      if (failure.status === 401) { this.endSession('Your session ended. Sign in again.', failure.requestID, operation); return; }
       this.change({ stale: true, message: 'Could not refresh settings. Check the connection and retry.', requestID: failure.requestID });
       this.report(failure.causeCode === 'request_timeout' ? 'request_timeout' : failure.causeCode === 'service_unavailable' ? 'service_unavailable' : 'request_failed', operation, failure.requestID, this.system.now() - started);
     } finally {
@@ -175,7 +215,6 @@ export class PortalController {
 
   async createClientKey(name: string, key: string) {
     if (this.#view.phase !== 'authenticated' || this.#view.keySave?.pending) return;
-    if (this.#view.expiresAt !== null && this.system.now() >= this.#view.expiresAt) { this.expire(); return; }
     const generation = this.#generation;
     const operationID = this.system.id();
     this.change({ keySave: { pending: true, message: '', requestID: '', operationID } });
@@ -192,7 +231,7 @@ export class PortalController {
     } catch (error) {
       if (generation !== this.#generation) return;
       const failure = error instanceof APIError ? error : new APIError('request_failed');
-      if (failure.status === 401) { this.expire(); return; }
+      if (failure.status === 401) { this.endSession('Your session ended. Sign in again.', failure.requestID, operationID); return; }
       const message = failure.causeCode === 'client_key_conflict' ? 'The name or key is already in use, or the configuration changed. Review the current client keys.' :
         failure.causeCode === 'invalid_client_key' ? 'Enter a valid name and bearer key.' :
         failure.causeCode === 'client_key_save_failed' ? 'The broker could not write config.yaml. Check its configuration directory permissions and broker logs.' :
@@ -215,7 +254,7 @@ export class PortalController {
   }
 
   async logout() {
-    if (this.#loggingOut) return;
+    if (this.#loggingOut || this.#view.phase === 'signing_out') return;
     this.#loggingOut = true;
     const previous = this.#generation;
     if (this.history.hasPendingReads()) await this.history.abandon();
@@ -223,15 +262,20 @@ export class PortalController {
     if (previous !== this.#generation) return;
     this.cancel();
     const generation = this.#generation;
-    const pending = this.api.logout(this.system.id(), this.#abort.signal);
-    this.api.setSession(null);
+    const operationID = this.system.id();
     this.#view = initial(this.#view.page);
-    this.change({ message: 'Signed out.' });
-    try { await pending; }
+    this.change({ phase: 'signing_out', message: 'Signing out…', operationID });
+    this.system.announceSignOut('started');
+    try {
+      await this.api.logout(operationID, this.#abort.signal);
+      if (generation !== this.#generation) return;
+      this.endSession('Signed out.');
+      this.system.announceSignOut('confirmed');
+    }
     catch (error) {
-      if (generation === this.#generation && !(error instanceof APIError && error.status === 401)) {
-        this.change({ message: 'Signed out in this browser. Server sign-out could not be confirmed.' });
-      }
+      if (generation !== this.#generation) return;
+      this.change({ phase: 'logout_unconfirmed', message: 'Sign-out could not be confirmed. Retry to end this browser’s session.',
+        requestID: error instanceof APIError ? error.requestID : '' });
     }
   }
 }

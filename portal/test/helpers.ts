@@ -1,11 +1,11 @@
-import type { API, BrowserReport, Session, Settings } from '../src/api';
+import { APIError, type API, type BrowserReport, type Settings } from '../src/api';
 import type { System } from '../src/controller';
 import type { Worker, Enrollment, EnrollmentKind } from '../src/worker-api';
 import type { Execution, HistoryPage, RequestDetail, RequestSummary, TimelineEntry } from '../src/history-api';
 import { detail, entry, execution, summary } from './history-fixtures';
 
 export const token = 'muse_portal_' + 'a'.repeat(43);
-export const settings = (): Settings => ({ build: { revision: 'development', dirty: false }, instance_id: 'instance-1', client_key_names: [], ready: true, database: 'available', schema_version: 1, effective_yaml: 'control-portal:\n  password: "[REDACTED]"\n', capabilities: ['Native requests', 'Buffered SSE lifecycle events'] });
+export const settings = (): Settings => ({ build: { revision: 'development', dirty: false }, instance_id: 'instance-1', client_key_names: [], ready: true, database: 'available', schema_version: 2, effective_yaml: 'control-portal:\n  password: "[REDACTED]"\n', capabilities: ['Native requests', 'Buffered SSE lifecycle events'] });
 export const settle = async () => { for (let i = 0; i < 100; i++) await Promise.resolve(); };
 export const worker = (id = 'a'.repeat(32), name = 'Studio worker'): Worker => ({ id, name, registered_at: '2026-11-13T00:00:00Z', revoked_at: null, last_contact_at: '2026-11-13T00:00:00Z', connection_status: 'online', work_status: 'idle', current_job: null, waiting_for_client_tool: 0, last_heartbeat_at: '2026-11-13T00:00:00Z', inference_readiness: 'unverified', qualification_history: [] });
 export const enrollment = (kind: EnrollmentKind = 'prompt'): Enrollment => ({ enrollment_id: 'e'.repeat(32), created_at: '2026-11-13T00:00:00Z', expires_at: '2026-11-13T00:15:00Z', ...(kind === 'code' ? { enrollment_code: 'muse_enroll_' + 'e'.repeat(43) } : { setup_prompt: 'Complete pinned Muse setup\nKeep this single-use authority private.\nRegister the supported reconnection hook.\n', worker_package: { version: '0.1.0-rc.0', sha256: 'a'.repeat(64), url: 'https://example.test/worker.tgz' } }) });
@@ -23,6 +23,8 @@ export class TestSystem implements System {
   next = 0;
   timers = new Map<number, { at: number; callback: () => void }>();
   listeners = new Set<() => void>();
+  signOutListeners = new Set<Parameters<System['watchSignOut']>[0]>();
+  signOutAnnouncements: string[] = [];
   now = () => this.time;
   id = () => `operation-${++this.sequence}`;
   visible = () => this.showing;
@@ -32,6 +34,8 @@ export class TestSystem implements System {
     return () => { this.timers.delete(id); };
   };
   watchVisibility = (callback: () => void) => { this.listeners.add(callback); return () => { this.listeners.delete(callback); }; };
+  watchSignOut: System['watchSignOut'] = callback => { this.signOutListeners.add(callback); return () => { this.signOutListeners.delete(callback); }; };
+  announceSignOut: System['announceSignOut'] = notice => { this.signOutAnnouncements.push(notice); };
   async advance(milliseconds: number) {
     const until = this.time + milliseconds;
     for (;;) {
@@ -49,12 +53,13 @@ export class TestSystem implements System {
 }
 
 export class TestAPI implements API {
-  credential: string | null = null;
   reports: BrowserReport[] = [];
   loginCalls = 0;
   settingsCalls = 0;
   logoutCalls = 0;
-  loginWork: () => Promise<Session>;
+  remember = false;
+  loginWork = async () => {};
+  restoreWork: () => Promise<void> = async () => { throw new APIError('unauthorized', 401); };
   clientNames: string[] = [];
   settingsWork = async () => ({ value: { ...settings(), client_key_names: this.clientNames.slice() }, requestID: 'request-1' });
   createKeyWork = async (name: string, _key: string) => {
@@ -73,9 +78,9 @@ export class TestAPI implements API {
   detailWork: (id: string) => Promise<{ value: RequestDetail; requestID: string }> = async () => ({ value: detail(), requestID: 'history-detail' });
   timelineWork: (conversation: string, cursor: string) => Promise<{ value: HistoryPage<TimelineEntry>; requestID: string }> = async () => ({ value: { items: [entry()] }, requestID: 'history-timeline' });
   cancelWork: (id: string, submission: string) => Promise<{ value: Execution; requestID: string }> = async () => ({ value: execution('cancelled'), requestID: 'history-cancel' });
-  constructor(public system: TestSystem) { this.loginWork = async () => ({ session_token: token, expires_at: new Date(system.time + 1_800_000).toISOString() }); }
-  setSession(value: string | null) { this.credential = value; }
-  async login() { this.loginCalls++; return this.loginWork(); }
+  constructor(public system: TestSystem) {}
+  async login(_password: string, remember: boolean) { this.loginCalls++; this.remember = remember; await this.loginWork(); }
+  async restore() { await this.restoreWork(); }
   async settings() { this.settingsCalls++; return this.settingsWork(); }
   async createClientKey(name: string, key: string) { return this.createKeyWork(name, key); }
   async logout() { this.logoutCalls++; return this.logoutWork(); }

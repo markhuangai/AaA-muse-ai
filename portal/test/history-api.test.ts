@@ -16,7 +16,6 @@ test('recorded JSON preserves admitted numeric values through the actual history
 function adapter(data: unknown, status = 200) {
   const calls: { path: string; options: RequestInit }[] = [];
   const api = new BrowserAPI((async (path, options) => { calls.push({ path: String(path), options: options! }); return new Response(JSON.stringify(data), { status, headers: { 'X-Request-Id': 'history-http' } }); }) as typeof fetch);
-  api.setSession(token);
   return { api, calls };
 }
 test('history boundaries validate admitted projections, cursors and optional legacy fields', () => {
@@ -48,8 +47,8 @@ test('real adapter uses bounded management reads and existing cancellation with 
   expect(cancel.calls[0].path).toBe(`/api/v1/admin/experiments/${requestID}/cancel`);
   expect(JSON.parse(cancel.calls[0].options.body as string)).toEqual({ protocol_version: 1, submission_id: 'submission-1' });
   for (const call of [...list.calls, ...one.calls, ...timeline.calls, ...cancel.calls]) {
-    expect(new Headers(call.options.headers).get('Authorization')).toBe('Bearer ' + token);
-    expect(call.options.credentials).toBe('omit'); expect(call.options.cache).toBe('no-store'); expect(call.path).not.toContain(token);
+    expect(new Headers(call.options.headers).has('Authorization')).toBe(false);
+    expect(call.options.credentials).toBe('same-origin'); expect(call.options.cache).toBe('no-store'); expect(call.path).not.toContain(token);
   }
 });
 test('real adapter rejects mismatched, duplicated, oversized and malformed history instead of silently dropping it', async () => {

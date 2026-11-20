@@ -2,6 +2,7 @@ import { chromium, expect } from '@playwright/test';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { browserTransport } from './browser-transport.mjs';
+import { checkBrowserSession } from './session.mjs';
 
 const fixture = JSON.parse(readFileSync(process.argv[process.argv.indexOf('--fixture') + 1], 'utf8'));
 const password = fixture.password ?? readFileSync(fixture.password_file, 'utf8').replace(/\n$/, '');
@@ -16,7 +17,7 @@ async function action(page, path, click, status = 200) {
   await click();
   const response = await pending;
   expect(response.status()).toBe(status);
-  return { data: await response.json(), request_id: response.headers()['x-request-id'] };
+  return { data: await response.json(), response, request_id: response.headers()['x-request-id'] };
 }
 
 try {
@@ -26,7 +27,7 @@ try {
   await page.goto(transport.origin + '/workers');
   await page.getByLabel('Portal password').fill(password);
   const login = await action(page, '/api/v1/portal/login', () => page.getByRole('button', { name: 'Sign in', exact: true }).click());
-  receipt.secrets.push(login.data.session_token); save();
+  receipt.secrets.push((await checkBrowserSession(page, login.response)).value); save();
   await expect(page.getByRole('heading', { name: 'Workers', exact: true })).toBeVisible();
   passed('portal.login', { request_id: login.request_id });
   if (fixture.phase === 'setup') {
@@ -49,6 +50,8 @@ try {
         await expect(dialog).toContainText(worker.worker_id);
         const result = await action(page, `/api/v1/admin/workers/${worker.worker_id}/revoke`, () => dialog.getByRole('button', { name: 'Confirm revocation' }).click());
         expect(result.data.id).toBe(worker.worker_id); expect(!!result.data.revoked_at).toBe(true);
+        await expect(row).toHaveCount(0);
+        await expect(page.locator('.worker-drawer')).not.toBeVisible();
         passed('portal.revoke.' + worker.slot, { request_id: result.request_id, worker_id: worker.worker_id });
       } else {
         const name = `Qualification ${worker.slot} 名称`;
@@ -58,7 +61,7 @@ try {
         await expect(page.getByRole('heading', { name, exact: true })).toBeVisible();
         passed('portal.rename.' + worker.slot, { request_id: result.request_id, worker_id: worker.worker_id, name });
       }
-      await page.getByRole('button', { name: 'All workers', exact: true }).click();
+      if (fixture.phase !== 'revoke') await page.getByRole('button', { name: 'Close worker settings', exact: true }).click();
     }
     if (fixture.phase === 'inspect') {
       await page.getByRole('link', { name: 'Requests', exact: true }).click();
@@ -76,7 +79,7 @@ try {
     }
   }
   const storage = await page.evaluate(() => [Object.keys(localStorage), Object.keys(sessionStorage)]);
-  expect(storage).toEqual([[], []]); expect(await context.cookies()).toEqual([]);
+  expect(storage).toEqual([[], []]); expect((await context.cookies()).length).toBe(1); expect(await page.evaluate(() => document.cookie)).toBe('');
   receipt.outcome = 'passed'; save();
 } catch (error) {
   receipt.cause = 'product_browser_failed'; save();

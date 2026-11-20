@@ -38,6 +38,19 @@ type Authority struct {
 	clientKeys func() map[string]config.Secret
 }
 
+type PortalPasswordState struct {
+	Generation int64
+	Salt       []byte
+	Verifier   []byte
+}
+
+var (
+	ErrPortalGeneration = errors.New("portal_password_generation_changed")
+	ErrPortalGrant      = errors.New("invalid_session")
+	ErrPortalCapacity   = errors.New("session_capacity_exhausted")
+	ErrPortalCollision  = errors.New("session_collision")
+)
+
 func New(c config.Config) *Authority {
 	c.ClientKeys = maps.Clone(c.ClientKeys)
 	return NewWithConfiguration(func() *config.Config { return &c })
