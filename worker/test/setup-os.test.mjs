@@ -5,7 +5,34 @@ import { openSync, closeSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { setupIO, backgroundStderr } from '../dist/setup-os.js';
-import { fixture, until } from './helpers.mjs';
+import { fixture, ID, until } from './helpers.mjs';
+
+test('setup prepares only an owned private asset directory and identifies refused entries', async t => {
+  const f = await fixture(t);
+  const io = setupIO(f.state.root);
+  const parent = f.state.path('skills');
+  await fs.mkdir(parent);
+  await fs.chmod(parent, 0o2700);
+  const skill = join(parent, 'aaa-muse-worker-' + ID);
+  await io.prepareDirectory(skill, 'skill_directory', ID);
+  assert.equal((await fs.stat(skill)).mode & 0o7777, 0o700);
+  await fs.chmod(skill, 0o2700);
+  await fs.writeFile(join(skill, '.retained'), 'retained');
+  await assert.rejects(io.prepareDirectory(skill, 'skill_directory', ID), error => {
+    assert.equal(error.code, 'state_unsafe');
+    assert.deepEqual(error.fields, { capability: 'skill_directory', worker_id: ID, stage: 'worker',
+      expected_state: 'mode_700_uid_' + process.geteuid(), observed_state: 'mode_2700_uid_' + process.geteuid(), cause: 'directory_not_empty' });
+    return true;
+  });
+  assert.equal((await fs.stat(skill)).mode & 0o7777, 0o2700);
+  assert.equal(await fs.readFile(join(skill, '.retained'), 'utf8'), 'retained');
+  await fs.unlink(join(skill, '.retained'));
+  const inode = (await fs.stat(skill)).ino;
+  await io.prepareDirectory(skill, 'skill_directory', ID);
+  assert.equal((await fs.stat(skill)).ino, inode);
+  assert.equal((await fs.stat(skill)).mode & 0o7777, 0o700);
+  assert.equal((await fs.stat(parent)).mode & 0o7777, 0o2700);
+});
 
 test('production process adapter uses real native runtime output and rejects errors', async t => {
   const f = await fixture(t); const io = setupIO(f.state.root);

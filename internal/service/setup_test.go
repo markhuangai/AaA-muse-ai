@@ -19,7 +19,7 @@ func TestSetupPromptUsesIssuedAuthorityAndPinnedMechanics(t *testing.T) {
 	if code == "" {
 		t.Fatal("complete prompt lacks bootstrap authority")
 	}
-	for _, fragment := range []string{result.WorkerPackage.URL, result.WorkerPackage.SHA256, "hooks.list", "include_disabled:true", "hooks.add", "five-second", "no script arguments", "HATCH_HOOK_RUNTIME", "muse.skill_search", "End this installation turn", "single-use", "sha256sum", "actual_version", "setup.digest_mismatch"} {
+	for _, fragment := range []string{result.WorkerPackage.URL, result.WorkerPackage.SHA256, "hooks.list", "include_disabled:true", "hooks.add", "five-second", "no script arguments", "HATCH_HOOK_RUNTIME", "muse.skill_search", "End this installation turn", "single-use", "sha256sum", "actual_version", "setup.digest_mismatch", "empty 2700 worker directory", "confirming the saved worker identity"} {
 		if !strings.Contains(result.Prompt, fragment) {
 			t.Fatal("missing setup mechanism", fragment)
 		}

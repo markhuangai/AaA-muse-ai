@@ -32,7 +32,7 @@ export function packageWorker(args = process.argv.slice(2), { directory = worker
   for (const file of result.files) assert(/^(dist\/|setup\/|package.json$|LICENSE$|README.md$)/.test(file.path), `unexpected package path: ${file.path}`);
   assert(result.files.some(file => file.path === 'dist/main.js'));
   assert(result.files.some(file => file.path === 'dist/build.json'));
-  for (const path of ['setup/install.sh', 'setup/hook.sh', 'setup/SKILL.md']) assert(result.files.some(file => file.path === path));
+  for (const path of ['setup/install.sh', 'setup/private-directory.sh', 'setup/hook.sh', 'setup/SKILL.md']) assert(result.files.some(file => file.path === path));
   const archive = join(owned, result.filename);
   verifyArchive(archive, metadata.version, source.source_sha, owned, { execute, directory });
   const receipt = { outcome: 'passed', package: metadata.name, version: metadata.version, archive, sha256: createHash('sha256').update(readFileSync(archive)).digest('hex'), source, runtime: process.version, files: result.files.map(file => file.path), owned_directory: owned };

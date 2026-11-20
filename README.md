@@ -4,6 +4,12 @@ A self-hosted broker that connects model clients to a Muse worker through outbou
 
 ## Status
 
+On November 20, the owner reported two pre-enrollment directory refusals on `v0.2.1-rc.1` and two working installations. A controlled Linux run verified the published worker archive `941dafadfd6c544390dc9c98e178c81b0fe5d31422e57b752de7db067a0bbd5f` at source `4aa70503705ba162f946443e5e3da973720091e8`. Under a setgid parent the installer refused mode `2700`. Clearing setgid on the two empty worker directories let the same archive reach worker setup. The fixture used no enrollment code.
+
+The owner approved a paired prompt and installer fix for the XDG, hook and skill directories. The helper verifies the directory identity, owner and contents before clearing setgid. A post-enrollment refusal requires the saved worker identity on retry. The delivery requires the independent plan audit, all CI, CodeQL, Codex and complete configured AI review, with a CodeRabbit exemption for this PR. [Worker setup and recovery](worker/README.md#installation-detector-and-recovery)
+
+Controlled validation passed by `2026-11-20T13:58:43Z` at working-source digest `8e42fe5c5b3c2588d346b0b1c60d2e09a05b34f51a4b96b5993c339babed9636` before this note. The independent audit was conformant on its first pass. The packed setup and recovery suites recorded 15 and 10 passing cases with worker archive `d8cb6a7507b3c63dea8b55179fcdfab0141c8350598f2c91a1f76b4ea37e172a`. Private receipts identified all four pre-enrollment refusal cases and both post-enrollment asset failures. The recovered worker authenticated with its saved credential. All six unit coverage gates passed. Live recovery of the two reported instances has not been verified.
+
 The November 20 owner decision at `46e9ac8373980eba1c344a100b35e85e4a3e9a63` replaces PostgreSQL with embedded SQLite on one host. The SQLite deployment starts with fresh data. Concurrent broker processes share a local file and preserve accepted decisions, worker fencing, and unsettled holds across restarts. The delivery requires the independent plan audit, all CI, CodeQL, Codex, and complete configured AI review. The owner exempted CodeRabbit for this change. [Operation and cutover](#sqlite-state-and-cutover)
 
 Controlled SQLite validation passed by `2026-11-20T01:29:40Z` using working-source digest `3fbb9cd2932c02ed18383248e3bfc05faf53f19c7b39846f067ec9bef6e41f7a` before this note and broker image `sha256:a8a7d5fd760fb0bcf9cbab29eb9506ea8e9d5af2de4faffd3f8cc04dd83120d3`. The round-two independent audit was conformant. All six unit coverage gates, both product shards, the browser and worker suites, real media expiry, and controlled release verification passed. In a disposable Compose stack, a held SQLite writer left history readable. The blocked write returned SQLite code 5 after 2,009 ms. A forced statement failure returned code 1811 and rolled back. Protected exports identified both causes and the successful startup retry. [Storage and recovery diagnostics](docs/history-api.md#broker-restart-recovery)
@@ -216,6 +222,8 @@ Use your actual shell, site and hook permissions. Present permission cards to th
 
 Before running the bootstrap, check the model name and total context window your Muse setup status reports. Replace only the {} line below with one JSON object containing the available model_name (string) and context_window_tokens (positive integer). Omit unavailable values. Leave {} when neither value is known. Keep quota, current usage and credentials out of this report. Use JSON string escaping and keep the report on one line. This report describes the setup turn.
 
+Run as the same user throughout. The verified installer creates private worker directories at 0700. It clears inherited setgid only on a real, empty 2700 worker directory owned by this user. Shared parent permissions stay under their owner's control. On a directory refusal, preserve the private receipt and report its stage, directory role, cause and observed mode. If hook or skill preparation fails after enrollment, preserve the credential and state. Resume with the verified installer at the same origin and state directory only after correcting the reported cause and confirming the saved worker identity. An uncertain identity needs owner inspection.
+
 Run this Bash bootstrap with tracing disabled. Retain its private evidence directory on failure:
 
 ```bash
@@ -275,7 +283,7 @@ Setup must leave one subscriber, one enabled five-second native hook, and a prot
 
 Recovery starts only a provably absent subscriber using retained state. The subscriber retries transient connection failures. This does not establish survival of a wipe or independently check connectivity while a process stays alive.
 
-**Observed installation limitation:** worker `0.1.0-rc.0` required manual repair of new worker-specific directories that inherited setgid (`2700` rather than `0700`). Skill search also missed the installed skill, so its exact returned path was verified and used. These findings are recorded in #7; this README update does not fix the installer or change the generated prompt.
+Worker `0.1.0-rc.0` required manual repair of new worker-specific directories that inherited setgid. Skill search also missed the installed skill, so its exact returned path was verified and used. [Historical observations in #7](https://github.com/markhuangai/AaA-muse-ai/issues/7)
 
 ## Reference
 

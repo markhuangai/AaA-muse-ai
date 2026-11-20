@@ -191,11 +191,122 @@ class WorkerSetup(Inference):
             extra += ["-e", "HATCH_HOOK_DRY_RUN=1"]
         return self.command(environment, ["bash", environment["receipt"]["hook_path"]], extra=extra, want=want)
 
+    def prepare_setgid_fixture(self, env, prompt):
+        home = env["home"]
+        parents = {home / ".local": 0o2770, home / ".local/share": 0o2700, home / ".local/state": 0o2700,
+                   home / "hooks/scripts": 0o2770, home / "workspace/skills": 0o2700}
+        for path, mode in parents.items():
+            path.mkdir(parents=True, exist_ok=True)
+            path.chmod(mode)
+        leaf = home / ".local/share/aaa-muse-worker"
+        uid = os.getuid()
+
+        def refused(reason, mode, owner):
+            previous = set((home / "tmp").glob("aaa-muse-setup.*"))
+            self.install(env, prompt, want=1)
+            created, = set((home / "tmp").glob("aaa-muse-setup.*")) - previous
+            capture = (created / "bootstrap.ndjson").read_text()
+            self.assert_private(capture)
+            events = [json.loads(line) for line in capture.splitlines()]
+            require(any(e.get("msg") == "setup.runtime_unsupported" and e["level"] == "ERROR" and
+                        e["stage"] == "installer" and e["execution_started"] is False and
+                        e["setup_id"] == prompt["enrollment_id"] and e["capability"] == "install_directory" and
+                        e["expected_state"] == f"mode_700_uid_{uid}" and e["observed_state"] == f"mode_{mode:o}_uid_{owner}" and
+                        e["cause"] == reason for e in events), "installer refusal could not be diagnosed from private receipt")
+            require(not (env["state"] / "credential.key").exists() and
+                    self.checked("/api/v1/admin/workers", self.admin)[0]["workers"] == [], "directory refusal enrolled a worker")
+            require(leaf.lstat().st_mode & 0o7777 == mode and leaf.lstat().st_uid == owner, "refusal changed the directory entry")
+
+        leaf.mkdir(mode=0o700)
+        marker = leaf / ".retained"
+        marker.write_text("existing installation")
+        refused("directory_not_empty", 0o2700, uid)
+        require(marker.read_text() == "existing installation", "populated setgid directory was modified")
+        marker.unlink()
+        leaf.chmod(0o750)
+        refused("unsafe_directory_mode", 0o750, uid)
+        leaf.rmdir()
+        sibling = home / "other-worker"
+        sibling.mkdir()
+        sibling.chmod(0o2700)
+        leaf.symlink_to("../../other-worker")
+        refused("wrong_directory_type", 0o777, uid)
+        require(leaf.resolve() == sibling and sibling.stat().st_mode & 0o7777 == 0o2700, "installer modified a link target")
+        leaf.unlink()
+        leaf.mkdir(mode=0o700)
+        other_uid = 65534 if uid != 65534 else 65533
+        container_path = "/home/worker/.local/share/aaa-muse-worker"
+        try:
+            self.docker("exec", "--user", "0:0", env["container"], "chown", str(other_uid), container_path)
+            refused("wrong_directory_owner", leaf.stat().st_mode & 0o7777, other_uid)
+        finally:
+            self.docker("exec", "--user", "0:0", env["container"], "chown", str(uid), container_path)
+        leaf.chmod(0o2700)
+        self.receipt("setup.unsafe_directory_refusals", populated=True, broader_mode=True, link=True, foreign_owner=True,
+                     private_receipts_verified=True, stopped_before_enrollment=True)
+        return parents
+
+    def asset_directory_recovery(self):
+        env = self.environment("asset-directory-recovery")
+        home = env["home"]
+        data_parent = home / ".local/share"
+        data_parent.mkdir(parents=True)
+        data_parent.chmod(0o2700)
+        (home / "hooks").mkdir()
+        alternate = home / "alternate-hooks"
+        alternate.mkdir()
+        hooks = home / "hooks/scripts"
+        hooks.symlink_to("../alternate-hooks")
+        first = self.prompt()
+        self.install(env, first, want=1)
+        saved = json.loads((env["state"] / "installation.json").read_text())
+        worker_id = saved["worker_id"]
+        credential = (env["state"] / "credential.key").read_text().strip()
+        self.secrets.append(credential)
+        require(self.checked("/api/v1/worker/status", credential)[0]["id"] == worker_id, "failed setup lost its authenticated worker")
+        require(data_parent.stat().st_mode & 0o7777 == 0o2700 and (data_parent / "aaa-muse-worker").stat().st_mode & 0o7777 == 0o700,
+                "fresh install directory inherited setgid")
+        require(not (env["state"] / "launch.json").exists() and not list(alternate.iterdir()), "failed hook setup wrote assets or launched a subscriber")
+        env["receipt"] = {"launcher": saved["root"] + "/bin/aaa-muse-worker"}
+
+        def diagnosis(prompt, role, observed, cause):
+            output = self.cli(env, "diagnostics-export", "--operation-id", prompt["enrollment_id"], "--decode").stdout
+            records = [json.loads(line) for line in output.splitlines()]
+            require(records[0]["complete"] and not records[0]["omissions"], "setup directory export incomplete")
+            require(any(e.get("msg") == "worker.state_unsafe" and e["level"] == "ERROR" and
+                        e["worker_id"] == worker_id and e["setup_id"] == prompt["enrollment_id"] and e["stage"] == "worker" and
+                        e["capability"] == role and e["expected_state"] == f"mode_700_uid_{os.getuid()}" and
+                        e["observed_state"] == observed and e["cause"] == cause for e in records), "worker directory refusal lost identity or cause")
+
+        diagnosis(first, "hook_directory", "unavailable", "directory_path_link")
+        hooks.unlink()
+        hooks.mkdir()
+        hooks.chmod(0o2700)
+        skills = home / "workspace/skills"
+        skills.mkdir(parents=True)
+        skills.chmod(0o2700)
+        skill = skills / ("aaa-muse-worker-" + worker_id)
+        skill.mkdir(mode=0o700)
+        marker = skill / ".retained"
+        marker.write_text("operator fixture")
+        second = self.prompt()
+        self.install(env, second, want=1)
+        diagnosis(second, "skill_directory", f"mode_2700_uid_{os.getuid()}", "directory_not_empty")
+        require(skill.stat().st_mode & 0o7777 == 0o2700 and marker.read_text() == "operator fixture", "failed skill setup changed populated state")
+        marker.unlink()
+        self.install(env, second)
+        require(env["receipt"]["identity_preserved"] and env["worker"]["id"] == worker_id and env["credential"] == credential,
+                "setup recovery replaced the enrolled worker")
+        require(skill.stat().st_mode & 0o7777 == 0o700 and hooks.stat().st_mode & 0o7777 == 0o2700 and
+                skills.stat().st_mode & 0o7777 == 0o2700, "asset recovery changed parent modes or skipped the leaf correction")
+        self.receipt("setup.asset_directory_recovery", worker_id=worker_id, hook_and_skill_diagnosed=True, identity_preserved=True)
+
     def exercise(self):
         status, _, _ = self.api("/api/v1/admin/setup-prompts", self.client, "POST", {})
         require(status == 401, "client authority generated setup prompt")
         primary = self.environment("primary")
         initial = self.prompt()
+        parents = self.prepare_setgid_fixture(primary, initial)
         self.install(primary, initial, model_report=json.dumps({"model_name": "Controlled Muse", "context_window_tokens": 350000}))
         first_id = primary["worker"]["id"]
         first_pid = json.loads((primary["state"] / "launch.json").read_text())["pid"]
@@ -211,8 +322,19 @@ class WorkerSetup(Inference):
         body["messages"][0]["content"] = "x" * 1048576
         code, _, _ = self.api("/v1/chat/completions", self.client, "POST", body)
         require(code == 413, "reported context window changed the broker body limit")
-        for path, mode in [(primary["state"], 0o700), (primary["state"] / "credential.key", 0o600)]:
-            require(path.stat().st_mode & 0o777 == mode, "installed credential permissions differ")
+        home = primary["home"]
+        data = home / ".local/share/aaa-muse-worker"
+        hook = home / "hooks/scripts" / ("aaa-muse-worker-" + first_id)
+        skill = home / "workspace/skills" / ("aaa-muse-worker-" + first_id)
+        for path in (data, primary["state"], hook, skill):
+            require(path.is_dir() and not path.is_symlink() and path.stat().st_mode & 0o7777 == 0o700 and
+                    path.stat().st_uid == os.getuid(), "worker directory is not private and owned")
+        require((primary["state"] / "credential.key").stat().st_mode & 0o7777 == 0o600, "installed worker key permissions differ")
+        for path, mode in parents.items():
+            require(path.stat().st_mode & 0o7777 == mode, "installer changed a parent mode")
+        for path, key in [(hook / "detector.sh", "hook_path"), (skill / "SKILL.md", "skill_path")]:
+            require(path.is_file() and primary["receipt"][key] == "/home/worker/" + str(path.relative_to(home)), "installer returned the wrong asset")
+        self.receipt("setup.setgid_install", exact_modes=True, rc1_leftover=True, parents_preserved=True, worker_id=first_id)
 
         self.hook(primary, dry=True)
         require(json.loads(self.hook(primary).stdout)["action"] == "silent", "idle hook woke model")
@@ -321,6 +443,7 @@ class WorkerSetup(Inference):
         require({file.name: file.read_bytes() for file in (primary["state"] / "journals").glob("*.json")} == old_journals,
                 "fresh enrollment changed the prior installation's journals")
         self.receipt("setup.sqlite_fresh_start", old_credential_denied=True, fresh_enrollment=True, journal_preserved=True)
+        self.asset_directory_recovery()
 
 
 def run(harness_type=WorkerSetup, suite="worker-setup"):

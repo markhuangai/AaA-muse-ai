@@ -87,6 +87,8 @@ Use your actual shell, site and hook permissions. Present permission cards to th
 
 Before running the bootstrap, check the model name and total context window your Muse setup status reports. Replace only the {} line below with one JSON object containing the available model_name (string) and context_window_tokens (positive integer). Omit unavailable values. Leave {} when neither value is known. Keep quota, current usage and credentials out of this report. Use JSON string escaping and keep the report on one line. This report describes the setup turn.
 
+Run as the same user throughout. The verified installer creates private worker directories at 0700. It clears inherited setgid only on a real, empty 2700 worker directory owned by this user. Shared parent permissions stay under their owner's control. On a directory refusal, preserve the private receipt and report its stage, directory role, cause and observed mode. If hook or skill preparation fails after enrollment, preserve the credential and state. Resume with the verified installer at the same origin and state directory only after correcting the reported cause and confirming the saved worker identity. An uncertain identity needs owner inspection.
+
 Run this Bash bootstrap with tracing disabled. Retain its private evidence directory on failure:
 
 ` + "```bash\n" + `set +x
