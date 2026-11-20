@@ -51,11 +51,14 @@ type Config struct {
 type Error struct {
 	Field, Reason string
 	Line, Column  int
+	readError     error
 }
 
 func (e *Error) Error() string {
 	return fmt.Sprintf("configuration rejected: %s (%s)", e.Field, e.Reason)
 }
+
+func (e *Error) Unwrap() error { return e.readError }
 
 func Defaults() Config {
 	var c Config
@@ -72,7 +75,7 @@ var envReference = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)\}`)
 func Load(readFile func(string) ([]byte, error), lookup func(string) (string, bool), path string) (Config, error) {
 	b, err := readFile(path)
 	if err != nil {
-		return Config{}, &Error{Field: "configuration", Reason: "read_failed"}
+		return Config{}, &Error{Field: "configuration", Reason: "read_failed", readError: err}
 	}
 	return Parse(b, lookup)
 }

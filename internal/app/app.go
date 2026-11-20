@@ -80,6 +80,10 @@ func Run(ctx context.Context, args []string, build service.Build, d Dependencies
 		fatal("build.rejected", "invalid_release_metadata", nil)
 		return 1
 	}
+	if len(args) > 0 && args[0] == "prepare-mounts" {
+		paths := []string{filepath.Dir(d.DatabasePath), d.MediaDir, config.Defaults().Diagnostics.Directory}
+		return runMountPreparation(args[1:], build.Revision, config.DefaultPath, paths, d)
+	}
 	flags.SetOutput(io.Discard)
 	path := flags.String("config", config.DefaultPath, "Configuration path")
 	if err := flags.Parse(args); err != nil || flags.NArg() != 0 {
@@ -93,6 +97,13 @@ func Run(ctx context.Context, args []string, build service.Build, d Dependencies
 		attrs := []any{}
 		if ce != nil {
 			attrs = []any{"field", ce.Field, "reason", ce.Reason, "line", ce.Line, "column", ce.Column}
+			if ce.Reason == "read_failed" {
+				expectedPath := "custom"
+				if *path == config.DefaultPath {
+					expectedPath = config.DefaultPath
+				}
+				attrs = append(attrs, "config_path", expectedPath, "read_cause", fileErrorReason(err))
+			}
 		}
 		fatal("config.rejected", "startup_stopped", attrs)
 		return 1

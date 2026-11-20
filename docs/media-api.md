@@ -29,7 +29,7 @@ Completed status includes `committed_at`, `expires_at` and the measured `artifac
 
 ## Storage and recovery
 
-Mount the private media volume at `/var/lib/aaa-muse-ai/media` with ownership `10001:10001` and mode `0700`. Mount the same filesystem on every service instance in the pool. Exclude this volume from filesystem snapshots and backups. The operator's reverse proxy must allow the upload sizes and 120-second transfers. The HTTP responses request `Cache-Control: no-store`.
+Mount private media storage at `/var/lib/aaa-muse-ai/media` with the service's numeric UID and GID and mode `0700`. Mount the same filesystem on every service instance in the pool. Exclude media storage from filesystem snapshots and backups. The operator's reverse proxy must allow the upload sizes and 120-second transfers. The HTTP responses request `Cache-Control: no-store`. [Storage setup](deployment.md#fresh-install)
 
 The worker stages each new job in a private `0700` directory under `/tmp` on the Muse VM. Muse writes the generated files, thumbnails and other tool output in that directory. The VM manages their lifetime, so the worker can leave them there after upload. The worker stores the path and assignment progress in its durable journal. If the VM removes an unaccepted upload from `/tmp`, the worker reports the missing file and preserves the assignment for reconciliation. It can confirm an already committed upload from the broker's matching receipt even if the local files are gone. In-flight jobs from earlier releases can finish from their recorded worker state directory.
 
