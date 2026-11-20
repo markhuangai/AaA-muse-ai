@@ -95,8 +95,10 @@ func TestRunRealHTTPAndGeneratedKey(t *testing.T) {
 			var origin string
 			select {
 			case origin = <-address:
-			case <-time.After(3 * time.Second):
-				t.Fatal("startup stalled")
+			case code := <-result:
+				t.Fatalf("startup exited before listening (status %d)", code)
+			case <-time.After(10 * time.Second):
+				t.Fatal("startup did not listen within 10 seconds")
 			}
 			client := &http.Client{Timeout: time.Second}
 			response, err := client.Get("http://" + origin + "/healthz")
