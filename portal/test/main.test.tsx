@@ -1,5 +1,5 @@
 import { act } from '@testing-library/react';
-import { expect, test } from 'vitest';
+import { expect, test, vi } from 'vitest';
 import { TestAPI, TestSystem } from './helpers';
 import { PortalController } from '../src/controller';
 
@@ -13,8 +13,9 @@ test('the production entrypoint mounts the real app and disposes the injected co
   await act(async () => { await controller.login('password'); });
   expect(element.textContent).toContain('Service settings');
   await act(async () => { stop(); });
-  expect(element.childNodes).toHaveLength(0); expect(api.credential).toBeNull(); element.remove();
+  expect(element.childNodes).toHaveLength(0); element.remove();
   const other = document.createElement('div'); document.body.append(other);
+  vi.stubGlobal('fetch', async () => new Response(null, { status: 401 }));
   await act(async () => { stop = entry.mount(other); });
-  expect(other.textContent).toContain('Service access'); await act(async () => { stop(); }); other.remove();
+  expect(other.textContent).toContain('Service access'); await act(async () => { stop(); }); other.remove(); vi.unstubAllGlobals();
 });

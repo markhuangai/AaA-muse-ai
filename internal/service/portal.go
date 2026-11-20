@@ -53,16 +53,20 @@ type Portal struct {
 	random            io.Reader
 	now               func() time.Time
 	sessions          map[[32]byte]portalRecord
+	browser           PortalBrowserRepository
+	browserGeneration int64
+	browserReports    map[string]portalWindow
 	peers             map[string]portalWindow
 	failures, reports portalWindow
 }
 
 func NewPortal(authority *auth.Authority, random io.Reader, now func() time.Time) *Portal {
-	return &Portal{authority: authority, random: random, now: now, sessions: map[[32]byte]portalRecord{}, peers: map[string]portalWindow{}}
+	return &Portal{authority: authority, random: random, now: now, sessions: map[[32]byte]portalRecord{}, peers: map[string]portalWindow{}, browserReports: map[string]portalWindow{}}
 }
 
 func PortalSettings() map[string]any {
-	return map[string]any{"session_lifetime_seconds": 1800, "session_capacity": PortalCapacity, "peer_capacity": PortalCapacity,
+	return map[string]any{"bearer_session_lifetime_seconds": 1800, "bearer_session_capacity": PortalCapacity,
+		"browser_grant_capacity": PortalCapacity, "remember_max_age_seconds": int(PortalRememberLifetime.Seconds()), "peer_capacity": PortalCapacity,
 		"failed_logins_per_peer_minute": 5, "failed_logins_per_minute": 60, "browser_event_max_bytes": 4096,
 		"browser_events_per_session_minute": 20, "browser_events_per_minute": 120,
 		"request_timeout_ms": 10000, "refresh_interval_ms": 30000, "stale_after_ms": 60000}
@@ -82,19 +86,16 @@ func (p *Portal) prune(now time.Time, logger *slog.Logger) {
 	}
 }
 
-func (p *Portal) Login(logger *slog.Logger, peer, password string) (PortalSession, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	now := p.now().UTC()
+func (p *Portal) checkPassword(logger *slog.Logger, peer, password string, now time.Time) error {
 	p.prune(now, logger)
 	p.failures.reset(now)
 	window, exists := p.peers[peer]
 	window.reset(now)
 	loginAttempt := window.Count + 1
-	denied := func(reason string, status int, retry int) (PortalSession, error) {
+	denied := func(reason string, status int, retry int) error {
 		logger.Warn("portal.auth_failed", "component", "login", "cause", reason, "peer", peer, "peer_failures", window.Count,
 			"global_failures", p.failures.Count, "retry_after_seconds", retry, "attempt", loginAttempt, "expected_state", "authenticated", "observed_state", "unauthenticated", "outcome", "rejected")
-		return PortalSession{}, &PortalError{Reason: reason, Status: status, RetryAfter: retry}
+		return &PortalError{Reason: reason, Status: status, RetryAfter: retry}
 	}
 	if p.failures.Count >= 60 || window.Count >= 5 || (!exists && len(p.peers) >= PortalCapacity) {
 		until := window.Started.Add(time.Minute)
@@ -109,8 +110,19 @@ func (p *Portal) Login(logger *slog.Logger, peer, password string) (PortalSessio
 		p.failures.Count++
 		return denied("wrong_password", 401, 0)
 	}
+	return nil
+}
+
+func (p *Portal) Login(logger *slog.Logger, peer, password string) (PortalSession, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := p.now().UTC()
+	if err := p.checkPassword(logger, peer, password, now); err != nil {
+		return PortalSession{}, err
+	}
 	if len(p.sessions) >= PortalCapacity {
-		return denied("session_capacity_exhausted", 503, 0)
+		logger.Warn("portal.auth_failed", "component", "login", "cause", "session_capacity_exhausted", "outcome", "rejected")
+		return PortalSession{}, &PortalError{Reason: "session_capacity_exhausted", Status: 503}
 	}
 	for attempt := 1; attempt <= 3; attempt++ {
 		token, err := auth.Token(auth.PortalPrefix, p.random)

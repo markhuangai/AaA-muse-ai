@@ -3,11 +3,19 @@ import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { App } from '../src/app';
 import { PortalController } from '../src/controller';
 import { Workers, timestamp } from '../src/workers';
-import { TestAPI, TestSystem, enrollment, settle, worker } from './helpers';
+import { TestAPI, TestSystem, deferred, enrollment, settle, worker } from './helpers';
 
 const dialogRestores: (() => void)[] = [];
 afterEach(() => { cleanup(); history.replaceState(null, '', '/'); for (const restore of dialogRestores.splice(0)) restore(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
+function dialogAdapter() {
+  for (const [method, open] of [['showModal', true], ['close', false]] as const) {
+    const original = Object.getOwnPropertyDescriptor(HTMLDialogElement.prototype, method);
+    Object.defineProperty(HTMLDialogElement.prototype, method, { configurable: true, value: function(this: HTMLDialogElement) { this.open = open; } });
+    dialogRestores.push(() => { if (original) Object.defineProperty(HTMLDialogElement.prototype, method, original); else Reflect.deleteProperty(HTMLDialogElement.prototype, method); });
+  }
+}
 async function fixture() {
+  dialogAdapter();
   const system = new TestSystem(); const api = new TestAPI(system); const portal = new PortalController(api, system);
   await portal.login('password'); portal.navigate('workers'); await settle();
   return { system, api, portal, controller: portal.workers };
@@ -28,7 +36,7 @@ test('actual worker components show facts separately, text-safe names and the se
   expect(screen.getByText('2026-11-18 00:00:00 UTC')).toBeTruthy();
   expect(screen.getByText('Installed version').parentElement?.textContent).toContain('Not reported'); expect(screen.getByText('Not independently observed')).toBeTruthy();
   expect(screen.getByText('job-observed')).toBeTruthy(); expect(screen.getByText('Controlled software evidence')).toBeTruthy();
-  expect(screen.getByText('No automatic expiry; valid until revoked')).toBeTruthy();
+  expect(screen.getByText('Valid until revoked')).toBeTruthy();
   fireEvent.change(screen.getByLabelText('Display name'), { target: { value: '  Accepted name  ' } });
   await act(async () => { fireEvent.submit(screen.getByLabelText('Display name').closest('form')!); await settle(); });
   expect(screen.getByRole('heading', { name: 'Accepted name' })).toBeTruthy();
@@ -40,7 +48,7 @@ test('actual worker components show facts separately, text-safe names and the se
 test('empty, loading, stale and enrollment states keep usable controls without persisting sensitive text', async () => {
   const { portal, api, controller, system } = await fixture();
   api.workersWork = async () => ({ value: [], requestID: 'empty-workers' }); await controller.refresh(); render(<Workers controller={controller} />);
-  expect(screen.getByText(/No workers are registered/)).toBeTruthy();
+  expect(screen.getByText(/No workers have access/)).toBeTruthy();
   await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Generate setup prompt' })); await settle(); });
   expect((screen.getByLabelText('Complete setup prompt') as HTMLTextAreaElement).value === enrollment().setup_prompt).toBe(true);
   const select = vi.spyOn(HTMLTextAreaElement.prototype, 'select'); fireEvent.click(screen.getByRole('button', { name: 'Select text' })); expect(select).toHaveBeenCalledOnce();
@@ -56,21 +64,16 @@ test('empty, loading, stale and enrollment states keep usable controls without p
 
 test('native-dialog callbacks issue revocation only after confirmation and expose accepted revocation', async () => {
   const { portal, controller } = await fixture();
-  for (const [method, open] of [['showModal', true], ['close', false]] as const) {
-    const original = Object.getOwnPropertyDescriptor(HTMLDialogElement.prototype, method);
-    Object.defineProperty(HTMLDialogElement.prototype, method, { configurable: true, value: function(this: HTMLDialogElement) { this.open = open; } });
-    dialogRestores.push(() => { if (original) Object.defineProperty(HTMLDialogElement.prototype, method, original); else Reflect.deleteProperty(HTMLDialogElement.prototype, method); });
-  }
-  vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => { callback(0); return 1; }); vi.spyOn(window, 'scrollTo').mockImplementation(() => {});
   render(<Workers controller={controller} />);
   await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Studio worker' })); });
-  fireEvent.click(screen.getByRole('button', { name: 'Revoke worker' })); expect(screen.getByRole('dialog')).toBeTruthy();
+  fireEvent.click(screen.getByRole('button', { name: 'Revoke worker' })); expect(screen.getByRole('dialog', { name: 'Revoke this worker?' })).toBeTruthy();
   fireEvent.click(screen.getByRole('button', { name: 'Cancel' })); expect(controller.snapshot().workers?.[0].revoked_at).toBeNull();
   fireEvent.click(screen.getByRole('button', { name: 'Revoke worker' }));
   await act(async () => { fireEvent.submit(screen.getByRole('button', { name: 'Confirm revocation' }).closest('form')!); await settle(); });
-  expect(screen.getByText('Revoked registration')).toBeTruthy(); expect(screen.getByText(/server confirmed revocation/)).toBeTruthy();
-  await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'All workers' })); await settle(); });
-  expect(screen.getByRole('button', { name: 'Studio worker' })).toBeTruthy(); portal.dispose();
+  expect(screen.getByText(/server confirmed revocation/)).toBeTruthy();
+  expect(screen.queryByRole('dialog', { name: 'Studio worker' })).toBeNull();
+  expect(screen.queryByRole('button', { name: 'Studio worker' })).toBeNull();
+  expect(document.activeElement).toBe(screen.getByRole('heading', { name: 'Workers' })); portal.dispose();
 });
 
 test('shell navigation uses history in the same session and responds to back/forward', async () => {
@@ -81,4 +84,20 @@ test('shell navigation uses history in the same session and responds to back/for
   await act(async () => { history.replaceState(null, '', '/settings'); window.dispatchEvent(new PopStateEvent('popstate')); await settle(); });
   expect(screen.getByRole('heading', { name: 'Service settings' })).toBeTruthy(); expect(api.loginCalls).toBe(1);
   expect(timestamp(null)).toBe('Not observed'); portal.dispose();
+});
+
+test('closing a worker drawer during rename returns focus to the row before and after the response', async () => {
+  const { portal, controller, api } = await fixture();
+  const rename = deferred<{ value: ReturnType<typeof worker>; requestID: string }>();
+  api.renameWork = () => rename.promise;
+  render(<Workers controller={controller} />);
+  const opener = screen.getByRole('button', { name: 'Studio worker' });
+  fireEvent.click(opener);
+  fireEvent.change(screen.getByLabelText('Display name'), { target: { value: 'Updated worker' } });
+  await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Save name' })); await settle(); });
+  fireEvent(screen.getByRole('dialog', { name: 'Studio worker' }), new Event('cancel', { cancelable: true, bubbles: true }));
+  expect(document.activeElement).toBe(opener);
+  await act(async () => { rename.resolve({ value: worker(undefined, 'Updated worker'), requestID: 'reply' }); await settle(); });
+  expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Updated worker' }));
+  portal.dispose();
 });

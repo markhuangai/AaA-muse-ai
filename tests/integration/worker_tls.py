@@ -104,7 +104,8 @@ class TLSFixture:
                         if delayed and delayed[0] == identity:
                             # Expire liveness while leaving time for the final HTTP attempt to receive the broker's refusal.
                             time.sleep(max(0, delayed[1] - time.monotonic()))
-                    headers = {key: self.headers[key] for key in ("Authorization", "Content-Type", "X-Request-Id", "X-Portal-Operation-Id",
+                    headers = {key: self.headers[key] for key in ("Authorization", "Content-Type", "Cookie", "Host", "Origin", "Sec-Fetch-Site",
+                               "X-Request-Id", "X-Portal-Operation-Id",
                                "X-Muse-Worker-Version", "X-Muse-Worker-Model-Report", "X-Muse-Media-Jobs",
                                "X-Muse-Artifact-Sha256", "X-Muse-Connection-Id", "X-Muse-Connection-Generation",
                                "X-Muse-Generation", "X-Muse-Lease-Id") if key in self.headers}
@@ -176,9 +177,9 @@ class TLSFixture:
                             return
                     self.send_response(response.status)
                     for key in ("Content-Type", "X-Request-Id", "X-Muse-Service-Version", "Cache-Control", "Content-Security-Policy",
-                                "Referrer-Policy", "X-Content-Type-Options", "WWW-Authenticate", "Retry-After", "Allow"):
-                        if response.getheader(key):
-                            self.send_header(key, response.getheader(key))
+                                "Referrer-Policy", "X-Content-Type-Options", "WWW-Authenticate", "Retry-After", "Allow", "Set-Cookie"):
+                        for value in response.headers.get_all(key, []):
+                            self.send_header(key, value)
                     if not streaming:
                         self.send_header("Content-Length", str(len(payload)))
                     self.end_headers()

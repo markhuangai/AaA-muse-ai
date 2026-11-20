@@ -118,6 +118,44 @@ func TestSQLiteBootstrapConnectionSettingsAndRestart(t *testing.T) {
 	}
 }
 
+func TestSQLitePortalMigrationPreservesPopulatedVersionOne(t *testing.T) {
+	path := privatePath(t)
+	original := openRepo(t, path)
+	execute(t, original, schema)
+	execute(t, original, "INSERT INTO aaa_schema_migrations(version,checksum) VALUES(1,?1)", migrationChecksums[0])
+	execute(t, original, "PRAGMA journal_mode=WAL")
+	credential := enroll(t, original, "version-one-worker")
+	original.Close()
+
+	first, second := openRepo(t, path), openRepo(t, path)
+	start := make(chan struct{})
+	done := make(chan error, 2)
+	for _, repo := range []*Repository{first, second} {
+		go func() { <-start; done <- repo.Bootstrap(t.Context()) }()
+	}
+	close(start)
+	for range 2 {
+		if err := <-done; err != nil {
+			t.Fatal(err, Classify(err).Detail())
+		}
+	}
+	for _, repo := range []*Repository{first, second} {
+		if err := repo.Ping(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		record, err := repo.AuthenticateWorker(t.Context(), credential)
+		if err != nil || record.ID != "version-one-worker" {
+			t.Fatal("migration lost existing worker identity", err)
+		}
+	}
+	for _, version := range []int{1, 2} {
+		execute(t, first, "UPDATE aaa_schema_migrations SET checksum='changed' WHERE version=?1", version)
+		failReason(t, second.Ping(t.Context()), "migration_checksum_mismatch")
+		failReason(t, second.Bootstrap(t.Context()), "migration_checksum_mismatch")
+		execute(t, first, "UPDATE aaa_schema_migrations SET checksum=?2 WHERE version=?1", version, migrationChecksums[version-1])
+	}
+}
+
 func TestSQLiteUnsafeFileAndSchemaRejections(t *testing.T) {
 	t.Run("relative", func(t *testing.T) {
 		_, err := Open(t.Context(), "relative")
@@ -162,13 +200,16 @@ func TestSQLiteUnsafeFileAndSchemaRejections(t *testing.T) {
 	})
 	t.Run("ledger", func(t *testing.T) {
 		repo := newRepo(t)
-		execute(t, repo, "UPDATE aaa_schema_migrations SET version=2")
-		if f := failReason(t, repo.Bootstrap(t.Context()), "schema_version_incompatible"); f.Observed != "2" || f.Expected != "1" {
+		execute(t, repo, "UPDATE aaa_schema_migrations SET version=3 WHERE version=2")
+		if f := failReason(t, repo.Bootstrap(t.Context()), "schema_version_incompatible"); f.Observed != "3" || f.Expected != "2" {
 			t.Fatal(f)
 		}
-		execute(t, repo, "UPDATE aaa_schema_migrations SET version=1,checksum='changed'")
+		execute(t, repo, "UPDATE aaa_schema_migrations SET checksum='changed' WHERE version=1")
 		failReason(t, repo.Bootstrap(t.Context()), "migration_checksum_mismatch")
 		failReason(t, repo.Ping(t.Context()), "migration_checksum_mismatch")
+		execute(t, repo, "DELETE FROM aaa_schema_migrations")
+		failReason(t, repo.Ping(t.Context()), "schema_version_incompatible")
+		failReason(t, repo.Bootstrap(t.Context()), "schema_version_incompatible")
 		execute(t, repo, "DROP TABLE aaa_schema_migrations")
 		if f := failReason(t, repo.Ping(t.Context()), "sqlite_error"); f.Phase != "probe" || f.Code != "1" {
 			t.Fatal(f)

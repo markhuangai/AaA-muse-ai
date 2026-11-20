@@ -7,7 +7,11 @@ export async function inspectTaste(page, directory, name) {
   if (!root) return { requested: false, reason: 'Local design-skill inspection is separate from hosted browser conformance.' };
   const probes = await import(pathToFileURL(join(root, 'scripts/lib/probe.mjs')).href);
   const rules = await import(pathToFileURL(join(root, 'scripts/lib/rules.mjs')).href);
-  await page.evaluate(() => { scrollTo(0, 0); return document.fonts.ready; });
+  await page.evaluate(async () => {
+    scrollTo(0, 0);
+    await document.fonts.ready;
+    await Promise.allSettled(document.getAnimations().map(animation => animation.finished));
+  });
   const metrics = await page.evaluate(probes.probe);
   const layout = await page.evaluate(probes.layout);
   const app = await page.evaluate(probes.app);
@@ -19,17 +23,26 @@ export async function inspectTaste(page, directory, name) {
   if (!await page.evaluate(() => document.fonts.check('14px Geist'))) findings.push({ level: 'FAIL', id: 'font-not-dealt', message: 'The dealt Geist face did not load.' });
   const frames = [];
   const modal = await page.evaluate(() => {
-    const dialog = document.querySelector('dialog:modal');
+    const dialog = [...document.querySelectorAll('dialog:modal')].at(-1);
     if (!dialog) return null;
     const clipped = [], covered = [];
-    for (const element of [dialog, ...dialog.querySelectorAll('h2, p, code, button')]) {
+    const drawer = dialog.classList.contains('worker-drawer');
+    const heading = dialog.querySelector('.drawer-heading');
+    const initialTop = dialog.scrollTop;
+    const items = [dialog, ...dialog.querySelectorAll('h2, p, code, button')];
+    for (const element of items) {
+      if (!element.checkVisibility()) continue;
+      if (drawer && element !== dialog && !heading.contains(element)) element.scrollIntoView({ block: 'center' });
       const box = element.getBoundingClientRect();
       if (!box.width || !box.height) continue;
-      const text = element === dialog ? 'Native confirmation dialog' : element.textContent.trim().slice(0, 48);
-      if (box.left < -1 || box.right > innerWidth + 1 || box.top < -1 || box.bottom > innerHeight + 1) clipped.push({ text });
-      const hit = document.elementFromPoint(box.left + box.width / 2, box.top + box.height / 2);
+      const text = element === dialog ? 'Active dialog' : element.textContent.trim().slice(0, 48);
+      if (box.left < -1 || box.right > innerWidth + 1 || (!drawer && (box.top < -1 || box.bottom > innerHeight + 1))) clipped.push({ text });
+      const center = box.top + box.height / 2;
+      if (drawer && (center < 0 || center >= innerHeight)) continue;
+      const hit = document.elementFromPoint(box.left + box.width / 2, center);
       if (hit && !element.contains(hit) && !hit.contains(element)) covered.push({ text });
     }
+    dialog.scrollTop = initialTop;
     return { clipped, covered, focus_inside: dialog.contains(document.activeElement) };
   });
   if (modal) {

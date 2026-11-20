@@ -148,17 +148,44 @@ func (p *Portal) Report(logger *slog.Logger, credential string, input PortalRepo
 	if err != nil {
 		return err
 	}
+	if err := p.report(logger, record.ID, &record.Reports, input); err != nil {
+		return err
+	}
+	p.sessions[auth.Digest(credential)] = record
+	return nil
+}
+
+func (p *Portal) ReportBrowser(logger *slog.Logger, id string, input PortalReport) error {
+	if !input.valid() {
+		return &PortalError{Reason: "invalid_browser_report", Status: 400}
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := p.now()
+	for session, window := range p.browserReports {
+		if !now.Before(window.Started.Add(time.Minute)) {
+			delete(p.browserReports, session)
+		}
+	}
+	window := p.browserReports[id]
+	if err := p.report(logger, id, &window, input); err != nil {
+		return err
+	}
+	p.browserReports[id] = window
+	return nil
+}
+
+func (p *Portal) report(logger *slog.Logger, id string, window *portalWindow, input PortalReport) error {
 	now := p.now()
 	p.reports.reset(now)
-	record.Reports.reset(now)
-	if p.reports.Count >= 120 || record.Reports.Count >= 20 {
-		logger.Warn("portal.report_throttled", "portal_session_id", record.ID, "cause", "browser_report_limit", "outcome", "rejected")
+	window.reset(now)
+	if p.reports.Count >= 120 || window.Count >= 20 {
+		logger.Warn("portal.report_throttled", "portal_session_id", id, "cause", "browser_report_limit", "outcome", "rejected")
 		return &PortalError{Reason: "browser_report_limit", Status: 429, RetryAfter: 60}
 	}
 	p.reports.Count++
-	record.Reports.Count++
-	p.sessions[auth.Digest(credential)] = record
-	fields := []any{"client_report", true, "portal_session_id", record.ID, "client_build", input.Build, "component", input.Component,
+	window.Count++
+	fields := []any{"client_report", true, "portal_session_id", id, "client_build", input.Build, "component", input.Component,
 		"cause", input.Cause, "related_request_id", input.RequestID, "operation_id", input.OperationID, "expected_state", input.Expected,
 		"observed_state", input.Observed, "last_good_at", input.LastGoodAt, "duration_ms", input.DurationMS, "attempt", input.Attempt,
 		"omitted_reports", input.OmittedReports, "outcome", "reported"}
@@ -170,7 +197,7 @@ func (p *Portal) Report(logger *slog.Logger, credential string, input PortalRepo
 			"request_sequence", input.RequestSequence, "accepted_sequence", input.AcceptedSequence, "latest_sequence", input.LatestSequence, "session_generation", input.SessionGeneration,
 			"query_generation", input.QueryGeneration, "selection_generation", input.SelectionGeneration)
 	}
-	logger.Debug("portal.browser_report", "client_report", true, "report", input, "portal_session_id", record.ID)
+	logger.Debug("portal.browser_report", "client_report", true, "report", input, "portal_session_id", id)
 	if input.Event == "portal.render_failed" {
 		logger.Error(input.Event, fields...)
 	} else {

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useSyncExternalStore, type FormEvent } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore, type FormEvent } from 'react';
 import type { Worker, Qualification, EnrollmentKind } from './worker-api';
 import type { WorkersController, WorkersView } from './worker-controller';
 
@@ -21,21 +21,37 @@ function QualificationDetail({ qualification }: { qualification: Qualification }
   </dl>;
 }
 
-function WorkerDetail({ worker, controller, view, back }: { worker: Worker; controller: WorkersController; view: WorkersView; back: () => void }) {
+function WorkerNotices({ view }: { view: WorkersView }) {
+  return <>
+    {view.stale && view.workers && <p className="snapshot-label">Stale snapshot · Refresh before changing worker access.</p>}
+    {view.message && <div className="notice" role="status"><p>{view.message}</p><Correlation request={view.requestID} operation={view.operationID} /></div>}
+    {view.actionMessage && <div className="notice" role="status"><p>{view.actionMessage}</p><Correlation request={view.actionRequestID} operation={view.actionOperationID} /></div>}
+  </>;
+}
+
+function WorkerDetail({ worker, controller, view }: { worker: Worker; controller: WorkersController; view: WorkersView }) {
   const [name, setName] = useState(worker.name);
   const [confirming, setConfirming] = useState(false);
   const dialog = useRef<HTMLDialogElement>(null);
-  const title = useRef<HTMLHeadingElement>(null);
   const disabled = view.stale || !!view.pending;
+  const refreshDisabled = view.loading || !!view.pending;
   useEffect(() => { setName(worker.name); }, [worker.id, worker.name]);
-  useEffect(() => { title.current?.focus(); }, [worker.id]);
   useEffect(() => { if (confirming) dialog.current?.showModal(); }, [confirming]);
   function rename(event: FormEvent) { event.preventDefault(); void controller.mutate('rename', worker.id, name); }
   function cancel() { dialog.current?.close(); setConfirming(false); }
-  function revoke(event: FormEvent) { event.preventDefault(); cancel(); void controller.mutate('revoke', worker.id); }
+  function revoke(event: FormEvent) {
+    event.preventDefault();
+    if (disabled) return;
+    cancel();
+    void controller.mutate('revoke', worker.id);
+  }
   return <section className="worker-detail" aria-label="Worker detail">
-    <button className="text-action" onClick={back} disabled={!!view.pending}>All workers</button>
-    <div className="detail-heading"><div><h2 tabIndex={-1} ref={title}>{worker.name}</h2><code className="worker-id">{worker.id}</code></div><span>{worker.revoked_at ? 'Revoked registration' : 'Registered worker'}</span></div>
+    <div className="drawer-heading"><div><h2 id="worker-drawer-title" tabIndex={-1}>{worker.name}</h2><code className="worker-id">{worker.id}</code></div>
+      <button type="button" onClick={() => controller.select('')}>Close worker settings</button></div>
+    <div className="drawer-refresh"><button type="button" aria-disabled={refreshDisabled} onClick={() => {
+      if (!refreshDisabled) void controller.refresh();
+    }}>{view.loading ? 'Refreshing…' : 'Refresh workers'}</button></div>
+    {view.selectedID === worker.id && <WorkerNotices view={view} />}
     <div className="worker-fact-grid">
       <section className="data-panel"><h3>Subscriber connection</h3><dl className="identity-list">
         <div><dt>Subscriber</dt><dd>{stateName(worker.connection_status)}</dd></div>
@@ -63,17 +79,16 @@ function WorkerDetail({ worker, controller, view, back }: { worker: Worker; cont
       </section>
       <section className="data-panel"><h3>Registration and access</h3><dl className="identity-list">
         <div><dt>Registered</dt><dd>{timestamp(worker.registered_at)}</dd></div>
-        <div><dt>Revoked</dt><dd>{worker.revoked_at ? timestamp(worker.revoked_at) : 'No'}</dd></div>
-        <div><dt>Credential expiry</dt><dd>{worker.revoked_at ? 'Access revoked' : 'No automatic expiry; valid until revoked'}</dd></div>
-      </dl><form className="rename-form" onSubmit={rename}><label htmlFor="worker-name">Display name</label><input id="worker-name" value={name} onChange={event => setName(event.target.value)} autoComplete="off" disabled={disabled} /><button type="submit" disabled={disabled}>{view.pending === 'rename' ? 'Saving…' : 'Save name'}</button></form>
+        <div><dt>Credential expiry</dt><dd>Valid until revoked</dd></div>
+      </dl><form className="rename-form" onSubmit={rename}><label htmlFor="worker-name">Display name</label><input id="worker-name" value={name} onChange={event => setName(event.target.value)} autoComplete="off" readOnly={disabled} /><button type="submit" aria-disabled={disabled}>{view.pending === 'rename' ? 'Saving…' : 'Save name'}</button></form>
         <p className="field-note">Names may be shared. The immutable worker ID determines identity and access.</p>
-        <button className="danger-action" disabled={disabled || !!worker.revoked_at} onClick={() => setConfirming(true)}>{worker.revoked_at ? 'Access revoked' : 'Revoke worker'}</button>
+        <button className="danger-action" aria-disabled={disabled} onClick={() => { if (!disabled) setConfirming(true); }}>Revoke worker</button>
       </section>
     </div>
-    <dialog ref={dialog} aria-labelledby="revoke-title" aria-describedby="revoke-description" onCancel={() => setConfirming(false)} onClose={() => setConfirming(false)}>
+    <dialog ref={dialog} aria-labelledby="revoke-title" aria-describedby="revoke-description" onCancel={event => { event.stopPropagation(); setConfirming(false); }} onClose={() => setConfirming(false)}>
       <h2 id="revoke-title">Revoke this worker?</h2><p className="confirm-identity">{worker.name}<br /><code>{worker.id}</code></p><p id="revoke-description">This blocks access for every copy of this worker credential. Registration and history are retained. Remote activity may remain unknown.</p>
       {view.stale && <p>Cancel and refresh worker state before revoking.</p>}
-      <form onSubmit={revoke}><button type="button" autoFocus onClick={cancel}>Cancel</button><button type="submit" className="danger-action" disabled={disabled}>Confirm revocation</button></form>
+      <form onSubmit={revoke}><button type="button" autoFocus onClick={cancel}>Cancel</button><button type="submit" className="danger-action" aria-disabled={disabled}>Confirm revocation</button></form>
     </dialog>
   </section>;
 }
@@ -103,25 +118,48 @@ function EnrollmentPanel({ controller, view }: { controller: WorkersController; 
 export function Workers({ controller }: { controller: WorkersController }) {
   const view = useSyncExternalStore(controller.subscribe, controller.snapshot);
   const selected = view.workers?.find(worker => worker.id === view.selectedID);
-  const scroll = useRef(0);
   const list = useRef<HTMLHeadingElement>(null);
-  function select(id: string) { scroll.current = window.scrollY; controller.select(id); }
-  function back() { controller.select(''); requestAnimationFrame(() => { list.current?.focus({ preventScroll: true }); window.scrollTo(0, scroll.current); }); }
+  const opener = useRef<HTMLButtonElement | null>(null);
+  const drawer = useRef<HTMLDialogElement>(null);
+  const lastSelection = useRef<Worker | undefined>(undefined);
+  const drawerWorker = selected ?? lastSelection.current;
+  useLayoutEffect(() => {
+    const dialog = drawer.current!;
+    if (selected) {
+      lastSelection.current = selected;
+      if (!dialog.open) {
+        dialog.scrollTop = 0;
+        dialog.showModal();
+        dialog.querySelector<HTMLElement>('#worker-drawer-title')?.focus({ preventScroll: true });
+      }
+    } else if (dialog.open) {
+      for (const confirmation of dialog.querySelectorAll<HTMLDialogElement>('dialog[open]')) confirmation.close();
+      dialog.close();
+      const target = opener.current?.isConnected ? opener.current : list.current;
+      target?.focus({ preventScroll: true });
+    }
+  }, [selected]);
   return <main className="workers-page">
     <div className="page-heading"><div><p className="context-label">Worker management</p><h1 tabIndex={-1} ref={list}>Workers</h1><p className="page-purpose">See what the broker observed and manage worker access.</p></div><div className="refresh-control"><span>{view.lastGood === null ? 'No successful refresh yet' : `Last checked ${timestamp(new Date(view.lastGood).toISOString())}`}</span><button onClick={() => void controller.refresh()} disabled={view.loading || !!view.pending}>{view.loading ? 'Refreshing…' : 'Refresh workers'}</button></div></div>
-    {view.stale && view.workers && <p className="snapshot-label">Stale snapshot · Refresh before changing worker access.</p>}
-    {view.message && <div className="notice" role="status"><p>{view.message}</p><Correlation request={view.requestID} operation={view.operationID} /></div>}
-    {view.actionMessage && <div className="notice" role="status"><p>{view.actionMessage}</p><Correlation request={view.actionRequestID} operation={view.actionOperationID} /></div>}
+    {!selected && <WorkerNotices view={view} />}
     {!view.actionMessage && view.actionRequestID && view.enrollmentMessage && <Correlation request={view.actionRequestID} operation={view.actionOperationID} />}
-    {selected ? <WorkerDetail key={selected.id} worker={selected} controller={controller} view={view} back={back} /> : <section className="worker-list" aria-label="Registered workers" aria-busy={view.loading}>
+    <section className="worker-list" aria-label="Registered workers" aria-busy={view.loading}>
       <p className="scope-note">Subscriber health, broker activity and inference qualification are independent observations. Hidden Muse activity is not observable here.</p>
-      {view.workers === null ? <p className="empty-state">{view.loading ? 'Loading registered workers…' : 'Worker information is unavailable. Use Refresh workers to retry.'}</p> : view.workers.length === 0 ? <p className="empty-state">No workers are registered. Generate setup text below to enroll the first worker.</p> :
+      {view.workers === null ? <p className="empty-state">{view.loading ? 'Loading registered workers…' : 'Worker information is unavailable. Use Refresh workers to retry.'}</p> : view.workers.length === 0 ? <p className="empty-state">No workers have access. Use enrollment to add a worker.</p> :
         <table className="workers-table"><thead><tr><th scope="col">Worker identity</th><th scope="col">Subscriber</th><th scope="col">Broker activity</th><th scope="col">Qualification</th></tr></thead><tbody>{view.workers.map(worker => <tr key={worker.id}>
-          <td><button className="worker-name" onClick={() => select(worker.id)} disabled={!!view.pending}>{worker.name}</button><code className="worker-id">{worker.id}</code>{worker.revoked_at && <span className="row-note">Access revoked</span>}</td>
-          <td><span className={`status ${worker.connection_status === 'online' && !worker.revoked_at ? 'healthy' : ''}`}>{stateName(worker.connection_status)}</span><span className="row-note">Contact {timestamp(worker.last_contact_at)}</span></td>
+          <td><button className="worker-name" aria-haspopup="dialog" aria-disabled={!!view.pending} onClick={event => {
+            if (view.pending) return;
+            opener.current = event.currentTarget; controller.select(worker.id);
+          }}>{worker.name}</button><code className="worker-id">{worker.id}</code></td>
+          <td><span className={`status ${worker.connection_status === 'online' ? 'healthy' : ''}`}>{stateName(worker.connection_status)}</span><span className="row-note">Contact {timestamp(worker.last_contact_at)}</span></td>
           <td>{stateName(worker.work_status)}<span className="row-note">{worker.waiting_for_client_tool} client-tool waits</span></td><td>{stateName(worker.inference_readiness)}<span className="row-note">{worker.qualification?.evidence.evidence_kind === 'controlled' ? 'Controlled evidence' : worker.qualification?.evidence.evidence_kind === 'live' ? 'Live trial evidence' : 'No evidence reported'}</span></td>
         </tr>)}</tbody></table>}
-    </section>}
+    </section>
     <EnrollmentPanel controller={controller} view={view} />
+    <dialog ref={drawer} className="worker-drawer" aria-labelledby="worker-drawer-title" onCancel={event => {
+      event.preventDefault(); controller.select('');
+    }}>
+      {drawerWorker && <WorkerDetail key={drawerWorker.id} worker={drawerWorker} view={view} controller={controller} />}
+    </dialog>
   </main>;
 }

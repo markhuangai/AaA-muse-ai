@@ -4,6 +4,7 @@ import { PortalController, type View } from './controller';
 import { Workers } from './workers';
 import { Requests } from './history';
 import { ClientKeys } from './client-keys';
+import { Appearance } from './appearance';
 
 function Mark() {
   return <span className="wordmark"><svg aria-hidden="true" viewBox="0 0 28 28"><path d="M3 22 9 6l5 12L19 6l6 16M6 15h6m4 0h6" /></svg><span>AaA <span className="wordmark-detail">Muse</span></span></span>;
@@ -11,26 +12,36 @@ function Mark() {
 
 export function Login({ controller, view }: { controller: PortalController; view: View }) {
   const [password, setPassword] = useState('');
+  const [remember, setRemember] = useState(false);
   function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    const pending = controller.login(password);
+    const pending = controller.login(password, remember);
     setPassword('');
     void pending;
   }
   return <main className="login-page">
-    <div className="login-intro"><p className="product-purpose">Model clients. Your broker. Your control.</p><h1>Service access</h1><p>Sign in to manage workers and inspect service settings.</p></div>
+    <div className="login-intro"><h1>Service access</h1><p>Manage workers, client keys, and request history.</p></div>
     <section className="login-panel" aria-label="Sign in">
       <h2>Operator sign-in</h2>
       <form onSubmit={submit}>
         <label htmlFor="portal-password">Portal password</label>
         <input id="portal-password" type="password" value={password} onChange={event => setPassword(event.target.value)} autoComplete="off" required disabled={view.phase === 'signing_in'} />
+        <label className="remember-me"><input type="checkbox" checked={remember} onChange={event => setRemember(event.target.checked)} disabled={view.phase === 'signing_in'} /> Remember me</label>
         <button type="submit" className="primary" disabled={!password || view.phase === 'signing_in'}>{view.phase === 'signing_in' ? 'Signing in…' : 'Sign in'}</button>
       </form>
       <p className="field-note">Use the portal password from your service configuration.</p>
       {view.message && <div className="notice" role="status"><p>{view.message}</p><Correlation view={view} /></div>}
     </section>
-    <p className="login-scope">Worker and client-key management · Session expires after 30 minutes</p>
   </main>;
+}
+
+function SessionStatus({ controller, view }: { controller: PortalController; view: View }) {
+  return <main className="login-page"><section className="login-panel" aria-label="Portal session">
+    <div role="status"><p>{view.message}</p>
+      {(view.phase === 'restore_failed' || view.phase === 'logout_unconfirmed') && <Correlation view={view} />}</div>
+    {view.phase === 'restore_failed' && <button className="primary" onClick={() => void controller.restore()}>Retry session check</button>}
+    {view.phase === 'logout_unconfirmed' && <button className="primary" onClick={() => void controller.logout()}>Retry sign-out</button>}
+  </section></main>;
 }
 
 function Correlation({ view }: { view: View }) {
@@ -66,7 +77,7 @@ export class RenderBoundary extends Component<{ controller: PortalController; re
   static getDerivedStateFromError() { return { failed: true }; }
   componentDidCatch() { this.props.controller.renderFailed(); }
   render() {
-    if (this.state.failed) return <main className="render-error"><h1>Portal view could not be rendered</h1><p>Reload the portal and sign in again. The client failure has been reported when the service is reachable.</p><button className="primary" onClick={this.props.reload}>Reload and sign in</button></main>;
+    if (this.state.failed) return <main className="render-error"><h1>Portal view could not be rendered</h1><p>The browser reports this failure when the service is reachable.</p><button className="primary" onClick={this.props.reload}>Reload portal</button></main>;
     return this.props.children;
   }
 }
@@ -84,8 +95,14 @@ export function App({ controller, reload = () => location.reload() }: { controll
     window.addEventListener('unhandledrejection', report);
     return () => { window.removeEventListener('error', report); window.removeEventListener('unhandledrejection', report); };
   }, [controller]);
-  return <><header className="site-header"><div className="header-content"><Mark /><span className="header-label">Control portal</span>{view.phase === 'authenticated' && <><nav aria-label="Portal">{(['settings', 'workers', 'requests'] as const).map(page => <a key={page} href={`/${page}`} aria-current={view.page === page ? 'page' : undefined} onClick={event => {
+  const authenticated = view.phase === 'authenticated';
+  const showLogin = view.phase === 'login' || view.phase === 'signing_in';
+  return <><header className="site-header"><div className="header-content"><Mark /><span className="header-label">Control portal</span>{authenticated && <nav aria-label="Portal">{(['settings', 'workers', 'requests'] as const).map(page => <a key={page} href={`/${page}`} aria-current={view.page === page ? 'page' : undefined} onClick={event => {
     if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
     event.preventDefault(); history.pushState(null, '', `/${page}`); controller.navigate(page);
-  }}>{page === 'settings' ? 'Settings' : page === 'workers' ? 'Workers' : 'Requests'}</a>)}</nav><button className="sign-out" onClick={() => void controller.logout()}>Sign out</button></>}</div></header><RenderBoundary key={view.phase === 'authenticated' ? 'session' : 'login'} controller={controller} reload={reload}>{view.phase === 'authenticated' ? view.page === 'workers' ? <Workers controller={controller.workers} /> : view.page === 'requests' ? <Requests controller={controller.history} /> : <Configuration controller={controller} view={view} /> : <Login controller={controller} view={view} />}</RenderBoundary><footer className="site-footer"><span>AaA Muse · Operator console</span><span className="build-label">Portal build <code>{BUILD.slice(0, 8)}</code></span></footer></>;
+  }}>{page === 'settings' ? 'Settings' : page === 'workers' ? 'Workers' : 'Requests'}</a>)}</nav>}<div className="header-controls"><Appearance />{authenticated && <button className="sign-out" onClick={() => void controller.logout()}>Sign out</button>}</div></div></header>
+    <RenderBoundary key={authenticated ? 'session' : 'login'} controller={controller} reload={reload}>
+      {authenticated ? view.page === 'workers' ? <Workers controller={controller.workers} /> : view.page === 'requests' ? <Requests controller={controller.history} /> : <Configuration controller={controller} view={view} /> :
+        showLogin ? <Login controller={controller} view={view} /> : <SessionStatus controller={controller} view={view} />}
+    </RenderBoundary><footer className="site-footer"><span>AaA Muse · Operator console</span><span className="build-label">Portal build <code>{BUILD.slice(0, 8)}</code></span></footer></>;
 }

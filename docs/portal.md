@@ -6,29 +6,32 @@ Settings shows redacted effective YAML, service and build identity, database hea
 
 ## Session boundary
 
-Login exchanges the password for a cryptographically random bearer session with an absolute thirty-minute lifetime. Only its digest and nonsecret metadata are retained in service memory. The browser holds the credential in memory, outside rendered state; it uses no local storage, session storage, cookies, IndexedDB, Cache API or service worker for authentication. Reload requires a fresh login. Server expiry, logout and restart invalidate session authority.
+The browser uses a host-only Secure, HttpOnly, SameSite=Strict session cookie. With **Remember me** unchecked, reloads and new tabs stay signed in for the browser session. With it checked, sign-in also survives closing the browser and restarting the broker. The broker renews the remembered cookie during use at most once per day with a maximum lifetime of 400 days per issuance. Browser cookie retention and session restore settings affect what survives closing the browser.
 
-If logout cannot reach the service, the browser clears its credential and explicitly says server sign-out was not confirmed. The unreachable server session can remain valid until its original expiry. No credential is retained for an automatic retry.
+**Sign out** revokes the shared grant for this browser and clears private views in open tabs when confirmed. If confirmation is lost, the portal hides private content and offers **Retry sign-out**. A session check during a service outage offers a retry. A denied session opens sign-in.
 
 Sessions authorize existing management APIs without giving the browser the automation management key. They cannot call model-client or worker APIs. Conversely, raw portal passwords, model-client keys and worker credentials do not authorize portal management requests. The automation key remains valid for its existing management endpoints.
 
-Sessions are local to one broker process. An origin backed by multiple broker instances needs operator-managed affinity. A restart requires login again; sessions are not persisted or replicated through SQLite.
+SQLite holds browser-grant digests and a salted password verifier. Restart the brokers with the same updated configuration to rotate the portal password and invalidate every browser grant. An old broker generation rejects browser session operations. Coordinated upgrades apply migration 002 and retain existing state. Back up the database before upgrading and stop older broker processes before opening the schema with the new binary. A rollback to a schema-001 binary needs its compatible pre-upgrade backup.
 
-Failed logins are bounded to five per transport peer per minute and sixty globally per minute. Forwarded address headers are ignored. The peer table and active session table each hold at most 1,024 records; expired entries are pruned and capacity exhaustion is rejected. Throttling returns HTTP 429 with `Retry-After`; a full session table returns 503 without evicting valid sessions.
+Failed logins are bounded to five per transport peer per minute and sixty per broker per minute. The broker uses the transport address. Throttling returns HTTP 429 with `Retry-After`. The shared store supports 1,024 browser grants. It reclaims expired remembered grants and confirmed sign-outs. A browser that discards its cookie can leave a grant behind. A full store returns 503 and retains current grants. Sign out another browser or rotate the portal password to recover capacity.
 
 ## HTTP interfaces
 
 | Method and path | Behavior |
 |---|---|
-| `POST /api/v1/portal/login` | JSON `password`; returns `session_token` and `expires_at` |
-| `POST /api/v1/portal/logout` | Invalidates the authenticated portal session |
+| `POST /api/v1/portal/login` | JSON `password` and boolean `remember_me` set a browser cookie and return `{"authenticated":true}`. Omitting `remember_me` returns the existing process-local, thirty-minute `session_token` and `expires_at`. |
+| `GET /api/v1/portal/session` | Checks current authority with a non-cacheable response. Returns `{"authenticated":true}`, 401 for denied authority, or 503 for an unavailable session store. |
+| `POST /api/v1/portal/logout` | Revokes browser or bearer authority. Cookie sign-out can be retried after an uncertain response. |
 | `GET /api/v1/portal/settings` | Returns redacted effective YAML, `client_key_names`, build and instance identity, service and database health, schema version and implemented capabilities |
 | `POST /api/v1/portal/client-keys` | Takes JSON `{name, key}` and returns HTTP 201 with `{name}` after saving to `config.yaml`. Requires an active portal session. |
 | `POST /api/v1/portal/events` | Accepts authenticated, allowlisted browser reports |
 
-Go serves the compiled React assets at `/`, `/settings`, `/workers`, `/requests` and `/assets/*` on the existing HTTP port. Navigation and browser back/forward retain the in-memory session; reloading requires login. Unknown API paths and missing assets retain errors. Production has no Node server, CORS middleware, bundled reverse proxy or certificate management. The operator's Traefik, Nginx or other proxy owns routing and TLS. The CSP permits only same-origin resources; fonts are bundled with their OFL-1.1 license notices in the image.
+Go serves the compiled React assets at `/`, `/settings`, `/workers`, `/requests` and `/assets/*` on the existing HTTP port. Keep the portal and API on one HTTPS origin through the operator's reverse proxy. Browser writes require same-origin requests and `X-Portal-Operation-Id`. An explicit Authorization header takes precedence over the cookie. The CSP permits same-origin resources. Fonts are bundled with their OFL-1.1 license notices.
 
-The browser uses ten-second request deadlines, refreshes every thirty seconds while visible, and marks snapshots stale after sixty seconds without a successful refresh. Failed refreshes retain the last snapshot with an explicit error and Retry action. Logout and new login generations fence delayed responses. Build mismatches require a reload and fresh login.
+The browser uses ten-second request deadlines, refreshes every thirty seconds while visible, and marks snapshots stale after sixty seconds without a successful refresh. Failed refreshes retain the last snapshot with an explicit error and Retry action. Logout and new login generations fence delayed responses. Reload the portal for a build mismatch.
+
+**Appearance** defaults to System and follows live operating system changes. Choose Light or Dark to save an override in this browser. The portal reduces motion when requested by the operating system.
 
 ## Client keys
 
@@ -40,7 +43,7 @@ Duplicate names and credentials return HTTP 409. When the save outcome is uncert
 
 ## Worker management
 
-Worker detail comes from the existing `GET /api/v1/admin/workers` projection, selected by immutable worker ID. Names may be shared. Renaming uses `PATCH /api/v1/admin/workers/{id}` and displays the actual accepted name or safe validation error. It does not change identity, authority or assignments.
+Selecting a worker opens a right-hand drawer and keeps the list in place. Close it with **Close worker settings** or Escape. The list uses the existing `GET /api/v1/admin/workers` projection and selects by immutable worker ID. Names may be shared. Renaming uses `PATCH /api/v1/admin/workers/{id}` and displays the accepted name or safe validation error.
 
 **Reported by Muse during setup** shows the reported model name, total context window, and original report time from the optional `model_report` field. Reconnecting can resend the same report with its original time. Each unavailable value is shown as such. This report describes the setup turn, and the broker applies its existing request limits and readiness policy.
 
@@ -48,7 +51,7 @@ Connection state, authenticated last contact, heartbeat, broker activity, curren
 
 `POST /api/v1/admin/setup-prompts` takes `{"origin":"https://host:8443"}` and creates a fifteen-minute single-use enrollment with pinned setup and reconnection instructions. The browser supplies its current HTTPS origin. Use `POST /api/v1/admin/enrollments` for code-only enrollment. Expiry, session end, and leaving Workers clear the current text and copy control. Clipboard denial leaves selectable text, and the broker enforces single use and expiry.
 
-Revocation uses a native confirmation dialog naming the worker and immutable ID, then `POST /api/v1/admin/workers/{id}/revoke`. The server result is shown without optimistic authority changes. Every copy of the credential is rejected after confirmed revocation; registration and history remain. The portal does not claim that remote execution stopped. Worker credentials have no automatic expiry and are never displayed here.
+Revocation uses a confirmation dialog naming the worker and immutable ID, then `POST /api/v1/admin/workers/{id}/revoke`. A confirmed revoke or fresh list response removes the worker from the Workers list and closes the drawer. The broker rejects every copy of the revoked worker credential. Registration and request history retain the worker identity. Remote execution may remain uncertain.
 
 Worker polling and freshness are independent from settings. Session generations and request sequences fence late responses, including reads started before a mutation. Stale snapshots disable rename/revoke and retain the last observations. Failed or lost mutation responses remain explicitly unconfirmed; no mutation is retried automatically. Refresh reconciles current server values.
 
@@ -60,7 +63,7 @@ Detail shows the immutable request, conversation, client/session, response, work
 
 The conversation timeline pages through at most fifty chronological events within the existing 2-MiB page limit. It marks the selected request and preserves unknown event kinds and full event details. Related request links open their own snapshots. Assignment events retain old/new worker and job IDs, generations, replacement reasons and full-history boundaries. Legacy records explicitly mark missing provenance, native identity and event times. Server write observations do not prove remote consumption; neither the portal nor recorded history exposes private Muse reasoning.
 
-Current views poll every thirty seconds while visible. Timeline pages with a continuation cursor remain anchored; the last page can refresh for new events. Sixty seconds without a successful read marks a snapshot stale. Cancellation is disabled for stale, pending or terminal detail. Logout and expiry clear all history; query, selection, session generations and read sequences fence superseded responses.
+Current views poll every thirty seconds while visible. Timeline pages with a continuation cursor remain anchored. The last page can refresh for new events. Sixty seconds without a successful read marks a snapshot stale. Cancellation is disabled for stale, pending or terminal detail. Session loss clears the browser's history view. Query, selection, session generations and read sequences fence superseded responses.
 
 **Cancel request** opens a native confirmation naming the immutable request ID. Confirming sends one fresh submission ID to the existing management cancellation endpoint, including for unassigned requests. The portal displays the returned state and remote outcome. A claimed request can remain remotely uncertain with a retained busy hold; the worker's exact idle acknowledgement releases capacity without inventing a stopped outcome. Accepted decisions, client tool IDs/results and history remain durable. Cancellation never executes a tool or grants inference replay authority. A lost response is explicitly unconfirmed; refresh reconciles current state before another deliberate action. No mutation is retried automatically.
 
@@ -84,7 +87,7 @@ Runtime output defaults to INFO JSON. The existing protected capture always reta
 
 Filter by the request or operation ID displayed after a key save. `client_key.created` at INFO records the saved name. `client_key.rejected` at WARN distinguishes invalid input from conflicts. `client_key.persist_failed` and `client_key.reload_failed` at ERROR record the failing stage and cause. A directory permission error calls for correcting the mount and ownership. A directory sync failure after replacement calls for inspecting the host file to reconcile the uncertain save. Key values are omitted from capture. `setup.prompt_created` records the accepted HTTPS origin at INFO, and `setup.origin_rejected` records a safe cause at WARN before enrollment starts.
 
-`portal.auth_failed` WARN identifies rejected passwords, throttling and invalid/expired sessions. Session lifecycle INFO events identify issuance, logout and expiry through a nonsecret session identifier. `portal.state_stale` WARN identifies database degradation or a browser-reported refresh failure. `portal.render_failed` ERROR is a client report, not proof of a server exception. `portal.assets_unavailable` ERROR identifies an unreadable compiled asset and its safe filesystem cause.
+`portal.auth_failed` at WARN identifies rejected passwords, throttling, cross-origin requests, denied sessions and capacity. INFO lifecycle events identify issuance, renewal, and sign-out with a safe session ID. `portal.session_generation_stale` at WARN identifies a broker that needs to restart with the current password configuration. `portal.session_store_failed` at ERROR identifies the failing stage and cause. Use the protected DEBUG detail to restore the SQLite dependency before retrying. `portal.state_stale` at WARN reports a stale snapshot. `portal.render_failed` at ERROR identifies a client rendering failure. `portal.assets_unavailable` at ERROR identifies an unreadable asset.
 
 Browser reports contain only allowlisted event, component, cause, expected/observed state, build, correlation, timing, attempt, last-good time and omission fields. They do not carry arbitrary exception messages, stacks, URLs or payloads. They are labeled `client_report` and are limited to 4 KiB, twenty per session per minute and 120 globally per minute. A disconnected browser retains at most twenty reports in memory and reports omitted counts, saturated at one million; session end clears its queue. Reports lost with the browser or an expired session cannot be recovered from the service.
 

@@ -28,6 +28,7 @@ import (
 type Repository interface {
 	service.WorkerRepository
 	service.InferenceRepository
+	service.PortalBrowserRepository
 	Bootstrap(context.Context) error
 	Ping(context.Context) error
 	Close()
@@ -151,6 +152,11 @@ func Run(ctx context.Context, args []string, build service.Build, d Dependencies
 		return 1
 	}
 	defer repo.Close()
+	authority := auth.NewWithConfiguration(current)
+	portal := service.NewPortal(authority, d.Random, d.Now)
+	if err = portal.ConfigureBrowser(ctx, startup, repo, string(c.Portal.Password)); err != nil {
+		return 1
+	}
 	broker := service.NewBroker(repo, d.Random, d.Now, d.Wait)
 	if d.MediaDir != "" {
 		broker.Media = media.New(d.MediaDir)
@@ -186,13 +192,13 @@ func Run(ctx context.Context, args []string, build service.Build, d Dependencies
 	}
 	svc := service.New(repo, c, build, instance, d.Now, logger)
 	svc.UseConfiguration(current)
-	authority := auth.NewWithConfiguration(current)
 	serveCtx, cancelServe := context.WithCancel(ctx)
 	defer cancelServe()
 	handler := &httpapi.Handler{Service: svc, Workers: service.NewWorkers(repo, authority, d.Random, d.Now), Broker: broker, Authority: authority, Exporter: store, Logger: logger, Redactor: redactor, ClientKeys: clientKeys, Random: d.Random, Now: d.Now, Failed: failed}
-	handler.Portal = service.NewPortal(authority, d.Random, d.Now)
+	handler.Portal = portal
 	handler.Assets = d.PortalAssets
-	startup.Info("portal.configured", "effective_settings", service.PortalSettings(), "session_scope", "process_memory", "browser_storage", "none")
+	startup.Info("portal.configured", "effective_settings", service.PortalSettings(), "bearer_session_scope", "process_memory",
+		"browser_session_scope", "shared_sqlite", "browser_storage", "http_only_cookie")
 	handler.Setup = service.NewSetup(handler.Workers, svc.Build().WorkerPackage)
 	server := &http.Server{Handler: handler, BaseContext: func(net.Listener) context.Context { return serveCtx }, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 * 1024, ErrorLog: slog.NewLogLogger(logger.Handler(), slog.LevelError)}
 	brokerDone := make(chan struct{})

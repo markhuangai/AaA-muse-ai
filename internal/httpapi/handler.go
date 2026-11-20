@@ -194,10 +194,52 @@ func (h *Handler) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 	} else if strings.HasPrefix(route, "/api/v1/worker/") && route != "/api/v1/worker/enroll" {
 		expectedRole = "worker"
 	}
+	browserSession := ""
+	cookie := ""
+	authorization := r.Header.Get("Authorization")
+	hasAuthorization := len(r.Header.Values("Authorization")) != 0
+	cookieScope := expectedRole == "portal_session" || (expectedRole == "management" && route != mediaTrials)
+	if cookieScope && !hasAuthorization {
+		cookie = portalCookieValue(r)
+		if route == "/api/v1/portal/logout" && (cookie != "" || r.Header.Get(portalOperationHeader) != "") {
+			expectedRole = ""
+		} else if cookie != "" && h.Portal != nil {
+			if r.Method == routeMethod(route) && r.Method != http.MethodGet && !allowPortalWrite(w, r, logger) {
+				return
+			}
+			identity, renewed, err := h.Portal.AuthenticateBrowser(r.Context(), logger, cookie)
+			if err != nil {
+				if identity.ID != "" {
+					logger = logger.With("portal_session_id", identity.ID)
+				}
+				if rejected, ok := err.(*service.PortalError); ok && rejected.Status == 401 {
+					logger.Warn("portal.auth_failed", "component", "session", "cause", rejected.Reason, "expected_state", "authenticated",
+						"observed_state", "unauthenticated", "outcome", "rejected")
+					if route == "/api/v1/portal/session" {
+						writeJSON(w, 401, map[string]any{"error": "invalid_session"})
+						return
+					}
+				}
+				portalError(w, err)
+				return
+			}
+			if renewed {
+				setPortalCookie(w, cookie, int(service.PortalRememberLifetime.Seconds()))
+			}
+			role = "portal_session"
+			browserSession = identity.ID
+			portalSessionID = identity.ID
+			logger = logger.With("portal_session_id", identity.ID)
+		}
+	}
+	if route == "/api/v1/portal/session" && !hasAuthorization && cookie == "" {
+		portalError(w, &service.PortalError{Reason: "invalid_session", Status: 401})
+		return
+	}
 	var identity workerView
 	if expectedRole != "" {
-		credential := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-		if role == "unauthenticated" && strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") && strings.HasPrefix(credential, auth.PortalPrefix) && h.Portal != nil {
+		credential := strings.TrimPrefix(authorization, "Bearer ")
+		if role == "unauthenticated" && strings.HasPrefix(authorization, "Bearer ") && strings.HasPrefix(credential, auth.PortalPrefix) && h.Portal != nil {
 			identity, err := h.Portal.Authenticate(logger, credential)
 			if err != nil {
 				logger.Warn("portal.auth_failed", "component", "shell", "cause", err.Error(), "expected_state", "authenticated", "observed_state", "unauthenticated", "outcome", "rejected")
@@ -208,7 +250,7 @@ func (h *Handler) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 			portalSessionID = identity.ID
 			logger = logger.With("portal_session_id", identity.ID)
 		}
-		if role == "unauthenticated" && strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") && strings.HasPrefix(credential, auth.WorkerPrefix) && h.Workers != nil {
+		if role == "unauthenticated" && strings.HasPrefix(authorization, "Bearer ") && strings.HasPrefix(credential, auth.WorkerPrefix) && h.Workers != nil {
 			record, err := h.Workers.Authenticate(r.Context(), logger, credential)
 			w.workerID = record.ID
 			if err != nil {
@@ -273,8 +315,8 @@ func (h *Handler) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 	default:
 	}
 	switch route {
-	case "/api/v1/portal/login", "/api/v1/portal/logout", "/api/v1/portal/settings", "/api/v1/portal/events":
-		h.portalRequest(w, r, logger, route, body)
+	case "/api/v1/portal/login", "/api/v1/portal/logout", "/api/v1/portal/session", "/api/v1/portal/settings", "/api/v1/portal/events":
+		h.portalRequest(w, r, logger, route, browserSession, body)
 	case "/api/v1/portal/client-keys":
 		h.createClientKey(w, r, logger, body)
 	case "/healthz":

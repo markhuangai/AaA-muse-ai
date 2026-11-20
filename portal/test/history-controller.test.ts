@@ -164,19 +164,19 @@ test('logout records pending history abandonment before revoking session authori
   api.requestsWork = () => pending.promise; const read = portal.history.refresh();
   const report = deferred<void>(); api.reportWork = () => report.promise;
   const logout = portal.logout(); await settle();
-  expect(api.credential).not.toBeNull(); expect(api.logoutCalls).toBe(0);
+  expect(api.logoutCalls).toBe(0);
   expect(api.reports.at(-1)).toMatchObject({ event: 'portal.history_load_failed', cause: 'obsolete_response', query_kind: 'requests' });
   expect(portal.history.snapshot().list.value).toBeNull();
-  report.resolve(); await logout; expect(api.credential).toBeNull(); expect(api.logoutCalls).toBe(1);
+  report.resolve(); await logout; expect(api.logoutCalls).toBe(1);
   pending.resolve({ value: { items: [summary()] }, requestID: 'abandoned-source' }); await read;
   expect(portal.history.snapshot().list.value).toBeNull(); portal.dispose();
 });
-test('portal login activates history independently of delayed settings; navigation/logout/expiry remove authority', async () => {
+test('portal login activates history independently of delayed settings; navigation/logout/denial remove authority', async () => {
   const system = new TestSystem(), api = new TestAPI(system), controller = new PortalController(api, system), delayed = deferred<{ value: ReturnType<typeof import('./helpers').settings>; requestID: string }>();
   controller.navigate('requests'); api.settingsWork = () => delayed.promise; const login = controller.login('not-retained'); await settle(); expect(controller.history.snapshot().list.value?.items).toHaveLength(1);
   controller.renderFailed(); await settle(); expect(api.reports.at(-1)?.component).toBe('history');
   delayed.resolve({ value: (await import('./helpers')).settings(), requestID: 'settings' }); await login;
   await controller.history.select(requestID); controller.navigate('settings'); expect(controller.history.snapshot().detail.value).toBeNull();
   controller.navigate('requests'); await settle(); await controller.logout(); expect(controller.history.snapshot().list.value).toBeNull();
-  await controller.login('not-retained'); await system.advance(1_800_001); expect(controller.snapshot().phase).toBe('login'); expect(controller.history.snapshot().list.value).toBeNull(); controller.dispose();
+  await controller.login('not-retained'); api.settingsWork = async () => { throw new APIError('unauthorized', 401); }; await controller.refresh(); expect(controller.snapshot().phase).toBe('login'); expect(controller.history.snapshot().list.value).toBeNull(); controller.dispose();
 });

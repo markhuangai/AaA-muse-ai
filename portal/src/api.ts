@@ -12,7 +12,6 @@ export const schedule: Schedule = (callback, delay) => {
   return () => globalThis.clearTimeout(timer);
 };
 
-export interface Session { session_token: string; expires_at: string }
 export interface Settings {
   build: { revision: string; dirty: boolean };
   instance_id: string;
@@ -56,8 +55,8 @@ export class APIError extends Error {
 }
 
 export interface API {
-  setSession(token: string | null): void;
-  login(password: string, operation: string, signal: AbortSignal): Promise<Session>;
+  login(password: string, remember: boolean, operation: string, signal: AbortSignal): Promise<void>;
+  restore(operation: string, signal: AbortSignal): Promise<void>;
   logout(operation: string, signal: AbortSignal): Promise<void>;
   settings(operation: string, signal: AbortSignal): Promise<{ value: Settings; requestID: string }>;
   createClientKey(name: string, key: string, operation: string, signal: AbortSignal): Promise<{ value: string; requestID: string }>;
@@ -73,12 +72,9 @@ export interface API {
 }
 
 export class BrowserAPI implements API {
-  #token: string | null = null;
   constructor(private fetcher: typeof fetch = globalThis.fetch.bind(globalThis), private timer: Schedule = schedule,
     private origin = () => globalThis.location.origin) {}
-  setSession(token: string | null) { this.#token = token; }
-
-  private async request(path: string, method: string, operation: string, signal: AbortSignal, body?: unknown, authenticated = true, parse: (source: string) => unknown = JSON.parse) {
+  private async request(path: string, method: string, operation: string, signal: AbortSignal, body?: unknown, parse: (source: string) => unknown = JSON.parse) {
     const abort = new AbortController();
     let timedOut = false;
     const cancel = () => abort.abort();
@@ -86,10 +82,9 @@ export class BrowserAPI implements API {
     if (signal.aborted) cancel();
     const stop = this.timer(() => { timedOut = true; abort.abort(); }, 10_000);
     const headers: Record<string, string> = { 'X-Portal-Operation-Id': operation };
-    if (authenticated && this.#token) headers.Authorization = `Bearer ${this.#token}`;
     if (body !== undefined) headers['Content-Type'] = 'application/json';
     try {
-      const response = await this.fetcher(path, { method, headers, signal: abort.signal, body: body === undefined ? undefined : JSON.stringify(body), credentials: 'omit', cache: 'no-store', redirect: 'error' });
+      const response = await this.fetcher(path, { method, headers, signal: abort.signal, body: body === undefined ? undefined : JSON.stringify(body), credentials: 'same-origin', cache: 'no-store', redirect: 'error' });
       const requestID = response.headers.get('X-Request-Id') || '';
       if (!response.ok) {
         let reason = response.status === 401 ? 'unauthorized' : response.status === 429 ? 'throttled' : response.status >= 500 ? 'service_unavailable' : 'request_failed';
@@ -97,7 +92,8 @@ export class BrowserAPI implements API {
           const data: unknown = await response.json();
           if (object(data) && ['invalid_worker_name', 'worker_not_found', 'worker_package_unconfigured', 'https_origin_required',
             'invalid_client_key', 'client_key_conflict', 'client_key_save_failed', 'client_key_save_uncertain',
-            'history_not_found', 'invalid_cursor', 'experiment_already_completed', 'inference_not_found', 'submission_conflict'].includes(String(data.error))) reason = String(data.error);
+            'history_not_found', 'invalid_cursor', 'experiment_already_completed', 'inference_not_found', 'submission_conflict',
+            'invalid_session', 'portal_session_unavailable', 'session_capacity_exhausted'].includes(String(data.error))) reason = String(data.error);
         } catch { /* Error bodies are untrusted; retain the HTTP classification. */ }
         const retry = Number(response.headers.get('Retry-After'));
         throw new APIError(reason, response.status, requestID, Number.isFinite(retry) ? Math.max(0, Math.min(3600, retry)) : 0);
@@ -117,17 +113,23 @@ export class BrowserAPI implements API {
     }
   }
 
-  async login(password: string, operation: string, signal: AbortSignal): Promise<Session> {
-    const result = await this.request('/api/v1/portal/login', 'POST', operation, signal, { password }, false);
-    const data = result.data;
-    if (!object(data) || typeof data.session_token !== 'string' || !/^muse_portal_[A-Za-z0-9_-]{43}$/.test(data.session_token) || typeof data.expires_at !== 'string' || !Number.isFinite(Date.parse(data.expires_at))) {
-      throw new APIError('invalid_response', 200, result.requestID);
+  private confirmSession(result: { data: unknown; requestID: string; status: number }) {
+    if (result.status !== 200 || !object(result.data) || result.data.authenticated !== true || Object.keys(result.data).length !== 1) {
+      throw new APIError('invalid_response', result.status, result.requestID);
     }
-    return { session_token: data.session_token, expires_at: data.expires_at };
+  }
+
+  async login(password: string, remember: boolean, operation: string, signal: AbortSignal) {
+    this.confirmSession(await this.request('/api/v1/portal/login', 'POST', operation, signal, { password, remember_me: remember }));
+  }
+
+  async restore(operation: string, signal: AbortSignal) {
+    this.confirmSession(await this.request('/api/v1/portal/session', 'GET', operation, signal));
   }
 
   async logout(operation: string, signal: AbortSignal) {
-    await this.request('/api/v1/portal/logout', 'POST', operation, signal);
+    const result = await this.request('/api/v1/portal/logout', 'POST', operation, signal);
+    if (result.status !== 204) throw new APIError('invalid_response', result.status, result.requestID);
   }
 
   async settings(operation: string, signal: AbortSignal) {
@@ -198,7 +200,7 @@ export class BrowserAPI implements API {
 
   async requestDetail(id: string, operation: string, signal: AbortSignal) {
     if (!historyID(id)) throw new APIError('invalid_request_id');
-    const result = await this.request(`/api/v1/admin/requests/${id}`, 'GET', operation, signal, undefined, true, parseRecordedJSON);
+    const result = await this.request(`/api/v1/admin/requests/${id}`, 'GET', operation, signal, undefined, parseRecordedJSON);
     if (!isDetail(result.data) || result.data.request.id !== id) throw new APIError('invalid_response', 200, result.requestID);
     return { value: result.data, requestID: result.requestID };
   }
@@ -207,7 +209,7 @@ export class BrowserAPI implements API {
     if (!historyID(conversation) || !historyCursor(cursor)) throw new APIError('invalid_history_query');
     const query = new URLSearchParams({ limit: '50' });
     if (cursor) query.set('cursor', cursor);
-    const result = await this.request(`/api/v1/admin/conversations/${conversation}/timeline?${query}`, 'GET', operation, signal, undefined, true, parseRecordedJSON);
+    const result = await this.request(`/api/v1/admin/conversations/${conversation}/timeline?${query}`, 'GET', operation, signal, undefined, parseRecordedJSON);
     if (!isHistoryPage(result.data, isTimelineEntry) || result.data.items.some((item, i, items) => i > 0 && item.sequence <= items[i - 1].sequence)) throw new APIError('invalid_response', 200, result.requestID);
     return { value: result.data, requestID: result.requestID };
   }
