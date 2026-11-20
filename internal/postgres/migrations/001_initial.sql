@@ -1,5 +1,0 @@
-CREATE TABLE IF NOT EXISTS aaa_schema_migrations (
-    version INTEGER PRIMARY KEY,
-    checksum TEXT NOT NULL,
-    applied_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
-);

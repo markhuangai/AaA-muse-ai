@@ -11,7 +11,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/markhuangai/AaA-muse-ai/internal/auth"
-	"github.com/markhuangai/AaA-muse-ai/internal/postgres"
+	"github.com/markhuangai/AaA-muse-ai/internal/sqlite"
 	"github.com/markhuangai/AaA-muse-ai/internal/worker"
 )
 
@@ -38,7 +38,7 @@ func NewWorkers(repo WorkerRepository, authority *auth.Authority, random io.Read
 }
 
 func workerLogger(logger *slog.Logger, operation string) *slog.Logger {
-	return logger.With("operation", operation, "schema_version", postgres.SchemaVersion, "enrollment_lifetime_seconds", EnrollmentLifetime.Seconds(), "worker_authority_lifetime", "until_revoked")
+	return logger.With("operation", operation, "schema_version", sqlite.SchemaVersion, "enrollment_lifetime_seconds", EnrollmentLifetime.Seconds(), "worker_authority_lifetime", "until_revoked")
 }
 
 func (s *Workers) failed(logger *slog.Logger, err error, started time.Time, attrs ...any) error {
@@ -58,13 +58,13 @@ func (s *Workers) failed(logger *slog.Logger, err error, started time.Time, attr
 		logger.Warn(event, append(attrs, "reason", rejected.Reason, "worker_id", rejected.WorkerID, "enrollment", rejected.Enrollment, "transaction_outcome", outcome)...)
 		return err
 	}
-	cause, detail, state, outcome := "worker_dependency_failed", err.Error(), "", "not_started"
-	var failure *postgres.Failure
+	cause, detail, code, phase, outcome := "worker_dependency_failed", err.Error(), "", "", "not_started"
+	var failure *sqlite.Failure
 	if errors.As(err, &failure) {
-		cause, detail, state, outcome = failure.Reason, failure.Detail(), failure.SQLState, failure.Outcome
+		cause, detail, code, phase, outcome = failure.Reason, failure.Detail(), failure.Code, failure.Phase, failure.Outcome
 	}
-	logger.Debug("worker.storage_exchange", append(attrs, "cause", cause, "detail", detail, "sqlstate", state, "transaction_outcome", outcome)...)
-	logger.Error("worker.operation_failed", append(attrs, "cause", cause, "sqlstate", state, "transaction_outcome", outcome)...)
+	logger.Debug("worker.storage_exchange", append(attrs, "cause", cause, "detail", detail, "sqlite_code", code, "phase", phase, "transaction_outcome", outcome)...)
+	logger.Error("worker.operation_failed", append(attrs, "cause", cause, "sqlite_code", code, "phase", phase, "transaction_outcome", outcome)...)
 	return err
 }
 

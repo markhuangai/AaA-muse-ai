@@ -11,8 +11,6 @@ import (
 
 const fixture = `server:
   listen: 0.0.0.0:8080
-database:
-  url: postgres://service:database-sentinel@db:5432/muse
 management:
   key: management-sentinel
 control-portal:
@@ -32,9 +30,9 @@ func TestConfiguration(t *testing.T) {
 		t.Fatal("defaults missing")
 	}
 	lookup := func(name string) (string, bool) {
-		return map[string]string{"PORTAL": "a:#quoted\nsecret", "DB": "postgres://a:b@db/muse"}[name], true
+		return map[string]string{"PORTAL": "a:#quoted\nsecret"}[name], true
 	}
-	resolved, err := Parse([]byte(strings.ReplaceAll(strings.ReplaceAll(fixture, "portal-sentinel", "${PORTAL}"), "postgres://service:database-sentinel@db:5432/muse", "${DB}")), lookup)
+	resolved, err := Parse([]byte(strings.ReplaceAll(fixture, "portal-sentinel", "${PORTAL}")), lookup)
 	if err != nil || string(resolved.Portal.Password) != "a:#quoted\nsecret" {
 		t.Fatal("environment scalar was not preserved")
 	}
@@ -51,7 +49,7 @@ func TestConfiguration(t *testing.T) {
 		t.Fatal("read error missing or exposed")
 	}
 	encoded, _ := json.Marshal(c)
-	for _, secret := range []string{"management-sentinel", "portal-sentinel", "client-sentinel", "database-sentinel"} {
+	for _, secret := range []string{"management-sentinel", "portal-sentinel", "client-sentinel"} {
 		if strings.Contains(string(encoded), secret) {
 			t.Fatal("configuration JSON leaked a credential")
 		}
@@ -59,7 +57,7 @@ func TestConfiguration(t *testing.T) {
 	if fmt.Sprint(c.Management.Key) != "[REDACTED]" || !c.Management.Key.LogValue().Equal(slog.StringValue("[REDACTED]")) {
 		t.Fatal("secret wrappers failed")
 	}
-	if len(c.Secrets()) != 5 {
+	if len(c.Secrets()) != 3 {
 		t.Fatal("redaction registry missing credentials")
 	}
 }
@@ -115,12 +113,10 @@ func TestLegacySettingsAreIgnoredBeforeResolving(t *testing.T) {
 
 func TestConfigurationValidation(t *testing.T) {
 	cases := map[string]func(*Config){
-		"listen":             func(c *Config) { c.Server.Listen = "bad" },
-		"port-zero":          func(c *Config) { c.Server.Listen = ":0" },
-		"port-large":         func(c *Config) { c.Server.Listen = ":65536" },
-		"db-invalid":         func(c *Config) { c.Database.URL = "postgres://%" },
-		"db-scheme":          func(c *Config) { c.Database.URL = "sqlite://db/muse" },
-		"db-name":            func(c *Config) { c.Database.URL = "postgres://db/" },
+		"listen":     func(c *Config) { c.Server.Listen = "bad" },
+		"port-zero":  func(c *Config) { c.Server.Listen = ":0" },
+		"port-large": func(c *Config) { c.Server.Listen = ":65536" },
+
 		"portal":             func(c *Config) { c.Portal.Password = " " },
 		"management-reuse":   func(c *Config) { c.Management.Key = c.Portal.Password },
 		"management-empty":   func(c *Config) { c.Management.Key = " " },
@@ -152,8 +148,8 @@ func TestConfigurationValidation(t *testing.T) {
 		})
 	}
 	c, _ := Parse([]byte(fixture), absent)
-	c.Database.URL = "postgres://db/muse"
-	if len(c.Secrets()) != 4 {
+
+	if len(c.Secrets()) != 3 {
 		t.Fatal("unexpected password registration")
 	}
 }
@@ -163,9 +159,9 @@ func TestSafeOriginalLocations(t *testing.T) {
 		source, field, reason string
 		line                  int
 	}{
-		{fixture + "unsupported-private-name: private-value\n", "<unknown>", "unknown_field", 11},
-		{fixture + "management:\n  key: other\n", "management", "duplicate_field", 11},
-		{strings.ReplaceAll(fixture, "portal-sentinel", "${MISSING}"), "control-portal.password", "unresolved_environment_reference", 8},
+		{fixture + "unsupported-private-name: private-value\n", "<unknown>", "unknown_field", 9},
+		{fixture + "management:\n  key: other\n", "management", "duplicate_field", 9},
+		{strings.ReplaceAll(fixture, "portal-sentinel", "${MISSING}"), "control-portal.password", "unresolved_environment_reference", 6},
 		{"control-portal:\n  password: credential-sentinel\nbroken: [", "configuration", "invalid_yaml", 0},
 	} {
 		_, err := Parse([]byte(tc.source), absent)
@@ -188,7 +184,7 @@ func TestEscapedHTTPControlBytesRejected(t *testing.T) {
 		source := strings.ReplaceAll(fixture, "management-sentinel", encoded)
 		_, err := Parse([]byte(source), absent)
 		var ce *Error
-		if !errors.As(err, &ce) || ce.Field != "management.key" || ce.Line != 6 || ce.Column < 1 {
+		if !errors.As(err, &ce) || ce.Field != "management.key" || ce.Line != 4 || ce.Column < 1 {
 			t.Fatalf("HTTP control byte %d was not rejected at its safe source location", b)
 		}
 		if strings.Contains(err.Error(), "admin") || strings.Contains(err.Error(), "key\x00") {

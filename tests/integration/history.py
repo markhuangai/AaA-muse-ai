@@ -98,7 +98,7 @@ class History(Inference):
                    "deadline_exceeded": "inspect the last worker boundary; retain uncertainty and await the matching idle acknowledgement"}
         if event_name == "inference.operation_failed":
             detail = next((entry for entry in events if entry.get("request_id") == request_id and entry["msg"] == "inference.storage_exchange"), None)
-            require(detail is not None and detail["sqlstate"] == "23514" and detail["transaction_outcome"] == "rolled_back" and "history_output_" in detail["detail"], "storage cause cannot be reconstructed from logs")
+            require(detail is not None and detail["sqlite_code"] == "1811" and detail["transaction_outcome"] == "rolled_back" and "history_output_" in detail["detail"], "storage cause cannot be reconstructed from logs")
             action = "repair the rejecting database constraint; preserve any exposed decision and retry reading without regenerating"
         else:
             action = actions.get(cause)
@@ -326,14 +326,14 @@ class History(Inference):
         job, _, _ = self.claim(worker, peer, legacy_next)
         self.decision(worker, peer, job, {"type": "final", "text": text})
         ids = "','".join([first["id"], continued["id"], legacy["id"]])
-        retained = """SELECT string_agg(kind||':'||identity||':'||md5(payload),',' ORDER BY kind,identity) FROM (
-          SELECT 'experiment' AS kind,id AS identity,data::text AS payload FROM aaa_experiments WHERE id IN ('%s')
-          UNION ALL SELECT 'request',id,data::text FROM aaa_model_requests WHERE id IN ('%s')
-          UNION ALL SELECT 'job',id,data::text||context::text FROM aaa_inference_jobs WHERE experiment_id IN ('%s')
-          UNION ALL SELECT 'legacy',experiment_id||':'||sequence,data::text FROM aaa_inference_history WHERE experiment_id IN ('%s')
-          UNION ALL SELECT 'item',id,data::text FROM aaa_conversation_items WHERE request_id IN ('%s')
-          UNION ALL SELECT 'event',conversation_id||':'||sequence,data::text FROM aaa_conversation_events WHERE conversation_id='%s'
-          ) stored;""" % (ids, ids, ids, ids, ids, first["conversation_id"])
+        retained = """SELECT kind||':'||identity||':'||hex(payload) FROM (
+          SELECT 'experiment' AS kind,id AS identity,CAST(data AS TEXT) AS payload FROM aaa_experiments WHERE id IN ('%s')
+          UNION ALL SELECT 'request',id,CAST(data AS TEXT) FROM aaa_model_requests WHERE id IN ('%s')
+          UNION ALL SELECT 'job',id,CAST(data AS TEXT)||CAST(context AS TEXT) FROM aaa_inference_jobs WHERE experiment_id IN ('%s')
+          UNION ALL SELECT 'legacy',experiment_id||':'||sequence,CAST(data AS TEXT) FROM aaa_inference_history WHERE experiment_id IN ('%s')
+          UNION ALL SELECT 'item',id,CAST(data AS TEXT) FROM aaa_conversation_items WHERE request_id IN ('%s')
+          UNION ALL SELECT 'event',conversation_id||':'||sequence,CAST(data AS TEXT) FROM aaa_conversation_events WHERE conversation_id='%s'
+           ) stored ORDER BY kind,identity;""" % (ids, ids, ids, ids, ids, first["conversation_id"])
         before = self.sql(retained)
         for request, kind in ((first, "native"), (continued, "native"), (legacy, "legacy")):
             detail, headers = self.checked("/api/v1/admin/requests/" + request["id"], self.admin)
@@ -369,8 +369,8 @@ class History(Inference):
                 break
         require({first["conversation_id"], legacy["conversation_id"]} <= seen, "NUL histories missing from conversation list")
         require(self.sql(retained) == before, "management reads rewrote retained JSON")
-        original = self.sql("SELECT data::text FROM aaa_conversation_events WHERE conversation_id='" + first["conversation_id"] + "' AND sequence=0;")
-        self.sql("UPDATE aaa_conversation_events SET data='{\"sequence\":0,\"kind\":7}' WHERE conversation_id='" + first["conversation_id"] + "' AND sequence=0;")
+        original = self.sql("SELECT CAST(data AS TEXT) FROM aaa_conversation_events WHERE conversation_id='" + first["conversation_id"] + "' AND sequence=0;")
+        self.sql("UPDATE aaa_conversation_events SET data=CAST('{\"sequence\":0,\"kind\":7}' AS BLOB) WHERE conversation_id='" + first["conversation_id"] + "' AND sequence=0;")
         try:
             _, headers = self.checked("/api/v1/admin/conversations/" + first["conversation_id"] + "/timeline", self.admin, want=503)
             evidence = self.retained_export("request_id", headers["X-Request-Id"])
@@ -379,7 +379,7 @@ class History(Inference):
             require(failure["level"] == "ERROR" and failure["cause"] == "history_projection_invalid" and failure["transaction_outcome"] == "rolled_back" and failure["attempt"] == 1 and failure["duration_ms"] >= 0, "malformed projection failure lacks cause/outcome")
             require(detail["level"] == "DEBUG" and "kind" in detail["detail"] and failure["revision"] == self.args.source_sha, "projection cause or source revision missing")
         finally:
-            self.sql("UPDATE aaa_conversation_events SET data='" + original.replace("'", "''") + "' WHERE conversation_id='" + first["conversation_id"] + "' AND sequence=0;")
+            self.sql("UPDATE aaa_conversation_events SET data=x'" + original.encode().hex() + "' WHERE conversation_id='" + first["conversation_id"] + "' AND sequence=0;")
         require(self.sql(retained) == before, "projection fault fixture did not restore original history")
         require('nul-history-value' not in self.logs(self.main_service), "NUL payload escaped INFO filtering")
         peer.stop()
@@ -391,21 +391,21 @@ class History(Inference):
         request, _ = self.submit(self.input(worker, tools=[]), "boundary-fault")
         self.deliver(worker, peer, request, {"type": "final", "text": "safe output"})
         constraint = "history_output_start_test"
-        self.sql("ALTER TABLE aaa_model_requests ADD CONSTRAINT " + constraint + " CHECK(id <> '" + request["id"] + "' OR data->>'output_started_at' IS NULL);")
+        self.reject_writes(constraint, "aaa_model_requests", "NEW.id='" + request["id"] + "' AND json_extract(CAST(NEW.data AS TEXT),'$.output_started_at') IS NOT NULL")
         _, headers = self.read_native(request, want=503)
         event, events = self.diagnose_history(headers["X-Request-Id"], "inference.operation_failed")
-        require(event["sqlstate"] == "23514" and event["transaction_outcome"] == "rolled_back", "output-start storage failure cause unavailable")
+        require(event["sqlite_code"] == "1811" and event["transaction_outcome"] == "rolled_back", "output-start storage failure cause unavailable")
         require(any(e["msg"] == "inference.storage_exchange" and constraint in e["detail"] for e in events), "causal constraint missing from protected exchange")
-        self.sql("ALTER TABLE aaa_model_requests DROP CONSTRAINT " + constraint + ";")
+        self.sql("DROP TRIGGER " + constraint + ";")
         constraint = "history_output_finish_test"
-        self.sql("ALTER TABLE aaa_model_requests ADD CONSTRAINT " + constraint + " CHECK(id <> '" + request["id"] + "' OR data->>'output_completed_at' IS NULL);")
+        self.reject_writes(constraint, "aaa_model_requests", "NEW.id='" + request["id"] + "' AND json_extract(CAST(NEW.data AS TEXT),'$.output_completed_at') IS NOT NULL")
         output, headers = self.read_native(request)
         require(output["output"]["text"] == "safe output", "accepted output lost after completion-marker failure")
         _, events = self.diagnose_history(headers["X-Request-Id"], "inference.operation_failed")
         require(any(e["msg"] == "request.completed" and e["outcome"] == "uncertain" for e in events), "post-output persistence uncertainty hidden")
         detail = self.detail(request)["request"]
         require("output_started_at" in detail and "output_completed_at" not in detail, "failed completion falsely marked done")
-        self.sql("ALTER TABLE aaa_model_requests DROP CONSTRAINT " + constraint + ";")
+        self.sql("DROP TRIGGER " + constraint + ";")
         self.read_native(request)
         conflict = self.input(worker, [{"type": "message", "role": "user", "text": "changed prefix"}], tools=[])
         _, headers = self.submit(conflict, "boundary-fault", want=409)
@@ -419,7 +419,7 @@ class History(Inference):
         require('"msg":"history.input"' not in logs and '"msg":"inference.exchange"' not in logs, "protected DEBUG detail reached INFO output")
         require("history-only-private-" not in logs, "private conflict content reached runtime logs")
         self.assert_private(logs)
-        self.receipt("history.real_output_persistence_failures", sqlstate="23514", rollback_verified=True, output_uncertainty_recorded=True, log_only_diagnosis=True, corrective_action="repair rejecting database constraint; preserve exposed decision and retry reading rather than regenerating")
+        self.receipt("history.real_output_persistence_failures", sqlite_code="1811", rollback_verified=True, output_uncertainty_recorded=True, log_only_diagnosis=True, corrective_action="repair rejecting database constraint; preserve exposed decision and retry reading rather than regenerating")
 
     def deadline_and_restart(self, worker, peer, first, initial, canonical):
         pending, _ = self.submit(self.input(worker, tools=[], timeout=2), "deadline")

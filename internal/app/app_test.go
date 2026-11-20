@@ -11,17 +11,18 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/markhuangai/AaA-muse-ai/internal/config"
 	"github.com/markhuangai/AaA-muse-ai/internal/diagnostics"
 	"github.com/markhuangai/AaA-muse-ai/internal/inference"
-	"github.com/markhuangai/AaA-muse-ai/internal/postgres"
 	"github.com/markhuangai/AaA-muse-ai/internal/service"
+	"github.com/markhuangai/AaA-muse-ai/internal/sqlite"
 )
 
 type fakeRepository struct {
@@ -51,7 +52,7 @@ func fixtureDependencies(t *testing.T, generated bool) (Dependencies, *bytes.Buf
 	t.Helper()
 	var stdout, stderr bytes.Buffer
 	repo := &fakeRepository{}
-	data := map[string]any{"database": map[string]any{"url": "postgres://db-private-sentinel@db/muse"}, "control-portal": map[string]any{"password": "portal-private-sentinel"}, "diagnostics": map[string]any{"directory": t.TempDir()}}
+	data := map[string]any{"control-portal": map[string]any{"password": "portal-private-sentinel"}, "diagnostics": map[string]any{"directory": t.TempDir()}}
 	if !generated {
 		data["management"] = map[string]any{"key": "management-private-sentinel"}
 	}
@@ -202,8 +203,7 @@ func TestConnectRetriesAndDiagnosis(t *testing.T) {
 			d, _, _, _ := fixtureDependencies(t, false)
 			var output bytes.Buffer
 			logger := slog.New(slog.NewJSONHandler(&output, &slog.HandlerOptions{Level: slog.LevelDebug})).With("operation_id", "startup-fixture")
-			c := config.Defaults()
-			c.Database.URL = "postgres://db/muse"
+
 			attempts, sleeps := 0, 0
 			d.Sleep = func(_ context.Context, delay time.Duration) error {
 				sleeps++
@@ -219,17 +219,17 @@ func TestConnectRetriesAndDiagnosis(t *testing.T) {
 				attempts++
 				switch name {
 				case "migration":
-					return &fakeRepository{bootErr: &postgres.Failure{Reason: "schema_version_incompatible", Expected: "4", Observed: "5"}}, nil
+					return &fakeRepository{bootErr: &sqlite.Failure{Reason: "schema_version_incompatible", Expected: "4", Observed: "5"}}, nil
 				case "checksum":
-					return &fakeRepository{bootErr: &postgres.Failure{Reason: "migration_checksum_mismatch"}}, nil
+					return &fakeRepository{bootErr: &sqlite.Failure{Reason: "migration_checksum_mismatch"}}, nil
 				case "open-failed":
-					return nil, &postgres.Failure{Reason: "database_configuration_invalid"}
+					return nil, &sqlite.Failure{Reason: "database_configuration_invalid"}
 				}
 				if (name == "eventual" || name == "starting") && attempts == 3 {
 					return &fakeRepository{}, nil
 				}
 				if name == "starting" || name == "starting-exhausted" {
-					return &fakeRepository{bootErr: &pgconn.PgError{Code: "57P03", Message: "database system is starting up"}}, nil
+					return &fakeRepository{bootErr: &sqlite.Failure{Reason: "database_busy", Code: "5", Phase: "begin"}}, nil
 				}
 				return &fakeRepository{bootErr: context.DeadlineExceeded}, nil
 			}
@@ -239,7 +239,7 @@ func TestConnectRetriesAndDiagnosis(t *testing.T) {
 				ctx, cancel = context.WithCancel(ctx)
 				cancel()
 			}
-			repo, err := connect(ctx, c, d, logger)
+			repo, err := connect(ctx, d, logger)
 			if name == "eventual" || name == "starting" {
 				if err != nil || repo == nil || attempts != 3 || sleeps != 2 {
 					t.Fatal("retry recovery failed")
@@ -259,10 +259,10 @@ func TestConnectRetriesAndDiagnosis(t *testing.T) {
 			if (name == "exhausted" || name == "starting-exhausted") && (attempts != 3 || sleeps != 2) {
 				t.Fatal("unavailable database exceeded the retry bound")
 			}
-			if strings.HasPrefix(name, "starting") && !strings.Contains(output.String(), "57P03") {
-				t.Fatal("transient PostgreSQL diagnosis lost its SQLSTATE")
+			if strings.HasPrefix(name, "starting") && !strings.Contains(output.String(), `"sqlite_code":"5"`) {
+				t.Fatal("transient SQLite diagnosis lost its result code")
 			}
-			if !strings.Contains(output.String(), "startup-fixture") || !strings.Contains(output.String(), "database_host") {
+			if !strings.Contains(output.String(), "startup-fixture") || !strings.Contains(output.String(), "database_file") {
 				t.Fatal("diagnostic correlation or dependency target missing")
 			}
 		})
@@ -345,10 +345,14 @@ func TestRuntimeHelpers(t *testing.T) {
 	if d.ReadFile == nil || d.LookupEnv == nil || d.Random == nil || d.Now == nil || d.Sleep == nil || d.Files == nil || d.Listen == nil {
 		t.Fatal("production boundary missing")
 	}
-	if _, err := d.OpenDB(context.Background(), "postgres://%"); err == nil {
+	if _, err := d.OpenDB(context.Background(), "relative.sqlite3"); err == nil {
 		t.Fatal("production connector ignored invalid input")
 	}
-	repo, err := d.OpenDB(context.Background(), "postgres://db/muse?sslmode=disable")
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	repo, err := d.OpenDB(context.Background(), filepath.Join(dir, "broker.sqlite3"))
 	if err != nil || repo == nil {
 		t.Fatal("production connector lost a valid repository")
 	}
@@ -358,24 +362,14 @@ func TestRuntimeHelpers(t *testing.T) {
 func TestProductionDatabaseConfigurationFailure(t *testing.T) {
 	d, out, errout, _ := fixtureDependencies(t, false)
 	d.OpenDB = Production(out, errout).OpenDB
-	for _, u := range []string{"postgres://%", "postgres://db/muse?sslmode=invalid"} {
-		if repo, err := d.OpenDB(context.Background(), u); err == nil || repo != nil {
-			t.Fatal("failed production connector returned a repository interface")
-		}
-	}
-	read := d.ReadFile
-	d.ReadFile = func(path string) ([]byte, error) {
-		b, err := read(path)
-		return bytes.ReplaceAll(b, []byte("@db/muse"), []byte("@db/muse?sslmode=invalid")), err
-	}
+	d.DatabasePath = filepath.Join(t.TempDir(), "missing-directory", "broker.sqlite3")
 	if Run(context.Background(), nil, service.Build{}, d) != 1 {
-		t.Fatal("invalid database options did not stop startup")
+		t.Fatal("unavailable database file did not stop startup")
 	}
-	if !strings.Contains(out.String(), `"msg":"db.connect_failed"`) || !strings.Contains(out.String(), `"cause":"database_configuration_invalid"`) || !strings.Contains(out.String(), `"attempt":1`) || !strings.Contains(out.String(), `"outcome":"startup_stopped"`) {
-		t.Fatal("invalid database options lost safe startup diagnosis")
-	}
-	if strings.Contains(out.String(), "private-sentinel") || strings.Contains(errout.String(), "private-sentinel") {
-		t.Fatal("database configuration error exposed credentials")
+	for _, expected := range []string{`"msg":"db.connect_failed"`, `"cause":"database_file_unavailable"`, `"attempt":1`, `"outcome":"startup_stopped"`, `"phase":"open"`} {
+		if !strings.Contains(out.String(), expected) {
+			t.Fatal("database open failure lost diagnosis", expected, out.String())
+		}
 	}
 	b, err := d.ReadFile("fixture")
 	if err != nil {
@@ -407,7 +401,7 @@ func TestProductionDatabaseConfigurationFailure(t *testing.T) {
 			captured.Write(payload)
 		}
 	}
-	if strings.Contains(captured.String(), "private-sentinel") || !strings.Contains(captured.String(), "db.exchange_failed") {
+	if strings.Contains(captured.String(), "portal-private-sentinel") || !strings.Contains(captured.String(), "db.exchange_failed") {
 		t.Fatal("database failure detail is missing or exposes credentials")
 	}
 }

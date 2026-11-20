@@ -1,6 +1,6 @@
 # Product qualification (#18)
 
-The product runner links the compiled portal, real service/PostgreSQL containers,
+The product runner links the compiled portal, real broker containers with SQLite,
 shipped setup prompt, verified archive/installer and installed subscriber. Its
 controlled model process calls the installed CLI; it cannot read client fixtures
 from the worker container. Eight Chat/Responses JSON/SSE tool cycles retain exact
@@ -131,7 +131,7 @@ a shell subscriber as proof of a working Muse backend:
 | `enroll` | Real portal password login and two setup prompts; run once before account setup. |
 | `baseline` | Independently observed readiness and client-tool trial for each worker, initial management capability approval, eight protocol cycles, later affinity, interleaving and cross-client rejection. Native observation IDs start `baseline-readiness-a`, `baseline-tool-a`, and the corresponding `b` names. |
 | `broker-prepare` | Stops with an accepted pending client-tool call, before executing its result. Retains the service process identity, call ID, worker approval and source exports. Both workers are approved before the restart checkpoint. |
-| `broker-resume` | Owner restarts only the qualification service while retaining PostgreSQL/diagnostics volumes. Record `product_case` for `recovery.broker-tool-wait`. The runner verifies a new service process and unchanged worker approval, then supplies the original result exactly once without requalification. |
+| `broker-resume` | Owner restarts only the qualification service while retaining SQLite and diagnostics volumes. Record `product_case` for `recovery.broker-tool-wait`. The runner verifies a new service process and unchanged worker approval, then supplies the original result exactly once without requalification. |
 | `worker-restart` | Record the scoped supported worker restart. A real client tool cycle must complete on the recovered connection under unchanged approval, preserving identity and one subscriber. No reapproval, reinstall or state deletion. |
 | `refresh` | Owner approves the exact supported non-destructive refresh scope, performs it, and observes the retained hook/task recovering without a manual Muse message. A real client tool cycle verifies the recovered connection under retained worker approval. A browser reload alone cannot establish this. |
 | `replacement` | After a completed final answer with no pending tool, stop only worker A's identified subscriber. Record `recovery.replacement-full-history`. The runner requires A offline with no held assignment or client-tool wait and B online/idle with retained approval, then continues the owned Responses session with full history and original accepted tool linkage. Offline work status stays `unknown`. |

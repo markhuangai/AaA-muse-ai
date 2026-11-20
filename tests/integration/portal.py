@@ -82,25 +82,15 @@ class Portal(WorkerAuth):
         require(self.api("/api/v1/portal/settings", session["session_token"], origin=sibling_origin)[0] == 401, "sessions were persisted or shared across service processes")
         second, _ = self.login(sibling_origin)
         require(self.api("/api/v1/admin/status", second["session_token"], origin=sibling_origin)[0] == 200, "sibling session failed")
-        self.docker("stop", "--time", "1", self.db)
-        try:
+        with self.storage_fault("aaa_schema_migrations"):
             status, headers, body = self.api("/api/v1/portal/settings", session["session_token"])
             value = json.loads(body)
             require(status == 200 and value["ready"] is False, "database outage concealed")
             event, _ = self.diagnose(headers["X-Request-Id"], "portal.state_stale", value["database"])
             require(event["expected_state"] == "ready" and event["observed_state"] == "unavailable", "outage evidence lacks expected/observed state")
-            self.receipt("portal.log_only_database_diagnosis", request_id=headers["X-Request-Id"], cause=event["cause"], corrective_action="Restore the PostgreSQL service, then refresh settings.")
-        finally:
-            self.docker("start", self.db)
-            deadline = time.monotonic() + 30
-            while time.monotonic() < deadline:
-                if self.docker("exec", self.db, "pg_isready", "-U", "postgres", success=False).returncode == 0:
-                    break
-                time.sleep(0.2)
-            else:
-                raise AssertionError("controlled PostgreSQL restart did not recover")
+            self.receipt("portal.log_only_database_diagnosis", request_id=headers["X-Request-Id"], cause=event["cause"], corrective_action="Restore the SQLite schema ledger, then refresh settings.")
         self.ready(self.main_service, self.origin_url)
-        self.receipt("portal.process_local_sessions", sibling_isolation=True, postgres_recovered=True)
+        self.receipt("portal.process_local_sessions", sibling_isolation=True, sqlite_recovered=True)
 
     def browser(self, key_origins):
         fixture = self.private("browser-fixture.json", json.dumps({"origin": self.origin_url, "password": self.portal,

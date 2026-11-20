@@ -208,16 +208,22 @@ function verifyOwner(identity) {
   expect(actual.Config.Labels['io.aaa-muse.test-owner']).toBe(fixture.owner);
 }
 
+function fixtureSQL(sql) {
+  verifyOwner(fixture.database);
+  execFileSync('docker', ['exec', '-i', '--user', '10001:10001', fixture.database, 'sqlite3', '-bail', '-batch', '-cmd', '.timeout 4000',
+    '/var/lib/aaa-muse-ai/state/broker.sqlite3'], { input: sql, stdio: ['pipe', 'pipe', 'pipe'] });
+}
+
 async function outageAndDenial() {
   const context = await browser.newContext({ ignoreHTTPSErrors: true, serviceWorkers: 'block' }); const page = await context.newPage(); const session = await login(page);
-  verifyOwner(fixture.database); execFileSync('docker', ['stop', '--time', '1', fixture.database], { stdio: 'pipe' });
+  fixtureSQL('ALTER TABLE aaa_workers RENAME TO hidden_aaa_workers;');
   try {
     const backend = page.waitForResponse(response => new URL(response.url()).pathname === '/api/v1/admin/workers' && response.status() === 503);
     const stale = report(page, 'service_unavailable'); await page.getByRole('button', { name: 'Refresh workers' }).click();
     const response = await backend; await stale;
     await expect(page.getByText('Could not refresh workers. Check the connection and retry.')).toBeVisible();
     receipt.diagnostics.push({ request_id: response.headers()['x-request-id'], event: 'worker.operation_failed' });
-  } finally { execFileSync('docker', ['start', fixture.database], { stdio: 'pipe' }); }
+  } finally { fixtureSQL('ALTER TABLE hidden_aaa_workers RENAME TO aaa_workers;'); }
   const deadline = Date.now() + 30_000; let ready = false;
   while (Date.now() < deadline) { const result = await control('/readyz'); if (result.response.status === 200) { ready = true; break; } await pause(100); }
   expect(ready).toBe(true); await page.getByRole('button', { name: 'Refresh workers' }).click(); await expect(page.getByText('Stale snapshot · Refresh before changing worker access.')).not.toBeVisible();
@@ -228,7 +234,7 @@ async function outageAndDenial() {
   receipt.diagnostics.push({ request_id: rejected.headers()['x-request-id'], event: 'portal.auth_failed' });
   await expect(page.getByText('Your session ended. Sign in again.')).toBeVisible();
   expect(await page.locator('[data-sensitive]').count()).toBe(0); await privateStorage(page, context);
-  passed('portal.worker_outage_recovery_and_denial', { real_postgres_outage: true, invalid_session_clears_enrollment: true }); await context.close();
+  passed('portal.worker_outage_recovery_and_denial', { real_sqlite_fault: true, invalid_session_clears_enrollment: true }); await context.close();
 }
 
 async function expiryAndLateLogout() {

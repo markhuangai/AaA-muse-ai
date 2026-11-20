@@ -1,18 +1,18 @@
-package postgres
+package sqlite
 
 import (
 	"context"
-	"github.com/jackc/pgx/v5"
+	"database/sql"
 )
 
 func (r *Repository) MediaCleanupStates(ctx context.Context, ids []string) (map[string]string, error) {
 	states := map[string]string{}
-	err := r.workerTransaction(ctx, func(tx pgx.Tx) error {
-		rows, err := tx.Query(ctx, `SELECT id, CASE
+	err := r.read(ctx, func(tx *sql.Tx) error {
+		rows, err := tx.QueryContext(ctx, `SELECT id, CASE
 		 WHEN state IN ('interrupted','cancelled') THEN state
-		 WHEN state='accepted' AND (data->'media'->>'expires_at')::timestamptz <= clock_timestamp() THEN 'expired'
+		 WHEN state='accepted' AND media_expires_at <= ?2 THEN 'expired'
 		 WHEN state='accepted' THEN 'completed' ELSE 'active' END
-		 FROM aaa_inference_jobs WHERE id=ANY($1::text[]) AND data->'media' IS NOT NULL`, ids)
+		 FROM aaa_inference_jobs WHERE id IN (SELECT value FROM json_each(?1)) AND has_media`, idList(ids), r.databaseTime().UnixMicro())
 		if err != nil {
 			return err
 		}

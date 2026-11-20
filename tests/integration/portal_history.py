@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -57,15 +58,25 @@ class PortalHistory(Portal, Routing):
         return {"first": first, "continued": continued, "last": last, "worker_id": worker["worker"]["id"], "response_request_id": response_request, "call_id": call["call_id"], "exact_result": result["output"]}
 
     def seed_legacy_pages(self, worker_id):
-        self.sql("""INSERT INTO aaa_experiments(id,worker_id,state,deadline_at,data)
-          SELECT md5('portal-history-page-'||g), '%s', 'completed', '2026-11-13T00:30:00Z',
-          json_build_object('id',md5('portal-history-page-'||g),'conversation_id',md5('portal-history-conversation-'||g),
-          'worker_id','%s','state','completed','created_at','2026-11-13T00:00:00Z','deadline_at','2026-11-13T00:30:00Z',
-          'current_job_id','','messages',json_build_array(json_build_object('type','message','role','user','text','Retained legacy fixture')),
-          'tools',json_build_array(),'final_text','Retained legacy answer','remote_outcome','decision_observed','numeric_fixture','1e200000'::json)
-          FROM generate_series(1,55) AS g;""" % (worker_id, worker_id))
-        identity = self.sql("SELECT md5('portal-history-page-1');")
-        self.sql("INSERT INTO aaa_inference_history(experiment_id,sequence,data) VALUES ('" + identity + "',0,'{\"type\":\"message\",\"role\":\"user\",\"text\":\"Retained legacy fixture\"}');")
+        created = "2026-11-13T00:00:00Z"
+        deadline = "2026-11-13T00:30:00Z"
+        message = {"type": "message", "role": "user", "text": "Retained legacy fixture"}
+        statements = []
+        for index in range(1, 56):
+            current = hashlib.md5(f"portal-history-page-{index}".encode(), usedforsecurity=False).hexdigest()
+            conversation = hashlib.md5(f"portal-history-conversation-{index}".encode(), usedforsecurity=False).hexdigest()
+            data = {"id": current, "conversation_id": conversation, "worker_id": worker_id, "state": "completed",
+                    "created_at": created, "deadline_at": deadline, "current_job_id": "", "messages": [message],
+                    "tools": [], "final_text": "Retained legacy answer", "remote_outcome": "decision_observed"}
+            raw = (json.dumps(data)[:-1] + ',"numeric_fixture":1e200000}').encode().hex()
+            statements.append("INSERT INTO aaa_experiments(id,worker_id,state,deadline_at,created_at,conversation_id,current_job_id,data) "
+                              f"VALUES ('{current}','{worker_id}','completed',unixepoch('{deadline}')*1000000,"
+                              f"unixepoch('{created}')*1000000,'{conversation}','',x'{raw}');")
+            if index == 1:
+                identity = current
+                raw_message = json.dumps(message).encode().hex()
+                statements.append(f"INSERT INTO aaa_inference_history(experiment_id,sequence,data) VALUES ('{identity}',0,x'{raw_message}');")
+        self.sql("BEGIN IMMEDIATE;" + "\n".join(statements) + "COMMIT;")
         seen, cursor = [], ""
         while True:
             value, _ = self.checked("/api/v1/admin/requests?limit=50" + ("&cursor=" + cursor if cursor else ""), self.admin)
@@ -166,7 +177,7 @@ class PortalHistory(Portal, Routing):
         if storage:
             require(status == 503 and storage[0].get("detail"), "storage failure lacks actual causal detail")
             cause, transaction = storage[0]["cause"], storage[0]["transaction_outcome"]
-            action = "Restore the PostgreSQL dependency identified by the protected causal detail, then refresh."
+            action = "Restore the SQLite table identified by the protected causal detail, then refresh."
         elif cancel:
             event = cancel[0]
             native = self.retained_export("operation_id", event["operation_id"])
@@ -209,7 +220,7 @@ class PortalHistory(Portal, Routing):
         if known.exists():
             self.secrets.extend(json.loads(known.read_text()))
         log = re.sub(r"muse_(?:worker|portal|enroll)_[A-Za-z0-9_-]{43}", "[REDACTED]", result.stdout + result.stderr)
-        for secret in (self.admin, self.portal, self.client, self.database_password, *self.secrets):
+        for secret in (self.admin, self.portal, self.client, *self.secrets):
             log = log.replace(secret, "[REDACTED]")
         self.private("history-browser-" + phase + ".log", log)
         require(result.returncode == 0, "history browser conformance failed; inspect private history-browser evidence")

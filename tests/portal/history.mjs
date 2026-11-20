@@ -97,8 +97,9 @@ function concurrentLegacy() {
   verifyOwner(fixture.database);
   const id = randomBytes(16).toString('hex'), conversation = randomBytes(16).toString('hex'), time = new Date().toISOString();
   const data = { id, conversation_id: conversation, worker_id: fixture.fixtures.native.worker_id, state: 'completed', created_at: time, deadline_at: time, current_job_id: '', messages: [], tools: [], final_text: 'Concurrent legacy arrival', remote_outcome: 'decision_observed' };
-  const sql = `INSERT INTO aaa_experiments(id,worker_id,state,deadline_at,data) VALUES ('${id}','${data.worker_id}','completed','${time}','${JSON.stringify(data)}');`;
-  execFileSync('docker', ['exec', '-i', fixture.database, 'psql', '-X', '-v', 'ON_ERROR_STOP=1', '-U', 'postgres', '-d', 'aaa_muse'], { input: sql, stdio: ['pipe', 'pipe', 'pipe'] });
+  const micros = Date.parse(time) * 1000, raw = Buffer.from(JSON.stringify(data)).toString('hex');
+  fixtureSQL(`INSERT INTO aaa_experiments(id,worker_id,state,deadline_at,created_at,conversation_id,current_job_id,data)
+    VALUES ('${id}','${data.worker_id}','completed',${micros},${micros},'${conversation}','',x'${raw}');`);
   return id;
 }
 
@@ -261,16 +262,22 @@ async function actualRenderFailure() {
   expect(report.request_id).not.toBe(await page.getByRole('region', { name: 'Request detail' }).locator('.history-correlation').first().innerText());
   passed('portal.history_actual_timeline_render_failure', { source_http_request_id: sourceID, component: 'timeline', actual_render_boundary: true }); await context.close();
 }
+function fixtureSQL(sql) {
+  verifyOwner(fixture.database);
+  execFileSync('docker', ['exec', '-i', '--user', '10001:10001', fixture.database, 'sqlite3', '-bail', '-batch', '-cmd', '.timeout 4000',
+    '/var/lib/aaa-muse-ai/state/broker.sqlite3'], { input: sql, stdio: ['pipe', 'pipe', 'pipe'] });
+}
+
 async function failuresAndExpiry() {
   const context = await browser.newContext({ serviceWorkers: 'block' }); const page = await context.newPage(); await page.clock.install(); const session = await login(page);
   const target = fixture.fixtures.cancellation.queued[4]; await open(page, target.id);
-  verifyOwner(fixture.database); execFileSync('docker', ['stop', '--time', '1', fixture.database], { stdio: 'pipe' });
+  fixtureSQL('ALTER TABLE aaa_experiments RENAME TO hidden_aaa_experiments;');
   try {
     const failed = page.waitForResponse(response => new URL(response.url()).pathname === '/api/v1/admin/requests/' + target.id && response.status() === 503);
     const reported = waitReport(page, 'portal.history_load_failed', 'service_unavailable', 'request');
     await page.getByRole('button', { name: 'Refresh history', exact: true }).click(); const response = await failed; await reported; receipt.diagnostics.push({ request_id: response.headers()['x-request-id'] });
     await expect(page.getByText(/Could not load request history/).first()).toBeVisible(); await expect(page.getByRole('button', { name: 'Cancel request', exact: true })).toBeDisabled();
-  } finally { execFileSync('docker', ['start', fixture.database], { stdio: 'pipe' }); }
+  } finally { fixtureSQL('ALTER TABLE hidden_aaa_experiments RENAME TO aaa_experiments;'); }
   const until = Date.now() + 30_000; let ready = false;
   while (Date.now() < until) { if ((await control('/readyz')).response.status === 200) { ready = true; break; } await pause(100); }
   expect(ready).toBe(true); await page.getByRole('button', { name: 'Refresh history', exact: true }).click(); await expect(page.getByRole('button', { name: 'Cancel request', exact: true })).toBeEnabled();
@@ -286,7 +293,7 @@ async function failuresAndExpiry() {
   const stale = waitReport(page, 'portal.history_load_failed', 'stale_data', 'request'); await page.clock.fastForward(60_001); await stale; await expect(page.getByRole('button', { name: 'Cancel request', exact: true })).toBeDisabled();
   await page.clock.fastForward(1_800_001); await expect(page.getByText('Your session ended. Sign in again.')).toBeVisible(); expect(await page.getByRole('region', { name: 'Request detail' }).count()).toBe(0); await privateStorage(page, context);
   const actual = await control('/api/v1/portal/logout', { key: session.session_token, method: 'POST' }); expect(actual.response.status).toBe(204);
-  passed('portal.history_outage_malformed_timeout_stale_and_browser_expiry', { actual_postgres_outage: true, browser_clock_is_not_server_expiry: true, render_source_correlated: true }); await context.close();
+  passed('portal.history_outage_malformed_timeout_stale_and_browser_expiry', { actual_sqlite_fault: true, browser_clock_is_not_server_expiry: true, render_source_correlated: true }); await context.close();
   const deniedContext = await browser.newContext({ serviceWorkers: 'block' }); const deniedPage = await deniedContext.newPage(); const deniedSession = await login(deniedPage);
   expect((await control('/api/v1/portal/logout', { key: deniedSession.session_token, method: 'POST' })).response.status).toBe(204);
   // The first denied parallel read clears the session and can abort its sibling.

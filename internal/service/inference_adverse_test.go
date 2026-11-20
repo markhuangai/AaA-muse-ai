@@ -12,7 +12,7 @@ import (
 
 	"github.com/markhuangai/AaA-muse-ai/internal/diagnostics"
 	"github.com/markhuangai/AaA-muse-ai/internal/inference"
-	"github.com/markhuangai/AaA-muse-ai/internal/postgres"
+	"github.com/markhuangai/AaA-muse-ai/internal/sqlite"
 )
 
 func TestPersistenceFailureRetainsResolvedExperimentInExport(t *testing.T) {
@@ -31,7 +31,7 @@ func TestPersistenceFailureRetainsResolvedExperimentInExport(t *testing.T) {
 			}
 			var stdout bytes.Buffer
 			log = diagnostics.NewLogger(&stdout, store, slog.LevelInfo, diagnostics.NewRedactor(nil), func() time.Time { return m.now }, func(error) { t.Fatal("capture failed") }).With("request_id", "failed-persistence")
-			m.persistFail = &postgres.Failure{Reason: "postgres_error", SQLState: "23514", Outcome: "rolled_back"}
+			m.persistFail = &sqlite.Failure{Reason: "sqlite_error", Code: "1811", Outcome: "rolled_back"}
 			if operation == "claim" {
 				_, err = b.Claim(context.Background(), log, "worker-a", e.CurrentJobID, inference.Claim{Version: 1, SubmissionID: "failed-claim", ConnectionID: c.ID, ConnectionGeneration: c.Generation})
 			} else {
@@ -64,7 +64,7 @@ func TestPersistenceFailureRetainsResolvedExperimentInExport(t *testing.T) {
 				}
 				name := event["msg"].(string)
 				seen[name] = true
-				if name != "inference.exchange" && (event["cause"] != "postgres_error" || event["sqlstate"] != "23514" || event["transaction_outcome"] != "rolled_back" || event["attempt"] != float64(1)) {
+				if name != "inference.exchange" && (event["cause"] != "sqlite_error" || event["sqlite_code"] != "1811" || event["transaction_outcome"] != "rolled_back" || event["attempt"] != float64(1)) {
 					t.Fatal("storage cause or transaction evidence missing")
 				}
 				if name == "inference.storage_exchange" && (event["level"] != "DEBUG" || event["detail"] == nil) || name == "inference.operation_failed" && event["level"] != "ERROR" {

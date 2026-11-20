@@ -61,7 +61,7 @@ class PortalWorkers(Portal, History):
 
     def expiry_and_role_boundaries(self):
         expired = self.issue()
-        self.sql("UPDATE aaa_worker_enrollments SET created_at=clock_timestamp()-interval '2 hours', expires_at=clock_timestamp()-interval '1 hour' WHERE id='" + expired["enrollment_id"] + "';")
+        self.sql("UPDATE aaa_worker_enrollments SET created_at=CAST(unixepoch('subsec')*1000000 AS INTEGER)-7200000000, expires_at=CAST(unixepoch('subsec')*1000000 AS INTEGER)-3600000000 WHERE id='" + expired["enrollment_id"] + "';")
         status, headers, _ = self.enroll(expired)
         require(status == 410, "server accepted expired enrollment authority")
         event, _ = self.diagnose(headers["X-Request-Id"], "enrollment.rejected", "enrollment_expired")
@@ -147,9 +147,9 @@ class PortalWorkers(Portal, History):
         elif diagnostic["event"] == "worker.operation_failed":
             storage = [item for item in requested if item["msg"] == "worker.storage_exchange"]
             require(status == 503 and len(storage) == 1 and storage[0].get("detail") and storage[0]["cause"] == event["cause"] and storage[0]["transaction_outcome"] == event["transaction_outcome"], "dependency cause or transaction outcome cannot be reconstructed")
-            require(event["cause"] in ("database_unavailable", "database_operation_failed", "postgres_error"), "unexpected dependency cause needs investigation")
+            require(event["cause"] in ("database_unavailable", "database_operation_failed", "sqlite_error"), "unexpected dependency cause needs investigation")
             cause, transaction = event["cause"], event["transaction_outcome"]
-            action = "Restore the PostgreSQL dependency identified by the protected storage detail, then refresh worker reads."
+            action = "Restore the SQLite table identified by the protected storage detail, then refresh worker reads."
         elif diagnostic["event"] == "portal.auth_failed":
             require(status == 401 and event["cause"] in ("invalid_session", "session_expired") and event["expected_state"] == "authenticated" and event["observed_state"] == "unauthenticated", "denied-session cause cannot be reconstructed")
             require(completion[0]["role"] == "unauthenticated" and not any(item["msg"] == "request.admitted" for item in requested), "denied request reached an admitted operation")

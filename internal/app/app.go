@@ -11,8 +11,8 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -21,8 +21,8 @@ import (
 	"github.com/markhuangai/AaA-muse-ai/internal/diagnostics"
 	"github.com/markhuangai/AaA-muse-ai/internal/httpapi"
 	"github.com/markhuangai/AaA-muse-ai/internal/media"
-	"github.com/markhuangai/AaA-muse-ai/internal/postgres"
 	"github.com/markhuangai/AaA-muse-ai/internal/service"
+	"github.com/markhuangai/AaA-muse-ai/internal/sqlite"
 )
 
 type Repository interface {
@@ -33,6 +33,7 @@ type Repository interface {
 	Close()
 }
 type Dependencies struct {
+	DatabasePath   string
 	MediaDir       string
 	ReadFile       func(string) ([]byte, error)
 	LookupEnv      func(string) (string, bool)
@@ -49,8 +50,8 @@ type Dependencies struct {
 }
 
 func Production(stdout, stderr io.Writer) Dependencies {
-	return Dependencies{MediaDir: "/var/lib/aaa-muse-ai/media", ReadFile: os.ReadFile, LookupEnv: os.LookupEnv, Random: rand.Reader, Now: time.Now, Sleep: sleep, Wait: sleep, Files: diagnostics.OSFiles{}, PortalAssets: os.DirFS("/usr/share/aaa-muse-ai/portal"), ClientKeyFile: config.NewClientKeyFile, OpenDB: func(ctx context.Context, u string) (Repository, error) {
-		repo, err := postgres.Open(ctx, u)
+	return Dependencies{DatabasePath: sqlite.Path, MediaDir: "/var/lib/aaa-muse-ai/media", ReadFile: os.ReadFile, LookupEnv: os.LookupEnv, Random: rand.Reader, Now: time.Now, Sleep: sleep, Wait: sleep, Files: diagnostics.OSFiles{}, PortalAssets: os.DirFS("/usr/share/aaa-muse-ai/portal"), ClientKeyFile: config.NewClientKeyFile, OpenDB: func(ctx context.Context, u string) (Repository, error) {
+		repo, err := sqlite.Open(ctx, u)
 		if err != nil {
 			return nil, err
 		}
@@ -133,7 +134,7 @@ func Run(ctx context.Context, args []string, build service.Build, d Dependencies
 		return 1
 	default:
 	}
-	repo, err := connect(ctx, c, d, startup)
+	repo, err := connect(ctx, d, startup)
 	if err != nil {
 		return 1
 	}
@@ -186,7 +187,7 @@ func Run(ctx context.Context, args []string, build service.Build, d Dependencies
 	go func() { defer close(brokerDone); broker.Run(serveCtx, logger) }()
 	result := make(chan error, 1)
 	go func() { result <- server.Serve(listener) }()
-	startup.Info("server.started", "listen", c.Server.Listen, "schema_version", postgres.SchemaVersion)
+	startup.Info("server.started", "listen", c.Server.Listen, "schema_version", sqlite.SchemaVersion)
 	code := 0
 	select {
 	case <-ctx.Done():
@@ -221,37 +222,36 @@ func Run(ctx context.Context, args []string, build service.Build, d Dependencies
 	return code
 }
 
-func connect(ctx context.Context, c config.Config, d Dependencies, logger *slog.Logger) (Repository, error) {
-	target, _ := url.Parse(string(c.Database.URL))
-	logger = logger.With("database_host", target.Host, "database_name", target.Path)
+func connect(ctx context.Context, d Dependencies, logger *slog.Logger) (Repository, error) {
+	logger = logger.With("database_engine", "sqlite", "sqlite_version", sqlite.EngineVersion, "database_file", filepath.Base(d.DatabasePath))
 	for attempt := 1; attempt <= 3; attempt++ {
 		started := d.Now()
 		bounded, cancel := context.WithTimeout(ctx, 5*time.Second)
-		repo, err := d.OpenDB(bounded, string(c.Database.URL))
+		repo, err := d.OpenDB(bounded, d.DatabasePath)
 		if err == nil {
 			err = repo.Bootstrap(bounded)
 		}
 		cancel()
 		if err == nil {
-			logger.Info("db.connected", "attempt", attempt, "schema_version", postgres.SchemaVersion, "duration_ms", d.Now().Sub(started).Milliseconds())
+			logger.Info("db.connected", "attempt", attempt, "schema_version", sqlite.SchemaVersion, "journal_mode", "wal", "synchronous", "full", "foreign_keys", true, "busy_timeout_ms", sqlite.BusyTimeoutMS, "duration_ms", d.Now().Sub(started).Milliseconds())
 			return repo, nil
 		}
 		if repo != nil {
 			repo.Close()
 		}
-		failure := postgres.Classify(err)
-		logger.Debug("db.exchange_failed", "attempt", attempt, "cause", failure.Reason, "sqlstate", failure.SQLState, "detail", failure.Detail(), "expected", failure.Expected, "observed", failure.Observed, "duration_ms", d.Now().Sub(started).Milliseconds())
-		retry := failure.Reason == "database_unavailable" || failure.Reason == "database_operation_failed"
+		failure := sqlite.Classify(err)
+		logger.Debug("db.exchange_failed", "attempt", attempt, "cause", failure.Reason, "sqlite_code", failure.Code, "phase", failure.Phase, "transaction_outcome", failure.Outcome, "detail", failure.Detail(), "expected", failure.Expected, "observed", failure.Observed, "duration_ms", d.Now().Sub(started).Milliseconds())
+		retry := failure.Reason == "database_busy" || failure.Reason == "database_unavailable" || failure.Reason == "database_operation_failed"
 		if !retry || attempt == 3 || ctx.Err() != nil {
 			event := "db.connect_failed"
-			if failure.Reason == "schema_version_incompatible" || failure.Reason == "migration_checksum_mismatch" {
+			if failure.Reason == "schema_version_incompatible" || failure.Reason == "migration_checksum_mismatch" || failure.Reason == "database_schema_unrecognized" {
 				event = "db.migration_failed"
 			}
-			logger.Error(event, "cause", failure.Reason, "attempt", attempt, "sqlstate", failure.SQLState, "expected", failure.Expected, "observed", failure.Observed, "duration_ms", d.Now().Sub(started).Milliseconds(), "outcome", "startup_stopped")
+			logger.Error(event, "cause", failure.Reason, "attempt", attempt, "sqlite_code", failure.Code, "phase", failure.Phase, "transaction_outcome", failure.Outcome, "expected", failure.Expected, "observed", failure.Observed, "duration_ms", d.Now().Sub(started).Milliseconds(), "outcome", "startup_stopped")
 			return nil, err
 		}
 		delay := time.Duration(attempt) * time.Second
-		logger.Warn("db.retry_scheduled", "cause", failure.Reason, "attempt", attempt, "delay_ms", delay.Milliseconds(), "duration_ms", d.Now().Sub(started).Milliseconds())
+		logger.Warn("db.retry_scheduled", "cause", failure.Reason, "sqlite_code", failure.Code, "phase", failure.Phase, "attempt", attempt, "delay_ms", delay.Milliseconds(), "duration_ms", d.Now().Sub(started).Milliseconds())
 		if err = d.Sleep(ctx, delay); err != nil {
 			logger.Error("db.connect_failed", "cause", "startup_cancelled", "attempt", attempt, "outcome", "startup_stopped")
 			return nil, err

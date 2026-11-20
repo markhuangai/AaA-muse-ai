@@ -1,5 +1,5 @@
 FROM golang:1.27.3-alpine3.24@sha256:fa3d596898d9f126af7c01d14ee7597bab3f39cccf392ef36b69fe77cd681f18 AS tools
-RUN apk add --no-cache build-base ffmpeg
+RUN apk add --no-cache build-base ffmpeg sqlite
 WORKDIR /src
 
 FROM node:24.22.2-alpine3.24@sha256:a34ab6d7f6f4813f4d0c5469d74685604b962fbdbf5793a7bc7b4998ecb867c8 AS frontend
@@ -15,7 +15,9 @@ RUN npm run check --workspace portal && VITE_SOURCE_SHA=${SOURCE_SHA} npm run bu
 
 FROM tools AS build
 COPY go.mod go.sum ./
-RUN go mod download
+RUN go mod download \
+    && mkdir -p /out/sqlite-licenses \
+    && cp "$(go list -m -f '{{.Dir}}' modernc.org/sqlite)"/LICENSE* /out/sqlite-licenses/
 COPY cmd ./cmd
 COPY internal ./internal
 ARG SOURCE_SHA=development
@@ -26,11 +28,12 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.revision=${SOURCE_S
 
 FROM alpine:3.24@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf AS runtime
 RUN apk add --no-cache ffmpeg && addgroup -g 10001 service && adduser -D -H -u 10001 -G service service \
-    && mkdir -p /etc/aaa-muse-ai /var/lib/aaa-muse-ai/diagnostics /var/lib/aaa-muse-ai/media \
-    && chown service:service /var/lib/aaa-muse-ai/diagnostics /var/lib/aaa-muse-ai/media \
-    && chmod 0700 /var/lib/aaa-muse-ai/diagnostics /var/lib/aaa-muse-ai/media
+    && mkdir -p /etc/aaa-muse-ai /var/lib/aaa-muse-ai/state /var/lib/aaa-muse-ai/diagnostics /var/lib/aaa-muse-ai/media \
+    && chown service:service /var/lib/aaa-muse-ai/state /var/lib/aaa-muse-ai/diagnostics /var/lib/aaa-muse-ai/media \
+    && chmod 0700 /var/lib/aaa-muse-ai/state /var/lib/aaa-muse-ai/diagnostics /var/lib/aaa-muse-ai/media
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=build /out/service /usr/local/bin/service
+COPY --from=build /out/sqlite-licenses/ /usr/share/aaa-muse-ai/licenses/sqlite/
 COPY --from=frontend /src/portal/dist /usr/share/aaa-muse-ai/portal
 COPY --from=frontend /src/node_modules/@fontsource/geist/LICENSE /usr/share/aaa-muse-ai/licenses/geist-OFL.txt
 COPY --from=frontend /src/node_modules/@fontsource/geist-mono/LICENSE /usr/share/aaa-muse-ai/licenses/geist-mono-OFL.txt

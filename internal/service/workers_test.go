@@ -13,7 +13,7 @@ import (
 
 	"github.com/markhuangai/AaA-muse-ai/internal/auth"
 	"github.com/markhuangai/AaA-muse-ai/internal/config"
-	"github.com/markhuangai/AaA-muse-ai/internal/postgres"
+	"github.com/markhuangai/AaA-muse-ai/internal/sqlite"
 	"github.com/markhuangai/AaA-muse-ai/internal/worker"
 )
 
@@ -227,7 +227,7 @@ func TestWorkerRejectionsAndDependencyFailures(t *testing.T) {
 	if _, err := s.Revoke(ctx, log, "missing"); err == nil {
 		t.Fatal("revoked missing worker")
 	}
-	m.fail = &postgres.Failure{Reason: "database_unavailable", SQLState: "57P03", Outcome: "uncertain"}
+	m.fail = &sqlite.Failure{Reason: "database_unavailable", Code: "5", Outcome: "uncertain"}
 	if _, secret, err := s.Issue(ctx, log); err == nil || secret != "" {
 		t.Fatal("failed issue exposed authority")
 	}
@@ -246,7 +246,7 @@ func TestWorkerRejectionsAndDependencyFailures(t *testing.T) {
 	if _, err := s.Revoke(ctx, log, "id"); err == nil {
 		t.Fatal("failed revocation accepted")
 	}
-	if !strings.Contains(out.String(), "worker.operation_failed") || !strings.Contains(out.String(), "uncertain") || !strings.Contains(out.String(), "57P03") {
+	if !strings.Contains(out.String(), "worker.operation_failed") || !strings.Contains(out.String(), "uncertain") || !strings.Contains(out.String(), "5") {
 		t.Fatal("dependency cause/outcome missing")
 	}
 }

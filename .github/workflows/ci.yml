@@ -220,7 +220,7 @@ jobs:
         run: npm ci --ignore-scripts --no-audit --no-fund
       - name: Check service
         run: make check-service
-      - name: Real HTTP and PostgreSQL integration
+      - name: Real HTTP and SQLite integration
         run: make test-service
       - name: Worker enrollment, revocation, and diagnosis
         run: make test-worker-auth
@@ -427,7 +427,7 @@ jobs:
         run: npm ci --ignore-scripts --no-audit --no-fund
       - name: Check worker types
         run: npm run check --workspace worker
-      - name: Packed CLI with real HTTPS, SSE and PostgreSQL
+      - name: Packed CLI with real HTTPS, SSE and SQLite
         run: make test-worker-transport
       - name: Worker startup outages, abrupt crashes, receipt replay and uncertainty
         run: make test-worker-recovery

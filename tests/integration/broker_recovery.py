@@ -198,15 +198,14 @@ class Recovery(Routing):
         output_text = "durable output\x00 literal\\u0000"
         self.deliver(worker, peer, request, {"type": "final", "text": output_text})
         constraint = "recovery_output_finish"
-        metadata = r"replace(data::text,E'\\u0000',E'\\u0001')::json"
-        self.sql("ALTER TABLE aaa_model_requests ADD CONSTRAINT " + constraint + " CHECK(id <> '" + request["id"] + "' OR (" + metadata + ")->>'output_completed_at' IS NULL);")
+        self.reject_writes(constraint, "aaa_model_requests", "NEW.id='" + request["id"] + "' AND json_extract(CAST(NEW.data AS TEXT),'$.output_completed_at') IS NOT NULL")
         try:
             _, headers = self.read_native(request)
             self.trace_request(headers["X-Request-Id"], request["id"])
             before = self.detail(request)
             require("output_started_at" in before["request"] and "output_completed_at" not in before["request"], "incomplete-output fixture falsely completed")
         finally:
-            self.sql("ALTER TABLE aaa_model_requests DROP CONSTRAINT " + constraint + ";")
+            self.sql("DROP TRIGGER " + constraint + ";")
         peer.stop()
         self.restart_broker()
         require(self.detail(request) == before, "restart altered accepted output or delivery boundaries")
@@ -221,15 +220,14 @@ class Recovery(Routing):
         request, _ = self.submit(self.input(worker, messages=[{"type": "message", "role": "user", "text": "context\x00 literal\\u0000"}], tools=[]), "context-only-recovery")
         job = self.detail(request)["assignment"]
         constraint = "recovery_context_finish"
-        metadata = r"replace(data::text,E'\\u0000',E'\\u0001')::json"
-        self.sql("ALTER TABLE aaa_model_requests ADD CONSTRAINT " + constraint + " CHECK(id <> '" + request["id"] + "' OR (" + metadata + ")->>'context_delivery_written_at' IS NULL);")
+        self.reject_writes(constraint, "aaa_model_requests", "NEW.id='" + request["id"] + "' AND json_extract(CAST(NEW.data AS TEXT),'$.context_delivery_written_at') IS NOT NULL")
         try:
             _, headers = self.checked("/api/v1/worker/jobs/" + job["id"], worker["credential"])
             self.trace_request(headers["X-Request-Id"], request["id"])
             before = self.detail(request)
             require(before["request"]["state"] == "queued" and "context_delivery_started_at" in before["request"] and "context_delivery_written_at" not in before["request"] and "output" not in before["request"] and before["assignment"]["claimed_at"] is None, "context-only fixture contains inference or a decision")
         finally:
-            self.sql("ALTER TABLE aaa_model_requests DROP CONSTRAINT " + constraint + ";")
+            self.sql("DROP TRIGGER " + constraint + ";")
         peer.stop()
         self.restart_broker()
         require(self.detail(request) == before, "context-only recovery changed assignment or manufactured output")
@@ -252,7 +250,7 @@ class Recovery(Routing):
         self.docker("kill", "--signal", "KILL", self.main_service)
         peer.stop()
         constraint = "recovery_controlled_job_fence"
-        self.sql("ALTER TABLE aaa_inference_jobs ADD CONSTRAINT " + constraint + " CHECK(id <> '" + job["id"] + "' OR state <> 'interrupted');")
+        self.reject_writes(constraint, "aaa_inference_jobs", "NEW.id='" + job["id"] + "' AND NEW.state='interrupted'")
         expiry = datetime.fromisoformat(job["lease_expires_at"].replace("Z", "+00:00")).timestamp()
         self.until(lambda: time.time() >= expiry, "controlled lease did not expire", timeout=40)
         try:
@@ -262,16 +260,16 @@ class Recovery(Routing):
             self.assert_private(logs)
             events = [json.loads(line) for line in logs.splitlines() if line.startswith("{")]
             failed = [e for e in events if e.get("msg") == "recovery.failed"][-1]
-            require(failed["sqlstate"] == "23514" and failed["transaction_outcome"] == "rolled_back", "startup failure lacks causal storage outcome")
+            require(failed["sqlite_code"] == "1811" and failed["transaction_outcome"] == "rolled_back", "startup failure lacks causal storage outcome")
             require(not any(e["msg"] in ("recovery.restored", "server.started") and e["instance_id"] == failed["instance_id"] for e in events), "failed startup falsely restored state or became ready")
         finally:
-            self.sql("ALTER TABLE aaa_inference_jobs DROP CONSTRAINT " + constraint + ";")
+            self.sql("DROP TRIGGER " + constraint + ";")
         self.docker("start", self.main_service)
         self.origin_url = self.origin(self.main_service)
         self.origins = [self.origin_url]
         self.ready(self.main_service, self.origin_url)
         evidence = self.export_operation(failed["operation_id"])
-        require(any(e["msg"] == "inference.storage_exchange" and e["level"] == "DEBUG" and constraint in e["detail"] and e["sqlstate"] == "23514" for e in evidence), "original failed startup cannot be diagnosed from retained logs")
+        require(any(e["msg"] == "inference.storage_exchange" and e["level"] == "DEBUG" and constraint in e["detail"] and e["sqlite_code"] == "1811" for e in evidence), "original failed startup cannot be diagnosed from retained logs")
         state = self.detail(request)
         require(state["request"]["state"] == "interrupted" and state["assignment"]["held"] and state["assignment"]["generation"] == job["generation"], "expired inference was lost, replayed or released")
         self.restored(request, "claimed_inference")

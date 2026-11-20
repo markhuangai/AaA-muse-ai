@@ -1,4 +1,4 @@
-package postgres
+package sqlite
 
 import (
 	"bytes"
@@ -8,18 +8,18 @@ import (
 	"sort"
 	"time"
 
-	"github.com/jackc/pgx/v5"
+	"database/sql"
 	"github.com/markhuangai/AaA-muse-ai/internal/inference"
 )
 
-const inferenceAdmissionLock int64 = 0x414141494e46
-
-const recoveryRequests = `SELECT m.id FROM (SELECT *, ` + metadataJSON + ` AS metadata FROM aaa_model_requests) m
+const recoveryRequests = `SELECT m.id FROM aaa_model_requests m
  JOIN aaa_conversations c ON c.id=m.conversation_id
- WHERE (c.pending_call_id<>'' AND m.id=c.data->>'current_request_id')
- OR (m.metadata->>'output' IS NOT NULL AND m.metadata->>'output_completed_at' IS NULL)
- OR (m.metadata->>'context_delivery_started_at' IS NOT NULL
- AND m.metadata->>'context_delivery_written_at' IS NULL)`
+ WHERE (c.pending_call_id<>'' AND m.id=c.current_request_id) OR m.incomplete_delivery`
+
+func idList(ids []string) string {
+	value, _ := json.Marshal(ids)
+	return string(value)
+}
 
 func decodeInference(data []byte, out any) error {
 	d := json.NewDecoder(bytes.NewReader(data))
@@ -28,9 +28,9 @@ func decodeInference(data []byte, out any) error {
 }
 
 func (r *Repository) InferenceWorkers(ctx context.Context) (ids []string, err error) {
-	err = r.workerTransaction(ctx, func(tx pgx.Tx) error {
-		rows, err := tx.Query(ctx, `SELECT DISTINCT worker_id FROM (
-			SELECT worker_id FROM aaa_worker_connections WHERE (data->>'connected')::boolean
+	err = r.read(ctx, func(tx *sql.Tx) error {
+		rows, err := tx.QueryContext(ctx, `SELECT DISTINCT worker_id FROM (
+			SELECT worker_id FROM aaa_worker_connections WHERE connected
 			UNION SELECT worker_id FROM aaa_experiments WHERE state NOT IN ('completed','cancelled','interrupted')
 			UNION SELECT worker_id FROM aaa_inference_jobs WHERE held) AS active WHERE worker_id IS NOT NULL ORDER BY worker_id`)
 		if err != nil {
@@ -49,12 +49,12 @@ func (r *Repository) InferenceWorkers(ctx context.Context) (ids []string, err er
 	return
 }
 
-func resolveInference(ctx context.Context, tx pgx.Tx, ref *inference.Ref) error {
+func resolveInference(ctx context.Context, tx *sql.Tx, ref *inference.Ref) error {
 	wid, exp := ref.WorkerID, ref.ExperimentID
 	var err error
 	if ref.JobID != "" {
 		var data []byte
-		err = tx.QueryRow(ctx, "SELECT worker_id, experiment_id, data FROM aaa_inference_jobs WHERE id=$1", ref.JobID).Scan(&wid, &exp, &data)
+		err = tx.QueryRowContext(ctx, "SELECT worker_id, experiment_id, data FROM aaa_inference_jobs WHERE id=?1", ref.JobID).Scan(&wid, &exp, &data)
 		if err == nil {
 			var job inference.Job
 			if err = decodeInference(data, &job); err != nil {
@@ -63,9 +63,9 @@ func resolveInference(ctx context.Context, tx pgx.Tx, ref *inference.Ref) error 
 			ref.Correlation = map[string]any{"operation_id": exp, "experiment_id": exp, "conversation_id": job.ConversationID, "job_id": ref.JobID, "worker_id": wid, "generation": job.Generation, "connection_id": job.ConnectionID, "connection_generation": job.ConnectionGeneration, "expected_state": job.State, "lease_expires_at": job.LeaseExpiresAt, "deadline_at": job.DeadlineAt}
 		}
 	} else if exp != "" {
-		err = tx.QueryRow(ctx, "SELECT worker_id FROM aaa_experiments WHERE id=$1", exp).Scan(&wid)
+		err = tx.QueryRowContext(ctx, "SELECT COALESCE(worker_id, '') FROM aaa_experiments WHERE id=?1", exp).Scan(&wid)
 	}
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, sql.ErrNoRows) {
 		return inference.Reject("inference_not_found", 404)
 	}
 	if err != nil {
@@ -82,17 +82,7 @@ func (r *Repository) WithinInference(ctx context.Context, ref inference.Ref, app
 	if ref.Routing {
 		return r.withinRouting(ctx, ref, apply)
 	}
-	return r.workerTransaction(ctx, func(tx pgx.Tx) error {
-		if ref.Admission {
-			if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", inferenceAdmissionLock); err != nil {
-				return err
-			}
-		}
-		if ref.SubmissionID != "" {
-			if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtextextended($1,0))", ref.Principal+":"+ref.SubmissionID); err != nil {
-				return err
-			}
-		}
+	return r.write(ctx, func(tx *sql.Tx) error {
 		if err := ownedHistory(ctx, tx, &ref); err != nil {
 			return err
 		}
@@ -100,9 +90,9 @@ func (r *Repository) WithinInference(ctx context.Context, ref inference.Ref, app
 			return err
 		}
 		s := &inference.State{WorkerID: ref.WorkerID, Experiments: map[string]*inference.Experiment{}, Jobs: map[string]*inference.Job{}}
-		var revoked *time.Time
-		err := tx.QueryRow(ctx, "SELECT revoked_at FROM aaa_workers WHERE id=$1 FOR UPDATE", ref.WorkerID).Scan(&revoked)
-		if errors.Is(err, pgx.ErrNoRows) {
+		var revoked *int64
+		err := tx.QueryRowContext(ctx, "SELECT revoked_at FROM aaa_workers WHERE id=?1", ref.WorkerID).Scan(&revoked)
+		if errors.Is(err, sql.ErrNoRows) {
 			return inference.Reject("worker_not_found", 404)
 		}
 		if err != nil {
@@ -112,21 +102,15 @@ func (r *Repository) WithinInference(ctx context.Context, ref inference.Ref, app
 		if s.Revoked && ref.WorkerAuth != "" {
 			return inference.Reject("worker_revoked", 401, "correlation", ref.Correlation, "expected_worker_id", ref.WorkerID, "observed_worker_id", ref.WorkerAuth)
 		}
-		s.DatabaseTime = func() (time.Time, error) {
-			var now time.Time
-			err := tx.QueryRow(ctx, "SELECT clock_timestamp()").Scan(&now)
-			return now, err
-		}
-		if s.Now, err = s.DatabaseTime(); err != nil {
-			return err
-		}
+		s.DatabaseTime = func() (time.Time, error) { return r.databaseTime(), nil }
+		s.Now = r.databaseTime()
 		var data []byte
-		err = tx.QueryRow(ctx, "SELECT data FROM aaa_worker_connections WHERE worker_id=$1", ref.WorkerID).Scan(&data)
+		err = tx.QueryRowContext(ctx, "SELECT data FROM aaa_worker_connections WHERE worker_id=?1", ref.WorkerID).Scan(&data)
 		if err == nil {
 			if err = decodeInference(data, &s.Connection); err != nil {
 				return err
 			}
-		} else if !errors.Is(err, pgx.ErrNoRows) {
+		} else if !errors.Is(err, sql.ErrNoRows) {
 			return err
 		}
 		if err = loadInference(ctx, tx, ref, s); err != nil {
@@ -139,13 +123,13 @@ func (r *Repository) WithinInference(ctx context.Context, ref inference.Ref, app
 			return err
 		}
 		if ref.SubmissionID != "" {
-			err = tx.QueryRow(ctx, "SELECT data FROM aaa_inference_receipts WHERE principal=$1 AND submission_id=$2", ref.Principal, ref.SubmissionID).Scan(&data)
+			err = tx.QueryRowContext(ctx, "SELECT data FROM aaa_inference_receipts WHERE principal=?1 AND submission_id=?2", ref.Principal, ref.SubmissionID).Scan(&data)
 			if err == nil {
 				s.Receipt = &inference.Receipt{}
 				if err = decodeInference(data, s.Receipt); err != nil {
 					return err
 				}
-			} else if !errors.Is(err, pgx.ErrNoRows) {
+			} else if !errors.Is(err, sql.ErrNoRows) {
 				return err
 			}
 		}
@@ -167,11 +151,11 @@ func (r *Repository) WithinInference(ctx context.Context, ref inference.Ref, app
 	})
 }
 
-func loadInference(ctx context.Context, tx pgx.Tx, ref inference.Ref, s *inference.State) error {
-	rows, err := tx.Query(ctx, `SELECT data FROM aaa_experiments WHERE (worker_id=$1 OR (worker_id IS NULL AND $1='')) AND
-		(state NOT IN ('completed','cancelled','interrupted') OR id=$2 OR id IN
-		(SELECT experiment_id FROM aaa_inference_jobs WHERE id=$3 OR held) OR id=ANY($4::text[])
-		OR ($5 AND id IN (`+recoveryRequests+`))) ORDER BY id`, s.WorkerID, ref.ExperimentID, ref.BaseJobID, ref.EvidenceIDs, ref.Recovery)
+func loadInference(ctx context.Context, tx *sql.Tx, ref inference.Ref, s *inference.State) error {
+	rows, err := tx.QueryContext(ctx, `SELECT data FROM aaa_experiments WHERE (worker_id=?1 OR (worker_id IS NULL AND ?1='')) AND
+		(state NOT IN ('completed','cancelled','interrupted') OR id=?2 OR id IN
+		(SELECT experiment_id FROM aaa_inference_jobs WHERE id=?3 OR held) OR id IN (SELECT value FROM json_each(?4))
+		OR (?5 AND id IN (`+recoveryRequests+`))) ORDER BY id`, s.WorkerID, ref.ExperimentID, ref.BaseJobID, idList(ref.EvidenceIDs), ref.Recovery)
 	if err != nil {
 		return err
 	}
@@ -195,7 +179,7 @@ func loadInference(ctx context.Context, tx pgx.Tx, ref inference.Ref, s *inferen
 	}
 	if ref.Full {
 		for id, e := range s.Experiments {
-			rows, err = tx.Query(ctx, "SELECT data FROM aaa_inference_history WHERE experiment_id=$1 ORDER BY sequence", id)
+			rows, err = tx.QueryContext(ctx, "SELECT data FROM aaa_inference_history WHERE experiment_id=?1 ORDER BY sequence", id)
 			if err != nil {
 				return err
 			}
@@ -225,10 +209,10 @@ func loadInference(ctx context.Context, tx pgx.Tx, ref inference.Ref, s *inferen
 			ids = append(ids, id)
 		}
 	}
-	rows, err = tx.Query(ctx, `SELECT data, CASE WHEN $4 THEN context ELSE NULL END FROM aaa_inference_jobs
-		WHERE worker_id=$1 AND (state IN ('queued','claimed') OR held OR id=$2 OR id=$3 OR
-		id=(SELECT (`+metadataJSON+`)->>'current_job_id' FROM aaa_experiments WHERE id=$5) OR experiment_id=ANY($6::text[])
-		OR experiment_id=ANY($7::text[])) ORDER BY id`, s.WorkerID, ref.JobID, ref.BaseJobID, ref.Full, ref.ExperimentID, ref.EvidenceIDs, ids)
+	rows, err = tx.QueryContext(ctx, `SELECT data, CASE WHEN ?4 THEN context ELSE NULL END FROM aaa_inference_jobs
+		WHERE worker_id=?1 AND (state IN ('queued','claimed') OR held OR id=?2 OR id=?3 OR
+		id=(SELECT current_job_id FROM aaa_experiments WHERE id=?5) OR experiment_id IN (SELECT value FROM json_each(?6))
+		OR experiment_id IN (SELECT value FROM json_each(?7))) ORDER BY id`, s.WorkerID, ref.JobID, ref.BaseJobID, ref.Full, ref.ExperimentID, idList(ref.EvidenceIDs), idList(ids))
 	if err != nil {
 		return err
 	}
@@ -297,13 +281,13 @@ func inferenceSnapshot(s *inference.State) (b inferenceBefore, err error) {
 	return
 }
 
-func saveInference(ctx context.Context, tx pgx.Tx, ref inference.Ref, s *inference.State, b inferenceBefore) error {
+func saveInference(ctx context.Context, tx *sql.Tx, ref inference.Ref, s *inference.State, b inferenceBefore) error {
 	data, err := json.Marshal(s.Connection)
 	if err != nil {
 		return err
 	}
 	if s.Pool == nil && !bytes.Equal(data, b.connection) {
-		if _, err = tx.Exec(ctx, "INSERT INTO aaa_worker_connections(worker_id,data) VALUES($1,$2) ON CONFLICT(worker_id) DO UPDATE SET data=EXCLUDED.data", s.WorkerID, data); err != nil {
+		if _, err = tx.ExecContext(ctx, "INSERT INTO aaa_worker_connections(worker_id,connected,data) VALUES(?1,?2,?3) ON CONFLICT(worker_id) DO UPDATE SET connected=excluded.connected,data=excluded.data", s.WorkerID, s.Connection.Connected, data); err != nil {
 			return err
 		}
 	}
@@ -313,8 +297,9 @@ func saveInference(ctx context.Context, tx pgx.Tx, ref inference.Ref, s *inferen
 			return err
 		}
 		if !bytes.Equal(data, b.experiments[id]) {
-			if _, err = tx.Exec(ctx, `INSERT INTO aaa_experiments(id,worker_id,state,deadline_at,data) VALUES($1,$2,$3,$4,$5)
-				ON CONFLICT(id) DO UPDATE SET worker_id=EXCLUDED.worker_id,state=EXCLUDED.state,data=EXCLUDED.data`, id, nullableWorker(e.WorkerID), e.State, e.DeadlineAt, data); err != nil {
+			if _, err = tx.ExecContext(ctx, `INSERT INTO aaa_experiments(id,worker_id,state,deadline_at,created_at,conversation_id,current_job_id,data) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
+				ON CONFLICT(id) DO UPDATE SET worker_id=excluded.worker_id,state=excluded.state,current_job_id=excluded.current_job_id,data=excluded.data`,
+				id, nullableWorker(e.WorkerID), e.State, e.DeadlineAt.UnixMicro(), e.CreatedAt.UnixMicro(), e.ConversationID, e.CurrentJobID, data); err != nil {
 				return err
 			}
 		}
@@ -324,13 +309,13 @@ func saveInference(ctx context.Context, tx pgx.Tx, ref inference.Ref, s *inferen
 				if err != nil {
 					return err
 				}
-				if _, err = tx.Exec(ctx, "INSERT INTO aaa_inference_history(experiment_id,sequence,data) VALUES($1,$2,$3)", id, i, data); err != nil {
+				if _, err = tx.ExecContext(ctx, "INSERT INTO aaa_inference_history(experiment_id,sequence,data) VALUES(?1,?2,?3)", id, i, data); err != nil {
 					return err
 				}
 			}
 		}
 	}
-	// Existing fences must reach PostgreSQL before replacements hit immediate unique indexes.
+	// Existing fences must be saved before replacements hit immediate unique indexes.
 	jobIDs := make([]string, 0, len(s.Jobs))
 	for id := range s.Jobs {
 		jobIDs = append(jobIDs, id)
@@ -355,8 +340,14 @@ func saveInference(ctx context.Context, tx pgx.Tx, ref inference.Ref, s *inferen
 		if err != nil {
 			return err
 		}
-		if _, err = tx.Exec(ctx, `INSERT INTO aaa_inference_jobs(id,worker_id,experiment_id,state,held,data,context) VALUES($1,$2,$3,$4,$5,$6,$7)
-			ON CONFLICT(id) DO UPDATE SET state=EXCLUDED.state,held=EXCLUDED.held,data=EXCLUDED.data`, id, j.WorkerID, j.ExperimentID, j.State, j.Held, data, delivery); err != nil {
+		var expires any
+		if j.Media != nil && j.Media.ExpiresAt != nil {
+			expires = j.Media.ExpiresAt.UnixMicro()
+		}
+		if _, err = tx.ExecContext(ctx, `INSERT INTO aaa_inference_jobs(id,worker_id,experiment_id,state,held,created_at,has_media,media_expires_at,data,context)
+			VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+			ON CONFLICT(id) DO UPDATE SET state=excluded.state,held=excluded.held,has_media=excluded.has_media,media_expires_at=excluded.media_expires_at,data=excluded.data`,
+			id, j.WorkerID, j.ExperimentID, j.State, j.Held, j.CreatedAt.UnixMicro(), j.Media != nil, expires, data, delivery); err != nil {
 			return err
 		}
 	}
@@ -365,7 +356,7 @@ func saveInference(ctx context.Context, tx pgx.Tx, ref inference.Ref, s *inferen
 		if err != nil {
 			return err
 		}
-		_, err = tx.Exec(ctx, "INSERT INTO aaa_inference_receipts(principal,submission_id,data) VALUES($1,$2,$3)", s.Receipt.Principal, s.Receipt.SubmissionID, data)
+		_, err = tx.ExecContext(ctx, "INSERT INTO aaa_inference_receipts(principal,submission_id,data) VALUES(?1,?2,?3)", s.Receipt.Principal, s.Receipt.SubmissionID, data)
 	}
 	return err
 }

@@ -4,6 +4,12 @@ A self-hosted broker that connects model clients to a Muse worker through outbou
 
 ## Status
 
+The November 20 owner decision at `46e9ac8373980eba1c344a100b35e85e4a3e9a63` replaces PostgreSQL with embedded SQLite on one host. The SQLite deployment starts with fresh data. Concurrent broker processes share a local file and preserve accepted decisions, worker fencing, and unsettled holds across restarts. The delivery requires the independent plan audit, all CI, CodeQL, Codex, and complete configured AI review. The owner exempted CodeRabbit for this change. [Operation and cutover](#sqlite-state-and-cutover)
+
+Controlled SQLite validation passed by `2026-11-20T01:29:40Z` using working-source digest `3fbb9cd2932c02ed18383248e3bfc05faf53f19c7b39846f067ec9bef6e41f7a` before this note and broker image `sha256:a8a7d5fd760fb0bcf9cbab29eb9506ea8e9d5af2de4faffd3f8cc04dd83120d3`. The round-two independent audit was conformant. All six unit coverage gates, both product shards, the browser and worker suites, real media expiry, and controlled release verification passed. In a disposable Compose stack, a held SQLite writer left history readable. The blocked write returned SQLite code 5 after 2,009 ms. A forced statement failure returned code 1811 and rolled back. Protected exports identified both causes and the successful startup retry. [Storage and recovery diagnostics](docs/history-api.md#broker-restart-recovery)
+
+On a Linux x86_64 Docker 29.1.3 host, ten overlapping clients submitted 30 mixed Chat and Responses requests through two brokers sharing SQLite. Two controlled workers each took five seconds per job. All requests completed in 94.492 seconds (0.317 per second), with 88 successful history reads, zero lock failures, and a maximum heartbeat gap of 10.125 seconds. P95 across 30 samples per timing was 128 ms for broker admission, 42 ms for claim, 29.015 s for queue wait, and 33.152 s for client latency. The median of three ready, idle measurements on the same host was 8.02 MiB across one SQLite container and 65.17 MiB across two PostgreSQL containers at `v0.2.1-rc.0`. [Footprint comparison](docs/history-api.md#controlled-idle-footprint-comparison)
+
 The owner approved browser-origin setup prompts, named client-key creation in `config.yaml`, and removal of the global job cap at `cfcb83da92ecfc910fee1a07ac100b76e9abe562`. The portal displays generated values before Save and lists names afterward. Shared configuration needs a writable directory for atomic replacement. One worker still runs one inference job at a time. [Control portal](docs/portal.md)
 
 Controlled validation passed by `2026-11-19T21:04:39Z` at working-source digest `218de390e5822eeae48e0fc6557bd1172d8fe62e843f20880d436d097afef848` before this note, using the broker image `sha256:b190fa3daa43895b167bfbbc0a0c1047b5454b157aa501154688afa8eb8be1a4`. Chromium verified two HTTPS origins, immediate key authentication on both brokers, and persistence across restart. The protected export identified a read-only mount's failed write. Routing admitted ten jobs while each worker retained one assignment. Both product shards and all six unit coverage gates passed. [Portal diagnostics](docs/portal.md#diagnostics) · [Routing](docs/history-api.md#qualification-and-dispatch)
@@ -140,18 +146,15 @@ Create a private `.env` with real values:
 
 ```dotenv
 MUSE_SERVICE_IMAGE=ghcr.io/markhuangai/aaa-muse-ai@sha256:<verified-paired-release-digest>
-POSTGRES_PASSWORD=<database-password>
 MUSE_MANAGEMENT_KEY=<management-key>
 MUSE_PORTAL_PASSWORD=<distinct-portal-password>
 ```
 
-Use `compose.yaml` in a separate qualification directory. Its default HTTP binding is `127.0.0.1:8081`; the operator owns reverse-proxy routing and TLS. The example config fixes the database host, user and name and uses the same `POSTGRES_PASSWORD` as PostgreSQL. Go escapes the password; no second URL-encoded secret or `MUSE_DATABASE_URL` setting is needed. Existing complete database URLs remain supported. Do not combine a URL password with `database.password`.
+Use `compose.yaml` in a dedicated project directory with local Docker volumes. Its default HTTP binding is `127.0.0.1:8081`. The operator owns reverse-proxy routing and TLS. The service initializes SQLite on a new named `sqlite` volume and bootstraps it before accepting traffic.
 
 The service and worker are released together with the same full version and source SHA. Same-major workers may connect regardless of minor or patch differences. A different major reports `update_required`; the worker logs manual operator action and never updates itself. Product versions are independent of the existing `protocol_version: 1` wire field. Legacy handshakes without product metadata remain supported only by major-zero services and do not establish an exact installed version.
 
 Worker installation metadata comes from the service image, never `config.yaml`. Setup prompts still verify the exact archive version and trusted SHA-256 before executing code. Read [paired release and manual upgrade](docs/releases.md) before changing versions. Existing `worker-v0.1.0-rc.N` releases remain unchanged; new paired releases use `vVERSION` and include a `product-release.json` receipt. A partial publication is not a complete pair.
-
-The published image recorded before this change does not implement the new configuration. Use the immutable digest of the verified prerequisite build when available; no replacement release is published by this documentation change.
 
 After selecting that verified image:
 
@@ -165,6 +168,19 @@ Compose mounts `./config` at `/etc/aaa-muse-ai`. The service uses the writable d
 Create keys in **Settings → Client keys**. Copy a generated value before saving or read a saved value directly from the protected host file. Read the configuration directory with the service UID or administrator authority. Brokers sharing that directory pick up the new client keys on their next request.
 
 If `management.key` is empty, startup prints an automatically generated management key once. Keep it local in a protected header file containing `Authorization: Bearer <management-key>` under a `0700` directory, with file mode `0600`. Never send that key to Muse. Liveness is `GET /healthz`; readiness is `GET /readyz`.
+
+### SQLite state and cutover
+
+The `sqlite` volume mounts `/var/lib/aaa-muse-ai/state`. Keep `broker.sqlite3` and its WAL and shared-memory sidecars together on a local Linux filesystem. Same-host sibling brokers can use the same state directory. All processes must use the same volume and SQLite version. Back up SQLite by stopping all brokers using that volume and copying the complete private state directory. Keep operator config and protected diagnostics separately. Media has its own expiry lifecycle and stays outside database backups.
+
+For the one-time fresh start from a PostgreSQL deployment:
+
+1. Stop submitting work. Let expiring media drain, and save any still-needed worker journal evidence in its protected state directory.
+2. Inspect the old Compose project's database container and its mount at `/var/lib/postgresql`. Match the exact database volume to the old project's Compose labels before removing anything. Stop the old service and PostgreSQL container, remove that container, then remove only the verified PostgreSQL volume. The new broker will start without the old registrations, approvals, history and pending jobs.
+3. Remove the `database` block from the protected `config.yaml` and remove `POSTGRES_PASSWORD` from the Compose environment. Keep the operator configuration and existing diagnostics volume. Start the verified SQLite image with a new `sqlite` state volume and drained media storage.
+4. For a returning worker, retire its old hook and stop its subscriber. Keep the old private directory with its journals. Set a fresh private absolute `XDG_STATE_HOME` when running the original installer with a new single-use enrollment code. Register its returned hook and obtain initial capability approval.
+
+An older config still containing `database` is rejected before any database file is opened. Native worker restart and broker restart within SQLite both retain the new registrations.
 
 ## Worker registration
 

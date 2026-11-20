@@ -184,11 +184,11 @@ class Chat(History):
                 evidence.update({"expected_call_id": fields["expected_call_id"], "observed_call_id": fields["observed_call_id"]})
                 action = "return the client result for expected call " + fields["expected_call_id"]
         elif cause == "output_boundary_failed":
-            storage = next(e for e in selected if e["msg"] == "inference.operation_failed" and e.get("sqlstate") == "23514")
-            detail = next(e for e in selected if e["msg"] == "inference.storage_exchange" and e.get("sqlstate") == "23514")
+            storage = next(e for e in selected if e["msg"] == "inference.operation_failed" and e.get("sqlite_code") == "1811")
+            detail = next(e for e in selected if e["msg"] == "inference.storage_exchange" and e.get("sqlite_code") == "1811")
             require(storage["transaction_outcome"] == "rolled_back" and "chat_output_start_fixture" in detail["detail"] and observed["output_accepted"], "storage diagnosis lacks the causal constraint, rollback or accepted decision")
-            evidence.update({"sqlstate": storage["sqlstate"], "transaction_outcome": storage["transaction_outcome"], "output_accepted": True})
-            action = "repair the recorded PostgreSQL constraint, then replay the accepted completion in the same session"
+            evidence.update({"sqlite_code": storage["sqlite_code"], "transaction_outcome": storage["transaction_outcome"], "output_accepted": True})
+            action = "repair the recorded SQLite trigger, then replay the accepted completion in the same session"
         elif cause in ("deadline_exceeded", "worker_disconnected", "request_context_cancelled", "response_write_failed"):
             if observed["output_accepted"]:
                 interruption = next(e for e in selected if e["msg"] == "request.output_interrupted")
@@ -399,7 +399,7 @@ class Chat(History):
                 pending = pool.submit(self.chat, self.chat_body(marker, stream), "deadline-" + str(stream))
                 bot, job = self.job_for(marker)
                 expired = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
-                self.sql("BEGIN; UPDATE aaa_experiments SET deadline_at='" + expired + "', data=jsonb_set(data::jsonb,'{deadline_at}',to_jsonb('" + expired + "'::text))::json WHERE id='" + job["experiment_id"] + "'; UPDATE aaa_inference_jobs SET data=jsonb_set(data::jsonb,'{deadline_at}',to_jsonb('" + expired + "'::text))::json WHERE id='" + job["id"] + "'; COMMIT;")
+                self.expire_job(job, expired)
                 status, headers, raw = pending.result(timeout=12)
             require(status == 504 and json.loads(raw)["error"]["code"] == "deadline_exceeded", "deadline did not produce explicit OpenAI error")
             self.diagnose_chat(headers["X-Request-Id"], "chat.stream_terminated" if stream else "chat.request_terminated", "deadline_exceeded")
@@ -416,16 +416,16 @@ class Chat(History):
                 pending = pool.submit(self.chat, body, session)
                 bot, job = self.job_for(marker)
                 constraint = "chat_output_start_fixture"
-                self.sql("ALTER TABLE aaa_model_requests ADD CONSTRAINT " + constraint + " CHECK(id <> '" + job["experiment_id"] + "' OR data->>'output_started_at' IS NULL);")
+                self.reject_writes(constraint, "aaa_model_requests", "NEW.id='" + job["experiment_id"] + "' AND json_extract(CAST(NEW.data AS TEXT),'$.output_started_at') IS NOT NULL")
                 self.decision(bot.worker, bot.peer, job, {"type": "final", "text": "retained accepted answer"})
                 status, headers, raw = pending.result(timeout=12)
             require(status == 503 and isinstance(json.loads(raw)["error"], dict), "failed boundary exposed output")
             events = self.diagnose_chat(headers["X-Request-Id"], "chat.stream_terminated" if stream else "chat.request_terminated", "output_boundary_failed")
             require(any(e["msg"] == "inference.storage_exchange" and constraint in e["detail"] for e in events), "logs lack causal storage detail")
-            self.sql("ALTER TABLE aaa_model_requests DROP CONSTRAINT " + constraint + ";")
+            self.sql("DROP TRIGGER " + constraint + ";")
             replay = self.chat(body, session)
             require(self.answer(replay)[0] == "retained accepted answer" and self.answer(replay)[1] == "chatcmpl-" + job["experiment_id"], "boundary retry regenerated accepted work")
-        self.receipt("chat.output_boundary_failure_and_exact_replay", sqlstate="23514", log_only_diagnosis=True, no_inference_retry=True)
+        self.receipt("chat.output_boundary_failure_and_exact_replay", sqlite_code="1811", log_only_diagnosis=True, no_inference_retry=True)
 
     def interrupted_delivery(self):
         marker = "aaa-chat:hold:interrupted-delivery"

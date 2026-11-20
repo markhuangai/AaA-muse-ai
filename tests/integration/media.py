@@ -1,4 +1,4 @@
-"""Controlled artifact delivery using the production broker, PostgreSQL and installed packed worker."""
+"""Controlled artifact delivery using the production broker, SQLite and installed packed worker."""
 import hashlib
 import http.client
 import urllib.parse

@@ -1,4 +1,4 @@
-package postgres
+package sqlite
 
 import (
 	"bytes"
@@ -6,9 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"sort"
-	"time"
 
-	"github.com/jackc/pgx/v5"
+	"database/sql"
 	"github.com/markhuangai/AaA-muse-ai/internal/inference"
 )
 
@@ -19,10 +18,10 @@ func nullableWorker(id string) any {
 	return id
 }
 
-func loadRouting(ctx context.Context, tx pgx.Tx, s *inference.State) error {
+func loadRouting(ctx context.Context, tx *sql.Tx, s *inference.State) error {
 	var data []byte
-	err := tx.QueryRow(ctx, "SELECT data FROM aaa_worker_routing WHERE worker_id=$1", s.WorkerID).Scan(&data)
-	if errors.Is(err, pgx.ErrNoRows) {
+	err := tx.QueryRowContext(ctx, "SELECT data FROM aaa_worker_routing WHERE worker_id=?1", s.WorkerID).Scan(&data)
+	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}
 	if err != nil {
@@ -31,10 +30,10 @@ func loadRouting(ctx context.Context, tx pgx.Tx, s *inference.State) error {
 	return decodeInference(data, &s.Routing)
 }
 
-func loadConnection(ctx context.Context, tx pgx.Tx, s *inference.State) error {
+func loadConnection(ctx context.Context, tx *sql.Tx, s *inference.State) error {
 	var data []byte
-	err := tx.QueryRow(ctx, "SELECT data FROM aaa_worker_connections WHERE worker_id=$1", s.WorkerID).Scan(&data)
-	if errors.Is(err, pgx.ErrNoRows) {
+	err := tx.QueryRowContext(ctx, "SELECT data FROM aaa_worker_connections WHERE worker_id=?1", s.WorkerID).Scan(&data)
+	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}
 	if err != nil {
@@ -43,15 +42,15 @@ func loadConnection(ctx context.Context, tx pgx.Tx, s *inference.State) error {
 	return decodeInference(data, &s.Connection)
 }
 
-func routingStates(ctx context.Context, tx pgx.Tx, ref inference.Ref) (*inference.State, error) {
+func (r *Repository) routingStates(ctx context.Context, tx *sql.Tx, ref inference.Ref) (*inference.State, error) {
 	s := &inference.State{Experiments: map[string]*inference.Experiment{}, Jobs: map[string]*inference.Job{}, Pool: map[string]*inference.State{}}
-	rows, err := tx.Query(ctx, "SELECT id,revoked_at FROM aaa_workers ORDER BY id FOR UPDATE")
+	rows, err := tx.QueryContext(ctx, "SELECT id,revoked_at FROM aaa_workers ORDER BY id")
 	if err != nil {
 		return nil, err
 	}
 	for rows.Next() {
 		var id string
-		var revoked *time.Time
+		var revoked *int64
 		if err = rows.Scan(&id, &revoked); err != nil {
 			rows.Close()
 			return nil, err
@@ -63,9 +62,7 @@ func routingStates(ctx context.Context, tx pgx.Tx, ref inference.Ref) (*inferenc
 	if err != nil {
 		return nil, err
 	}
-	if err = tx.QueryRow(ctx, "SELECT clock_timestamp()").Scan(&s.Now); err != nil {
-		return nil, err
-	}
+	s.Now = r.databaseTime()
 	for _, w := range s.Pool {
 		w.Now = s.Now
 	}
@@ -105,24 +102,16 @@ func routingStates(ctx context.Context, tx pgx.Tx, ref inference.Ref) (*inferenc
 }
 
 func (r *Repository) withinRouting(ctx context.Context, ref inference.Ref, apply func(*inference.State) error) error {
-	return r.workerTransaction(ctx, func(tx pgx.Tx) error {
-		if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", inferenceAdmissionLock); err != nil {
-			return err
-		}
-		if ref.SubmissionID != "" {
-			if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtextextended($1,0))", ref.Principal+":"+ref.SubmissionID); err != nil {
-				return err
-			}
-		}
+	return r.write(ctx, func(tx *sql.Tx) error {
 		if err := ownedHistory(ctx, tx, &ref); err != nil {
 			return err
 		}
-		s, err := routingStates(ctx, tx, ref)
+		s, err := r.routingStates(ctx, tx, ref)
 		if err != nil {
 			return err
 		}
 		if ref.Recovery {
-			if err = tx.QueryRow(ctx, "SELECT (SELECT count(*) FROM aaa_inference_receipts), (SELECT count(*) FROM aaa_conversations)").Scan(&s.Recovery.Receipts, &s.Recovery.Conversations); err != nil {
+			if err = tx.QueryRowContext(ctx, "SELECT (SELECT count(*) FROM aaa_inference_receipts), (SELECT count(*) FROM aaa_conversations)").Scan(&s.Recovery.Receipts, &s.Recovery.Conversations); err != nil {
 				return err
 			}
 		}
@@ -135,12 +124,12 @@ func (r *Repository) withinRouting(ctx context.Context, ref inference.Ref, apply
 		}
 		if ref.SubmissionID != "" {
 			var data []byte
-			err = tx.QueryRow(ctx, "SELECT data FROM aaa_inference_receipts WHERE principal=$1 AND submission_id=$2", ref.Principal, ref.SubmissionID).Scan(&data)
+			err = tx.QueryRowContext(ctx, "SELECT data FROM aaa_inference_receipts WHERE principal=?1 AND submission_id=?2", ref.Principal, ref.SubmissionID).Scan(&data)
 			if err == nil {
 				s.Receipt = &inference.Receipt{}
 				err = decodeInference(data, s.Receipt)
 			}
-			if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
 				return err
 			}
 		}
@@ -172,7 +161,7 @@ func (r *Repository) withinRouting(ctx context.Context, ref inference.Ref, apply
 				return err
 			}
 			if !bytes.Equal(data, connections[id]) {
-				if _, err = tx.Exec(ctx, "INSERT INTO aaa_worker_connections(worker_id,data) VALUES($1,$2) ON CONFLICT(worker_id) DO UPDATE SET data=EXCLUDED.data", id, data); err != nil {
+				if _, err = tx.ExecContext(ctx, "INSERT INTO aaa_worker_connections(worker_id,connected,data) VALUES(?1,?2,?3) ON CONFLICT(worker_id) DO UPDATE SET connected=excluded.connected,data=excluded.data", id, w.Connection.Connected, data); err != nil {
 					return err
 				}
 			}
@@ -181,7 +170,7 @@ func (r *Repository) withinRouting(ctx context.Context, ref inference.Ref, apply
 				return err
 			}
 			if !bytes.Equal(data, routing[id]) {
-				if _, err = tx.Exec(ctx, "INSERT INTO aaa_worker_routing(worker_id,data) VALUES($1,$2) ON CONFLICT(worker_id) DO UPDATE SET data=EXCLUDED.data", id, data); err != nil {
+				if _, err = tx.ExecContext(ctx, "INSERT INTO aaa_worker_routing(worker_id,data) VALUES(?1,?2) ON CONFLICT(worker_id) DO UPDATE SET data=EXCLUDED.data", id, data); err != nil {
 					return err
 				}
 			}
