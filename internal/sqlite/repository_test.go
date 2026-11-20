@@ -59,18 +59,29 @@ func failReason(t *testing.T, err error, reason string) *Failure {
 func TestSQLiteBootstrapConnectionSettingsAndRestart(t *testing.T) {
 	path := privatePath(t)
 	first, second := openRepo(t, path), openRepo(t, path)
-	done := make(chan error, 2)
+	type bootstrapResult struct {
+		repo *Repository
+		err  error
+	}
+	done := make(chan bootstrapResult, 2)
 	var ready sync.WaitGroup
 	ready.Add(2)
 	for _, repo := range []*Repository{first, second} {
 		go func() {
 			ready.Done()
 			ready.Wait()
-			done <- repo.Bootstrap(t.Context())
+			done <- bootstrapResult{repo, repo.Bootstrap(t.Context())}
 		}()
 	}
-	for range 2 {
-		if err := <-done; err != nil {
+	// Concurrent WAL activation can report SQLITE_BUSY before either attempt observes WAL mode.
+	for _, result := range [2]bootstrapResult{<-done, <-done} {
+		if result.err == nil {
+			continue
+		}
+		if Classify(result.err).Reason != "database_busy" {
+			t.Fatal(result.err, Classify(result.err).Detail())
+		}
+		if err := result.repo.Bootstrap(t.Context()); err != nil {
 			t.Fatal(err, Classify(err).Detail())
 		}
 	}

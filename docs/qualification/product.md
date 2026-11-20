@@ -34,12 +34,11 @@ available for diagnosis; cleanup removes only resources with the harness label.
 
 ## Private live inputs
 
-Use a separate qualification stack with [compose.yaml](../../compose.yaml) and
-[config.example.yaml](../../config.example.yaml). The owner supplies a verified
-paired-release image digest and the new HTTPS origin. The previously published
-service does not implement this configuration. The reverse proxy must allow at
-least 330 seconds for inference responses. The runner uses HTTPS and exports;
-there is no SSH dependency or deployment command in it.
+Use a separate qualification stack and follow the deployment guide for the
+tested source revision. The owner supplies the verified paired-release image
+digest and new HTTPS origin. The reverse proxy must allow at least 330 seconds
+for inference responses. The runner uses HTTPS and exports. The owner deploys
+the qualification stack separately. [Deployment guide](../deployment.md)
 
 The two browser sessions use private port forwarding of `6080` and `6081`:
 

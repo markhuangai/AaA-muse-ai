@@ -2,7 +2,10 @@
 node_modules/
 .artifacts/
 config.yaml
+/config.yml
 /config/
+/sqlite/
+/media/
 .env
 worker/dist/
 portal/dist/

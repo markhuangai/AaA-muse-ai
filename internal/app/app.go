@@ -42,6 +42,7 @@ type Dependencies struct {
 	Sleep          func(context.Context, time.Duration) error
 	Wait           func(context.Context, time.Duration) error
 	Files          diagnostics.Files
+	mounts         mountFilesystem
 	PortalAssets   fs.FS
 	ClientKeyFile  func(string, func(string) (string, bool), config.Config) *config.ClientKeyFile
 	OpenDB         func(context.Context, string) (Repository, error)
@@ -50,7 +51,7 @@ type Dependencies struct {
 }
 
 func Production(stdout, stderr io.Writer) Dependencies {
-	return Dependencies{DatabasePath: sqlite.Path, MediaDir: "/var/lib/aaa-muse-ai/media", ReadFile: os.ReadFile, LookupEnv: os.LookupEnv, Random: rand.Reader, Now: time.Now, Sleep: sleep, Wait: sleep, Files: diagnostics.OSFiles{}, PortalAssets: os.DirFS("/usr/share/aaa-muse-ai/portal"), ClientKeyFile: config.NewClientKeyFile, OpenDB: func(ctx context.Context, u string) (Repository, error) {
+	return Dependencies{DatabasePath: sqlite.Path, MediaDir: "/var/lib/aaa-muse-ai/media", ReadFile: os.ReadFile, LookupEnv: os.LookupEnv, Random: rand.Reader, Now: time.Now, Sleep: sleep, Wait: sleep, Files: diagnostics.OSFiles{}, mounts: osMountFilesystem{}, PortalAssets: os.DirFS("/usr/share/aaa-muse-ai/portal"), ClientKeyFile: config.NewClientKeyFile, OpenDB: func(ctx context.Context, u string) (Repository, error) {
 		repo, err := sqlite.Open(ctx, u)
 		if err != nil {
 			return nil, err
@@ -80,6 +81,10 @@ func Run(ctx context.Context, args []string, build service.Build, d Dependencies
 		fatal("build.rejected", "invalid_release_metadata", nil)
 		return 1
 	}
+	if len(args) > 0 && args[0] == "prepare-mounts" {
+		paths := []string{filepath.Dir(d.DatabasePath), d.MediaDir, config.Defaults().Diagnostics.Directory}
+		return runMountPreparation(args[1:], build.Revision, config.DefaultPath, paths, d)
+	}
 	flags.SetOutput(io.Discard)
 	path := flags.String("config", config.DefaultPath, "Configuration path")
 	if err := flags.Parse(args); err != nil || flags.NArg() != 0 {
@@ -93,6 +98,13 @@ func Run(ctx context.Context, args []string, build service.Build, d Dependencies
 		attrs := []any{}
 		if ce != nil {
 			attrs = []any{"field", ce.Field, "reason", ce.Reason, "line", ce.Line, "column", ce.Column}
+			if ce.Reason == "read_failed" {
+				expectedPath := "custom"
+				if *path == config.DefaultPath {
+					expectedPath = config.DefaultPath
+				}
+				attrs = append(attrs, "config_path", expectedPath, "read_cause", fileErrorReason(err))
+			}
 		}
 		fatal("config.rejected", "startup_stopped", attrs)
 		return 1
