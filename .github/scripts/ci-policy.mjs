@@ -5,6 +5,7 @@ import { parseDocument } from 'yaml';
 import { logEvent } from './ci-log.mjs';
 
 const standardRunners = new Set(['ubuntu-latest', 'ubuntu-24.04', 'ubuntu-22.04']);
+const remoteDevWorkflow = 'markhuangai/agent-remote-dev/.github/workflows/remote-dev.yml@v1';
 
 export function workflowProblems(source, filename = 'workflow') {
   const document = parseDocument(source, { uniqueKeys: true });
@@ -16,11 +17,23 @@ export function workflowProblems(source, filename = 'workflow') {
   return Object.entries(workflow.jobs).flatMap(([name, job]) => {
     const errors = [];
     const prefix = `${filename}: jobs.${name}`;
-    const maximum = filename === 'ai-pr-review.yml' && name === 'review' ? 45 : 30;
-    const fields = { workflow: filename, job: name, runner: job?.['runs-on'] ?? null, timeout: job?.['timeout-minutes'] ?? null, maximum };
+    const remoteDev = filename === 'remote-dev.yml' && name === 'remote-dev' && job?.uses === remoteDevWorkflow;
+    let maximum = 30;
+    if (filename === 'ai-pr-review.yml' && name === 'review') maximum = 45;
+    if (remoteDev) maximum = 300;
+    const scheduling = remoteDev ? job.with : job;
+    const runner = scheduling?.['runs-on'] ?? null;
+    const timeout = scheduling?.['timeout-minutes'] ?? null;
+    const fields = { workflow: filename, job: name, runner, timeout, maximum };
     if (!job || typeof job !== 'object' || Array.isArray(job)) return [{ ...fields, cause: 'invalid_job', message: `${prefix}: invalid job` }];
-    if (!standardRunners.has(job['runs-on'])) errors.push({ ...fields, cause: 'unsupported_runner', message: `${prefix}: runs-on must be a literal standard hosted Ubuntu runner` });
-    const timeout = job['timeout-minutes'];
+    if (Object.hasOwn(job, 'uses') && !remoteDev) {
+      return [{ ...fields, cause: 'unsupported_reusable_workflow', message: `${prefix}: reusable workflow is outside the runner and timeout policy` }];
+    }
+    if (remoteDev && runner !== '["ubuntu-latest"]') {
+      errors.push({ ...fields, cause: 'unsupported_runner', message: `${prefix}: with.runs-on must be the literal JSON string ["ubuntu-latest"]` });
+    } else if (!remoteDev && !standardRunners.has(runner)) {
+      errors.push({ ...fields, cause: 'unsupported_runner', message: `${prefix}: runs-on must be a literal standard hosted Ubuntu runner` });
+    }
     if (!Number.isInteger(timeout) || timeout < 1 || timeout > maximum) {
       errors.push({ ...fields, cause: 'invalid_timeout', message: `${prefix}: timeout-minutes must be a literal integer from 1 through ${maximum}` });
     }
