@@ -21,10 +21,12 @@ from worker_tls import TLSFixture
 
 
 class PackedModel:
-    def __init__(self, harness, worker):
+    def __init__(self, harness, worker, *, verify_next_wake=False):
         self.h, self.worker = harness, worker
         self.stop_event = threading.Event()
         self.seen, self.jobs, self.errors = set(), [], []
+        self.verify_next_wake = verify_next_wake
+        self.verified_wake = threading.Event()
         self.thread = threading.Thread(target=self.run, daemon=True)
 
     def run(self):
@@ -37,7 +39,11 @@ class PackedModel:
                     if pending["job_id"] in self.seen or pending["state"] != "pending":
                         continue
                     self.seen.add(pending["job_id"])
-                    self.h.hook(self.worker)
+                    poll = self.h.hook(self.worker)
+                    if self.verify_next_wake and not self.verified_wake.is_set():
+                        require(json.loads(poll.stdout)["action"] == "wake", "recovered assignment did not emit its first genuine wake")
+                        require(json.loads(self.h.hook(self.worker).stdout)["action"] == "silent", "recovered assignment emitted another wake")
+                        self.verified_wake.set()
                     shown = json.loads(self.h.cli(self.worker, "job-show", "--job-id", pending["job_id"]).stdout)
                     self.jobs.append(shown)
                     messages = shown["context"]["messages"]
@@ -134,7 +140,7 @@ class Product(WorkerRecovery, History):
     def client_flow(self, phase, cycle=None):
         names = [f"{slot}.{protocol}.{mode}" for slot in ("a", "b") for protocol in ("chat", "responses") for mode in ("json", "sse")]
         fixtures = {}
-        for name in [*names, "interleave-a", "interleave-b", "restart", "worker-probe"]:
+        for name in [*names, "interleave-a", "interleave-b", "restart", "worker-probe", "watchdog-probe"]:
             contents = "client-only-" + secrets.token_hex(32) + "\nexact 😀\n"
             path = self.private("product-" + phase + "-" + name + "-" + secrets.token_hex(6) + ".txt", contents)
             fixtures[name] = {"id": secrets.token_hex(12), "owner": "client_driver", "created_at": datetime.now(timezone.utc).isoformat(), "path": str(path), "contents": contents}
@@ -145,12 +151,13 @@ class Product(WorkerRecovery, History):
         self.private("product-client-" + phase + ".log", result.stdout + result.stderr)
         receipt = json.loads((self.root / ("product-client-" + phase + "-receipt.json")).read_text())
         require(result.returncode == 0 and receipt["outcome"] == "passed", "product protocol flow failed; inspect private evidence")
-        if phase != "prepare-restart":
+        if phase not in ("prepare-restart", "watchdog-recovery"):
             for case in receipt["cases"]:
                 self.add(case["id"], **{k: v for k, v in case.items() if k not in ("id", "outcome", "contexts")})
-        for item in receipt["cycles"]:
-            self.cycles = [prior for prior in self.cycles if prior["id"] != item["id"]]
-            self.cycles.append(item)
+        if phase != "watchdog-recovery":
+            for item in receipt["cycles"]:
+                self.cycles = [prior for prior in self.cycles if prior["id"] != item["id"]]
+                self.cycles.append(item)
         return receipt
 
     def worker_boundaries(self):
@@ -231,6 +238,19 @@ class Product(WorkerRecovery, History):
         require(self.status(b)["qualification"] == qualifications["b"], "worker recovery changed approval")
         require(all(turn["connection_id"] == recovered["connection_id"] and turn["connection_generation"] == recovered["connection_generation"] for turn in self.cycles[-1]["turns"]), "client probe did not use recovered connection")
         self.add("recovery.hook", recovery_case_id="recovery.worker", worker_ids=[b["worker"]["id"]], operation_ids=probe["operation_ids"], one_consumer=True, supported_refresh_qualified=False)
+        for model in self.models:
+            model.stop()
+        self.models = []
+        recovered = self.watchdog_recover(b)
+        recovered_model = PackedModel(self, b, verify_next_wake=True).start()
+        self.models = [PackedModel(self, a).start(), recovered_model]
+        watchdog_probe = self.client_flow("watchdog-recovery")
+        require(recovered_model.verified_wake.is_set(), "watchdog client flow lacks a verified single genuine wake")
+        require(self.status(b)["qualification"] == qualifications["b"], "watchdog client probe required a changed approval")
+        require(all(turn["connection_id"] == recovered["connection_id"] and turn["connection_generation"] == recovered["connection_generation"]
+                    for turn in watchdog_probe["cycles"][0]["turns"]), "watchdog client did not use the recovered connection")
+        self.receipt("recovery.watchdog", worker_id=b["worker"]["id"], connection_generation=recovered["connection_generation"],
+                     operation_ids=watchdog_probe["cases"][0]["operation_ids"], one_consumer=True, approval_preserved=True, wake_once=True)
         self.stop(a)
         self.proxy.interrupt()
         self.until(lambda: self.status(a)["connection_status"] == "offline", "stopped replacement worker remained healthy", timeout=45)
@@ -348,6 +368,7 @@ def main():
             "installer_sha256": hashlib.sha256(installer.read_bytes()).hexdigest()}, "status_receipt": status, "cases": h.product_cases, "cycles": h.cycles,
             "workers": [{"slot": w["slot"], "worker_id": w["worker"]["id"], "account_ref": "controlled-container-" + w["slot"], "installed_version": h.package["version"], "installed_sha256": h.package["sha256"]} for w in h.workers],
             "observations": h.product_observations, "checkpoints": h.product_checkpoints, "exports": exports,
+            "watchdog_recovery": next((case for case in h.receipts if case["case"] == "recovery.watchdog"), None),
             "cleanup": json.loads((h.root / "cleanup.json").read_text()), "model_cleanup_failures": model_failures}
         h.assert_private(json.dumps(report))
         report_path = h.private("product-report.json", json.dumps(report, indent=2))

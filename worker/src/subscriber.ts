@@ -8,6 +8,8 @@ import type { Transport } from './transport.js';
 export class Subscriber {
   active?: ObjectValue;
   lastEvent = '';
+  private supervision?: ObjectValue;
+  private lastAcknowledged?: ObjectValue;
   private mediaUpload?: Promise<void>;
   private mediaFailure?: unknown;
   constructor(readonly worker: Worker) {}
@@ -40,7 +42,9 @@ export class Subscriber {
           (error.fields.reason === 'stale_connection' || error.fields.reason === 'unknown_or_expired_challenge')) error.retryable = true;
       throw error;
     }
-    await this.worker.state.write('connection.json', encode({ ...this.active, last_event_id: this.lastEvent, last_heartbeat_at: new Date(this.worker.state.sys.now()).toISOString(), status: result.data.connection_status }));
+    const at = new Date(this.worker.state.sys.now()).toISOString();
+    this.lastAcknowledged = { at, connection_id: challenge.connection_id, connection_generation: challenge.connection_generation, request_id: result.requestId };
+    await this.saveConnection(text(result.data.connection_status), { last_heartbeat_at: at });
     if (acknowledged) {
       acknowledged.state = 'confirmed';
       await acks.write(`${text(acknowledged.job_id)}.json`, encode(acknowledged));
@@ -49,11 +53,19 @@ export class Subscriber {
       await this.worker.logger.log('INFO', 'worker.idle_confirmed', { ...correlation(current), request_id: result.requestId });
     }
   }
+  private async saveConnection(status: string, fields: ObjectValue = {}): Promise<void> {
+    await this.worker.state.write('connection.json', encode({ ...this.active, ...this.supervision, status,
+      last_event_id: this.lastEvent, last_acknowledged: this.lastAcknowledged, ...fields }));
+  }
   async run(signal: AbortSignal, background = false): Promise<void> {
     const { worker } = this;
     const release = await worker.state.lock('daemon', false);
     try {
       if (background) requireValue(!(await worker.state.read('run-stop.json')), 'subscriber_terminal_stop');
+      const owner = await worker.state.lockOwner('daemon');
+      requireValue(owner?.pid === worker.state.sys.pid, 'lock_owner_ambiguous', { lock: 'daemon' });
+      this.supervision = { subscriber_pid: owner.pid, subscriber_owner: owner.owner, subscriber_started_at: worker.state.sys.now() };
+      this.lastAcknowledged = undefined;
       const transport = await worker.load();
       let attempt = 0;
       await worker.logger.log('INFO', 'worker.supervision_started', { worker_id: worker.config.worker_id, pid: worker.state.sys.pid, lock: 'daemon', outcome: 'exclusive_owner', background });
@@ -76,7 +88,7 @@ export class Subscriber {
               connection(event.data);
               requireValue(!this.active, 'duplicate_connection_opened');
               this.active = event.data;
-              await worker.state.write('connection.json', encode({ ...event.data, last_event_id: event.id, status: 'connecting' }));
+              await this.saveConnection('connecting');
               await worker.logger.log('INFO', 'worker.connected', { worker_id: worker.config.worker_id, ...event.data });
             } else if (event.type === 'health.challenge') {
               await this.heartbeat(transport, event.data);
@@ -102,7 +114,7 @@ export class Subscriber {
           if (!(error instanceof Failure && error.retryable)) throw error;
           const delay = Math.min(30_000, 1000 * 2 ** Math.min(attempt++, 5));
           await worker.logger.log('WARN', 'worker.stream_retrying', { worker_id: worker.config.worker_id, endpoint: worker.config.origin, ...this.active, cause: cause(error), ...error.fields, phase, attempt, delay_ms: delay, duration_ms: worker.state.sys.now() - started, last_event_id: this.lastEvent });
-          await worker.state.write('connection.json', encode({ ...(this.active ?? {}), status: 'offline', last_event_id: this.lastEvent }));
+          await this.saveConnection('offline');
           for (let elapsed = 0; elapsed < delay && !signal.aborted; elapsed += 100) await worker.state.sys.wait(Math.min(100, delay - elapsed));
         }
       }

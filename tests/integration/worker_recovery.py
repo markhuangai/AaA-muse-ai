@@ -109,6 +109,70 @@ class WorkerRecovery(WorkerSetup):
         self.private("supervision-" + str(second) + "-diagnosis.json", json.dumps({"since": since, "until": until, "instance_id": owners[0]["instance_id"], "duplicate_instance_id": duplicates[-1]["instance_id"], "broker_request_id": forwarded[-1]["request_id"], "cause": "previous process exited abruptly; a new exclusive owner connected and the contender was rejected", "corrective_action": "retain the current consumer and its identity; no reinstall or state deletion", "events": scope}))
         self.receipt("worker.recovery_crash_and_duplicate", one_consumer=True, identity_preserved=True, log_only_diagnosis=True)
 
+    def watchdog_recover(self, worker):
+        since = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+        old = self.online(worker)
+        credential = (worker["state"] / "credential.key").read_bytes()
+        poll = worker["state"] / "hook-poll.json"
+        previous_poll = poll.read_bytes() if poll.exists() else None
+        first = self.stop(worker, "KILL")
+        command = ["bash", "-c", worker["receipt"]["watchdog"]["command"]]
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            runs = list(pool.map(lambda _: self.command(worker, command), range(2)))
+        current = self.online(worker, old["connection_id"])
+        pid = self.pid(worker)
+        require(pid != first and current["connection_generation"] > old["connection_generation"], "watchdog kept the old subscriber or generation")
+        require((worker["state"] / "credential.key").read_bytes() == credential, "watchdog changed the credential")
+        require((poll.read_bytes() if poll.exists() else None) == previous_poll, "watchdog advanced the genuine hook poll")
+        reports = [n for run in runs if run.stdout for n in json.loads(run.stdout)["notices"] if n["kind"] == "subscriber_recovered"]
+        require(reports == [{"kind": "subscriber_recovered", "pid": pid, "connection_generation": current["connection_generation"]}],
+                "missing or duplicate acknowledged recovery notice")
+        lines = [json.loads(line) for run in runs for line in run.stderr.splitlines()]
+        require(not any(line["level"] == "DEBUG" for line in lines), "watchdog leaked private DEBUG output to the scheduler sink")
+        recovered, = [e for e in lines if e["msg"] == "watchdog.subscriber_recovered"]
+        require(recovered["level"] == "INFO" and recovered["attempts"] == 1 and recovered["worker_id"] == worker["worker"]["id"]
+                and recovered["subscriber"]["heartbeat_evidence"] == "current" and recovered["request_id"], "INFO lacks recovery proof")
+        until = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+        events = self.events(worker, since, until)
+        owners = [e for e in events if e["msg"] == "worker.supervision_started" and e.get("worker_id") == worker["worker"]["id"]]
+        require(len(owners) == 1 and owners[0]["pid"] == pid, "watchdog did not recover exactly one subscriber")
+        detail = next(e for e in events if e["msg"] == "watchdog.observed" and e.get("instance_id") == recovered["instance_id"])
+        require(detail["level"] == "DEBUG" and detail["before"]["subscriber"]["owner_state"] == "absent" and
+                detail["before"]["subscriber"]["launch_pid"] == first and detail["observed"]["subscriber"]["connection_id"] == current["connection_id"],
+                "watchdog logs cannot explain the old and recovered owners")
+        accepted, _ = self.diagnose(recovered["request_id"], "worker.health_reply")
+        require(accepted["worker_id"] == worker["worker"]["id"] and accepted["connection_id"] == current["connection_id"] and
+                accepted["connection_generation"] == current["connection_generation"], "watchdog receipt did not join the authenticated heartbeat")
+        self.receipt("worker.watchdog_recovery", one_consumer=True, log_only_diagnosis=True,
+                     worker_id=worker["worker"]["id"], connection_generation=current["connection_generation"], request_id=recovered["request_id"])
+        return current
+
+    def watchdog_live_stall(self, worker):
+        now = datetime.now(timezone.utc)
+        current = self.online(worker)
+        pid = self.pid(worker)
+        self.command(worker, ["bash", "-c", 'kill -STOP "$1"', "owned-worker-fixture", str(pid)])
+        try:
+            path = worker["state"] / "connection.json"
+            saved = json.loads(path.read_text())
+            stale = datetime.fromtimestamp(now.timestamp() - 121, timezone.utc).isoformat()
+            saved["last_heartbeat_at"] = saved["last_acknowledged"]["at"] = stale
+            path.write_text(json.dumps(saved))
+            first = self.cli(worker, "watchdog-check")
+            repeat = self.cli(worker, "watchdog-check")
+            require(any(n.get("cause") == "heartbeat_unconfirmed" for n in json.loads(first.stdout)["notices"]), "live stale heartbeat was not reported")
+            require(not repeat.stdout and self.pid(worker) == pid and self.command(worker, ["bash", "-c", 'kill -0 "$1"', "owned-worker-fixture", str(pid)]),
+                    "live stall duplicated a notice or replaced the process")
+            events = [json.loads(line) for line in first.stderr.splitlines()]
+            stalled, = [e for e in events if e["msg"] == "watchdog.subscriber_stalled"]
+            require(stalled["level"] == "WARN" and stalled["subscriber"]["connection_id"] == current["connection_id"] and
+                    stalled["subscriber"]["heartbeat_age_ms"] > 120000 and stalled["attempts"] == 0 and stalled["corrective_action"],
+                    "live stall lacks operator evidence at normal verbosity")
+        finally:
+            self.command(worker, ["bash", "-c", 'kill -CONT "$1"', "owned-worker-fixture", str(pid)])
+        self.online(worker)
+        self.receipt("worker.watchdog_live_stall", live_owner_preserved=True, repeated_notice_suppressed=True)
+
     def lost_receipt(self, worker):
         experiment = self.create(worker, "controlled recovery tool request")
         shown = self.wait_job(worker, experiment)
@@ -186,6 +250,10 @@ class WorkerRecovery(WorkerSetup):
         self.until(lambda: (worker["state"] / "run-stop.json").exists(), "revocation did not retain terminal evidence", timeout=40)
         self.until(lambda: not (worker["state"] / "daemon.lock").exists(), "revoked owner did not release its lock")
         marker = (worker["state"] / "run-stop.json").read_bytes()
+        launch = (worker["state"] / "launch.json").read_bytes()
+        notice = json.loads(self.cli(worker, "watchdog-check").stdout)
+        require(any(n.get("cause") == "subscriber_terminal_stop" for n in notice["notices"]) and
+                (worker["state"] / "launch.json").read_bytes() == launch, "watchdog crossed a terminal stop")
         self.hook(worker, want=1)
         self.background_refusal(worker)
         require((worker["state"] / "run-stop.json").read_bytes() == marker and (worker["state"] / "credential.key").read_text().strip() == worker["credential"], "restart restored revoked authority or replaced its evidence")
@@ -200,6 +268,8 @@ class WorkerRecovery(WorkerSetup):
         key = (worker["state"] / "credential.key").read_bytes()
         self.startup_outage(worker)
         self.crash_and_duplicate(worker)
+        self.watchdog_recover(worker)
+        self.watchdog_live_stall(worker)
         self.lost_receipt(worker)
         self.broker_restart_hold(worker)
         self.invalid_state_and_revocation(worker)

@@ -32,6 +32,7 @@ class TLSFixture:
         self.failed_claims = []
         self.allow_statuses = 0
         self.fail_statuses = 0
+        self.enrollment_accepted = None
         self.pause_decision = False
         self.decision_captured = threading.Event()
         self.release_decision = threading.Event()
@@ -163,6 +164,8 @@ class TLSFixture:
                         if delayed_context:
                             fixture.context_captured.set()
                             fixture.release_context.wait(timeout=8)
+                        if self.path == "/api/v1/worker/enroll" and response.status == 201 and fixture.enrollment_accepted is not None:
+                            fixture.enrollment_accepted(json.loads(payload)["worker"]["id"])
                         if paused_claim:
                             fixture.claim_captured.set()
                             fixture.release_claim.wait(timeout=8)

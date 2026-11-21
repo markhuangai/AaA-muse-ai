@@ -61,6 +61,7 @@ state="${XDG_STATE_HOME:-$HOME/.local/state}/aaa-muse-worker"
 private_dir "$root" install_directory
 private_dir "$root/releases" bundle_directory
 private_dir "$state" state_directory
+private_dir "$state/diagnostics" diagnostics_directory
 stage=runtime
 capability=node_runtime
 expected_state=node_22_12_or_linux_x64_fallback

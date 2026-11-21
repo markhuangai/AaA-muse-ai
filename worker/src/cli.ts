@@ -12,10 +12,12 @@ import { encode, object, parse, identifier, type ObjectValue } from './json.js';
 import type { Network } from './transport.js';
 import { Setup, captureBootstrap } from './setup.js';
 import { setupIO, backgroundStderr, type SetupIO } from './setup-os.js';
+import { inspectHealth } from './health.js';
+import { checkWatchdog } from './watchdog.js';
 
 import { VERSION } from './version.js';
 export { VERSION } from './version.js';
-const help = 'aaa-muse-worker setup --origin HTTPS_ORIGIN --code-stdin --install-dir ABSOLUTE_PATH --setup-id ID [--bootstrap FILE] | hook-check | configure --origin HTTPS_ORIGIN | enroll --code-stdin | run | status | doctor | job-show --job-id ID | media-finish --job-id ID | decision-submit --job-id ID (--input FILE|- | --ack-idle) | diagnostics-export [--operation-id ID] [--request-id ID] [--since RFC3339] [--until RFC3339] [--decode]\nCommon: --state-dir ABSOLUTE_PATH, --help, --version\n';
+const help = 'aaa-muse-worker setup --origin HTTPS_ORIGIN --code-stdin --install-dir ABSOLUTE_PATH --setup-id ID [--bootstrap FILE] | hook-check | health | watchdog-check | configure --origin HTTPS_ORIGIN | enroll --code-stdin | run | status | doctor | job-show --job-id ID | media-finish --job-id ID | decision-submit --job-id ID (--input FILE|- | --ack-idle) | diagnostics-export [--operation-id ID] [--request-id ID] [--since RFC3339] [--until RFC3339] [--decode]\nCommon: --state-dir ABSOLUTE_PATH, --help, --version\n';
 export interface Adapters {
   files: Files;
   system: System;
@@ -35,7 +37,7 @@ export function argumentsFor(args: string[]): { command: string; flags: Record<s
   const flags: Record<string, string | boolean> = Object.create(null);
   const allowed: Record<string, string[]> = {
     configure: ['origin'], enroll: ['code-stdin'], run: ['background'], status: [], doctor: [], 'job-show': ['job-id'], 'media-finish': ['job-id'],
-    setup: ['origin', 'code-stdin', 'install-dir', 'setup-id', 'bootstrap'], 'hook-check': ['runtime-error'],
+    setup: ['origin', 'code-stdin', 'install-dir', 'setup-id', 'bootstrap'], 'hook-check': ['runtime-error'], health: [], 'watchdog-check': [],
     'decision-submit': ['job-id', 'input', 'ack-idle'], 'diagnostics-export': ['operation-id', 'request-id', 'since', 'until', 'decode'],
   };
   requireValue(Object.hasOwn(allowed, command) || ['--help', '--version'].includes(command), 'unknown_command');
@@ -52,10 +54,14 @@ export function argumentsFor(args: string[]): { command: string; flags: Record<s
 export async function execute(args: string[], io: Adapters): Promise<number> {
   let logger: Logger | undefined;
   let command = 'parse';
+  let setupID: string | undefined;
+  let safeDetails = {};
   try {
     const parsed = argumentsFor(args);
     command = parsed.command;
     const flags = parsed.flags;
+    setupID = typeof flags['setup-id'] === 'string' && /^[0-9a-f]{32}$/.test(flags['setup-id']) ? flags['setup-id'] : undefined;
+    if (command === 'watchdog-check' || command === 'health') safeDetails = { corrective_action: 'Inspect the reported installation or state prerequisite.' };
     if (command === '--help' || flags.help) { io.stdout(help); return 0; }
     if (command === '--version' || flags.version) { io.stdout(VERSION + '\n'); return 0; }
     const match = /^v(\d+)\.(\d+)\./.exec(io.nodeVersion);
@@ -64,21 +70,38 @@ export async function execute(args: string[], io: Adapters): Promise<number> {
     requireValue(!xdg || isAbsolute(xdg), 'absolute_xdg_state_home_required');
     const path = flags['state-dir'] as string | undefined ?? join(xdg || join(io.home(), '.local', 'state'), 'aaa-muse-worker');
     const state = new State(path, io.files, io.system);
-    await state.ensure();
+    if (command === 'health' || command === 'watchdog-check') {
+      try { await state.check(state.root, true); }
+      catch (error) { if (cause(error) === 'ENOENT') throw new Failure('worker_state_missing'); throw error; }
+    } else {
+      await state.ensure();
+    }
+    if (command === 'health') {
+      const { view } = await inspectHealth(state, io.home());
+      io.stdout(encode(view) + '\n');
+      return 0;
+    }
     const metadata = await io.metadata();
-    const logs = await state.child('diagnostics');
+    let logs;
+    if (command === 'watchdog-check') {
+      logs = new State(state.path('diagnostics'), state.io, state.sys);
+      try { await logs.check(logs.root, true); }
+      catch (error) { if (cause(error) === 'ENOENT') throw new Failure('worker_diagnostics_missing'); throw error; }
+    } else {
+      logs = await state.child('diagnostics');
+    }
     logger = new Logger(state, new Capture(logs), io.stderr, { package_version: VERSION, node_version: io.nodeVersion, protocol_version: 1, command, command_id: io.system.uuid(), ...metadata, setup_id: flags['setup-id'] as string, operation_id: flags['setup-id'] as string, effective_settings: { request_timeout_ms: 10_000, request_attempts: 3, stream_idle_timeout_ms: 30_000, stream_retry_max_ms: 30_000, capture_level: 'DEBUG', runtime_level: 'INFO', retention_days: 7, capture_max_bytes: 128 * 1024 * 1024, max_body_bytes: 1024 * 1024 } });
     if (command === 'setup' && typeof flags.bootstrap === 'string') {
       requireValue(typeof flags['setup-id'] === 'string', 'setup_id_required');
       await captureBootstrap(logger, flags['setup-id'], await io.input(flags.bootstrap));
     }
-    const installedRaw = await state.read('installation.json');
+    const installedRaw = command === 'watchdog-check' ? undefined : await state.read('installation.json');
     const installed = installedRaw ? object(parse(installedRaw)) : {};
     Object.assign(logger.base, { setup_id: flags['setup-id'] ?? installed.setup_id, operation_id: flags['setup-id'] ?? installed.setup_id, worker_id: installed.worker_id });
-    const credential = await state.read('credential.key');
+    const credential = command === 'watchdog-check' ? undefined : await state.read('credential.key');
     if (credential) logger.redactor.add(credential.trim());
     const worker = new Worker(state, logger, io.network);
-    if (command !== 'hook-check') await logger.log('INFO', 'worker.command_started');
+    if (command !== 'hook-check' && command !== 'watchdog-check') await logger.log('INFO', 'worker.command_started');
     let result: ObjectValue;
     switch (command) {
       case 'setup': {
@@ -90,6 +113,11 @@ export async function execute(args: string[], io: Adapters): Promise<number> {
         if (typeof flags['runtime-error'] === 'string') await new Setup(worker, io.setup ?? setupIO(io.home()), VERSION).runtimeError(flags['runtime-error']);
         io.stdout(await new Setup(worker, io.setup ?? setupIO(io.home()), VERSION).check(io.env.HATCH_HOOK_RUNTIME ?? ''));
         return 0;
+      case 'watchdog-check': {
+        const notice = await checkWatchdog(new Setup(worker, io.setup ?? setupIO(io.home()), VERSION), io.signal);
+        if (notice) io.stdout(encode(logger.redactor.value(notice, '', false)) + '\n');
+        return 0;
+      }
       case 'configure':
         requireValue(typeof flags.origin === 'string', 'origin_required');
         result = await worker.configure(flags.origin);
@@ -138,7 +166,8 @@ export async function execute(args: string[], io: Adapters): Promise<number> {
     if (logger && code !== 'diagnostics_unavailable' && !(error instanceof Failure && error.fields.diagnostic_recorded)) {
       try { await logger.log('ERROR', code === 'update_required' ? 'worker.update_required' : code === 'state_unsafe' ? 'worker.state_unsafe' : 'worker.command_failed', event); }
       catch { return 1; }
-    } else if (!logger) io.stderr(encode({ level: 'ERROR', msg: code === 'state_unsafe' ? 'worker.state_unsafe' : 'worker.command_failed', protected_capture_unavailable: true, ...event }) + '\n');
+    } else if (!logger) io.stderr(encode({ level: 'ERROR', msg: code === 'state_unsafe' ? 'worker.state_unsafe' : 'worker.command_failed',
+      package_version: VERSION, setup_id: setupID, protected_capture_unavailable: true, ...safeDetails, ...event }) + '\n');
     return 1;
   }
 }

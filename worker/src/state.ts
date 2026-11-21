@@ -5,7 +5,8 @@ import { randomUUID } from 'node:crypto';
 import { Failure, cause, requireValue } from './errors.js';
 import { encode, parse, object, text, integer } from './json.js';
 
-export type Files = Pick<typeof fs, 'mkdir' | 'mkdtemp' | 'lstat' | 'open' | 'rename' | 'unlink' | 'rmdir' | 'readdir'>;
+export type Files = Pick<typeof fs, 'mkdir' | 'mkdtemp' | 'lstat' | 'stat' | 'open' | 'rename' | 'unlink' | 'rmdir' | 'readdir'>;
+export interface LockOwner { pid: number; owner: string }
 export interface System {
   now(): number;
   uuid(): string;
@@ -82,6 +83,20 @@ export class State {
   async list(): Promise<string[]> {
     await this.check(this.root, true);
     return await this.io.readdir(this.root);
+  }
+  async lockOwner(name: string): Promise<LockOwner | undefined> {
+    const lock = new State(this.path(`${name}.lock`), this.io, this.sys);
+    try {
+      const raw = await lock.read('owner.json');
+      requireValue(raw, 'lock_owner_ambiguous', { lock: name });
+      const saved = object(parse(raw));
+      const pid = integer(saved.pid);
+      requireValue(pid > 0 && typeof saved.owner === 'string' && saved.owner.length > 0, 'lock_owner_ambiguous', { lock: name });
+      return { pid, owner: saved.owner };
+    } catch (error) {
+      if (cause(error) === 'ENOENT') return undefined;
+      throw error;
+    }
   }
   async lock(name: string, wait = true): Promise<() => Promise<void>> {
     const path = this.path(`${name}.lock`);
