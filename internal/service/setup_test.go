@@ -51,7 +51,8 @@ func TestSetupPromptRequiresVerifiedNativeWatchdogAndScopedUpgrade(t *testing.T)
 		"Read back the saved job ID, owner goal, action and state path, cadence, timeout and enabled status", "Re-list after any uncertain write",
 		"Setup remains incomplete if either registration cannot be verified", "On every run, use hooks.list with include_disabled:true",
 		"verify its single enabled five-second hook by ID, path and interval", "invoke the exact installed watchdog-check command once",
-		"stay silent", "first unattended execution, native message delivery and VM replacement or supported-refresh survival",
+		"stay silent", "first unattended execution and native message delivery only when each is observed",
+		"supported-refresh recovery or VM replacement require an exact live observation of that event",
 	} {
 		if !strings.Contains(after, phrase) {
 			t.Fatal("missing watchdog contract", phrase)
