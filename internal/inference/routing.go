@@ -23,8 +23,26 @@ type Qualification struct {
 }
 
 type WorkerRouting struct {
-	LastDispatchedAt *time.Time      `json:"last_dispatched_at,omitempty"`
-	Qualifications   []Qualification `json:"qualifications"`
+	LastDispatchedAt *time.Time          `json:"last_dispatched_at,omitempty"`
+	Qualifications   []Qualification     `json:"qualifications"`
+	Upgrade          *UpgradeReservation `json:"upgrade_reservation,omitempty"`
+}
+
+type UpgradeReservation struct {
+	OperationID string     `json:"operation_id"`
+	Generation  int64      `json:"generation"`
+	ExpiresAt   *time.Time `json:"expires_at,omitempty"`
+}
+
+func (u *UpgradeReservation) Active(now time.Time) bool {
+	return u != nil && u.ExpiresAt != nil && now.Before(*u.ExpiresAt)
+}
+
+func (r WorkerRouting) UpgradeGeneration() int64 {
+	if r.Upgrade == nil {
+		return 0
+	}
+	return r.Upgrade.Generation
 }
 
 func (r WorkerRouting) Latest() *Qualification {

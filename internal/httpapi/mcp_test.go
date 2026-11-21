@@ -26,7 +26,7 @@ const askMCP = `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"
 
 func TestMCPTextOutputBoundaries(t *testing.T) {
 	h, db, worker, key := inferenceHTTPFixture(t)
-	c := onlineNativeHTTP(t, h, db, worker.ID)
+	c := onlineHTTP(t, h, worker.ID)
 	answer := "exact answer muse_download_" + strings.Repeat("A", 43)
 	completeChatOnWait(t, h, db, c, key, inference.Item{Type: "final", Text: answer})
 	failed := &chatWriter{ResponseRecorder: httptest.NewRecorder(), failWrite: true}
@@ -65,7 +65,7 @@ func TestMCPTextOutputBoundaries(t *testing.T) {
 
 func TestMCPTransportAndMediaAdmission(t *testing.T) {
 	h, db, worker, _ := inferenceHTTPFixture(t)
-	onlineNativeHTTP(t, h, db, worker.ID)
+	onlineHTTP(t, h, worker.ID)
 	h.Broker.Media = media.New(t.TempDir())
 	connection := &db.states[worker.ID].Connection
 	connection.MediaJobs, connection.PromptWAV = true, true
@@ -115,7 +115,7 @@ func TestMCPTransportAndMediaAdmission(t *testing.T) {
 
 func TestMCPLegacyDisconnectCancelsText(t *testing.T) {
 	h, db, worker, _ := inferenceHTTPFixture(t)
-	onlineNativeHTTP(t, h, db, worker.ID)
+	onlineHTTP(t, h, worker.ID)
 	r := mcpRequest(askMCP)
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()

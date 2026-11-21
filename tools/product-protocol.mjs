@@ -1,6 +1,8 @@
 import { model, readSSE, validateCompletion } from './openai-conformance.mjs';
 import { readResponseSSE, validateResponse } from './responses-conformance.mjs';
 import { decodeExport, identifier, need, same } from './qualification-evidence.mjs';
+import { randomUUID } from 'node:crypto';
+import { setTimeout as delay } from 'node:timers/promises';
 
 export const cycleIDs = ['a', 'b'].flatMap(slot => ['chat', 'responses'].flatMap(protocol => ['json', 'sse'].map(format => `${slot}.${protocol}.${format}`)));
 export const instructions = 'The client owns the file and executes read_file. For aaa-product:tool:, propose exactly that client tool using the path after the prefix. Do not read a file on your VM. After the matching client result, return that result exactly, including newlines. For aaa-product:echo:, return exactly the text after that prefix.';
@@ -21,6 +23,36 @@ export class ProductProtocol {
     this.origin = origin; this.keys = keys; this.fetcher = fetcher; this.now = now; this.readFixture = readFixture; this.save = save;
   }
   stamp() { return new Date(this.now()).toISOString(); }
+  async pin(item, workerID) {
+    need(identifier(workerID) && item.turns.length === 0 && !item.pin, 'invalid_product_pin');
+    const submission = randomUUID();
+    const answer = 'pin-' + submission;
+    const user = { role: 'user', content: 'Reply with exactly: ' + answer };
+    const head = item.protocol === 'chat' ? item.initial_body.messages.slice(0, 1) : [];
+    const headers = { Authorization: this.keys[item.slot], 'Content-Type': 'application/json', 'X-Muse-Session-Id': item.session_id };
+    const request = async (path, body) => {
+      const response = await this.fetcher(this.origin + path, { method: body ? 'POST' : 'GET', headers,
+        body: body && JSON.stringify(body), redirect: 'error', signal: AbortSignal.timeout(10_000) });
+      need(response.ok, `product_pin_http_${response.status}`);
+      return response.json();
+    };
+    const base = '/api/v1/requests';
+    const admitted = await request(base, { protocol_version: 1, submission_id: submission, worker_id: workerID, timeout_seconds: 300,
+      messages: [...head, user].map(message => ({ type: 'message', role: message.role, text: message.content })), tools: [] });
+    need(identifier(admitted.id) && admitted.session_id === item.session_id, 'product_pin_identity_missing');
+    const timeout = AbortSignal.timeout(300_000);
+    let observed = admitted;
+    while (['queued', 'inference'].includes(observed.state)) {
+      await delay(200, undefined, { signal: timeout });
+      observed = await request(base + '/' + admitted.id);
+    }
+    need(observed.state === 'completed' && observed.worker_id === workerID && observed.output?.type === 'final' && observed.output.text === answer, 'product_pin_unconfirmed');
+    const history = [...head, user, { role: 'assistant', content: answer }];
+    if (item.protocol === 'chat') item.initial_body.messages = [...history, ...item.initial_body.messages.slice(1)];
+    else item.initial_body.input = [...history, ...item.initial_body.input];
+    item.pin = { request_id: admitted.id, worker_id: workerID };
+    await this.save(item);
+  }
   async call(item, body, session = item.session_id) {
     const started = this.stamp();
     const response = await this.fetcher(this.origin + '/v1/' + (item.protocol === 'chat' ? 'chat/completions' : 'responses'), {

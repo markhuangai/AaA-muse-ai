@@ -11,7 +11,7 @@ import (
 
 func TestChatAwaitUsesNativeDecisionAndCancellation(t *testing.T) {
 	b, m, logger, _ := inferenceFixture()
-	c := connectNative(t, b, m, logger, "worker-a")
+	c := connectInference(t, b, m, logger, "worker-a")
 	v := admitted(t, b, "alice", "chat-session", requestInput("chat"))
 	waits := 0
 	b.Wait = func(ctx context.Context, d time.Duration) error {
@@ -48,7 +48,7 @@ func TestChatAwaitStopsOnContextAndNativeDeadline(t *testing.T) {
 	for _, kind := range []string{"context", "wait", "deadline", "hard-bound"} {
 		t.Run(kind, func(t *testing.T) {
 			b, m, logger, _ := inferenceFixture()
-			connectNative(t, b, m, logger, "worker-a")
+			connectInference(t, b, m, logger, "worker-a")
 			v := admitted(t, b, "alice", "chat", requestInput("chat"))
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()

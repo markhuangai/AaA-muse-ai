@@ -123,7 +123,7 @@ func completeChatOnWait(t *testing.T, h *Handler, m *httpInferenceStore, c infer
 func TestChatHTTPNativeFlowAndProtectedEvidence(t *testing.T) {
 	for _, stream := range []bool{false, true} {
 		h, m, worker, key := inferenceHTTPFixture(t)
-		c := onlineNativeHTTP(t, h, m, worker.ID)
+		c := onlineHTTP(t, h, worker.ID)
 		completeChatOnWait(t, h, m, c, key, inference.Item{Type: "final", Text: "exact\r\n😀"})
 		body := chatRequestBody(stream)
 		body["messages"] = []any{map[string]any{"role": "user", "content": "question client-private-sentinel"}}
@@ -167,7 +167,7 @@ func TestChatHTTPWriteAndFlushFailuresPreserveAcceptedOutput(t *testing.T) {
 	for _, mode := range []string{"write", "flush", "delivery-deadline", "start-deadline"} {
 		t.Run(mode, func(t *testing.T) {
 			h, m, worker, key := inferenceHTTPFixture(t)
-			c := onlineNativeHTTP(t, h, m, worker.ID)
+			c := onlineHTTP(t, h, worker.ID)
 			completeChatOnWait(t, h, m, c, key, inference.Item{Type: "final", Text: "accepted once"})
 			w := &chatWriter{ResponseRecorder: httptest.NewRecorder()}
 			switch mode {
@@ -208,7 +208,7 @@ func TestChatHTTPWriteAndFlushFailuresPreserveAcceptedOutput(t *testing.T) {
 func TestChatHTTPAbortPreservesOwnedAndAcceptedState(t *testing.T) {
 	for _, accepted := range []bool{false, true} {
 		h, m, worker, key := inferenceHTTPFixture(t)
-		c := onlineNativeHTTP(t, h, m, worker.ID)
+		c := onlineHTTP(t, h, worker.ID)
 		ctx, cancel := context.WithCancel(context.Background())
 		w := &chatWriter{ResponseRecorder: httptest.NewRecorder()}
 		if accepted {
@@ -247,7 +247,7 @@ func TestChatHTTPAbortPreservesOwnedAndAcceptedState(t *testing.T) {
 
 func TestChatHTTPToolRoundTripAndEarlyErrors(t *testing.T) {
 	h, m, worker, key := inferenceHTTPFixture(t)
-	c := onlineNativeHTTP(t, h, m, worker.ID)
+	c := onlineHTTP(t, h, worker.ID)
 	tool := inference.Item{Type: "tool_call", CallID: "call-a", Name: "read_file", Arguments: map[string]any{"path": "client-only"}}
 	completeChatOnWait(t, h, m, c, key, tool)
 	body := chatRequestBody(false)
@@ -348,7 +348,7 @@ func TestChatHTTPAllResponsePathsRenewShortDeadline(t *testing.T) {
 				body = []byte(`{"model":"other","messages":[]}`)
 			}
 			if mode == "output-boundary" {
-				c := onlineNativeHTTP(t, h, m, worker.ID)
+				c := onlineHTTP(t, h, worker.ID)
 				h.Broker = service.NewBroker(chatBoundaryStore{m}, h.Random, time.Now, nil)
 				completeChatOnWait(t, h, m, c, key, inference.Item{Type: "final", Text: "accepted"})
 			}
@@ -375,7 +375,7 @@ func TestChatHTTPAllResponsePathsRenewShortDeadline(t *testing.T) {
 
 func TestChatHTTPRedactsUnicodeEscapedAdmittedCredentials(t *testing.T) {
 	h, m, worker, key := inferenceHTTPFixture(t)
-	c := onlineNativeHTTP(t, h, m, worker.ID)
+	c := onlineHTTP(t, h, worker.ID)
 	completeChatOnWait(t, h, m, c, key, inference.Item{Type: "final", Text: "safe answer"})
 	r := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"muse-pool-text","messages":[{"role":"user","content":"question \u0063lient-private-sentinel"}]}`))
 	r.Header.Set("Authorization", "Bearer client-private-sentinel")

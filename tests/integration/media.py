@@ -13,7 +13,7 @@ from datetime import datetime
 from pathlib import Path
 
 from media_mcp import MCPMedia
-from product import PackedModel, Product
+from product import Product
 from service import require
 from worker_setup import run
 
@@ -77,11 +77,7 @@ class MediaFlow(MCPMedia, Product):
         worker = self.environment("media", mount_system_tmp=True)
         worker["slot"] = "media"
         self.install(worker, self.prompt())
-        ready = PackedModel(self, worker).start()
-        try:
-            self.qualify_packed(worker)
-        finally:
-            ready.stop()
+        self.mcp_text(worker)
         foreign = self.new_worker()
         stills, video, audios = self.inputs()
         prompt = "private-motion-" + secrets.token_hex(20)

@@ -24,7 +24,7 @@ func submitResponse(t *testing.T, b *Broker, session string, input inference.Res
 
 func TestResponsesCanonicalChainingInstructionsAndReplay(t *testing.T) {
 	b, m, logger, _ := inferenceFixture()
-	c := connectNative(t, b, m, logger, "worker-a")
+	c := connectInference(t, b, m, logger, "worker-a")
 	input := responseInput("response-first", "question")
 	instruction := "first only"
 	input.Instructions = &instruction
@@ -79,7 +79,7 @@ func TestResponsesFunctionReplayIDsAndConflictingResults(t *testing.T) {
 	for _, chain := range []bool{false, true} {
 		t.Run(map[bool]string{false: "full", true: "chain"}[chain], func(t *testing.T) {
 			b, m, logger, _ := inferenceFixture()
-			c := connectNative(t, b, m, logger, "worker-a")
+			c := connectInference(t, b, m, logger, "worker-a")
 			input := responseInput("tool-first", "read fixture")
 			input.Input.Tools = requestInput("unused").Tools
 			first := submitResponse(t, b, "tool-session", input)
@@ -120,7 +120,7 @@ func TestResponsesFunctionReplayIDsAndConflictingResults(t *testing.T) {
 
 func TestResponsesItemValidationAndAtomicFailure(t *testing.T) {
 	b, m, logger, _ := inferenceFixture()
-	c := connectNative(t, b, m, logger, "worker-a")
+	c := connectInference(t, b, m, logger, "worker-a")
 	first := submitResponse(t, b, "items", responseInput("items-first", "question"))
 	nativeDecide(t, b, m, c, first, inference.Item{Type: "final", Text: "answer"})
 	for _, kind := range []string{"unknown", "changed", "duplicate", "length", "size", "busy"} {

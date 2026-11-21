@@ -1,10 +1,11 @@
 import * as fs from 'node:fs/promises';
-import { constants, fstatSync, ftruncateSync, writeSync } from 'node:fs';
+import { constants, fstatSync, ftruncateSync, readFileSync, statSync, writeSync } from 'node:fs';
 import { execFile, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { isAbsolute } from 'node:path';
-import { State } from './state.js';
+import { dirname, isAbsolute, join } from 'node:path';
+import { State, type LockOwner } from './state.js';
 import { cause, Failure, requireValue } from './errors.js';
+import { text, type ObjectValue } from './json.js';
 
 type DirectoryRole = 'install_directory' | 'launcher_directory' | 'hook_directory' | 'skill_directory';
 export interface SetupIO {
@@ -57,6 +58,22 @@ export function setupIO(home: string): SetupIO {
     }),
   };
 }
+
+export const upgradeIO = {
+  async stage(root: string, entry: string): Promise<string> {
+    const directory = await fs.mkdtemp(join(root, 'releases', 'upgrade.'));
+    await fs.cp(dirname(dirname(entry)), join(directory, 'package'), { recursive: true, force: false, errorOnExist: true });
+    return join(directory, 'package', 'dist', 'main.js');
+  },
+  stop(owner: LockOwner, stateDir: string, installation: ObjectValue): void {
+    const proc = '/proc/' + owner.pid;
+    const args = readFileSync(proc + '/cmdline', 'utf8').split('\0').slice(0, -1);
+    const expected = [text(installation.node), text(installation.entry), 'run', '--state-dir', stateDir, '--background'];
+    requireValue(statSync(proc).uid === process.geteuid?.() && args.length === expected.length &&
+      args.every((arg, i) => arg === expected[i]), 'upgrade_subscriber_changed', { pid: owner.pid });
+    process.kill(owner.pid, 'SIGTERM');
+  },
+};
 
 export function backgroundStderr(line: string, fd = 2, io = { fstatSync, ftruncateSync, writeSync }): void {
   const info = io.fstatSync(fd);

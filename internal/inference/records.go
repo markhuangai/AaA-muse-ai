@@ -223,6 +223,7 @@ type Projection struct {
 	InferenceReadiness   string          `json:"inference_readiness"`
 	Qualification        *Qualification  `json:"qualification,omitempty"`
 	QualificationHistory []Qualification `json:"qualification_history"`
+	UpgradeGeneration    int64           `json:"upgrade_reservation_generation"`
 	ModelReport          *ModelReport    `json:"model_report,omitempty"`
 }
 
@@ -240,7 +241,7 @@ type Ref struct {
 	Admission, Full                          bool
 	Routing                                  bool
 	Recovery                                 bool
-	EvidenceIDs                              []string
+	UpdateRouting                            bool
 	Correlation                              map[string]any
 	ClientID, SessionID, ResponseID          string
 	ReferenceRequestID                       string

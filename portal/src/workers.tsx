@@ -1,9 +1,9 @@
 import { useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore, type FormEvent, type MouseEvent } from 'react';
-import type { Worker, Qualification, EnrollmentKind } from './worker-api';
+import type { Worker, EnrollmentKind } from './worker-api';
 import type { WorkersController, WorkersView } from './worker-controller';
 
 export const timestamp = (value: string | null) => value ? new Date(value).toISOString().replace('T', ' ').replace(/\.\d+Z$/, ' UTC') : 'Not observed';
-const states: Record<string, string> = { online: 'Online', offline: 'Offline', connecting: 'Connecting', not_observed: 'Not observed', idle: 'Idle', busy: 'Busy', unknown: 'Unknown', unverified: 'Not yet qualified', verified: 'Approved', withdrawn: 'Withdrawn', stale: 'Stale qualification' };
+const states: Record<string, string> = { online: 'Online', offline: 'Offline', connecting: 'Connecting', not_observed: 'Not observed', idle: 'Idle', busy: 'Busy', upgrading: 'Upgrading', unknown: 'Unknown' };
 const stateName = (value: string) => states[value] ?? value;
 
 function formatOfflineDuration(milliseconds: number) {
@@ -19,17 +19,6 @@ function onBackdrop(event: MouseEvent<HTMLDialogElement>) {
 
 function Correlation({ request, operation }: { request: string; operation: string }) {
   return <>{request && <p className="trace">Request <code>{request}</code></p>}{operation && <p className="trace">Operation <code>{operation}</code></p>}</>;
-}
-
-function QualificationDetail({ qualification }: { qualification: Qualification }) {
-  return <dl className="identity-list qualification-facts">
-    <div><dt>Approval action</dt><dd>{qualification.evidence.action}</dd></div>
-    <div><dt>Evidence provenance</dt><dd>{qualification.evidence.evidence_kind === 'controlled' ? 'Controlled software evidence' : qualification.evidence.evidence_kind === 'live' ? 'Live trial evidence' : 'Not reported'}</dd></div>
-    <div><dt>Recorded at</dt><dd>{timestamp(qualification.created_at)}</dd></div>
-    <div><dt>Evidence connection</dt><dd><code>{qualification.connection_id}</code> · generation {qualification.connection_generation}</dd></div>
-    <div><dt>Capabilities</dt><dd>{qualification.capabilities.join(', ') || 'None approved'}</dd></div>
-    <div><dt>Evidence reference</dt><dd>{qualification.evidence.evidence_reference}</dd></div>
-  </dl>;
 }
 
 function WorkerNotices({ view }: { view: WorkersView }) {
@@ -92,11 +81,6 @@ function WorkerDetail({ worker, controller, view }: { worker: Worker; controller
         <div><dt>Client-tool waits</dt><dd className="num">{worker.waiting_for_client_tool}</dd></div>
         <div><dt>Background wake</dt><dd>Not independently observed</dd></div>
       </dl><p className="field-note">Busy means the broker retains an assignment. Tool waits depend on the calling client. Offline does not establish whether remote work stopped.</p></section>
-      <section className="data-panel"><h3>Inference qualification</h3><p className="qualification-state">{stateName(worker.inference_readiness)}</p>
-        {worker.qualification ? <QualificationDetail qualification={worker.qualification} /> : <p>No management-approved evidence is recorded.</p>}
-        <p className="field-note">Approval stays with this enrolled worker across authenticated reconnects until withdrawn or revoked. The evidence connection records the original trial. Controlled evidence does not establish live Muse qualification.</p>
-        {worker.qualification_history.length > 0 && <details><summary>Qualification history ({worker.qualification_history.length})</summary><ol className="qualification-history">{worker.qualification_history.map(item => <li key={item.id}><QualificationDetail qualification={item} /></li>)}</ol></details>}
-      </section>
     </div>
     <dialog ref={dialog} aria-labelledby="revoke-title" aria-describedby="revoke-description" onCancel={event => { event.stopPropagation(); setConfirming(false); }} onClose={() => setConfirming(false)}>
       <h2 id="revoke-title">Revoke this worker?</h2><p className="confirm-identity">{worker.name}<br /><code>{worker.id}</code></p><p id="revoke-description">This blocks access for every copy of this worker credential. Registration and history are retained. Remote activity may remain unknown.</p>
@@ -159,9 +143,9 @@ export function Workers({ controller }: { controller: WorkersController }) {
     {!selected && <WorkerNotices view={view} />}
     {!view.actionMessage && view.actionRequestID && view.enrollmentMessage && <Correlation request={view.actionRequestID} operation={view.actionOperationID} />}
     <section className="worker-list" aria-label="Registered workers" aria-busy={view.loading}>
-      <p className="scope-note">Subscriber health, broker activity and inference qualification are independent observations. Hidden Muse activity is not observable here.</p>
+      <p className="scope-note">Online workers can take new work as their slots free up.</p>
       {view.workers === null ? <p className="empty-state">{view.loading ? 'Loading registered workers…' : 'Worker information is unavailable. Use Refresh workers to retry.'}</p> : view.workers.length === 0 ? <p className="empty-state">No workers have access. Use enrollment to add a worker.</p> :
-        <table className="workers-table"><thead><tr><th scope="col">Worker identity</th><th scope="col">Subscriber</th><th scope="col">Offline for</th><th scope="col">Broker activity</th><th scope="col">Qualification</th></tr></thead><tbody>{view.workers.map(worker => <tr key={worker.id}>
+        <table className="workers-table"><thead><tr><th scope="col">Worker identity</th><th scope="col">Subscriber</th><th scope="col">Offline for</th><th scope="col">Broker activity</th></tr></thead><tbody>{view.workers.map(worker => <tr key={worker.id}>
           <td><button className="worker-name" aria-haspopup="dialog" aria-disabled={!!view.pending} onClick={event => {
             if (view.pending) return;
             opener.current = event.currentTarget; controller.select(worker.id);
@@ -172,7 +156,7 @@ export function Workers({ controller }: { controller: WorkersController }) {
             <span className="num">{worker.connection_status === 'online' || worker.offline_for_ms === undefined ? '-' :
               formatOfflineDuration(worker.offline_for_ms + (view.stale ? 0 : Math.max(0, view.offlineClock - worker.receivedAt)))}</span>
           </td>
-          <td>{stateName(worker.work_status)}<span className="row-note">{worker.waiting_for_client_tool} client-tool waits</span></td><td>{stateName(worker.inference_readiness)}<span className="row-note">{worker.qualification?.evidence.evidence_kind === 'controlled' ? 'Controlled evidence' : worker.qualification?.evidence.evidence_kind === 'live' ? 'Live trial evidence' : 'No evidence reported'}</span></td>
+          <td>{stateName(worker.work_status)}<span className="row-note">{worker.waiting_for_client_tool} client-tool waits</span></td>
         </tr>)}</tbody></table>}
     </section>
     <EnrollmentPanel controller={controller} view={view} />

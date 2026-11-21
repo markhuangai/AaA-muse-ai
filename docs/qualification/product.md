@@ -128,12 +128,12 @@ a shell subscriber as proof of a working Muse backend:
 | Stage | Action and required evidence |
 | --- | --- |
 | `enroll` | Real portal password login and two setup prompts; run once before account setup. |
-| `baseline` | Independently observed readiness and client-tool trial for each worker, initial management capability approval, eight protocol cycles, later affinity, interleaving and cross-client rejection. Native observation IDs start `baseline-readiness-a`, `baseline-tool-a`, and the corresponding `b` names. |
-| `broker-prepare` | Stops with an accepted pending client-tool call, before executing its result. Retains the service process identity, call ID, worker approval and source exports. Both workers are approved before the restart checkpoint. |
-| `broker-resume` | Owner restarts only the qualification service while retaining SQLite and diagnostics volumes. Record `product_case` for `recovery.broker-tool-wait`. The runner verifies a new service process and unchanged worker approval, then supplies the original result exactly once without requalification. |
-| `worker-restart` | Record the scoped supported worker restart. A real client tool cycle must complete on the recovered connection under unchanged approval, preserving identity and one subscriber. No reapproval, reinstall or state deletion. |
-| `refresh` | Owner approves the exact supported non-destructive refresh scope, performs it, and observes the retained hook/task recovering without a manual Muse message. A real client tool cycle verifies the recovered connection under retained worker approval. A browser reload alone cannot establish this. |
-| `replacement` | After a completed final answer with no pending tool, stop only worker A's identified subscriber. Record `recovery.replacement-full-history`. The runner requires A offline with no held assignment or client-tool wait and B online/idle with retained approval, then continues the owned Responses session with full history and original accepted tool linkage. Offline work status stays `unknown`. |
+| `baseline` | Independently observed model and client-tool trial for each worker, eight protocol cycles, later affinity, interleaving and cross-client rejection. Native observation IDs start `baseline-readiness-a`, `baseline-tool-a`, and the corresponding `b` names. |
+| `broker-prepare` | Stops with an accepted pending client-tool call before executing its result. Retains the service process identity, call ID and source exports. |
+| `broker-resume` | Owner restarts only the qualification service while retaining SQLite and diagnostics volumes. Record `product_case` for `recovery.broker-tool-wait`. The runner verifies a new service process and the original worker's pending tool wait, then supplies the original result exactly once. |
+| `worker-restart` | Record the scoped supported worker restart. A real client tool cycle must complete on the recovered connection with the same worker identity and one subscriber. |
+| `refresh` | Owner approves the exact supported non-destructive refresh scope, performs it, and observes the retained hook or task recovering without a manual Muse message. A real client tool cycle verifies the recovered connection. |
+| `replacement` | After a completed final answer with no pending tool, stop only worker A's identified subscriber. Record `recovery.replacement-full-history`. The runner requires A offline with no held assignment or client-tool wait and B online and idle, then continues the owned Responses session with full history and original accepted tool linkage. Offline work status stays `unknown`. |
 | `boundaries` | Import observed cross-worker rejection, old-generation rejection, partial-output and unresolved-work cases plus log-only diagnosis. Each needs exact operation/worker IDs and complete exports from the actual induced action. A declaration without causal broker evidence cannot pass. |
 | `portal` | Real password login, rename preserving immutable IDs, and request-history reads for the matrix's actual requests. |
 | `revoke` | Final confirmed portal revocation of only the two test workers; preceding required case receipts must exist. |
@@ -149,14 +149,11 @@ the supported-refresh path, replay an accepted client tool, or acknowledge
 uncertain native work as stopped just to continue the run. The collector does
 not install, reset, wipe or remotely restart a worker for these observations.
 
-The November 15 owner correction removes per-connection reapproval. Initial
-approval still requires independent readiness/tool proof. Before a recovery
-intervention, ensure the selected worker is approved; a deliberately withdrawn
-worker must remain withdrawn. Probe routing may withdraw a sibling worker to
-isolate selection, but never approves the recovered worker. New proof and
-approval before its first client request would mask the recovery behavior
-being tested. Retained approval is authorization, not evidence that the new
-connection has independently passed a live model trial.
+The collector establishes a session pin through a client-owned native request
+addressed to the worker under test. It includes that accepted turn in the
+following Chat or Responses history. Recovery checks join the real client
+cycle to the recovered worker and connection generation. The independent
+model and tool trials retain their own evidence in the report.
 
 The partial-output receipt requires `request_id`, nonempty `operation_ids` and
 `worker_ids`, with a matching `request.output_interrupted` and Chat/Responses

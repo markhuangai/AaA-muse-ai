@@ -72,7 +72,7 @@ func (b *Broker) SubmitMedia(ctx context.Context, l *slog.Logger, p *media.Stage
 		ref.Principal = "media-trial:" + owner
 	}
 	return b.run(ctx, l, ref, "media_create", input, func(s *inference.State, ev *[]inferenceEvent) (any, error) {
-		workers, _ := candidates(s, nil, inference.RequestInput{WorkerID: target}, false, "")
+		workers, evidence := candidates(s, nil, inference.RequestInput{WorkerID: target}, false, "")
 		var selected *inference.State
 		for _, w := range workers {
 			if supportsMedia(w.Connection, p.Record.Profile) && available(s, w.WorkerID, "") {
@@ -81,7 +81,7 @@ func (b *Broker) SubmitMedia(ctx context.Context, l *slog.Logger, p *media.Stage
 			}
 		}
 		if selected == nil {
-			return nil, inference.Reject("no_ready_worker", 503, "required_capability", mediaCapability(p.Record.Profile))
+			return nil, inference.Reject("no_ready_worker", 503, "required_capability", mediaCapability(p.Record.Profile), "candidates", evidence)
 		}
 		id, err := auth.ID(b.random)
 		if err != nil {
@@ -130,7 +130,7 @@ func mediaAssignment(s *inference.State, id string, f MediaFence, allowReceipt b
 	if s.Connection.Status(s.Now) != "online" {
 		return nil, inference.Reject("stale_assignment", 409)
 	}
-	if err := nativeEligibility(s, j); err != nil {
+	if err := jobEligibility(s, j); err != nil {
 		return nil, err
 	}
 	return j, nil

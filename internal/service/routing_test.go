@@ -4,13 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
-	"log/slog"
 	"reflect"
 	"strings"
 	"sync"
 	"testing"
-	"testing/iotest"
 	"time"
 
 	"github.com/markhuangai/AaA-muse-ai/internal/inference"
@@ -20,150 +17,11 @@ func autoInput(id string) inference.RequestInput {
 	return inference.RequestInput{Version: 1, SubmissionID: id, Messages: []inference.Item{{Type: "message", Role: "user", Text: id}}, Tools: []inference.Tool{}}
 }
 
-func qualificationTrials(t *testing.T, b *Broker, m *inferenceMemory, logger *slog.Logger, id string, c inference.Connection) (inference.Experiment, inference.Experiment) {
-	t.Helper()
-	data, err := b.Create(context.Background(), logger, inference.Create{Version: 1, SubmissionID: "ready-" + id, WorkerID: id, Messages: []inference.Item{{Type: "message", Role: "user", Text: "unpredictable-ready-" + id}}, Tools: []inference.Tool{}})
-	ready := decodeResult[inference.Experiment](t, data, err)
-	j := claimInference(t, b, logger, c, ready, "ready-claim-"+id)
-	_, err = b.Decide(context.Background(), logger, id, j.ID, submission(j, c, "ready-reply-"+id, inference.Item{Type: "final", Text: "unpredictable-ready-" + id}))
-	if err != nil {
-		t.Fatal(err)
-	}
-	tool := createInference(t, b, logger, id, "tool-"+id, 300)
-	j = claimInference(t, b, logger, c, tool, "tool-claim-"+id)
-	_, err = b.Decide(context.Background(), logger, id, j.ID, submission(j, c, "tool-call-"+id, inference.Item{Type: "tool_call", CallID: "client-call", Name: "read_file", Arguments: map[string]any{"path": "client-only"}}))
-	if err != nil {
-		t.Fatal(err)
-	}
-	data, err = b.ToolResult(context.Background(), logger, tool.ID, inference.ToolResult{Version: 1, SubmissionID: "result-" + id, CallID: "client-call", Output: "exact client-only\r\nvalue\n"})
-	tool = decodeResult[inference.Experiment](t, data, err)
-	j = claimInference(t, b, logger, c, tool, "tool-final-claim-"+id)
-	_, err = b.Decide(context.Background(), logger, id, j.ID, submission(j, c, "tool-final-"+id, inference.Item{Type: "final", Text: "exact client-only\r\nvalue\n"}))
-	if err != nil {
-		t.Fatal(err)
-	}
-	return ready, tool
-}
-
-func approvalInput(id string, ready, tool inference.Experiment) inference.QualificationInput {
-	return inference.QualificationInput{Version: 1, SubmissionID: "approve-" + id, Action: "approve", EvidenceKind: "controlled", EvidenceReference: "controlled software trial; no live qualification", ReadinessExperimentID: ready.ID, ToolExperimentID: tool.ID}
-}
-
-func TestQualificationUsesAuthenticatedTrialsAndPreservesProvenance(t *testing.T) {
-	b, m, logger, logs := inferenceFixture()
-	c := connectInference(t, b, m, logger, "worker-a")
-	ready, tool := qualificationTrials(t, b, m, logger, "worker-a", c)
-	input := approvalInput("a", ready, tool)
-	data, err := b.Qualify(context.Background(), logger, "worker-a", input)
-	q := decodeResult[inference.Qualification](t, data, err)
-	_, err = b.Qualify(context.Background(), logger, "worker-b", input)
-	requireInferenceReason(t, err, "submission_conflict")
-	if len(q.Capabilities) != 2 || q.ConnectionGeneration != c.Generation || q.Input.EvidenceKind != "controlled" || readiness(m.states["worker-a"]) != "verified" {
-		t.Fatal("qualification evidence lost", q)
-	}
-	data, err = b.Qualify(context.Background(), logger, "worker-a", input)
-	if decodeResult[inference.Qualification](t, data, err).ID != q.ID || len(m.states["worker-a"].Routing.Qualifications) != 1 {
-		t.Fatal("approval replay changed authority")
-	}
-	input.EvidenceReference = "changed"
-	_, err = b.Qualify(context.Background(), logger, "worker-a", input)
-	requireInferenceReason(t, err, "submission_conflict")
-	request := admitted(t, b, "alice", "eligible", autoInput("eligible"))
-	j := m.states[request.WorkerID].Jobs[m.states[request.WorkerID].Experiments[request.ID].CurrentJobID]
-	if j.Qualification == nil || j.Qualification.ID != q.ID {
-		t.Fatal("assignment omitted immutable qualification")
-	}
-	_, err = b.Qualify(context.Background(), logger, "worker-a", inference.QualificationInput{Version: 1, SubmissionID: "withdraw", Action: "withdraw", EvidenceReference: "operator withdrawal"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = b.Qualify(context.Background(), logger, "worker-b", inference.QualificationInput{Version: 1, SubmissionID: "withdraw", Action: "withdraw", EvidenceReference: "operator withdrawal"})
-	requireInferenceReason(t, err, "submission_conflict")
-	if len(m.states["worker-b"].Routing.Qualifications) != 0 {
-		t.Fatal("cross-worker retry changed authority")
-	}
-	if readiness(m.states["worker-a"]) != "withdrawn" || len(m.states["worker-a"].Routing.Qualifications) != 2 {
-		t.Fatal("withdrawal erased history")
-	}
-	_, err = b.Claim(context.Background(), logger, "worker-a", j.ID, inference.Claim{Version: 1, SubmissionID: "withdrawn-claim", ConnectionID: c.ID, ConnectionGeneration: c.Generation})
-	requireInferenceReason(t, err, "no_ready_worker")
-	events, err := b.Poll(context.Background(), logger, "worker-a", c.ID, c.Generation)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, event := range events {
-		if event.Type == "job.available" {
-			t.Fatal("withdrawn job offered")
-		}
-	}
-	if j.Qualification.ID != q.ID || !strings.Contains(logs.String(), "worker.qualification_changed") {
-		t.Fatal("qualification snapshot or diagnostics lost")
-	}
-}
-
-func TestQualificationRejectsUnsupportedIncompleteForeignAndStaleEvidence(t *testing.T) {
-	for _, kind := range []string{"version", "id", "action", "reference", "long-reference", "kind", "ready-id", "tool-id", "missing", "foreign", "not-completed", "native", "no-jobs", "queued-job", "wrong-generation", "wrong-echo", "tool-linkage", "offline", "revoked", "random"} {
-		t.Run(kind, func(t *testing.T) {
-			b, m, logger, _ := inferenceFixture()
-			c := connectInference(t, b, m, logger, "worker-a")
-			ready, tool := qualificationTrials(t, b, m, logger, "worker-a", c)
-			in := approvalInput("a", ready, tool)
-			s := m.states["worker-a"]
-			switch kind {
-			case "version":
-				in.Version = 2
-			case "id":
-				in.SubmissionID = "bad id"
-			case "action":
-				in.Action = "enable"
-			case "reference":
-				in.EvidenceReference = " "
-			case "long-reference":
-				in.EvidenceReference = strings.Repeat("x", 1025)
-			case "kind":
-				in.EvidenceKind = "self-reported"
-			case "ready-id":
-				in.ReadinessExperimentID = "!"
-			case "tool-id":
-				in.ToolExperimentID = "!"
-			case "missing":
-				in.ReadinessExperimentID = "missing"
-			case "foreign":
-				s.Experiments[ready.ID].WorkerID = "worker-b"
-			case "not-completed":
-				s.Experiments[ready.ID].State = "cancelled"
-			case "native":
-				s.Requests = map[string]*inference.Request{ready.ID: {ID: ready.ID, ConversationID: "not-native", WorkerID: "worker-a"}}
-				s.Conversations = map[string]*inference.Conversation{"not-native": {ID: "not-native", WorkerID: "worker-a"}}
-			case "no-jobs":
-				delete(s.Jobs, s.Experiments[ready.ID].CurrentJobID)
-			case "queued-job":
-				s.Jobs[s.Experiments[ready.ID].CurrentJobID].State = "queued"
-			case "wrong-generation":
-				s.Jobs[s.Experiments[ready.ID].CurrentJobID].ConnectionGeneration++
-			case "wrong-echo":
-				s.Experiments[ready.ID].Messages[0].Text = "changed"
-			case "tool-linkage":
-				s.Experiments[tool.ID].Messages[3].CallID = "wrong"
-			case "offline":
-				s.Connection.Connected = false
-			case "revoked":
-				s.Revoked = true
-			case "random":
-				b.random = iotest.ErrReader(errors.New("random unavailable"))
-			}
-			if _, err := b.Qualify(context.Background(), logger, "worker-a", in); err == nil {
-				t.Fatal("invalid evidence approved", kind)
-			}
-		})
-	}
-}
-
 func TestRoutingFairnessQueueIsolationAndAdmissionLimits(t *testing.T) {
 	b, m, logger, logs := inferenceFixture()
 
-	a := connectNative(t, b, m, logger, "worker-a")
-	z := connectNative(t, b, m, logger, "worker-b")
+	a := connectInference(t, b, m, logger, "worker-a")
+	z := connectInference(t, b, m, logger, "worker-b")
 	first := admitted(t, b, "alice", "a", autoInput("first"))
 	second := admitted(t, b, "alice", "b", autoInput("second"))
 	if first.WorkerID == second.WorkerID {
@@ -218,8 +76,8 @@ func TestRoutingSafeOfflineReassignmentAndExposureFence(t *testing.T) {
 		t.Run(boundary, func(t *testing.T) {
 			b, m, logger, logs := inferenceFixture()
 
-			ca := connectNative(t, b, m, logger, "worker-a")
-			connectNative(t, b, m, logger, "worker-b")
+			ca := connectInference(t, b, m, logger, "worker-a")
+			connectInference(t, b, m, logger, "worker-b")
 			in := autoInput("start")
 			if boundary == "tool-wait" {
 				in.Tools = requestInput("tools").Tools
@@ -278,104 +136,45 @@ func TestRoutingSafeOfflineReassignmentAndExposureFence(t *testing.T) {
 	}
 }
 
-func TestRoutingReconnectResumesClientWorkWithoutAnotherApproval(t *testing.T) {
-	for _, tools := range []bool{false, true} {
-		t.Run(fmt.Sprint("tools=", tools), func(t *testing.T) {
-			b, m, logger, _ := inferenceFixture()
-			ctx := context.Background()
-			c := connectInference(t, b, m, logger, "worker-a")
-			_, err := b.SubmitRequest(ctx, logger, "alice", "", autoInput("unready"))
-			requireInferenceReason(t, err, "no_ready_worker")
-			ready, trial := qualificationTrials(t, b, m, logger, "worker-a", c)
-			input := approvalInput("initial", ready, trial)
-			if !tools {
-				input.ToolExperimentID = ""
-			}
-			data, err := b.Qualify(ctx, logger, "worker-a", input)
-			q := decodeResult[inference.Qualification](t, data, err)
-			if err = b.Disconnect(ctx, logger, "worker-a", c.ID, c.Generation); err != nil {
-				t.Fatal(err)
-			}
-			reconnected := connectInference(t, b, m, logger, "worker-a")
-			state := m.states["worker-a"]
-			if readiness(state) != "verified" || reconnected.Generation <= c.Generation || reconnected.ID == c.ID {
-				t.Fatal("authenticated reconnect lost approval or reused connection authority")
-			}
-			if !reflect.DeepEqual(state.Routing.Qualifications, []inference.Qualification{q}) {
-				t.Fatal("reconnect rewrote historical qualification evidence")
-			}
-			_, err = b.Heartbeat(ctx, logger, "worker-a", inference.Heartbeat{Version: 1, ConnectionID: c.ID, Generation: c.Generation, ChallengeID: c.Challenges[0].ID})
-			requireInferenceReason(t, err, "stale_connection")
-			input.SubmissionID = "new-approval-with-old-evidence"
-			_, err = b.Qualify(ctx, logger, "worker-a", input)
-			requireInferenceReason(t, err, "qualification_evidence_stale")
-			request := autoInput("after-reconnect")
-			if tools {
-				request = requestInput("after-reconnect")
-			} else {
-				_, err = b.SubmitRequest(ctx, logger, "alice", "", requestInput("unapproved-tool"))
-				requireInferenceReason(t, err, "no_ready_worker")
-			}
-			v := admitted(t, b, "alice", "recovered-session", request)
-			j := nativeJob(t, b, m, reconnected, v)
-			if j.Qualification == nil || !reflect.DeepEqual(*j.Qualification, q) || j.ConnectionID != reconnected.ID || j.ConnectionGeneration != reconnected.Generation {
-				t.Fatal("recovered assignment lost approval provenance or current connection fencing")
-			}
-			_, err = b.Decide(ctx, logger, "worker-a", j.ID, submission(j, c, "old-connection", inference.Item{Type: "final", Text: "old"}))
-			requireInferenceReason(t, err, "stale_connection")
-			_, err = b.Decide(ctx, logger, "worker-a", j.ID, submission(j, reconnected, "recovered-final", inference.Item{Type: "final", Text: "recovered answer"}))
-			if err != nil {
-				t.Fatal(err)
-			}
-			result, err := b.ReadRequest(ctx, logger, "alice", v.ID, "")
-			if err != nil || result.State != "completed" || result.Output == nil || result.Output.Text != "recovered answer" || len(m.states["worker-a"].Routing.Qualifications) != 1 {
-				t.Fatal("client work did not complete under retained approval", result, err)
-			}
-		})
+func TestRoutingReconnectWithArchivedWithdrawal(t *testing.T) {
+	b, m, logger, _ := inferenceFixture()
+	ctx := context.Background()
+	c := connectInference(t, b, m, logger, "worker-a")
+	evidence := []inference.Qualification{{ID: "withdrawn", WorkerID: "worker-a", ConnectionID: c.ID,
+		ConnectionGeneration: c.Generation, Input: inference.QualificationInput{Action: "withdraw", EvidenceReference: "historical"}}}
+	m.states["worker-a"].Routing.Qualifications = evidence
+	if err := b.Disconnect(ctx, logger, "worker-a", c.ID, c.Generation); err != nil {
+		t.Fatal(err)
 	}
-}
-
-func TestRoutingReconnectPreservesWithdrawalAndRevocation(t *testing.T) {
-	for _, revoked := range []bool{false, true} {
-		t.Run(fmt.Sprint("revoked=", revoked), func(t *testing.T) {
-			b, m, logger, _ := inferenceFixture()
-			ctx := context.Background()
-			c := connectInference(t, b, m, logger, "worker-a")
-			ready, tool := qualificationTrials(t, b, m, logger, "worker-a", c)
-			if _, err := b.Qualify(ctx, logger, "worker-a", approvalInput("initial", ready, tool)); err != nil {
-				t.Fatal(err)
-			}
-			if revoked {
-				m.states["worker-a"].Revoked = true
-			} else if _, err := b.Qualify(ctx, logger, "worker-a", inference.QualificationInput{Version: 1, SubmissionID: "withdraw", Action: "withdraw", EvidenceReference: "operator withdrawal"}); err != nil {
-				t.Fatal(err)
-			}
-			if err := b.Disconnect(ctx, logger, "worker-a", c.ID, c.Generation); err != nil {
-				t.Fatal(err)
-			}
-			if revoked {
-				_, err := b.Open(ctx, logger, "worker-a", nil)
-				requireInferenceReason(t, err, "worker_revoked")
-			} else {
-				connectInference(t, b, m, logger, "worker-a")
-				if readiness(m.states["worker-a"]) != "withdrawn" {
-					t.Fatal("reconnect restored withdrawn approval")
-				}
-			}
-			_, err := b.SubmitRequest(ctx, logger, "alice", "", autoInput("denied"))
-			requireInferenceReason(t, err, "no_ready_worker")
-		})
+	_, err := b.SubmitRequest(ctx, logger, "alice", "", autoInput("offline"))
+	requireInferenceReason(t, err, "no_ready_worker")
+	reconnected := connectInference(t, b, m, logger, "worker-a")
+	v := admitted(t, b, "alice", "recovered-session", requestInput("recovered"))
+	j := nativeJob(t, b, m, reconnected, v)
+	if j.Qualification != nil || j.ConnectionGeneration != reconnected.Generation || reconnected.Generation <= c.Generation {
+		t.Fatal("recovered assignment lost fencing or included a qualification")
 	}
+	_, err = b.Decide(ctx, logger, "worker-a", j.ID, submission(j, c, "old-connection", inference.Item{Type: "final", Text: "old"}))
+	requireInferenceReason(t, err, "stale_connection")
+	_, err = b.Decide(ctx, logger, "worker-a", j.ID, submission(j, reconnected, "recovered-final", inference.Item{Type: "final", Text: "recovered answer"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := b.ReadRequest(ctx, logger, "alice", v.ID, "")
+	projection := project(m.states["worker-a"])
+	if err != nil || result.Output == nil || result.Output.Text != "recovered answer" ||
+		projection.InferenceReadiness != "withdrawn" || !reflect.DeepEqual(projection.QualificationHistory, evidence) {
+		t.Fatal("client work or archived evidence was lost", result, err)
+	}
+	m.states["worker-a"].Revoked = true
+	_, err = b.SubmitRequest(ctx, logger, "alice", "", autoInput("revoked"))
+	requireInferenceReason(t, err, "no_ready_worker")
 }
 
 func TestRoutingReconnectKeepsUncertainWorkHeld(t *testing.T) {
 	b, m, logger, _ := inferenceFixture()
 	ctx := context.Background()
 	c := connectInference(t, b, m, logger, "worker-a")
-	ready, tool := qualificationTrials(t, b, m, logger, "worker-a", c)
-	if _, err := b.Qualify(ctx, logger, "worker-a", approvalInput("initial", ready, tool)); err != nil {
-		t.Fatal(err)
-	}
 	first := admitted(t, b, "alice", "uncertain", autoInput("claimed"))
 	j := nativeJob(t, b, m, c, first)
 	if err := b.Disconnect(ctx, logger, "worker-a", c.ID, c.Generation); err != nil {
@@ -387,7 +186,7 @@ func TestRoutingReconnectKeepsUncertainWorkHeld(t *testing.T) {
 		t.Fatal(err)
 	}
 	state := m.states["worker-a"]
-	if readiness(state) != "verified" || !state.Jobs[j.ID].Held || state.Experiments[first.ID].RemoteOutcome != "unknown" || next.WorkerID != "" || next.State != "queued" || state.Requests[next.ID] != nil || state.Connection.AssignmentGeneration != j.Generation {
+	if !state.Jobs[j.ID].Held || state.Experiments[first.ID].RemoteOutcome != "unknown" || next.WorkerID != "" || next.State != "queued" || state.Requests[next.ID] != nil || state.Connection.AssignmentGeneration != j.Generation {
 		t.Fatal("reconnect released uncertain work or assigned new work over its hold")
 	}
 	_, err := b.Decide(ctx, logger, "worker-a", j.ID, submission(j, c, "late-uncertain", inference.Item{Type: "final", Text: "late"}))
@@ -397,7 +196,7 @@ func TestRoutingReconnectKeepsUncertainWorkHeld(t *testing.T) {
 func TestRoutingQueueDeadlineCancellationAndConcurrentSession(t *testing.T) {
 	b, m, logger, _ := inferenceFixture()
 
-	connectNative(t, b, m, logger, "worker-a")
+	connectInference(t, b, m, logger, "worker-a")
 	v := admitted(t, b, "alice", "busy", autoInput("reserved"))
 	_ = v
 	input := autoInput("deadline")
@@ -450,8 +249,8 @@ func TestRoutingQueueDeadlineCancellationAndConcurrentSession(t *testing.T) {
 func TestRoutingLeastRecentSelectionAndBlockedPinDoesNotStarveAnotherSession(t *testing.T) {
 	b, m, logger, _ := inferenceFixture()
 
-	ca := connectNative(t, b, m, logger, "worker-a")
-	cz := connectNative(t, b, m, logger, "worker-b")
+	ca := connectInference(t, b, m, logger, "worker-a")
+	cz := connectInference(t, b, m, logger, "worker-b")
 	a := admitted(t, b, "alice", "a", autoInput("a"))
 	nativeDecide(t, b, m, ca, a, inference.Item{Type: "final", Text: "A"})
 	z := admitted(t, b, "alice", "z", autoInput("z"))
@@ -488,8 +287,8 @@ func TestRoutingLeastRecentSelectionAndBlockedPinDoesNotStarveAnotherSession(t *
 func TestRoutingFirstAssignmentAndConstrainedWaitDoNotEstablishMovementAuthority(t *testing.T) {
 	b, m, logger, _ := inferenceFixture()
 
-	connectNative(t, b, m, logger, "worker-a")
-	connectNative(t, b, m, logger, "worker-b")
+	connectInference(t, b, m, logger, "worker-a")
+	connectInference(t, b, m, logger, "worker-b")
 	first := admitted(t, b, "alice", "first", autoInput("first"))
 	constraint := autoInput("constrained")
 	constraint.WorkerID = first.WorkerID

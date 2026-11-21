@@ -36,7 +36,7 @@ func responseRequestBody(stream bool) map[string]any {
 func TestResponsesHTTPProductionLogicAndProtectedEvidence(t *testing.T) {
 	for _, stream := range []bool{false, true} {
 		h, m, worker, key := inferenceHTTPFixture(t)
-		c := onlineNativeHTTP(t, h, m, worker.ID)
+		c := onlineHTTP(t, h, worker.ID)
 		completeChatOnWait(t, h, m, c, key, inference.Item{Type: "final", Text: "exact\r\n😀"})
 		w := &chatWriter{ResponseRecorder: httptest.NewRecorder()}
 		runResponseHTTP(t, h, w, responseRequestBody(stream), "response-session")
@@ -81,7 +81,7 @@ func TestResponsesHTTPFailedWritesNeverCompleteOrRegenerate(t *testing.T) {
 	for _, mode := range []string{"write", "flush", "start-deadline", "frame-deadline"} {
 		t.Run(mode, func(t *testing.T) {
 			h, m, worker, key := inferenceHTTPFixture(t)
-			c := onlineNativeHTTP(t, h, m, worker.ID)
+			c := onlineHTTP(t, h, worker.ID)
 			completeChatOnWait(t, h, m, c, key, inference.Item{Type: "final", Text: "accepted once"})
 			w := &chatWriter{ResponseRecorder: httptest.NewRecorder()}
 			switch mode {
@@ -148,7 +148,7 @@ func TestResponsesCancellationAfterAcceptanceRetainsOutputWithoutFallback(t *tes
 	for _, boundary := range []string{"before-exposure", "after-created"} {
 		t.Run(boundary, func(t *testing.T) {
 			h, m, worker, key := inferenceHTTPFixture(t)
-			c := onlineNativeHTTP(t, h, m, worker.ID)
+			c := onlineHTTP(t, h, worker.ID)
 			completeChatOnWait(t, h, m, c, key, inference.Item{Type: "final", Text: "accepted exactly once"})
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
@@ -189,7 +189,7 @@ func TestResponsesCancellationAfterAcceptanceRetainsOutputWithoutFallback(t *tes
 func TestResponsesHTTPAdmittedFailureAndAbort(t *testing.T) {
 	for _, abort := range []bool{false, true} {
 		h, m, worker, _ := inferenceHTTPFixture(t)
-		onlineNativeHTTP(t, h, m, worker.ID)
+		onlineHTTP(t, h, worker.ID)
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		h.Broker.Wait = func(context.Context, time.Duration) error {
@@ -224,7 +224,7 @@ func TestResponsesHTTPEarlyRejectionsAndDependencyFailures(t *testing.T) {
 	for _, mode := range []string{"schema", "session", "broker", "storage", "wait", "encoding"} {
 		t.Run(mode, func(t *testing.T) {
 			h, m, worker, key := inferenceHTTPFixture(t)
-			c := onlineNativeHTTP(t, h, m, worker.ID)
+			c := onlineHTTP(t, h, worker.ID)
 			body := responseRequestBody(false)
 			session := "errors"
 			switch mode {

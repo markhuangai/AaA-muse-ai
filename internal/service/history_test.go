@@ -98,7 +98,7 @@ func nativeDecide(t *testing.T, b *Broker, m *inferenceMemory, c inference.Conne
 func TestNativeCanonicalToolLoopReplayAndSnapshots(t *testing.T) {
 	b, m, logger, logs := inferenceFixture()
 	ctx := context.Background()
-	c := connectNative(t, b, m, logger, "worker-a")
+	c := connectInference(t, b, m, logger, "worker-a")
 	input := requestInput("first")
 	v := admitted(t, b, "alice", "session-a", input)
 	if v.SessionID != "session-a" || v.Output != nil {
@@ -191,7 +191,7 @@ func TestNativeCanonicalToolLoopReplayAndSnapshots(t *testing.T) {
 func TestNativeOwnershipIdentityAndBoundaryPersistence(t *testing.T) {
 	b, m, logger, logs := inferenceFixture()
 	ctx := context.Background()
-	c := connectNative(t, b, m, logger, "worker-a")
+	c := connectInference(t, b, m, logger, "worker-a")
 	input := requestInput("owned")
 	v := admitted(t, b, "alice", "shared-name", input)
 	other := admitted(t, b, "bob", "shared-name", requestInput("other"))
@@ -273,7 +273,7 @@ func TestNativeOwnershipIdentityAndBoundaryPersistence(t *testing.T) {
 func TestNativeConflictsAtomicFailureAndConcurrency(t *testing.T) {
 	b, m, logger, _ := inferenceFixture()
 	ctx := context.Background()
-	c := connectNative(t, b, m, logger, "worker-a")
+	c := connectInference(t, b, m, logger, "worker-a")
 	v := admitted(t, b, "alice", "race", requestInput("initial"))
 	nativeDecide(t, b, m, c, v, inference.Item{Type: "final", Text: "answer\n"})
 	base := inference.Messages(m.states["worker-a"].Conversations[v.ConversationID], 3)
@@ -368,7 +368,7 @@ func TestNativeValidationAndDependencyErrors(t *testing.T) {
 	_, err := b.SubmitRequest(ctx, logger, "alice", "offline", requestInput("offline"))
 	requireInferenceReason(t, err, "no_ready_worker")
 	requireCandidateReason(t, err, "worker-a", "worker_offline")
-	connectNative(t, b, m, logger, "worker-a")
+	connectInference(t, b, m, logger, "worker-a")
 	m.states["worker-a"].Revoked = true
 	_, err = b.SubmitRequest(ctx, logger, "alice", "revoked", requestInput("revoked"))
 	requireInferenceReason(t, err, "no_ready_worker")
@@ -402,7 +402,7 @@ func TestNativeValidationAndDependencyErrors(t *testing.T) {
 
 func TestNativeDecisionIdentifierFailureRemainsRetryable(t *testing.T) {
 	b, m, logger, _ := inferenceFixture()
-	c := connectNative(t, b, m, logger, "worker-a")
+	c := connectInference(t, b, m, logger, "worker-a")
 	v := admitted(t, b, "alice", "session", requestInput("first"))
 	job := nativeJob(t, b, m, c, v)
 	body := submission(job, c, "decision", inference.Item{Type: "final", Text: "result"})
@@ -453,10 +453,4 @@ func TestReconciliationRejectsUnsupportedAndConflictingItems(t *testing.T) {
 	if err := reconcileHistory(c, input); err == nil {
 		t.Fatal("invalid result fields accepted")
 	}
-}
-
-func connectNative(t *testing.T, b *Broker, m *inferenceMemory, logger *slog.Logger, id string) inference.Connection {
-	c := connectInference(t, b, m, logger, id)
-	m.states[id].Routing.Qualifications = []inference.Qualification{{ID: "fixture-qualification", WorkerID: id, ConnectionID: c.ID, ConnectionGeneration: c.Generation, Capabilities: []string{"text", "function_tools"}, Input: inference.QualificationInput{Action: "approve", EvidenceKind: "controlled"}}}
-	return c
 }

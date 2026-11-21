@@ -144,6 +144,15 @@ func (r *Repository) WithinInference(ctx context.Context, ref inference.Ref, app
 		if err = apply(s); err != nil {
 			return err
 		}
+		if ref.UpdateRouting {
+			data, err = json.Marshal(s.Routing)
+			if err != nil {
+				return err
+			}
+			if err = saveRouting(ctx, tx, s.WorkerID, data); err != nil {
+				return err
+			}
+		}
 		if err = saveInference(ctx, tx, ref, s, before); err != nil {
 			return err
 		}
@@ -154,8 +163,8 @@ func (r *Repository) WithinInference(ctx context.Context, ref inference.Ref, app
 func loadInference(ctx context.Context, tx *sql.Tx, ref inference.Ref, s *inference.State) error {
 	rows, err := tx.QueryContext(ctx, `SELECT data FROM aaa_experiments WHERE (worker_id=?1 OR (worker_id IS NULL AND ?1='')) AND
 		(state NOT IN ('completed','cancelled','interrupted') OR id=?2 OR id IN
-		(SELECT experiment_id FROM aaa_inference_jobs WHERE id=?3 OR held) OR id IN (SELECT value FROM json_each(?4))
-		OR (?5 AND id IN (`+recoveryRequests+`))) ORDER BY id`, s.WorkerID, ref.ExperimentID, ref.BaseJobID, idList(ref.EvidenceIDs), ref.Recovery)
+		(SELECT experiment_id FROM aaa_inference_jobs WHERE id=?3 OR held)
+		OR (?4 AND id IN (`+recoveryRequests+`))) ORDER BY id`, s.WorkerID, ref.ExperimentID, ref.BaseJobID, ref.Recovery)
 	if err != nil {
 		return err
 	}
@@ -211,8 +220,8 @@ func loadInference(ctx context.Context, tx *sql.Tx, ref inference.Ref, s *infere
 	}
 	rows, err = tx.QueryContext(ctx, `SELECT data, CASE WHEN ?4 THEN context ELSE NULL END FROM aaa_inference_jobs
 		WHERE worker_id=?1 AND (state IN ('queued','claimed') OR held OR id=?2 OR id=?3 OR
-		id=(SELECT current_job_id FROM aaa_experiments WHERE id=?5) OR experiment_id IN (SELECT value FROM json_each(?6))
-		OR experiment_id IN (SELECT value FROM json_each(?7))) ORDER BY id`, s.WorkerID, ref.JobID, ref.BaseJobID, ref.Full, ref.ExperimentID, idList(ref.EvidenceIDs), idList(ids))
+		id=(SELECT current_job_id FROM aaa_experiments WHERE id=?5)
+		OR experiment_id IN (SELECT value FROM json_each(?6))) ORDER BY id`, s.WorkerID, ref.JobID, ref.BaseJobID, ref.Full, ref.ExperimentID, idList(ids))
 	if err != nil {
 		return err
 	}

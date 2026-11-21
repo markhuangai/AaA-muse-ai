@@ -14,18 +14,10 @@ async function api(path, body) {
   need(response.ok, 'product_management_failed');
   return response;
 }
-async function select(slot, retainApproval = false) {
-  const { workers } = await (await api('/api/v1/admin/workers')).json();
-  if (retainApproval) need(workers.some(worker => worker.id === fixture.workers.find(value => value.slot === slot).worker_id && worker.inference_readiness === 'verified' && worker.qualification?.evidence.action === 'approve'), 'retained_worker_approval_required');
-  for (const worker of fixture.workers) {
-    const approve = worker.slot === slot || slot === 'all', current = workers.find(value => value.id === worker.worker_id);
-    if (approve && current?.inference_readiness === 'verified' || !approve && current?.qualification?.evidence.action === 'withdraw') continue;
-    await api(`/api/v1/admin/workers/${worker.worker_id}/qualifications`, {
-      protocol_version: 1, submission_id: randomUUID(), action: approve ? 'approve' : 'withdraw', evidence_kind: 'controlled',
-      evidence_reference: 'Packed installer/subscriber controlled software flow; no live Muse qualification.',
-      ...(approve ? worker.qualification : {}),
-    });
-  }
+async function startOnWorker(item) {
+  const worker = fixture.workers.find(value => value.slot === item.slot);
+  await driver.pin(item, worker.worker_id);
+  await driver.start(item);
 }
 function make(id, slot, protocol = 'chat', stream = false) {
   const item = cycle({ id, slot, protocol, stream, fixture: fixture.fixtures[id], session: 'product-' + randomUUID() });
@@ -41,18 +33,16 @@ async function capture(item) {
 try {
   if (fixture.phase === 'matrix') {
     for (const slot of ['a', 'b']) {
-      await select(slot);
       for (const protocol of ['chat', 'responses']) for (const stream of [false, true]) {
         const id = `${slot}.${protocol}.${stream ? 'sse' : 'json'}`, item = make(id, slot, protocol, stream);
-        await driver.start(item); await driver.finish(item);
+        await startOnWorker(item); await driver.finish(item);
         await driver.followup(item, 'affinity-' + id);
         output.cases.push(await capture(item));
       }
     }
     const a = make('interleave-a', 'a'), b = make('interleave-b', 'b', 'responses', true);
-    await select('a'); await driver.start(a);
-    await select('b'); await driver.start(b);
-    await select('all');
+    await startOnWorker(a);
+    await startOnWorker(b);
     await driver.finish(b); await driver.finish(a);
     const captured = await Promise.all([capture(a), capture(b)]);
     need(captured[0].conversation_id !== captured[1].conversation_id && captured[0].session_id !== captured[1].session_id, 'product_sessions_joined');
@@ -62,17 +52,14 @@ try {
     const boundary = await driver.rejectOtherClient(b);
     output.cases.push({ id: 'boundary.cross-client', outcome: 'passed', ...boundary });
   } else if (fixture.phase === 'prepare-restart') {
-    await select('a');
-    const item = make('restart', 'a'); await driver.start(item);
-    await select('all');
+    const item = make('restart', 'a'); await startOnWorker(item);
     output.cases.push(await capture(item));
   } else if (fixture.phase === 'resume-restart') {
     const item = fixture.cycle; output.cycles.push(item);
     await driver.finish(item); output.cases.push({ ...await capture(item), id: 'recovery.broker-tool-wait' });
   } else if (fixture.phase === 'worker-recovery' || fixture.phase === 'watchdog-recovery') {
-    await select('b', true);
     const watchdog = fixture.phase === 'watchdog-recovery';
-    const item = make(watchdog ? 'watchdog-probe' : 'worker-probe', 'b'); await driver.start(item); await driver.finish(item);
+    const item = make(watchdog ? 'watchdog-probe' : 'worker-probe', 'b'); await startOnWorker(item); await driver.finish(item);
     output.cases.push({ ...await capture(item), id: watchdog ? 'recovery.watchdog' : 'recovery.worker' });
   } else if (fixture.phase === 'replacement') {
     const item = fixture.cycle; item.replay_source_case_id = item.id; item.measured_from_turn = item.turns.length; item.id = 'replacement'; item.started_at = new Date().toISOString(); item.followup = undefined; output.cycles.push(item);

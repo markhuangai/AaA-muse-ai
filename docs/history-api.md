@@ -60,7 +60,7 @@ An optional `previous_response_id` resolves an owned, completed decision to its 
 
 Exact retries use the same submission ID and original correlation fields. Changing those inputs under the same ID returns 409. An identified request whose normalized input exactly matches an admitted request returns that existing request without appending history or creating work. Uncorrelated requests with different submission IDs stay independent.
 
-Other shortened/conflicting prefixes, unmatched/reused tool calls or results, and simultaneous new turns in the same session fail explicitly. Native requests do not queue overlapping session turns. Foreign and unknown request/response identifiers both return 404. Invalid/unsupported input returns 400, context/body overflow returns 413, `no_ready_worker` returns 503 when no permitted qualified online target exists, and storage unavailability returns 503. Online transport does not establish model readiness.
+Other shortened/conflicting prefixes, unmatched/reused tool calls or results, and simultaneous new turns in the same session fail explicitly. Native requests do not queue overlapping session turns. Foreign and unknown request/response identifiers both return 404. Invalid/unsupported input returns 400, context/body overflow returns 413, `no_ready_worker` returns 503 when no permitted online target exists, and storage unavailability returns 503. Online transport does not establish model readiness.
 
 Bodies and complete delivered contexts remain bounded at 1 MiB. Reaching that bound fails instead of trimming history. Canonical history, request snapshots and events have no automatic expiry or deletion API; storage grows with accepted work and operators must plan database capacity. Diagnostic retention is separate.
 
@@ -105,35 +105,17 @@ The SQLite schema starts at version 1 with a checksummed ledger. It supports pen
 
 `make test-history` runs the real service/SQLite/SSE software scenarios with controlled worker decisions, including log-only diagnosis and cleanup. Those results do not qualify live Muse wake, reasoning, account-memory isolation, refresh recovery, or client compatibility.
 
-## Qualification and dispatch
+## Worker dispatch
 
-Management-only `POST /api/v1/admin/workers/{id}/qualifications` records idempotent commands. Approval uses:
+An authenticated worker with a current heartbeat is eligible for text and tool requests. Dispatch assigns a job only when the worker has a free slot. An existing session pin or explicit worker constraint applies. Media also requires the advertised media and format support. Text waits under its request deadline when eligible workers are busy. A queued assignment, a held job, or an upgrade reservation occupies that worker's slot.
 
-```json
-{
-  "protocol_version": 1,
-  "submission_id": "approval-retry-identity",
-  "action": "approve",
-  "evidence_kind": "controlled",
-  "evidence_reference": "Exact protected trial receipt or observation reference",
-  "readiness_experiment_id": "completed-management-readiness-experiment",
-  "tool_experiment_id": "completed-management-client-tool-experiment"
-}
-```
+The retired management `POST /api/v1/admin/workers/{id}/qualifications` returns `410 qualification_retired` after authorization. The v1 status fields `inference_readiness`, `qualification`, and `qualification_history` describe recorded historical evidence. Archived withdrawals describe past decisions. Revocation blocks access for all copies of a worker credential. Management may still run explicit-worker experiments to observe actual wake and model behavior.
 
-The reference is nonempty and at most 1,024 UTF-8 bytes. `evidence_kind` is `controlled` or `live`; it describes the operator's evidence, not a broker-certified live PoC verdict. The broker checks accepted authenticated worker decisions, ownership, current connection generation, an exact challenge echo, and an optional complete client-tool call/result/final chain. Omit the tool experiment for text-only capability. Management attests independent unattended conditions and semantic correctness; the broker cannot independently observe those external facts. Heartbeats, aliases and worker self-report never establish inference readiness or vendor identity.
+Workers retain their enrolled identity across authenticated reconnects. Current connection health, single-turn capacity, and assignment fencing govern work. Reconnecting preserves uncertain busy holds and their original receipts. Dispatch orders ready requests by creation time and stable ID, skips blocked pins, and picks the eligible worker least recently assigned. Same-session overlaps still return `409 session_busy`.
 
-A withdrawal supplies `protocol_version`, `submission_id`, `action: "withdraw"` and `evidence_reference`. It stops new native dispatch/offers/claims while preserving qualification history, existing assignment snapshots, and any already-claimed outcome. It does not cancel remote inference or revoke the worker credential. Worker/client/portal credentials cannot approve or withdraw qualification. Management experiments retain explicit-worker access to establish evidence and still obey health, admission, lease and single-held-turn rules.
+Use the protected export route with `?request_id=HTTP_REQUEST_ID`, then `?operation_id=NATIVE_REQUEST_ID`. Reconstruct each export with `decodeExport` from `tools/qualification-evidence.mjs` and verify completeness and chunk digests. `dispatch.queued` and `dispatch.assigned` record worker selection, connection generation, capacity and timing. `dispatch.rejected` records candidate exclusions. The worker upgrade reservation logs the operation, worker, lease generation and expiry with its HTTP request. [Worker upgrade procedure](releases.md#existing-worker-upgrade-prompt)
 
-Worker management/status records separately expose connection status, work status, waiting client-tool count, `inference_readiness` (`unverified`, `verified` or `withdrawn`), latest `qualification`, and `qualification_history`. `verified` means the latest capability approval belongs to this enrolled worker; inspect its provenance. The November 15 owner correction retains that approval across authenticated reconnects and worker/service restarts. The worker reuses its protected durable credential without re-enrollment, a new token exchange, new trials or management reapproval. The qualification's connection ID/generation, time and provenance remain the original evidence, not a new-generation observation. Older services reported `stale` after reconnect.
-
-New approval still requires completed trials on the current connection. Explicit withdrawal survives reconnect, and revoked credentials cannot reconnect. A replacement enrolled identity needs its own approval. Current connection health, capability limits, single-held-turn capacity and assignment fencing still govern work. Reconnecting never releases uncertain busy holds or retries remote inference. Recovery validation must continue real client work without reapproving the recovered worker; successful authentication alone is insufficient.
-
-Dispatch orders queued requests by creation time and stable ID, skips blocked pins, and selects available eligible workers by least recent dispatch with stable worker-ID ties. Text is always required; supplied tools or historical tool items also require `function_tools`. Each worker holds at most one inference turn. Independent workers can run concurrently, and eligible busy workers leave requests queued until a slot opens or the deadline expires. `timeout_seconds` defaults to 300 and accepts 1–3600 seconds. Same-session overlaps still return `409 session_busy`; callers continue after the current decision using full canonical history.
-
-Use the existing protected export route first with `?request_id=HTTP_REQUEST_ID`, then with `?operation_id=NATIVE_REQUEST_ID`. Reconstruct through `decodeExport` from `tools/qualification-evidence.mjs`; require complete metadata and validated chunks/digests. Filter by owner, conversation, job and connection generation across broker exports. `dispatch.queued` and `dispatch.assigned` INFO include queue timing, candidates, selection reasons and qualification provenance. `dispatch.rejected` WARN identifies eligibility failures. Record matching qualification for an eligible worker. For queued work, inspect the worker reservations and deadline in `dispatch.queued`. `dispatch.pin_conflict` WARN identifies conflicting selections; use the owned session and its pinned worker. `dispatch.reassigned` INFO records the old/new identities and safe pre-claim/pre-context boundary. Existing deadline/outcome and causal storage events identify stalls and rollback. No business-table query or process attachment is needed for diagnosis.
-
-`make test-routing` exercises competing real HTTP/SQLite/SSE software paths through two broker processes, qualification provenance, queue limits, owner/session isolation, pinning and safe/unsafe offline boundaries, with protected diagnostic reconstruction and resource-cleanup receipts. Controlled peers never qualify live Muse behavior. No live probe scheduler or PoC/release configuration selector is provided.
+`make test-routing` exercises competing HTTP, SQLite and SSE paths through two broker processes, queue limits, owner and session isolation, pinning, and offline boundaries with controlled peers.
 
 ## OpenAI Chat Completions
 
@@ -265,7 +247,7 @@ Responses metadata is additive in existing request JSON. Existing records withou
 
 `make test-responses` reuses the broker/SQLite/SSE harness and `tools/openai-conformance.mjs --protocol responses`. The existing Chat invocation remains unchanged. The runner still takes `--base-url`, `--fixture`, and `--receipt`, and obtains its model-client credential only from `MUSE_CHAT_CLIENT_KEY`. SDK/raw HTTP and JSON/SSE cases execute only the exact permitted local `read_file` fixture and check its exact result, full replay, chained continuation, and retry identity.
 
-The same suite runs ten synchronized clients through two brokers on one SQLite file, with two qualified controlled workers answering after five seconds, request history reads once per second, and actual worker heartbeats. The safe Responses receipt records sample counts, completed requests per second, broker admission and claim p95, queue and client latency, and the longest heartbeat gap for the measured host and workload.
+The same suite runs ten synchronized clients through two brokers on one SQLite file, with two controlled workers answering after five seconds, request history reads once per second, and actual worker heartbeats. The safe Responses receipt records sample counts, completed requests per second, broker admission and claim p95, queue and client latency, and the longest heartbeat gap for the measured host and workload.
 
 Read `db.connected` and `readiness.changed` from `docker compose logs service`. For a busy startup, `db.retry_scheduled` includes cause, SQLite code, attempt and delay. For a failed open or schema check, `db.connect_failed` or `db.migration_failed` identifies the file, phase and expected or observed settings. Release an identified writer lock, restore private state-directory access, or restore a verified SQLite backup according to the recorded cause. After recovery, filter the authenticated protected export by the startup `operation_id`. For an affected request, export first by `request_id` and then its linked `operation_id`. The `decodeExport` decoder validates capture and digest completeness. SQLite exchanges include code, phase, elapsed time and transaction outcome. Preserve uncertain work when the commit outcome cannot be confirmed.
 

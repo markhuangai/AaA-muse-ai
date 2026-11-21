@@ -8,11 +8,67 @@ import (
 	"github.com/markhuangai/AaA-muse-ai/internal/inference"
 )
 
+func poolWorker(s *inference.State, id string) *inference.State {
+	if s.Pool != nil {
+		return s.Pool[id]
+	}
+	if s.WorkerID == id {
+		return s
+	}
+	return nil
+}
+
+func historicalReadiness(s *inference.State) string {
+	q := s.Routing.Latest()
+	if q == nil {
+		return "unverified"
+	}
+	if q.Input.Action != "approve" {
+		return "withdrawn"
+	}
+	return "verified"
+}
+
+func connectionEligibility(w *inference.State) string {
+	switch {
+	case w == nil:
+		return "worker_not_found"
+	case w.Revoked:
+		return "worker_revoked"
+	case w.Connection.Status(w.Now) != "online":
+		return "worker_offline"
+	}
+	return ""
+}
+
+func upgradeBlock(s *inference.State, worker string) error {
+	w := poolWorker(s, worker)
+	if w != nil && w.Routing.Upgrade.Active(s.Now) {
+		return inference.Reject("worker_upgrading", 409, "worker_id", worker, "upgrade_expires_at", w.Routing.Upgrade.ExpiresAt)
+	}
+	return nil
+}
+
+func jobEligibility(s *inference.State, j *inference.Job) error {
+	if err := upgradeBlock(s, j.WorkerID); err != nil {
+		return err
+	}
+	w := poolWorker(s, j.WorkerID)
+	if j.Media != nil || s.Requests[j.ExperimentID] != nil {
+		if reason := connectionEligibility(w); reason != "" {
+			return inference.Reject("no_ready_worker", 503, "worker_id", j.WorkerID, "eligibility_reason", reason)
+		}
+	}
+	if j.Media != nil && !supportsMedia(w.Connection, j.Media.Profile) {
+		return inference.Reject("media_worker_unsupported", 409, "required_capability", mediaCapability(j.Media.Profile))
+	}
+	return nil
+}
+
 func candidates(s *inference.State, c *inference.Conversation, input inference.RequestInput, movable bool, ownJob string) ([]*inference.State, []map[string]any) {
-	required := inference.RequiredCapabilities(input.Messages, input.Tools)
 	allowed, observed := []*inference.State{}, []map[string]any{}
 	for id, w := range s.Pool {
-		reason := eligible(w, required)
+		reason := connectionEligibility(w)
 		if input.WorkerID != "" && input.WorkerID != id {
 			reason = "selection_constraint"
 		}
@@ -26,6 +82,9 @@ func candidates(s *inference.State, c *inference.Conversation, input inference.R
 		exclusion := reason
 		if exclusion == "" && !capacity {
 			exclusion = "worker_capacity"
+			if w.Routing.Upgrade.Active(s.Now) {
+				exclusion = "worker_upgrading"
+			}
 		}
 		reservations := []map[string]any{}
 		for _, job := range s.Jobs {
@@ -34,7 +93,9 @@ func candidates(s *inference.State, c *inference.Conversation, input inference.R
 			}
 		}
 		sort.Slice(reservations, func(i, j int) bool { return reservations[i]["job_id"].(string) < reservations[j]["job_id"].(string) })
-		observed = append(observed, map[string]any{"capacity_available": capacity, "reservations": reservations, "last_dispatched_at": w.Routing.LastDispatchedAt, "eligibility_reason": reason, "worker_id": id, "connection_status": w.Connection.Status(s.Now), "connection_generation": w.Connection.Generation, "last_heartbeat_at": w.Connection.LastAckAt, "readiness": readiness(w), "qualification": w.Routing.Latest(), "exclusion_reason": exclusion})
+		observed = append(observed, map[string]any{"capacity_available": capacity, "reservations": reservations, "last_dispatched_at": w.Routing.LastDispatchedAt,
+			"eligibility_reason": reason, "worker_id": id, "connection_status": w.Connection.Status(s.Now), "connection_generation": w.Connection.Generation,
+			"last_heartbeat_at": w.Connection.LastAckAt, "exclusion_reason": exclusion, "media_jobs": w.Connection.MediaJobs, "prompt_wav": w.Connection.PromptWAV})
 		if reason == "" {
 			allowed = append(allowed, w)
 		}
@@ -57,6 +118,9 @@ func candidates(s *inference.State, c *inference.Conversation, input inference.R
 }
 
 func available(s *inference.State, worker, ownJob string) bool {
+	if upgradeBlock(s, worker) != nil {
+		return false
+	}
 	for _, j := range s.Jobs {
 		if j.WorkerID == worker && j.ID != ownJob && (j.Held || j.State == "queued") {
 			return false
@@ -123,8 +187,6 @@ func (b *Broker) dispatch(s *inference.State, events *[]inferenceEvent) error {
 		if err != nil {
 			return err
 		}
-		q := *selected.Routing.Latest()
-		j.Qualification = &q
 		stamp := s.Now
 		selected.Routing.LastDispatchedAt = &stamp
 		reason := "least_recent_dispatch"
@@ -134,7 +196,7 @@ func (b *Broker) dispatch(s *inference.State, events *[]inferenceEvent) error {
 		if previous != "" && previous != selected.WorkerID {
 			event(events, slog.LevelInfo, "dispatch.reassigned", s, j, "expected_worker_id", previous, "observed_worker_id", selected.WorkerID, "reason", "offline_before_claim_and_context", "context_delivery_started", false, "prior_job_id", priorJob)
 		}
-		event(events, slog.LevelInfo, "dispatch.assigned", s, j, "candidates", evidence, "selected_worker_id", selected.WorkerID, "reason", reason, "queue_wait_ms", s.Now.Sub(r.CreatedAt).Milliseconds(), "qualification", q, "required_capabilities", inference.RequiredCapabilities(r.Input.Messages, r.Input.Tools))
+		event(events, slog.LevelInfo, "dispatch.assigned", s, j, "candidates", evidence, "selected_worker_id", selected.WorkerID, "reason", reason, "queue_wait_ms", s.Now.Sub(r.CreatedAt).Milliseconds(), "required_capabilities", inference.RequiredCapabilities(r.Input.Messages, r.Input.Tools))
 		event(events, slog.LevelInfo, "job.queued", s, j, "context_kind", "full", "context_receipt_id", j.Context.ReceiptID)
 		event(events, slog.LevelDebug, "inference.context", s, j, "context", j.Context, "canonical_messages", e.Messages)
 	}

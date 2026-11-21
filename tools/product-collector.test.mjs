@@ -83,23 +83,22 @@ test('release exports cover the entire run through contiguous bounded intervals'
   assert.ok(h.collector.report.evidence_import_failures.some(item => item.cause === 'invalid_run_timing'));
 });
 
-test('native approval executes the actual evidence verifier before granting routing authority', async t => {
+test('native trials still execute the actual independent evidence verifier', async t => {
   const h = await releaseHarness(t); await h.collector.initialize();
   await h.collector.native('a', 'baseline');
   assert.equal(h.collector.report.native_cases.length, 2);
-  assert.ok(h.requests.some(request => request.body?.action === 'approve' && request.body.evidence_kind === 'live'));
+  assert.ok(!h.requests.some(request => request.path.endsWith('/qualifications')));
   assert.ok(h.collector.report.cases.some(item => item.id === 'idle.a'));
   const bad = await releaseHarness(t); await bad.collector.initialize(); bad.badNative = true;
   await assert.rejects(bad.collector.native('b', 'baseline'), /independent_live_trial_evidence_required/);
   assert.ok(!bad.requests.some(request => request.body?.action === 'approve'));
-  await assert.rejects(bad.collector.select('all'), /current_live_qualification_required/);
 });
 
 test('management exchanges retain the addressed worker and leave global requests unscoped', async t => {
   const h = await releaseHarness(t), exchanges = [], log = h.collector.log.bind(h.collector);
   h.collector.log = async (level, msg, fields) => { if (msg === 'qualification.http_exchange') exchanges.push(fields); return log(level, msg, fields); };
   await h.collector.api('/api/v1/admin/status');
-  await h.collector.api('/api/v1/admin/workers/worker-b/qualifications', 'POST', {});
+  await assert.rejects(h.collector.api('/api/v1/admin/workers/worker-b/qualifications', 'POST', {}), /http_410/);
   assert.equal(exchanges[0].worker_id, undefined); assert.equal(exchanges[1].worker_id, 'worker-b');
 });
 
@@ -107,7 +106,8 @@ test('release baseline links real client HTTP/SSE cycles, affinity, interleaving
   const h = await releaseHarness(t); await h.collector.initialize(); await h.collector.baseline();
   assert.equal(h.collector.report.cycles.length, 10);
   assert.ok(h.collector.report.cases.some(item => item.id === 'boundary.cross-client'));
-  assert.ok(h.requests.every(request => request.path.startsWith('/api/v1/admin/')));
+  assert.equal(h.requests.filter(request => request.path === '/api/v1/requests').length, 10);
+  assert.ok(!h.requests.some(request => request.path.endsWith('/qualifications')));
   const cases = h.collector.report.cases.length; await h.collector.baseline(); assert.equal(h.collector.report.cases.length, cases);
   await assert.rejects(h.collector.newCycle('a.chat.json', 'a'), /release_cycle_already_started/);
   await h.collector.browser('inspect'); assert.ok(h.collector.report.cases.some(item => item.id === 'portal.history'));
@@ -127,10 +127,9 @@ test('broker checkpoint requires the owner action and preserves a pending tool a
   Object.assign(observation, { time: h.collector.stamp(), expected_boundary: 'waiting tool', observed_boundary: 'new service process', worker_ids: ['worker-a'], operation_ids: ['native-operation'] });
   h.collector.report.observations = h.entries;
   await assert.rejects(h.collector.broker('broker-resume'), /owner_broker_restart_not_observed/);
-  const before = h.requests.length, qualification = structuredClone(h.qualifications['worker-a']);
+  const before = h.requests.length;
   h.instance = 'process-two'; await h.collector.broker('broker-resume');
   assert.equal(h.requests.slice(before).filter(request => request.path.endsWith('/qualifications')).length, 0);
-  assert.deepEqual(h.qualifications['worker-a'], qualification);
   assert.equal(h.collector.report.native_cases.length, 4);
   assert.equal(h.collector.report.checkpoints.broker.after_instance, 'process-two');
   assert.equal(h.collector.report.cycles.at(-1).client_tool_executions, 1);
@@ -145,13 +144,12 @@ test('recovery probes require observed identity/scope and boundary imports retai
   h.imports.set('/private/product-worker', h.fixture.files.get('worker-product.ndjson'));
   h.source.worker_exports.push({ case_id: 'all', path: '/private/product-worker' }); await h.write();
   h.collector.report.observations = h.entries;
-  const before = h.requests.length, qualification = structuredClone(h.qualifications['worker-a']);
+  const before = h.requests.length;
   await h.collector.recovered('worker');
   h.connections.a = { connection_id: 'refresh-connection-worker-a', connection_generation: 3 };
   await h.collector.recovered('refresh'); await h.collector.boundaries(); await h.collector.boundaries();
   assert.equal(h.requests.slice(before).filter(request => request.body?.action === 'approve').length, 0);
   assert.ok(!h.requests.slice(before).some(request => request.path === '/api/v1/admin/workers/worker-a/qualifications'));
-  assert.deepEqual(h.qualifications['worker-a'], qualification);
   assert.equal(h.collector.report.native_cases.length, 4);
   assert.ok(h.collector.report.cases.some(item => item.id === 'recovery.refresh'));
   h.collector.report.observations = []; assert.throws(() => h.collector.observation('missing'), /observed_product_case_required/);
@@ -159,19 +157,6 @@ test('recovery probes require observed identity/scope and boundary imports retai
   assert.throws(() => h.collector.observation('foreign'), /observation_worker_mismatch/);
   h.source.worker_exports.push({ case_id: 'all', path: '/missing/export' }); await h.write();
   const result = await h.collector.finalize(); assert.ok(result.missing.some(reason => reason.includes('evidence_import_failed')));
-});
-
-test('recovery never restores withdrawn approval or manufactures missing initial proof', async t => {
-  const h = await releaseHarness(t); await h.collector.initialize();
-  const before = h.requests.length;
-  await assert.rejects(h.collector.select('a', true), /retained_worker_approval_required/);
-  assert.ok(!h.requests.slice(before).some(request => request.path.endsWith('/qualifications')));
-  for (const slot of ['a', 'b']) await h.collector.native(slot, 'baseline');
-  await h.collector.select('b');
-  const withdrawn = structuredClone(h.qualifications['worker-a']), checkpoint = h.requests.length;
-  await assert.rejects(h.collector.select('a', true), /retained_worker_approval_required/);
-  assert.deepEqual(h.qualifications['worker-a'], withdrawn);
-  assert.ok(!h.requests.slice(checkpoint).some(request => request.path.endsWith('/qualifications')));
 });
 
 test('replacement keeps saved history, correlates only new work and verifies the complete replay', async t => {
@@ -220,7 +205,7 @@ test('replacement keeps saved history, correlates only new work and verifies the
     assert.deepEqual(replay.turns.slice(0, 4), priorTurns);
     assert.equal(replay.turns.length, 5); assert.equal(replay.client_tool_executions, 1);
     assert.deepEqual(original.turns, priorTurns);
-    assert.equal(h.requests.filter(request => request.body?.action === 'approve').length, 2);
+    assert.ok(!h.requests.some(request => request.path.endsWith('/qualifications')));
   }
 });
 

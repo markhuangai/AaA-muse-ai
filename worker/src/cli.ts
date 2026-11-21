@@ -11,9 +11,10 @@ import { Failure, cause, requireValue } from './errors.js';
 import { encode, object, parse, identifier, type ObjectValue } from './json.js';
 import type { Network } from './transport.js';
 import { Setup, captureBootstrap } from './setup.js';
-import { setupIO, backgroundStderr, type SetupIO } from './setup-os.js';
+import { setupIO, backgroundStderr, upgradeIO, type SetupIO } from './setup-os.js';
 import { inspectHealth } from './health.js';
 import { checkWatchdog } from './watchdog.js';
+import { EnrolledUpgrade } from './upgrade.js';
 
 import { VERSION } from './version.js';
 export { VERSION } from './version.js';
@@ -38,6 +39,7 @@ export function argumentsFor(args: string[]): { command: string; flags: Record<s
   const allowed: Record<string, string[]> = {
     configure: ['origin'], enroll: ['code-stdin'], run: ['background'], status: [], doctor: [], 'job-show': ['job-id'], 'media-finish': ['job-id'],
     setup: ['origin', 'code-stdin', 'install-dir', 'setup-id', 'bootstrap'], 'hook-check': ['runtime-error'], health: [], 'watchdog-check': [],
+    'upgrade-enrolled': ['mode', 'archive-sha256'],
     'decision-submit': ['job-id', 'input', 'ack-idle'], 'diagnostics-export': ['operation-id', 'request-id', 'since', 'until', 'decode'],
   };
   requireValue(Object.hasOwn(allowed, command) || ['--help', '--version'].includes(command), 'unknown_command');
@@ -113,6 +115,14 @@ export async function execute(args: string[], io: Adapters): Promise<number> {
         if (typeof flags['runtime-error'] === 'string') await new Setup(worker, io.setup ?? setupIO(io.home()), VERSION).runtimeError(flags['runtime-error']);
         io.stdout(await new Setup(worker, io.setup ?? setupIO(io.home()), VERSION).check(io.env.HATCH_HOOK_RUNTIME ?? ''));
         return 0;
+      case 'upgrade-enrolled': {
+        const mode = flags.mode;
+        const sha = flags['archive-sha256'];
+        requireValue((mode === 'prepare' || mode === 'apply' || mode === 'cancel') && typeof sha === 'string' &&
+          /^[a-f0-9]{64}$/.test(sha) && typeof flags['state-dir'] === 'string', 'upgrade_options_required');
+        result = await new EnrolledUpgrade(new Setup(worker, io.setup ?? setupIO(io.home()), VERSION), upgradeIO, sha).run(mode);
+        break;
+      }
       case 'watchdog-check': {
         const notice = await checkWatchdog(new Setup(worker, io.setup ?? setupIO(io.home()), VERSION), io.signal);
         if (notice) io.stdout(encode(logger.redactor.value(notice, '', false)) + '\n');

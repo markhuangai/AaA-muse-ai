@@ -13,7 +13,7 @@ export class Subscriber {
   private mediaUpload?: Promise<void>;
   private mediaFailure?: unknown;
   constructor(readonly worker: Worker) {}
-  async heartbeat(transport: Transport, challenge: ObjectValue): Promise<void> {
+  async heartbeat(transport: Transport, challenge: ObjectValue): Promise<ObjectValue> {
     connection(challenge);
     identifier(challenge.challenge_id);
     requireValue(this.active && challenge.connection_id === this.active.connection_id && integer(challenge.connection_generation) === integer(this.active.connection_generation), 'health_connection_mismatch');
@@ -52,6 +52,7 @@ export class Subscriber {
       await this.worker.publish(current, 'ack_confirmed', 'broker_confirmed_idle');
       await this.worker.logger.log('INFO', 'worker.idle_confirmed', { ...correlation(current), request_id: result.requestId });
     }
+    return this.lastAcknowledged;
   }
   private async saveConnection(status: string, fields: ObjectValue = {}): Promise<void> {
     await this.worker.state.write('connection.json', encode({ ...this.active, ...this.supervision, status,
@@ -68,6 +69,7 @@ export class Subscriber {
       this.lastAcknowledged = undefined;
       const transport = await worker.load();
       let attempt = 0;
+      let previousHeartbeat: ObjectValue | undefined;
       await worker.logger.log('INFO', 'worker.supervision_started', { worker_id: worker.config.worker_id, pid: worker.state.sys.pid, lock: 'daemon', outcome: 'exclusive_owner', background });
       await worker.logger.log('INFO', 'worker.started', { worker_id: worker.config.worker_id, endpoint: worker.config.origin, inference_readiness: 'unverified' });
       while (!signal.aborted) {
@@ -91,9 +93,11 @@ export class Subscriber {
               await this.saveConnection('connecting');
               await worker.logger.log('INFO', 'worker.connected', { worker_id: worker.config.worker_id, ...event.data });
             } else if (event.type === 'health.challenge') {
-              await this.heartbeat(transport, event.data);
+              previousHeartbeat = await this.heartbeat(transport, event.data);
               if (this.mediaFailure) throw this.mediaFailure;
               this.mediaUpload ??= drainMedia(worker, transport).catch(error => { this.mediaFailure = error; }).finally(() => { this.mediaUpload = undefined; });
+              if (attempt > 0) await worker.logger.log('INFO', 'worker.stream_recovered', { worker_id: worker.config.worker_id,
+                ...previousHeartbeat, retries: attempt, outcome: 'heartbeat_confirmed' });
               attempt = 0;
             } else if (event.type === 'job.available') {
               requireValue(this.active && event.data.worker_id === worker.config.worker_id, 'job_owner_mismatch');
@@ -113,7 +117,9 @@ export class Subscriber {
           if (signal.aborted) break;
           if (!(error instanceof Failure && error.retryable)) throw error;
           const delay = Math.min(30_000, 1000 * 2 ** Math.min(attempt++, 5));
-          await worker.logger.log('WARN', 'worker.stream_retrying', { worker_id: worker.config.worker_id, endpoint: worker.config.origin, ...this.active, cause: cause(error), ...error.fields, phase, attempt, delay_ms: delay, duration_ms: worker.state.sys.now() - started, last_event_id: this.lastEvent });
+          await worker.logger.log('WARN', 'worker.stream_retrying', { worker_id: worker.config.worker_id, endpoint: worker.config.origin, ...this.active,
+            previous_connection_id: previousHeartbeat?.connection_id, previous_connection_generation: previousHeartbeat?.connection_generation,
+            cause: cause(error), ...error.fields, phase, attempt, delay_ms: delay, duration_ms: worker.state.sys.now() - started, last_event_id: this.lastEvent });
           await this.saveConnection('offline');
           for (let elapsed = 0; elapsed < delay && !signal.aborted; elapsed += 100) await worker.state.sys.wait(Math.min(100, delay - elapsed));
         }

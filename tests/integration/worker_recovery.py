@@ -1,14 +1,135 @@
 #!/usr/bin/env python3
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+import hashlib
 import json
+import re
+import secrets
 import urllib.parse
+import urllib.request
 
 from service import require
 from worker_setup import WorkerSetup, run
 
 
 class WorkerRecovery(WorkerSetup):
+    def upgrade(self, worker, mode, want=0):
+        # Run the published prompt's shell entry with an independently verified archive.
+        self.command(worker, ["bash", "-c", 'umask 077; tar -xOzf /fixture/worker.tgz package/setup/upgrade-enrolled.sh > "$HOME/tmp/upgrade-enrolled.sh"'])
+        return self.command(worker, ["bash", "/home/worker/tmp/upgrade-enrolled.sh", mode, "/fixture/worker.tgz",
+                                     "/home/worker/.local/state/aaa-muse-worker"], want=want)
+
+    def archived_install(self, version, checksum):
+        archive = self.assets.public / ("worker-" + version + ".tgz")
+        url = "https://github.com/markhuangai/AaA-muse-ai/releases/download/v" + version + "/markhuangai-aaa-muse-worker-" + version + ".tgz"
+        with urllib.request.urlopen(url, timeout=90) as response:
+            archive.write_bytes(response.read())
+        require(hashlib.sha256(archive.read_bytes()).hexdigest() == checksum, "legacy upgrade artifact differs")
+        worker = self.environment("upgrade-" + version)
+        prompt = self.prompt()
+        code = re.search(r"muse_enroll_[A-Za-z0-9_-]{43}", prompt["setup_prompt"])[0]
+        argv = ["bash", "-c", 'umask 077; tar -xOzf "$1" package/setup/install.sh > "$HOME/tmp/old-install.sh"; '
+                ': > "$HOME/tmp/old-bootstrap.ndjson"; exec bash "$HOME/tmp/old-install.sh" "$@" "$HOME/tmp/old-bootstrap.ndjson"',
+                "legacy-upgrade-bootstrap", "/fixture/" + archive.name, version, checksum, self.proxy.origin, prompt["enrollment_id"]]
+        old = self.command(worker, argv, input_text=code + '\n{"model_name":"Retained worker model"}\n')
+        worker["receipt"] = json.loads(old.stdout.strip().splitlines()[-1])
+        worker["worker"] = {"id": worker["receipt"]["worker_id"]}
+        worker["credential"] = (worker["state"] / "credential.key").read_text().strip()
+        self.secrets.append(worker["credential"])
+        return worker
+
+    def hook_only_upgrade(self):
+        worker = self.archived_install("0.2.0", "efa77e92a16a1fa8009e555af33bcc49ac583c941cde7f2ed231b4552c4ae874")
+        started = self.online(worker)
+        old_hook = worker["receipt"]["hook_path"]
+        require("watchdog" not in worker["receipt"], "legacy hook-only fixture unexpectedly includes a watchdog")
+        self.upgrade(worker, "prepare")
+        upgraded = json.loads(self.upgrade(worker, "apply").stdout)
+        current = self.online(worker, started["connection_id"])
+        require(upgraded["hook_path"] == old_hook and current["connection_generation"] > started["connection_generation"]
+                and upgraded["watchdog"]["id"] == "aaa-muse-worker-watchdog" and upgraded["watchdog"]["interval_seconds"] == 300,
+                "hook-only upgrade did not preserve the hook or provide one watchdog action")
+        worker["receipt"] = upgraded
+        self.hook(worker)
+        require(not self.command(worker, ["bash", "-c", upgraded["watchdog"]["command"]]).stdout, "upgraded watchdog not healthy")
+        self.receipt("worker.upgrade_hook_only", verified_hook_path=True, watchdog_receipt=True, native_registration="unverified")
+        self.stop(worker)
+
+    def legacy_upgrade(self):
+        version = "0.3.0"
+        checksum = "70600449bf130a4c27e6f2e3ff1d58ad7dbae0c97baaa73b54ab1a67f9e62e6b"
+        worker = self.archived_install(version, checksum)
+        key = (worker["state"] / "credential.key").read_bytes()
+        started = self.online(worker)
+        old_pid = self.pid(worker)
+        old_installation = json.loads((worker["state"] / "installation.json").read_text())
+        queued = self.create(worker, "busy upgrade check", tools=False)
+        shown = self.wait_job(worker, queued)
+        deferred = self.upgrade(worker, "prepare", want=1)
+        require("upgrade_worker_busy" in deferred.stderr and self.pid(worker) == old_pid, "upgrade disturbed an active job")
+        self.cli(worker, "decision-submit", "--job-id", shown["job_id"], "--input", "-", input_text='{"type":"final","text":"done"}')
+        self.until(lambda: self.status(worker)["work_status"] == "idle", "released legacy work stayed busy")
+        lease = json.loads(self.upgrade(worker, "prepare").stdout)
+        require(lease["outcome"] == "reserved" and self.status(worker)["work_status"] == "upgrading", "upgrade did not reserve the worker slot")
+        self.upgrade(worker, "cancel")
+        require(self.pid(worker) == old_pid and self.status(worker)["work_status"] == "idle", "cancel did not restore capacity")
+        with self.proxy.lock:
+            self.proxy.worker_route_failures["/api/v1/worker/status"] = ["disconnect", 404]
+        self.proxy.interrupt()
+        marker_path = worker["state"] / "run-stop.json"
+        self.until(marker_path.exists, "archived worker did not produce the historical 404 latch", timeout=45)
+        self.until(lambda: self.status(worker)["connection_status"] == "offline", "old connection still authorized work", timeout=45)
+        marker = marker_path.read_bytes()
+        require(json.loads(marker)["cause"] == "broker_rejected", "legacy latch was not created by the reported failure")
+        history = {entry.name: entry.read_bytes() for entry in (worker["state"] / "journals").glob("*.json")}
+        self.upgrade(worker, "prepare")
+        self.upgrade(worker, "prepare")
+        upgraded = json.loads(self.upgrade(worker, "apply").stdout)
+        after = self.online(worker, started["connection_id"])
+        require(upgraded["outcome"] == "upgraded" and upgraded["package_version"] == self.package["version"] and
+                upgraded["watchdog"]["timeout_seconds"] == 300 and upgraded["hook_path"] == worker["receipt"]["hook_path"] and
+                len(list((worker["state"]).glob("run-stop.*.archived.json"))) == 1 and not marker_path.exists(), "upgrade lost receipt or stop history")
+        archive_path, = worker["state"].glob("run-stop.*.archived.json")
+        installed = json.loads((worker["state"] / "installation.json").read_text())
+        require(archive_path.read_bytes() == marker and installed["model_report"] == old_installation["model_report"] and
+                installed["setup_id"] == old_installation["setup_id"] and (worker["state"] / "credential.key").read_bytes() == key and
+                {entry.name: entry.read_bytes() for entry in (worker["state"] / "journals").glob("*.json")} == history,
+                "upgrade changed identity, journals or preserved stop evidence")
+        pid = self.pid(worker)
+        repeated = json.loads(self.upgrade(worker, "prepare").stdout)
+        require(repeated["outcome"] == "already_current" and self.pid(worker) == pid, "repeat interrupted a healthy upgrade")
+        events = self.events(worker)
+        saved, = [event for event in events if event["msg"] == "worker.upgrade_stop_archived"]
+        require(any(event["msg"] == "worker.http_exchange" and event.get("request_id") == saved["request_id"] and
+                    event.get("response_validation_cause") == "invalid_json" for event in events), "archive cannot be diagnosed from protected logs")
+        acceptance, _ = self.diagnose(upgraded["request_id"], "worker.authenticated")
+        require(acceptance["worker_id"] == worker["worker"]["id"], "upgrade heartbeat evidence joined another worker")
+        with self.proxy.lock:
+            self.proxy.worker_route_failures["/api/v1/worker/status"] = ["disconnect", 404, 404]
+            self.proxy.worker_route_failures["/api/v1/worker/events"] = [404]
+            self.proxy.worker_route_failures["/api/v1/worker/heartbeat"] = [404]
+        since = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+        self.proxy.interrupt()
+        recovered = self.online(worker, after["connection_id"])
+        require(self.pid(worker) == pid and not marker_path.exists(), "fixed subscriber stopped during the same outage")
+        events = self.events(worker, since, datetime.now(timezone.utc).isoformat(timespec="milliseconds"))
+        retries = {e.get("route"): e for e in events if e["msg"] == "worker.stream_retrying" and e.get("http_status") == 404}
+        require(set(retries) == {"/api/v1/worker/status", "/api/v1/worker/events", "/api/v1/worker/heartbeat"} and
+                recovered["connection_generation"] > retries["/api/v1/worker/heartbeat"]["connection_generation"] and
+                any(e["msg"] == "worker.stream_recovered" and e["connection_generation"] == recovered["connection_generation"] for e in events),
+                "cannot reconstruct the outage and fresh heartbeat from worker logs")
+        body = {"protocol_version": 1, "worker_id": worker["worker"]["id"], "submission_id": secrets.token_hex(16),
+                "messages": [{"type": "message", "role": "user", "text": "Reply pong"}], "tools": []}
+        client, _ = self.checked("/api/v1/requests", self.client, "POST", body, want=202)
+        job = self.wait_job(worker, self.experiment(client["id"]))
+        self.cli(worker, "decision-submit", "--job-id", job["job_id"], "--input", "-", input_text='{"type":"final","text":"pong"}')
+        answer, _ = self.checked("/api/v1/requests/" + client["id"], self.client)
+        require(answer["output"]["text"] == "pong" and job["connection_generation"] == recovered["connection_generation"],
+                "real client work did not use the recovered worker")
+        self.receipt("worker.legacy_outage_upgrade", previous_version=version, prior_digest=checksum, generation=recovered["connection_generation"],
+                     dispatched_without_qualification=True, archived_original=True, one_consumer=True, log_only_diagnosis=True)
+        self.stop(worker)
+
     def background_refusal(self, worker):
         return self.command(worker, ["bash", "-c", 'umask 077; exec "$@" 2>/home/worker/tmp/refused-background.stderr', "owned-background-refusal", worker["receipt"]["launcher"], "run", "--background", "--state-dir", "/home/worker/.local/state/aaa-muse-worker"], want=1)
 
@@ -260,9 +381,13 @@ class WorkerRecovery(WorkerSetup):
         denied = [e for e in self.events(worker) if e["msg"] == "worker.command_failed" and e.get("cause") == "worker_unauthorized" and e.get("request_id")]
         require(denied, "revoked daemon has no correlated authorization failure")
         self.diagnose(denied[-1]["request_id"], ("worker.auth_denied", "lease.rejected"), "worker_revoked")
+        self.upgrade(worker, "prepare", want=1)
+        require((worker["state"] / "run-stop.json").read_bytes() == marker, "upgrade crossed a genuine terminal stop")
         self.receipt("worker.recovery_invalid_and_revoked", no_reenrollment=True, invalid_state_preserved=True, terminal_stop_preserved=True)
 
     def exercise(self):
+        self.legacy_upgrade()
+        self.hook_only_upgrade()
         worker = self.environment("recovery")
         self.install(worker, self.prompt())
         key = (worker["state"] / "credential.key").read_bytes()

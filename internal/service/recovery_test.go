@@ -157,7 +157,7 @@ func TestClaimReceiptNeverRestoresExpiredAuthority(t *testing.T) {
 func TestRecoveryNativeToolWaitAndDeliveryBoundary(t *testing.T) {
 	b, m, log, logs := inferenceFixture()
 	ctx := context.Background()
-	c := connectNative(t, b, m, log, "worker-a")
+	c := connectInference(t, b, m, log, "worker-a")
 	input := requestInput("native-recovery")
 	v := admitted(t, b, "alice", "recovery-session", input)
 	tool := inference.Item{Type: "tool_call", CallID: "preserved-call", Name: "read_file", Arguments: map[string]any{"path": "client-only"}}
@@ -205,7 +205,7 @@ func TestRecoveryFailureDoesNotLogRestoration(t *testing.T) {
 func TestRecoveryContextOnlyHasApplicableCorrectiveAction(t *testing.T) {
 	b, m, log, logs := inferenceFixture()
 	ctx := context.Background()
-	connectNative(t, b, m, log, "worker-a")
+	connectInference(t, b, m, log, "worker-a")
 	v := admitted(t, b, "alice", "context-only", requestInput("context-only"))
 	e := m.states["worker-a"].Experiments[v.ID]
 	if _, err := b.Job(ctx, log, "worker-a", e.CurrentJobID); err != nil {

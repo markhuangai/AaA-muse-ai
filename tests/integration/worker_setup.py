@@ -328,10 +328,7 @@ class WorkerSetup(Inference):
         require(status["inference_readiness"] == "unverified", "setup report granted qualification")
         admin = self.checked("/api/v1/admin/workers", self.admin)[0]["workers"]
         require(admin[0]["id"] == first_id and admin[0]["model_report"] == report, "admin and worker report snapshots differ")
-        body = {"model": "muse-ai", "messages": [{"role": "user", "content": "A reported model must not qualify a worker."}]}
-        code, _, raw = self.api("/v1/chat/completions", self.client, "POST", body)
-        require(code == 503 and json.loads(raw)["error"]["code"] == "no_ready_worker", "setup report changed dispatch eligibility")
-        body["messages"][0]["content"] = "x" * 1048576
+        body = {"model": "muse-ai", "messages": [{"role": "user", "content": "x" * 1048576}]}
         code, _, _ = self.api("/v1/chat/completions", self.client, "POST", body)
         require(code == 413, "reported context window changed the broker body limit")
         home = primary["home"]
@@ -355,7 +352,13 @@ class WorkerSetup(Inference):
         self.hook(primary, dry=True)
         require(not (primary["state"] / "hook-poll.json").exists(), "dry run recorded a genuine poll")
         require(json.loads(self.hook(primary).stdout)["action"] == "silent", "idle hook woke model")
-        experiment = self.create(primary, "synthetic setup detector cue", tools=False)
+        request, _ = self.checked("/api/v1/requests", self.client, "POST", {
+            "protocol_version": 1, "submission_id": "setup-detector-cue",
+            "messages": [{"type": "message", "role": "user", "text": "synthetic setup detector cue"}],
+            "tools": [],
+        }, want=202)
+        require(request["worker_id"] == first_id, "fresh subscriber did not receive client work")
+        experiment = self.experiment(request["id"])
         self.until(lambda: (primary["state"] / "pending.json").exists() and bool(json.loads((primary["state"] / "pending.json").read_text())["jobs"]), "subscriber did not publish setup cue")
         original_poll = (primary["state"] / "hook-poll.json").read_bytes()
         original_wake = (primary["state"] / "hook-emission.json").read_bytes()
