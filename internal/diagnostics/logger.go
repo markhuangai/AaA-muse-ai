@@ -25,7 +25,7 @@ type Redactor struct {
 	current func() *Redactor
 }
 
-var credentialPattern = regexp.MustCompile(`muse_(?:enroll|worker|portal)_[A-Za-z0-9_-]{43}|aaa_muse_ai_[a-f0-9]{64}`)
+var credentialPattern = regexp.MustCompile(`muse_(?:enroll|worker|portal|download)_[A-Za-z0-9_-]{43}|aaa_muse_ai_[a-f0-9]{64}`)
 
 func RedactWorkerSecrets(value string) string {
 	return (&Redactor{}).text(value)

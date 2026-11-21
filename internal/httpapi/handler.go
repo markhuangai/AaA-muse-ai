@@ -39,6 +39,7 @@ type Handler struct {
 	Random     io.Reader
 	Now        func() time.Time
 	Failed     <-chan struct{}
+	mcpHandler http.Handler
 }
 
 type response struct {
@@ -53,15 +54,19 @@ type response struct {
 	conversationID, sessionID, requestRecordID string
 	boundaryFailed                             bool
 	captureReason                              string
-	openAI                                     bool
+	openAI, mcp                                bool
 	now                                        func() time.Time
 }
 
 func (w *response) shortDeadline() error {
-	if !w.openAI {
+	if !w.openAI && !w.mcp {
 		return nil
 	}
-	return http.NewResponseController(w.ResponseWriter).SetWriteDeadline(w.now().Add(5 * time.Second))
+	err := http.NewResponseController(w.ResponseWriter).SetWriteDeadline(w.now().Add(5 * time.Second))
+	if w.mcp && errors.Is(err, http.ErrNotSupported) {
+		return nil
+	}
+	return err
 }
 
 func (w *response) WriteHeader(code int) {
@@ -69,6 +74,9 @@ func (w *response) WriteHeader(code int) {
 		return
 	}
 	w.code = code
+	if w.mcp {
+		w.Header().Set("Cache-Control", "no-store")
+	}
 	if err := w.shortDeadline(); err != nil {
 		w.writeErr = err
 		return
@@ -81,7 +89,7 @@ func (w *response) Write(b []byte) (int, error) {
 	}
 	var n int
 	var err error
-	if w.openAI {
+	if w.openAI || w.mcp {
 		err = w.writeErr
 		if err == nil {
 			err = w.shortDeadline()
@@ -116,10 +124,13 @@ func (h *Handler) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 	}
 	route, requestedWorker := routeFor(r.URL.Path)
 	logger := h.Logger.With("request_id", id, "route", route)
-	w := &response{ResponseWriter: out, capture: route != "/api/v1/admin/diagnostics/export" && route != "/api/v1/portal/login", openAI: chatRoute(route), now: h.Now}
+	w := &response{ResponseWriter: out, capture: route != "/api/v1/admin/diagnostics/export" && route != "/api/v1/portal/login", openAI: chatRoute(route), mcp: route == mcpRoute, now: h.Now}
 	if isMediaRoute(route) {
 		w.capture = false
 		w.captureReason = "media_content_omitted"
+	}
+	if w.mcp {
+		w.capture, w.captureReason = false, "mcp_exchange_omitted"
 	}
 	if route == "/api/v1/portal/login" {
 		w.captureReason = "credentials_omitted"
@@ -189,7 +200,7 @@ func (h *Handler) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 		expectedRole = "management"
 	} else if strings.HasPrefix(route, "/api/v1/portal/") && route != "/api/v1/portal/login" {
 		expectedRole = "portal_session"
-	} else if strings.HasPrefix(route, "/api/v1/requests") || strings.HasPrefix(route, mediaJobs) || chatRoute(route) {
+	} else if strings.HasPrefix(route, "/api/v1/requests") || strings.HasPrefix(route, mediaJobs) || chatRoute(route) || route == mcpRoute {
 		expectedRole = "client"
 	} else if strings.HasPrefix(route, "/api/v1/worker/") && route != "/api/v1/worker/enroll" {
 		expectedRole = "worker"
@@ -239,7 +250,7 @@ func (h *Handler) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 	var identity workerView
 	if expectedRole != "" {
 		credential := strings.TrimPrefix(authorization, "Bearer ")
-		if role == "unauthenticated" && strings.HasPrefix(authorization, "Bearer ") && strings.HasPrefix(credential, auth.PortalPrefix) && h.Portal != nil {
+		if route != mcpRoute && role == "unauthenticated" && strings.HasPrefix(authorization, "Bearer ") && strings.HasPrefix(credential, auth.PortalPrefix) && h.Portal != nil {
 			identity, err := h.Portal.Authenticate(logger, credential)
 			if err != nil {
 				logger.Warn("portal.auth_failed", "component", "shell", "cause", err.Error(), "expected_state", "authenticated", "observed_state", "unauthenticated", "outcome", "rejected")
@@ -250,7 +261,7 @@ func (h *Handler) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 			portalSessionID = identity.ID
 			logger = logger.With("portal_session_id", identity.ID)
 		}
-		if role == "unauthenticated" && strings.HasPrefix(authorization, "Bearer ") && strings.HasPrefix(credential, auth.WorkerPrefix) && h.Workers != nil {
+		if route != mcpRoute && role == "unauthenticated" && strings.HasPrefix(authorization, "Bearer ") && strings.HasPrefix(credential, auth.WorkerPrefix) && h.Workers != nil {
 			record, err := h.Workers.Authenticate(r.Context(), logger, credential)
 			w.workerID = record.ID
 			if err != nil {
@@ -278,6 +289,10 @@ func (h *Handler) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 		logger.Warn("request.rejected", "reason", "method_not_allowed", "expected_method", method, "observed_method", r.Method)
 		w.Header().Set("Allow", method)
 		writeJSON(w, 405, map[string]any{"error": "method_not_allowed"})
+		return
+	}
+	if route == mcpRoute {
+		h.serveMCP(w, r, logger, clientID)
 		return
 	}
 	if !h.workerCompatibility(w, r, logger, route) {

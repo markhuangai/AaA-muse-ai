@@ -22,5 +22,11 @@ case "${1:-}" in
       -e GOCACHE=/src/.artifacts/go-cache -e GOMODCACHE=/module-cache "$tools_image" \
       go test -race -v -count=1 ./internal/httpapi ./internal/service -run '^TestPortal'
     ;;
-  *) echo 'Expected check, unit or portal' >&2; exit 1 ;;
+  mcp-client)
+    mkdir -p "$task_root/.artifacts/integration-tools"
+    docker run --rm --user "$(id -u):$(id -g)" -v "$task_root:/src" -v "$task_root/.artifacts/go-mod:/module-cache" -w /src \
+      -e GOCACHE=/src/.artifacts/go-cache -e GOMODCACHE=/module-cache -e CGO_ENABLED=0 "$tools_image" \
+      go build -tags mcp_integration -o .artifacts/integration-tools/mcp-client ./tests/integration/mcpclient
+    ;;
+  *) echo 'Expected check, unit, portal or mcp-client' >&2; exit 1 ;;
 esac

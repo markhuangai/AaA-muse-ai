@@ -181,6 +181,7 @@ type ModelReport struct {
 
 type Connection struct {
 	MediaJobs            bool         `json:"media_jobs,omitempty"`
+	PromptWAV            bool         `json:"prompt_wav,omitempty"`
 	ID                   string       `json:"connection_id"`
 	Generation           int64        `json:"connection_generation"`
 	AssignmentGeneration int64        `json:"assignment_generation"`

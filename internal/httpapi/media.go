@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"io"
 	"io/fs"
@@ -25,11 +26,20 @@ const (
 	mediaTrials         = "/api/v1/admin/media/trials"
 	mediaJob            = mediaJobs + "/{id}"
 	mediaArtifact       = mediaJob + "/artifact"
+	sharedMedia         = "/downloads/{id}/{token}"
+	sharedMediaPrefix   = "/downloads/"
 	workerMedia         = "/api/v1/worker/jobs/{id}/media/"
 	workerMediaArtifact = "/api/v1/worker/jobs/{id}/artifact"
 )
 
 func mediaRoute(path string) (string, string) {
+	if tail, ok := strings.CutPrefix(path, sharedMediaPrefix); ok {
+		id, _, _ := strings.Cut(tail, "/")
+		if !workerIDPattern.MatchString(id) {
+			return sharedMedia, ""
+		}
+		return sharedMedia, id
+	}
 	if path == mediaJobs || path == mediaTrials {
 		return path, ""
 	}
@@ -61,12 +71,13 @@ func mediaRoute(path string) (string, string) {
 	return "", ""
 }
 func isMediaRoute(route string) bool {
-	return strings.HasPrefix(route, mediaJobs) || route == mediaTrials || route == workerMediaArtifact || strings.HasPrefix(route, workerMedia)
+	return strings.HasPrefix(route, mediaJobs) || route == mediaTrials || route == sharedMedia || route == workerMediaArtifact || strings.HasPrefix(route, workerMedia)
 }
 
 type mediaRequest struct {
-	Prompt     string `json:"prompt"`
-	Submission string `json:"submission_id"`
+	Prompt     string          `json:"prompt"`
+	Submission string          `json:"submission_id"`
+	Format     json.RawMessage `json:"format,omitempty"`
 }
 type trialRequest struct {
 	FixtureHash string `json:"fixture_sha256,omitempty"`
@@ -106,7 +117,14 @@ func readMediaRequest(ctx context.Context, r *http.Request, store *media.Store, 
 		if err = decodeInferenceInput([]byte(data), &input, "submission_id", "prompt"); err != nil {
 			return input, inference.Reject("invalid_media_request", 400)
 		}
-		stage.Record.Profile = "prompt_video"
+		format := "mp4"
+		if input.Format != nil && json.Unmarshal(input.Format, &format) != nil {
+			return input, inference.Reject("unsupported_media_format", 400)
+		}
+		if string(input.Format) == "null" {
+			return input, inference.Reject("unsupported_media_format", 400)
+		}
+		return input, stage.GeneratedPrompt(format, input.Prompt)
 	case "multipart/form-data":
 		reader, err := r.MultipartReader()
 		if err != nil {
@@ -153,7 +171,7 @@ func readMediaRequest(ctx context.Context, r *http.Request, store *media.Store, 
 		if !seen["image"] {
 			return input, inference.Reject("reference_image_required", 400)
 		}
-		stage.Record.Profile = "image_video"
+		stage.Record.Profile = media.ImageVideoProfile
 	default:
 		return input, inference.Reject("unsupported_media_type", 415)
 	}
@@ -171,7 +189,7 @@ func (h *Handler) serveMedia(w *response, r *http.Request, l *slog.Logger, route
 		return
 	default:
 	}
-	if r.URL.RawQuery != "" || r.Method == "GET" && (r.ContentLength != 0 || len(r.TransferEncoding) > 0) {
+	if route != sharedMedia && (r.URL.RawQuery != "" || r.Method == "GET" && (r.ContentLength != 0 || len(r.TransferEncoding) > 0)) {
 		inferenceError(w, inference.Reject("unexpected_media_input", 400))
 		return
 	}
@@ -190,15 +208,21 @@ func (h *Handler) serveMedia(w *response, r *http.Request, l *slog.Logger, route
 	switch route {
 	case mediaJobs, mediaTrials:
 		err = h.submitMedia(w, r, ctx, l, route, owner)
-	case mediaJob, mediaArtifact:
+	case mediaJob:
+		var status mediaPollResult
+		status, err = h.pollMedia(ctx, l, owner, id, r.Host, "")
+		if err == nil {
+			writeJSON(w, 200, status)
+		}
+	case mediaArtifact:
 		var status service.MediaStatus
 		var f fs.File
-		status, f, err = h.Broker.ReadMedia(ctx, l, owner, id, route == mediaArtifact)
-		if err == nil && f == nil {
-			writeJSON(w, 200, status)
-		} else if err == nil {
+		status, f, err = h.Broker.ReadMedia(ctx, l, owner, id, true)
+		if err == nil {
 			err = sendFile(w, f, status.Artifact.MediaType, status.Artifact.Size)
 		}
+	case sharedMedia:
+		err = h.serveSharedMedia(ctx, l, w, r, id)
 	case workerMediaArtifact, workerMedia + "image", workerMedia + "prompt":
 		var f service.MediaFence
 		f.Connection = r.Header.Get("X-Muse-Connection-Id")
@@ -223,7 +247,11 @@ func (h *Handler) serveMedia(w *response, r *http.Request, l *slog.Logger, route
 		}
 		var rejected *inference.Rejection
 		if errors.As(err, &rejected) {
-			l.Warn("media.rejected", "cause", rejected.Reason, "evidence", rejected.Fields)
+			level := slog.LevelWarn
+			if rejected.Code >= 500 || rejected.Reason == "artifact_transfer_interrupted" {
+				level = slog.LevelError
+			}
+			l.Log(ctx, level, "media.rejected", "cause", rejected.Reason, "evidence", rejected.Fields, "outcome", "rejected")
 		} else {
 			l.Error("media.operation_failed", "cause", err.Error(), "route", route)
 		}
@@ -254,11 +282,7 @@ func (h *Handler) submitMedia(w *response, r *http.Request, ctx context.Context,
 	if err != nil {
 		return err
 	}
-	defer func() {
-		if e := stage.Close(); e != nil {
-			l.Error("media.cleanup_failed", "stage", "admission", "cause", e.Error())
-		}
-	}()
+	defer service.CloseMediaStage(l, stage)
 	var submission, target string
 	if route == mediaTrials {
 		data, err := boundedText(r.Body, 2048)

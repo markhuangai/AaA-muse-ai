@@ -47,6 +47,7 @@ test-history: image
 	python3 -B tests/integration/history.py --image $(SERVICE_IMAGE) --source-sha $(SOURCE_SHA) --source-dirty $(SOURCE_DIRTY)
 
 test-media: image worker-package
+	sh scripts/go.sh mcp-client
 	python3 -B tests/integration/media.py --image $(SERVICE_IMAGE) --source-sha $(SOURCE_SHA) --source-dirty $(SOURCE_DIRTY) --package-receipt .artifacts/worker-package/latest.json
 
 test-routing: image

@@ -11,6 +11,7 @@ import (
 const EnrollmentPrefix = "muse_enroll_"
 const WorkerPrefix = "muse_worker_"
 const PortalPrefix = "muse_portal_"
+const DownloadPrefix = "muse_download_"
 
 func Token(prefix string, random io.Reader) (string, error) {
 	b := make([]byte, 32)

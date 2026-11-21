@@ -14,6 +14,7 @@ const images: Record<string, string> = { 'image/png': 'reference.png', 'image/we
 const outputs: Record<string, [string, string]> = {
   image_video: ['result.mp4', 'video/mp4'], prompt_video: ['result.mp4', 'video/mp4'],
   native_mp3: ['result.mp3', 'audio/mpeg'], offline_wav: ['result.wav', 'audio/wav'],
+  prompt_wav: ['result.wav', 'audio/wav'],
 };
 const imageLimit = 8 * 1024 * 1024;
 const artifactLimit = 32 * 1024 * 1024;
@@ -131,9 +132,15 @@ export async function prepareMedia(worker: Worker, t: Transport, j: ObjectValue)
       const prompt = await transfer(t, j, 'media/prompt', {}, res => t.body(res, 4096, { preserveBOM: true }));
       requireValue(digest(prompt) === m.prompt_sha256, 'media_prompt_digest_mismatch');
       result.prompt = prompt;
-      if (m.profile === 'image_video') result.reference_path = await writeReference(directory, t, j);
-      else result.generated_still_path = directory.path('generated.webp');
-      result.action = m.profile === 'image_video' ? 'animate_reference' : 'generate_still_then_animate';
+      if (m.profile === 'prompt_wav') {
+        result.action = 'generate_wav_from_prompt';
+      } else if (m.profile === 'image_video') {
+        result.reference_path = await writeReference(directory, t, j);
+        result.action = 'animate_reference';
+      } else {
+        result.generated_still_path = directory.path('generated.webp');
+        result.action = 'generate_still_then_animate';
+      }
     }
     saved.state = 'generating';
     await spool.write('progress.json', encode(saved));

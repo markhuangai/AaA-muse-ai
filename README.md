@@ -4,7 +4,7 @@ AaA-muse-ai is a self-hosted broker for using Muse from model clients. Workers c
 
 - Use the OpenAI Chat Completions and Responses subsets for text and function tools, with JSON or buffered SSE. The model alias is `muse-ai`. [API and client setup](docs/history-api.md#openai-chat-completions)
 - Create client keys, enroll workers, and inspect requests in the control portal. [Portal guide](docs/portal.md)
-- Submit asynchronous video jobs and download expiring artifacts. [Media API](docs/media-api.md)
+- Ask Muse a question or generate WAV and MP4 files from an MCP client. [MCP tools and media API](docs/media-api.md#mcp-tools)
 
 ## Quick start
 

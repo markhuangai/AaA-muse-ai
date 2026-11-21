@@ -9,11 +9,14 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http/httptest"
+	neturl "net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/markhuangai/AaA-muse-ai/internal/auth"
 	"github.com/markhuangai/AaA-muse-ai/internal/inference"
 	"github.com/markhuangai/AaA-muse-ai/internal/media"
 )
@@ -36,7 +39,11 @@ func TestMediaHTTP(t *testing.T) {
 		r.Header.Set("Authorization", "Bearer "+principal)
 		r.Header.Set("Content-Type", kind)
 		for k, v := range headers {
-			r.Header.Set(k, v)
+			if k == "Host" {
+				r.Host = v
+			} else {
+				r.Header.Set(k, v)
+			}
 		}
 		out := httptest.NewRecorder()
 		h.ServeHTTP(out, r)
@@ -50,6 +57,10 @@ func TestMediaHTTP(t *testing.T) {
 		code int
 	}{{"{}", 400}, {`{"prompt":"x","submission_id":"ok","bad":true}`, 400}, {`{"prompt":"   ","submission_id":"ok"}`, 400}, {`{"prompt":"` + strings.Repeat("m", 4097) + `","submission_id":"ok"}`, 413}} {
 		req("POST", mediaJobs, client, "application/json", []byte(pair.body), nil, pair.code)
+	}
+	for _, format := range []string{"null", "1", `"ogg"`} {
+		body := `{"prompt":"sound","submission_id":"valid","format":` + format + "}"
+		req("POST", mediaJobs, client, "application/json", []byte(body), nil, 400)
 	}
 	req("POST", mediaJobs, client, "text/plain", nil, nil, 415)
 	req("POST", mediaJobs+"?other", client, "application/json", nil, nil, 400)
@@ -87,10 +98,49 @@ func TestMediaHTTP(t *testing.T) {
 	if !bytes.Equal(download.Body.Bytes(), payload) || download.Header().Get("Cache-Control") != "no-store" {
 		t.Fatal("unprotected or changed artifact")
 	}
+	req("GET", url, client, "", nil, map[string]string{"Host": "example.com:65536"}, 400)
+	owned := req("GET", url, client, "", nil, map[string]string{"Host": "broker.example:8443", "X-Forwarded-Host": "untrusted.invalid"}, 200)
+	var link mediaPollResult
+	if err := json.Unmarshal(owned.Body.Bytes(), &link); err != nil {
+		t.Fatal(err)
+	}
+	publicLink, err := neturl.Parse(link.DownloadURL)
+	if err != nil || publicLink.Scheme != "https" || publicLink.Host != "broker.example:8443" {
+		t.Fatal("status did not use the accepted HTTPS authority")
+	}
+	token := filepath.Base(publicLink.Path)
+	if !auth.ValidToken(token, auth.DownloadPrefix) {
+		t.Fatal("invalid share credential")
+	}
+	out := req("GET", publicLink.Path, "", "", nil, nil, 200)
+	if out.Header().Get("Content-Disposition") != "attachment; filename=muse.mp4" ||
+		out.Header().Get("Referrer-Policy") != "no-referrer" || !bytes.Equal(out.Body.Bytes(), payload) {
+		t.Fatal("anonymous download differed from verified artifact")
+	}
+	badToken := auth.DownloadPrefix + strings.Repeat("A", 43)
+	for _, path := range []string{sharedMediaPrefix + "invalid", strings.ReplaceAll(publicLink.Path, token, badToken),
+		sharedMediaPrefix + strings.Repeat("a", 32) + "/" + badToken, publicLink.Path + "?unused"} {
+		denied := req("GET", path, "", "", nil, nil, 404)
+		if denied.Body.String() != "{\"error\":\"not_found\"}\n" {
+			t.Fatal("public denial leaked its internal reason")
+		}
+	}
 	job := db.states[w.ID].Jobs[row.ID]
 	past := time.Now().Add(-time.Second)
 	job.Media.ExpiresAt = &past
 	req("GET", url+"/artifact", client, "", nil, nil, 410)
+	req("GET", publicLink.Path, "", "", nil, nil, 404)
+	future := time.Now().Add(time.Minute)
+	job.Media.ExpiresAt = &future
+	if err = os.Remove(filepath.Join(h.Broker.Media.Dir, row.ID, "artifact")); err != nil {
+		t.Fatal(err)
+	}
+	req("GET", publicLink.Path, "", "", nil, nil, 404)
+	req("GET", url, client, "", nil, nil, 404)
+	if err = os.WriteFile(filepath.Join(h.Broker.Media.Dir, row.ID, "download-token"), []byte("truncated"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	req("GET", publicLink.Path, "", "", nil, nil, 503)
 	req("POST", mediaTrials, client, "application/json", nil, nil, 401)
 	req("POST", mediaTrials, admin, "application/json", []byte("{}"), nil, 400)
 	trial, _ := json.Marshal(map[string]string{"worker_id": w.ID, "owner": "client", "profile": "native_mp3", "submission_id": "trial"})

@@ -97,6 +97,32 @@ func TestMediaReceiptAndOwnership(t *testing.T) {
 		t.Fatal(a, err)
 	}
 	before := *a.ExpiresAt
+	_, _, err = b.PollMedia(ctx, logger, "bob", j.ID, "video/mp4")
+	requireInferenceReason(t, err, "media_not_found")
+	_, _, err = b.PollMedia(ctx, logger, "alice", j.ID, "audio/wav")
+	requireInferenceReason(t, err, "media_not_found")
+	_, token, err := b.PollMedia(ctx, logger, "alice", j.ID, "video/mp4")
+	if err != nil || token == "" {
+		t.Fatal("owning poll did not issue a link", err)
+	}
+	if info, err := os.Stat(filepath.Join(b.Media.Dir, j.ID, "download-token")); err != nil || info.Mode().Perm() != 0600 {
+		t.Fatal("shared grant permissions changed", err)
+	}
+	_, tokenAgain, err := b.PollMedia(ctx, logger, "alice", j.ID, "video/mp4")
+	if err != nil || token != tokenAgain {
+		t.Fatal("repeated owning poll rotated a live link", err)
+	}
+	_, file, err = b.ReadSharedMedia(ctx, logger, j.ID, token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	original, err := io.ReadAll(file)
+	file.Close()
+	if err != nil || string(original) != "bytes" {
+		t.Fatal("anonymous read did not return the original", err)
+	}
+	_, _, err = b.ReadSharedMedia(ctx, logger, j.ID, "wrong")
+	requireInferenceReason(t, err, "download_link_invalid")
 	m.now = m.now.Add(time.Minute)
 	_, a, err = b.MediaUpload(ctx, logger, wid, j.ID, f, hash, 5, nil)
 	if err != nil || !a.ExpiresAt.Equal(before) {
@@ -114,12 +140,17 @@ func TestMediaReceiptAndOwnership(t *testing.T) {
 		t.Fatal("incorrect artifact")
 	}
 	m.now = before
+	_, _, err = b.ReadSharedMedia(ctx, logger, j.ID, token)
+	requireInferenceReason(t, err, "artifact_expired")
+	if _, err = os.Stat(filepath.Join(b.Media.Dir, j.ID, "artifact")); err != nil {
+		t.Fatal("expiry test no longer has the original on disk", err)
+	}
 	_, _, err = b.ReadMedia(ctx, logger, "alice", j.ID, true)
 	requireInferenceReason(t, err, "artifact_expired")
 	if _, err = os.Stat(filepath.Join(b.Media.Dir, j.ID, "prompt")); !os.IsNotExist(err) {
 		t.Fatal("retained motion text")
 	}
-	if strings.Contains(log.String(), message) || !strings.Contains(log.String(), "media.committed") {
+	if strings.Contains(log.String(), message) || strings.Contains(log.String(), token) || !strings.Contains(log.String(), "media.committed") {
 		t.Fatal("incorrect diagnostic capture")
 	}
 }

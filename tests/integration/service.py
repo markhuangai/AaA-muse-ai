@@ -94,7 +94,7 @@ class Harness:
     def setup(self):
         self.network = self.remember("networks", self.docker("network", "create", "--label", LABEL + "=" + self.owner, self.owner).stdout.strip())
         self.state_volume = self.volume("sqlite")
-        tools = "aaa-muse-sqlite-tools:" + self.args.source_sha
+        tools = os.environ.get("SERVICE_TOOLS_IMAGE", "aaa-muse-sqlite-tools:" + self.args.source_sha)
         self.docker("build", "--target", "tools", "-t", tools, ".", timeout=240)
         self.db = self.remember("containers", self.docker(
             "run", "-d", "--label", LABEL + "=" + self.owner, "-v", self.state_volume + ":" + SQLITE_STATE,

@@ -17,6 +17,10 @@ import (
 )
 
 const (
+	PromptVideoProfile = "prompt_video"
+	ImageVideoProfile  = "image_video"
+	PromptWAVProfile   = "prompt_wav"
+
 	ImageLimit      = 8 << 20
 	PromptLimit     = 4 << 10
 	ArtifactLimit   = 32 << 20
@@ -90,6 +94,18 @@ func writeBounded(dst stagedFile, input io.Reader, limit int64) (int64, string, 
 	return n, hex.EncodeToString(h.Sum(nil)), err
 }
 
+func (p *Stage) GeneratedPrompt(format, value string) error {
+	switch format {
+	case "mp4":
+		p.Record.Profile = PromptVideoProfile
+	case "wav":
+		p.Record.Profile = PromptWAVProfile
+	default:
+		return inference.Reject("unsupported_media_format", 400)
+	}
+	return p.Prompt(value)
+}
+
 func (p *Stage) Prompt(value string) error {
 	if len(value) > PromptLimit {
 		return inference.Reject("prompt_too_large", 413)
@@ -151,6 +167,9 @@ func TrialFixture(profile string, size int64, hash string) (int64, string, error
 }
 func AudioTrial(profile string) bool { _, ok := audioFixtures[profile]; return ok }
 func OutputType(profile string) string {
+	if profile == PromptWAVProfile {
+		return "audio/wav"
+	}
 	if fixture, ok := audioFixtures[profile]; ok {
 		return fixture.kind
 	}
@@ -237,13 +256,22 @@ func (u *Upload) Commit() error {
 }
 
 func (s *Store) Open(id, name string) (fs.File, error) {
-	if !jobDir.MatchString(id) || (name != "artifact" && name != "image" && name != "prompt") {
+	if !jobDir.MatchString(id) || (name != "artifact" && name != "image" && name != "prompt" && name != downloadTokenFile) {
 		return nil, os.ErrInvalid
 	}
 	return s.files.openJob(s.Dir, id, name)
 }
 
 func openJob(dir, id, name string) (fs.File, error) {
+	job, err := openJobRoot(dir, id)
+	if err != nil {
+		return nil, err
+	}
+	defer job.Close()
+	return job.Open(name)
+}
+
+func openJobRoot(dir, id string) (*os.Root, error) {
 	volume, err := os.OpenRoot(dir)
 	if err != nil {
 		return nil, err
@@ -253,25 +281,23 @@ func openJob(dir, id, name string) (fs.File, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer job.Close()
 
 	// A directory alias inside the shared volume must not select a different owner's job.
 	entry, err := volume.Lstat(id)
 	if err != nil {
+		job.Close()
 		return nil, err
 	}
 	opened, err := job.Stat(".")
 	if err != nil {
+		job.Close()
 		return nil, err
 	}
 	if !os.SameFile(entry, opened) {
+		job.Close()
 		return nil, os.ErrInvalid
 	}
-	f, err := job.Open(name)
-	if err != nil {
-		return nil, err
-	}
-	return f, nil
+	return job, nil
 }
 func (s *Store) ClearInputs(id string) error {
 	for _, name := range []string{"image", "prompt"} {

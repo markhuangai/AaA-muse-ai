@@ -106,7 +106,7 @@ export class Transport {
     let timer = this.net.setTimer(abort, 10_000);
     let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
     try {
-      const headers: Record<string, string> = { Authorization: 'Bearer ' + this.credential, Accept: 'text/event-stream', 'X-Muse-Media-Jobs': '1', 'X-Muse-Worker-Version': this.productVersion };
+      const headers: Record<string, string> = { Authorization: 'Bearer ' + this.credential, Accept: 'text/event-stream', 'X-Muse-Media-Jobs': '1', 'X-Muse-Prompt-Wav': '1', 'X-Muse-Worker-Version': this.productVersion };
       if (modelReport !== undefined) {
         const report = Buffer.from(encode(modelReport));
         if (report.length <= maxModelReportBytes) {
