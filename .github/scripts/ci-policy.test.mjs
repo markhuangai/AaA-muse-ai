@@ -43,7 +43,7 @@ test('every job needs its own literal integer timeout from one through thirty mi
   assert.match(checkWorkflow(workflow() + '\n  forgotten:\n    runs-on: ubuntu-latest\n')[0], /jobs.forgotten/);
 });
 
-test('only the approved AI review job has a forty-five-minute budget with cleanup headroom', () => {
+test('the approved AI review job has a forty-five-minute budget with cleanup headroom', () => {
   const review = budget => workflow('ubuntu-latest', budget).replace('  check:', '  review:');
   assert.deepEqual(checkWorkflow(review('45'), 'ai-pr-review.yml'), []);
   assert.match(checkWorkflow(review('46'), 'ai-pr-review.yml')[0], /1 through 45/);
@@ -55,6 +55,49 @@ test('only the approved AI review job has a forty-five-minute budget with cleanu
   const config = parse(readFileSync(new URL('../workflows/ai-pr-review.yml', import.meta.url), 'utf8'));
   assert.equal(config.jobs.review['timeout-minutes'], 45);
   assert.equal(config.jobs.review.steps.find(step => step.id === 'reviewer')['timeout-minutes'], 40);
+});
+
+test('the manual remote development caller forwards the agent choice and shared MCP config', () => {
+  const source = readFileSync(new URL('../workflows/remote-dev.yml', import.meta.url), 'utf8');
+  const caller = parse(source);
+  const job = caller.jobs['remote-dev'];
+  assert.deepEqual(Object.keys(caller.on), ['workflow_dispatch']);
+  const { type, options, default: defaultRunner } = caller.on.workflow_dispatch.inputs.runner;
+  assert.equal(type, 'choice');
+  assert.deepEqual(options, ['codex', 'claude']);
+  assert.equal(defaultRunner, 'codex');
+  assert.equal(job.if, "github.ref == 'refs/heads/main'");
+  assert.equal(job.with.runner, '${{ inputs.runner }}');
+  assert.equal(job.secrets['mcp-config'], '${{ secrets.MCP_CONFIG_JSON }}');
+  assert.equal(job.with['runs-on'], '["ubuntu-latest"]');
+  assert.equal(job.with['timeout-minutes'], 300);
+  assert.deepEqual(checkWorkflow(source, 'remote-dev.yml'), []);
+});
+
+test('the remote development scheduling exception applies only to the approved reusable job', () => {
+  const source = readFileSync(new URL('../workflows/remote-dev.yml', import.meta.url), 'utf8');
+  for (const [candidate, filename] of [
+    [source, 'other.yml'],
+    [source.replace('  remote-dev:', '  other:'), 'remote-dev.yml'],
+    [source.replace('remote-dev.yml@v1', 'remote-dev.yml@main'), 'remote-dev.yml'],
+  ]) {
+    assert.equal(workflowProblems(candidate, filename)[0].cause, 'unsupported_reusable_workflow');
+  }
+  assert.match(checkWorkflow(workflow('ubuntu-latest', '300').replace('  check:', '  remote-dev:'), 'remote-dev.yml')[0], /1 through 30/);
+});
+
+test('remote development rejects unsupported runners and unbounded timeouts', () => {
+  const source = readFileSync(new URL('../workflows/remote-dev.yml', import.meta.url), 'utf8');
+  for (const runner of ['["self-hosted"]', '["ubuntu-latest","self-hosted"]', '${{ inputs.runner }}']) {
+    const [problem] = workflowProblems(source.replace('["ubuntu-latest"]', runner), 'remote-dev.yml');
+    assert.equal(problem.cause, 'unsupported_runner');
+    assert.equal(problem.runner, runner);
+  }
+  for (const budget of ['', '      timeout-minutes: 301\n', '      timeout-minutes: "300"\n', '      timeout-minutes: ${{ inputs.timeout }}\n']) {
+    const [problem] = workflowProblems(source.replace('      timeout-minutes: 300\n', budget), 'remote-dev.yml');
+    assert.equal(problem.cause, 'invalid_timeout');
+    assert.equal(problem.maximum, 300);
+  }
 });
 
 test('invalid YAML, duplicate keys, absent jobs, and unbounded reusable jobs fail closed', () => {

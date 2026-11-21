@@ -31,4 +31,16 @@ Serve the portal and API through your HTTPS reverse proxy. Sign in to the portal
 
 The formal live qualification verdict remains inconclusive. The qualification record binds observations to the tested artifacts and distinguishes live trials from controlled software validation. [Qualification record](docs/releases.md#live-qualification-evidence) · [Project history](docs/project-history.md)
 
+## Remote development
+
+In **Actions → Remote development**, `Z-M-Huang` can dispatch a run from `main`. Select `codex` (the default) or `claude` in **runner**. The workflow passes the selected provider's credentials, `REMOTE_DEV_PAT`, and the optional `MCP_CONFIG_JSON` Actions secret to the runner. Use raw JSON with an `mcpServers` object for the shared MCP configuration. [Workflow](.github/workflows/remote-dev.yml) · [Upstream setup](https://github.com/markhuangai/agent-remote-dev/blob/4834e85a8b4416500fdde73bf09306c70942d4fd/docs/setup.md)
+
+```sh
+gh workflow run remote-dev.yml --repo markhuangai/AaA-muse-ai --ref main -f runner=claude -F plan=@plan.md
+gh run download RUN_ID --repo markhuangai/AaA-muse-ai --pattern 'remote-dev-result-*'
+gh workflow run remote-dev.yml --repo markhuangai/AaA-muse-ai --ref main -f runner=claude -f resume-run-id=RUN_ID -F plan=@context.md
+```
+
+Use public-safe prompts and fixtures because this repository stores conversation and result artifacts. Inspect the result artifact for the task outcome. Resume with the original runner and compatible version to restore the recorded published source revision. Include `$sdlc-plan-implementation` in the prompt when the task calls for an audited PR. Each execution can run for five hours, with up to three automatic continuations after timeouts. Cancel a run with `gh run cancel RUN_ID --repo markhuangai/AaA-muse-ai`. Check `gh run list --repo markhuangai/AaA-muse-ai --workflow remote-dev.yml` and cancel any already-queued continuation by its own run ID. [Project settings](.remote-dev.yml) · [Timeout decision](docs/project-history.md#remote-development)
+
 [Contributor instructions](AGENTS.md) · [Apache-2.0 license](LICENSE)
