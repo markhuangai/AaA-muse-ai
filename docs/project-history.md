@@ -4,11 +4,15 @@ These entries record decisions and evidence at the dates shown. See the release 
 
 ## Remote development
 
-The owner approved GitHub Actions remote development from `29cee2dc15c1457c6aea8419831f756315af36ea`. `Z-M-Huang` can dispatch Codex or Claude from `main`, resume with the original runner and a prior run ID, and cancel a continuation by its own run ID. Each execution runs on `ubuntu-latest` with a 300-minute timeout and can recover through up to three automatic continuations after a timeout. The CI policy grants this budget to the specific reusable call. The owner requires independent plan audit, full CI, release verification, CodeQL, Codex, and complete configured AI review, with a CodeRabbit exemption for this PR. [Contributor instructions](../AGENTS.md#remote-development)
+The owner approved GitHub Actions remote development from `29cee2dc15c1457c6aea8419831f756315af36ea`. `Z-M-Huang` can dispatch Codex or Claude from `main`, resume with the original runner and a prior run ID, and cancel a continuation by its own run ID. Each execution runs on `ubuntu-latest` with a 300-minute timeout and can recover through up to three automatic continuations after a timeout. The owner approved this narrow exception to the default CI job budget. The owner requires independent plan audit, full CI, release verification, CodeQL, Codex, and complete configured AI review, with a CodeRabbit exemption for this PR. [Contributor instructions](../README.md#remote-development)
 
 At preflight, the upstream stable `v1` tag resolved to release `v1.0.1` at `4834e85a8b4416500fdde73bf09306c70942d4fd`. GitHub listed the five required organization secret names for this repository. The PR skills use revision `224a5be4ddf40c6cf0a50b97885cb353e8522e2e`, and the Golden Rules use `2672323b1e53aef19fae939dc9bd258397db9ef8`. Hosted provider authentication, result artifacts, and checkpoint resume require verification from `main`. [Upstream stable release](https://github.com/markhuangai/agent-remote-dev/releases/tag/v1.0.1)
 
 By `2026-11-21T13:00:50Z`, the independent plan audit passed in its first round. The CI policy, workflow lint with actionlint 1.7.12, file sizes, and all 75 CI helper tests passed at working-source digest `bcb99a1631497ecefaab42464bf18469288bbb3f05b7402db03af553c11e784e` before this documentation update. The CI helpers covered 1,557 of 1,585 statements. The policy CLI rejected a self-hosted runner with a 301-minute timeout and logged both causes, the job, the observed settings, and the 300-minute limit.
+
+The README carries the contributor guidance after the owner asked to preserve `AGENTS.md`. At PR #68 head `095b6ff9ce36636ca2ab4f1556d5062a893d3fb6`, the caller omitted the optional `mcp-config` mapping. GitHub confirmed `MCP_CONFIG_JSON` is a repository secret. The caller now forwards it for either runner. [PR #68](https://github.com/markhuangai/AaA-muse-ai/pull/68)
+
+By `2026-11-21T13:11:23Z`, a second independent audit passed for the correction. Workflow lint, CI policy, file sizes, and all 75 CI helper tests passed at working-source digest `a5728ae24393b1df492468c9e9eaca5fe652b34958257e20d0262a08931e42de` before this note. The caller regression checks the runner choice and shared MCP secret mapping. A byte comparison verified the original `AGENTS.md`.
 
 ## Worker recovery and dispatch
 

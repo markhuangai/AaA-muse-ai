@@ -34,4 +34,5 @@ jobs:
       codex-api-key: ${{ inputs.runner == 'codex' && secrets.CODEX_API_KEY || '' }}
       claude-settings: ${{ inputs.runner == 'claude' && secrets.CLAUDE_SETTINGS_JSON || '' }}
       claude-api-key: ${{ inputs.runner == 'claude' && secrets.ANTHROPIC_API_KEY || '' }}
+      mcp-config: ${{ secrets.MCP_CONFIG_JSON }}
       github-token: ${{ secrets.REMOTE_DEV_PAT }}

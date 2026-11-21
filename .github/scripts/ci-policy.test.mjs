@@ -57,12 +57,18 @@ test('the approved AI review job has a forty-five-minute budget with cleanup hea
   assert.equal(config.jobs.review.steps.find(step => step.id === 'reviewer')['timeout-minutes'], 40);
 });
 
-test('the manual remote development caller uses the approved hosted runner and job budget', () => {
+test('the manual remote development caller forwards the agent choice and shared MCP config', () => {
   const source = readFileSync(new URL('../workflows/remote-dev.yml', import.meta.url), 'utf8');
   const caller = parse(source);
   const job = caller.jobs['remote-dev'];
   assert.deepEqual(Object.keys(caller.on), ['workflow_dispatch']);
+  const { type, options, default: defaultRunner } = caller.on.workflow_dispatch.inputs.runner;
+  assert.equal(type, 'choice');
+  assert.deepEqual(options, ['codex', 'claude']);
+  assert.equal(defaultRunner, 'codex');
   assert.equal(job.if, "github.ref == 'refs/heads/main'");
+  assert.equal(job.with.runner, '${{ inputs.runner }}');
+  assert.equal(job.secrets['mcp-config'], '${{ secrets.MCP_CONFIG_JSON }}');
   assert.equal(job.with['runs-on'], '["ubuntu-latest"]');
   assert.equal(job.with['timeout-minutes'], 300);
   assert.deepEqual(checkWorkflow(source, 'remote-dev.yml'), []);
