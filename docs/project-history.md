@@ -2,6 +2,14 @@
 
 These entries record decisions and evidence at the dates shown. See the release guide for the current publication and qualification rules. [Paired product releases](releases.md)
 
+## Muse MCP tools
+
+The owner approved a separate-worktree delivery from `c83690b01dea83507a2b7d7dfa1272afb9c31318`. Model-client keys authenticate stateless MCP prompts, media submissions and status polls. An owning poll can issue a temporary download link on the same public HTTPS hostname. The artifact and link share the existing ten-minute expiry after verified storage. Muse receives the caller's WAV brief and chooses the available producer. Controlled software validation uses the packed worker and real broker; creative WAV behavior on a live Muse account remains unverified. The owner requires an independent audit, full CI, CodeQL, Codex and complete configured AI review and exempted CodeRabbit for this PR. [MCP tools and media API](media-api.md#mcp-tools)
+
+Controlled validation passed by `2026-11-21T02:04:34Z` at working-source digest `6adf81e3b82da434ee225a09808a64e032c2abdf3baa709c833cc99a42e4858c` before this note. The combined image was `sha256:2c12ecf0f44c5b3656afa8669ad0297dd0bc226d56c53cebe77116ef699b6bf0` and the packed worker SHA-256 was `881ab4197406c9a7ec6ce743b77fc5d9a5a17a9530dba434adc6f6f40babe9c5`. The independent audit passed before tests. All six unit coverage gates passed, including 5,735 of 6,347 Go statements. The 17-case media suite proved a 32-second response and exact replay after a lost reply, two distinct controlled WAVs, cross-broker delivery, and 404 after receipt expiry while the file remained on disk. Chat, Responses, worker transport, setup and recovery checks passed.
+
+The first audit found a missing fixture import and gaps in transfer severity and diagnostic assertions. The first coverage run missed the 90% gate. Follow-up tests exercise anonymous route failures and output receipts. The delayed text fixture checks redaction in the accepted output. The expiry fixture holds the file before its deadline and the stopped-claim fixture expires a job only after an accepted claim. These controlled runs leave live prompt-to-WAV capability open.
+
 ## Worker drawer and offline duration
 
 The owner approved one portal pull request from `c3fb1ca5e20c6716450a49562235d3b2b6d4a2f1` to bring display-name editing to the top of the drawer, support backdrop dismissal, and show observed downtime in the Workers table. The timer starts at a recorded stream close or heartbeat deadline and clears on an accepted heartbeat. Older outages with no recorded start show a dash. The delivery requires independent plan audit, full CI, CodeQL, Codex and the configured AI review. The owner exempted CodeRabbit for this change. [Worker management](portal.md#worker-management)

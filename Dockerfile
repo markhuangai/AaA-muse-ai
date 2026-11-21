@@ -16,8 +16,9 @@ RUN npm run check --workspace portal && VITE_SOURCE_SHA=${SOURCE_SHA} npm run bu
 FROM tools AS build
 COPY go.mod go.sum ./
 RUN go mod download \
-    && mkdir -p /out/sqlite-licenses \
-    && cp "$(go list -m -f '{{.Dir}}' modernc.org/sqlite)"/LICENSE* /out/sqlite-licenses/
+    && mkdir -p /out/sqlite-licenses /out/mcp-licenses \
+    && cp "$(go list -m -f '{{.Dir}}' modernc.org/sqlite)"/LICENSE* /out/sqlite-licenses/ \
+    && cp "$(go list -m -f '{{.Dir}}' github.com/modelcontextprotocol/go-sdk)"/LICENSE /out/mcp-licenses/
 COPY cmd ./cmd
 COPY internal ./internal
 ARG SOURCE_SHA=development
@@ -34,6 +35,7 @@ RUN apk add --no-cache ffmpeg && addgroup -g 10001 service && adduser -D -H -u 1
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=build /out/service /usr/local/bin/service
 COPY --from=build /out/sqlite-licenses/ /usr/share/aaa-muse-ai/licenses/sqlite/
+COPY --from=build /out/mcp-licenses/ /usr/share/aaa-muse-ai/licenses/mcp-go-sdk/
 COPY --from=frontend /src/portal/dist /usr/share/aaa-muse-ai/portal
 COPY --from=frontend /src/node_modules/@fontsource/geist/LICENSE /usr/share/aaa-muse-ai/licenses/geist-OFL.txt
 COPY --from=frontend /src/node_modules/@fontsource/geist-mono/LICENSE /usr/share/aaa-muse-ai/licenses/geist-mono-OFL.txt

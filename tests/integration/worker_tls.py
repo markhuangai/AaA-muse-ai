@@ -24,6 +24,8 @@ class TLSFixture:
         self.media_finished = threading.Event()
         self.media_status = None
         self.lose_media_ack = False
+        self.lose_mcp_reply = False
+        self.mcp_reply_lost = threading.Event()
         self.media_ack_lost = threading.Event()
         self.dropped = 0
         self.expire_heartbeat = False
@@ -68,7 +70,16 @@ class TLSFixture:
                 self.forward()
 
             def forward(self):
-                connection = http.client.HTTPConnection(fixture.target.hostname, fixture.target.port, timeout=45)
+                path = urllib.parse.urlsplit(self.path).path
+                route = "/downloads/{id}/{token}" if path.startswith("/downloads/") else path
+                if route in ("/mcp", "/downloads/{id}/{token}") and self.headers.get("Host") != urllib.parse.urlsplit(fixture.origin).netloc:
+                    with fixture.lock:
+                        fixture.events.append({"event": "fixture.host_rejected", "route": route, "forwarded": False})
+                    self.send_response(403)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                connection = http.client.HTTPConnection(fixture.target.hostname, fixture.target.port, timeout=325 if route == "/mcp" else 45)
                 with fixture.lock:
                     fixture.connections.append(connection)
                 try:
@@ -106,8 +117,10 @@ class TLSFixture:
                             # Expire liveness while leaving time for the final HTTP attempt to receive the broker's refusal.
                             time.sleep(max(0, delayed[1] - time.monotonic()))
                     headers = {key: self.headers[key] for key in ("Authorization", "Content-Type", "Cookie", "Host", "Origin", "Sec-Fetch-Site",
+                               "Accept", "MCP-Protocol-Version", "MCP-Method", "MCP-Name", "Mcp-Session-Id",
+                               "Forwarded", "X-Forwarded-Host",
                                "X-Request-Id", "X-Portal-Operation-Id",
-                               "X-Muse-Worker-Version", "X-Muse-Worker-Model-Report", "X-Muse-Media-Jobs",
+                               "X-Muse-Worker-Version", "X-Muse-Worker-Model-Report", "X-Muse-Media-Jobs", "X-Muse-Prompt-Wav",
                                "X-Muse-Artifact-Sha256", "X-Muse-Connection-Id", "X-Muse-Connection-Generation",
                                "X-Muse-Generation", "X-Muse-Lease-Id") if key in self.headers}
                     if self.command == "PUT" and fixture.interrupt_media:
@@ -139,6 +152,14 @@ class TLSFixture:
                     streaming = self.path == "/api/v1/worker/events" and response.status == 200
                     if not streaming:
                         payload = response.read()
+                        if route == "/mcp" and fixture.lose_mcp_reply and response.status == 200:
+                            params = json.loads(body).get("params", {})
+                            if params.get("name") == "ask_muse":
+                                fixture.lose_mcp_reply = False
+                                fixture.mcp_reply_lost.set()
+                                self.connection.shutdown(socket.SHUT_RDWR)
+                                self.close_connection = True
+                                return
                         if self.command == "PUT" and fixture.lose_media_ack and response.status == 200:
                             fixture.lose_media_ack = False
                             fixture.media_ack_lost.set()
@@ -180,7 +201,8 @@ class TLSFixture:
                             return
                     self.send_response(response.status)
                     for key in ("Content-Type", "X-Request-Id", "X-Muse-Service-Version", "Cache-Control", "Content-Security-Policy",
-                                "Referrer-Policy", "X-Content-Type-Options", "WWW-Authenticate", "Retry-After", "Allow", "Set-Cookie"):
+                                "Referrer-Policy", "X-Content-Type-Options", "WWW-Authenticate", "Retry-After", "Allow", "Set-Cookie",
+                                "Content-Disposition", "Mcp-Session-Id"):
                         for value in response.headers.get_all(key, []):
                             self.send_header(key, value)
                     if not streaming:
@@ -197,7 +219,7 @@ class TLSFixture:
                         self.wfile.write(payload)
                 except (OSError, http.client.HTTPException) as error:
                     with fixture.lock:
-                        fixture.events.append({"event": "fixture.connection_closed", "cause": type(error).__name__, "route": self.path})
+                        fixture.events.append({"event": "fixture.connection_closed", "cause": type(error).__name__, "route": route})
                 finally:
                     connection.close()
                     with fixture.lock:

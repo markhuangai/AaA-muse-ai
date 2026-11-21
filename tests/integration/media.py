@@ -12,6 +12,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+from media_mcp import MCPMedia
 from product import PackedModel, Product
 from service import require
 from worker_setup import run
@@ -35,7 +36,7 @@ def multipart(fields, image, kind):
     return b''.join(pieces), {"Content-Type": "multipart/form-data; boundary=" + boundary}
 
 
-class MediaFlow(Product):
+class MediaFlow(MCPMedia, Product):
     def launch(self, *args, **kwargs):
         if not hasattr(self, "media_volume"):
             self.media_volume = self.volume("media")
@@ -70,6 +71,9 @@ class MediaFlow(Product):
         return hosted, progress
 
     def exercise(self):
+        self.sibling, self.sibling_origin, _ = self.launch()
+        self.ready(self.sibling, self.sibling_origin)
+        self.mcp_preflight()
         worker = self.environment("media", mount_system_tmp=True)
         worker["slot"] = "media"
         self.install(worker, self.prompt())
@@ -81,7 +85,7 @@ class MediaFlow(Product):
         foreign = self.new_worker()
         stills, video, audios = self.inputs()
         prompt = "private-motion-" + secrets.token_hex(20)
-        jobs = []
+        jobs, links = [], {}
         for case, image in [*stills.items(), ("prompt_video", None), *audios.items()]:
             motion = "\ufeff" + prompt if case == "prompt_video" else prompt
             fields = {"prompt": motion, "submission_id": secrets.token_hex(16)}
@@ -101,7 +105,13 @@ class MediaFlow(Product):
                 require(status == 202, f"{case} admission failed with {status}")
                 return json.loads(data)["job_id"]
 
-            identity = submit()
+            if case == "prompt_video":
+                identity = self.mcp_call("generate_video", fields)["job_id"]
+                pending = self.mcp_call("download_video", {"job_id": identity})
+                require(pending.get("retry_after_seconds") == 60 and "download_url" not in pending,
+                        "pending video produced a URL")
+            else:
+                identity = submit()
             require(submit() == identity, "exact retry created a second job")
             url = "/api/v1/media/jobs/" + identity
             self.until(lambda: (worker["state"] / "cues" / (identity + ".json")).exists(), "media claim missing", timeout=30)
@@ -141,7 +151,12 @@ class MediaFlow(Product):
             if case == "image/png":
                 require(time.monotonic() - started >= 11 and len(expected) == 32 << 20 and not self.proxy.slow_media, "slow maximum-size transfer was not exercised")
                 self.add("media.slow_maximum_upload", bytes=len(expected))
+            if case == "prompt_video":
+                links[identity] = self.ready_link(identity, "video", expected)
+                self.add("mcp.prompt_video_delivery")
             status = self.checked(url, self.client)[0]
+            if case in audios:
+                require("download_url" not in status, "management trial became shareable")
             properties = status["artifact"]
             require(properties["sha256"] == sha(expected) and properties["size"] == len(expected) and properties["duration"] > 0 and properties["streams"], "artifact metadata mismatch")
             require(self.api(url + "/artifact", self.client)[2] == expected and self.api(url + "/artifact", self.other_client)[0] == 404, "owner download integrity or isolation failed")
@@ -161,8 +176,13 @@ class MediaFlow(Product):
             self.add("media." + case, artifact_sha256=sha(expected), bytes=len(expected))
         self.limits(stills, prompt)
         self.diagnosis(worker, jobs[0][0], prompt, video)
+        mcp_jobs = self.mcp_generated_wav(worker)
+        for identity, expires_at, path, _ in mcp_jobs:
+            jobs.append((identity, timestamp(expires_at)))
+            links[identity] = path
+        self.mcp_text(worker, mcp_jobs[-1][2])
         self.cancel_during_upload(worker, video, prompt)
-        self.expire(jobs)
+        self.expire(jobs, links)
 
     def adverse_upload(self, worker, foreign, identity, expected, output):
         current = self.checked("/api/v1/worker/jobs/" + identity, worker["credential"])[0]
@@ -228,6 +248,10 @@ class MediaFlow(Product):
         status = self.checked("/api/v1/worker/jobs/" + identity, worker["credential"])[0]
         require(status["state"] == "cancelled" and status["held"] and output.read_bytes() == expected, "lost uncertain hold or local output")
         require(self.api("/api/v1/media/jobs/" + identity + "/artifact", self.client)[0] == 409, "cancelled stream published")
+        cancelled = self.mcp_call("download_video", {"job_id": identity})
+        require(cancelled["status"] == "cancelled" and cancelled.get("reason") and
+                "download_url" not in cancelled and "retry_after_seconds" not in cancelled,
+                "terminal cancellation did not end MCP polling")
         _, events = self.decode_export(self.api("/api/v1/admin/diagnostics/export?operation_id=" + identity, self.admin)[2])
         require(any(e["msg"] == "lease.fenced" and e.get("evidence", {}).get("busy_hold") is True for e in events), "missing commit-time fence diagnosis")
         self.add("media.cancel_during_upload")
@@ -243,7 +267,8 @@ class MediaFlow(Product):
         half = original[:len(original) // 2]
         require(evidence["expected_bytes"] == len(original) and evidence["observed_bytes"] == len(half)
                 and evidence["expected_sha256"] == sha(original) and evidence["observed_sha256"] == sha(half)
-                and evidence["stage"] == "receive" and evidence["partial_cleanup"] == "removed" and interrupted.get("request_id"),
+                and evidence["stage"] == "receive" and evidence["partial_cleanup"] == "removed" and interrupted.get("request_id")
+                and interrupted["level"] == "ERROR",
                 "interrupted transfer cannot be reconstructed from broker diagnostics")
         worker_log = self.cli(worker, "diagnostics-export", "--operation-id", identity, "--decode").stdout
         require("worker.media_upload_confirmed" in worker_log and "worker.media_transfer_pending" in worker_log, "missing worker diagnosis")
@@ -251,21 +276,44 @@ class MediaFlow(Product):
             require(prompt not in capture and self.sentinel.decode() not in capture, "raw media content retained")
         self.add("media.private_diagnostics")
 
-    def expire(self, jobs):
+    def expire(self, jobs, links):
         last, deadline = jobs[-1]
         url = "/api/v1/media/jobs/" + last + "/artifact"
         require(self.api(url, self.client)[0] == 200, "file unavailable before expiry")
-        time.sleep(max(0, deadline - time.time() - 8))
+        path = links[last]
+        self.docker("stop", "-t", "2", self.sibling)
+        self.docker("start", self.sibling)
+        self.sibling_origin = self.origin(self.sibling)
+        self.ready(self.sibling, self.sibling_origin)
+        require(self.api(path, origin=self.sibling_origin)[0] == 200, "restart lost the published token")
+        directory = "/var/lib/aaa-muse-ai/media/" + last
+        # Hold the file on disk while the application crosses its receipt expiry.
+        self.docker("exec", self.broker, "chmod", "0500", directory)
+        try:
+            time.sleep(max(0, deadline - time.time() + 0.1))
+            self.docker("exec", self.broker, "test", "-f", directory + "/artifact")
+            code, headers, _ = self.proxy_exchange(path)
+            require(code == self.api(path, origin=self.sibling_origin)[0] == 404,
+                    "an expired link was served while the file remained on disk")
+            self.mcp_rejection(headers["X-Request-Id"], "media.link_rejected", "artifact_expired", last)
+            expired = self.mcp_call("download_wav", {"job_id": last})
+            require(expired["status"] == "expired" and "download_url" not in expired, "expired job retained a download URL")
+        finally:
+            self.docker("stop", "-t", "2", self.sibling)
+            self.docker("exec", self.broker, "chmod", "0700", directory)
         self.docker("stop", "-t", "2", self.broker)
-        time.sleep(max(0, deadline - time.time() + 1))
         self.docker("start", self.broker)
         self.origin_url = self.origin(self.broker)
+        self.proxy.target = urllib.parse.urlsplit(self.origin_url)
         self.ready(self.broker, self.origin_url)
+        for path in links.values():
+            require(self.proxy_exchange(path)[0] == 404, "expired or deleted artifacts remained downloadable after restart")
         for identity, _ in jobs:
             route = "/api/v1/media/jobs/" + identity
             require(self.api(route + "/artifact", self.client)[0] == 410 and self.api(route, self.client)[0] == 200, "restart lost receipt or served expired media")
             self.docker("exec", self.broker, "test", "!", "-e", "/var/lib/aaa-muse-ai/media/" + identity)
         self.add("media.expiry_across_restart", window_seconds=600)
+        self.add("mcp.expiry_before_cleanup", brokers=2)
 
 
 if __name__ == "__main__":

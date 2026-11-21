@@ -195,6 +195,7 @@ func Run(ctx context.Context, args []string, build service.Build, d Dependencies
 	serveCtx, cancelServe := context.WithCancel(ctx)
 	defer cancelServe()
 	handler := &httpapi.Handler{Service: svc, Workers: service.NewWorkers(repo, authority, d.Random, d.Now), Broker: broker, Authority: authority, Exporter: store, Logger: logger, Redactor: redactor, ClientKeys: clientKeys, Random: d.Random, Now: d.Now, Failed: failed}
+	handler.InitMCP()
 	handler.Portal = portal
 	handler.Assets = d.PortalAssets
 	startup.Info("portal.configured", "effective_settings", service.PortalSettings(), "bearer_session_scope", "process_memory",

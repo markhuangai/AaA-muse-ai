@@ -8,7 +8,7 @@ export class Redactor {
   add(value: string): void { if (value && !this.secrets.includes(value)) this.secrets.push(value); }
   text(value: string): string {
     const spans: [number, number][] = [];
-    for (const match of value.matchAll(/(?=(muse_(?:enroll|worker|portal)_[A-Za-z0-9_-]{43}))/g)) spans.push([match.index!, match.index! + match[1].length]);
+    for (const match of value.matchAll(/(?=(muse_(?:enroll|worker|portal|download)_[A-Za-z0-9_-]{43}))/g)) spans.push([match.index!, match.index! + match[1].length]);
     for (const secret of this.secrets) {
       for (let offset = 0; offset < value.length;) {
         const index = value.indexOf(secret, offset);

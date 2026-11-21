@@ -59,8 +59,8 @@ func nativeEligibility(s *inference.State, j *inference.Job) error {
 		if reason := eligible(w, nil); reason != "" {
 			return inference.Reject("no_ready_worker", 503, "eligibility_reason", reason)
 		}
-		if !w.Connection.MediaJobs {
-			return inference.Reject("media_worker_unsupported", 409)
+		if !supportsMedia(w.Connection, j.Media.Profile) {
+			return inference.Reject("media_worker_unsupported", 409, "required_capability", mediaCapability(j.Media.Profile))
 		}
 	}
 	if r := s.Requests[j.ExperimentID]; r != nil {

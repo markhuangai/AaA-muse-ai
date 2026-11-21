@@ -267,13 +267,14 @@ class WorkerTransport(Inference):
             self.proxy.pause_claim = True
             self.proxy.claim_captured.clear()
             self.proxy.release_claim.clear()
-            e = self.create(worker, 'stopped during claim reconciliation', tools=False, timeout=2 if stopped == 'interrupted' else 300)
+            e = self.create(worker, 'stopped during claim reconciliation', tools=False)
             job_id = e['current_job_id']
             try:
                 require(self.proxy.claim_captured.wait(timeout=5), 'broker did not accept the paused claim')
                 if stopped == 'cancelled':
                     self.cancel(e['id'])
                 else:
+                    self.expire_job({"id": job_id, "experiment_id": e["id"]}, "2000-01-01T00:00:00Z")
                     self.until(lambda: self.experiment(e['id'])['state'] == stopped, 'paused claim never reached its deadline', timeout=5)
             finally:
                 self.proxy.release_claim.set()

@@ -472,10 +472,10 @@ func connectionMatches(s *inference.State, id string, generation int64) error {
 }
 
 func (b *Broker) Open(ctx context.Context, logger *slog.Logger, workerID string, report *inference.ModelReport) (json.RawMessage, error) {
-	return b.OpenSubscriber(ctx, logger, workerID, report, false)
+	return b.OpenSubscriber(ctx, logger, workerID, report, false, false)
 }
 
-func (b *Broker) OpenSubscriber(ctx context.Context, logger *slog.Logger, workerID string, report *inference.ModelReport, mediaJobs bool) (json.RawMessage, error) {
+func (b *Broker) OpenSubscriber(ctx context.Context, logger *slog.Logger, workerID string, report *inference.ModelReport, mediaJobs, promptWAV bool) (json.RawMessage, error) {
 	return b.run(ctx, logger, inference.Ref{WorkerID: workerID, WorkerAuth: workerID}, "connect", report, func(s *inference.State, events *[]inferenceEvent) (any, error) {
 		if s.Connection.Connected {
 			return nil, inference.Reject("subscriber_already_connected", 409)
@@ -486,12 +486,12 @@ func (b *Broker) OpenSubscriber(ctx context.Context, logger *slog.Logger, worker
 		}
 		s.Connection = inference.Connection{
 			ID: id, Generation: s.Connection.Generation + 1, AssignmentGeneration: s.Connection.AssignmentGeneration,
-			Connected: true, OpenedAt: s.Now, OfflineSince: s.Connection.OfflineSince, ModelReport: report, MediaJobs: mediaJobs,
+			Connected: true, OpenedAt: s.Now, OfflineSince: s.Connection.OfflineSince, ModelReport: report, MediaJobs: mediaJobs, PromptWAV: mediaJobs && promptWAV,
 		}
 		if err = b.challenge(s, events); err != nil {
 			return nil, err
 		}
-		event(events, slog.LevelInfo, "worker.connection_changed", s, nil, "connection_status", "connecting", "offline_since", s.Connection.OfflineSince)
+		event(events, slog.LevelInfo, "worker.connection_changed", s, nil, "connection_status", "connecting", "offline_since", s.Connection.OfflineSince, "media_jobs", mediaJobs, "prompt_wav", s.Connection.PromptWAV)
 		return s.Connection, nil
 	})
 }

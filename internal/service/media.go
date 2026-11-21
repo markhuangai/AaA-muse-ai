@@ -29,6 +29,35 @@ func mediaStatus(e *inference.Experiment, j *inference.Job) MediaStatus {
 	return MediaStatus{ID: j.ID, State: e.State, Profile: j.Media.Profile, CreatedAt: e.CreatedAt, DeadlineAt: e.DeadlineAt, CommittedAt: j.Media.CommittedAt, ExpiresAt: j.Media.ExpiresAt, Artifact: j.Media.Artifact, Reason: e.Reason}
 }
 
+func mediaCapability(profile string) string {
+	if profile == media.PromptWAVProfile {
+		return "prompt_wav"
+	}
+	return "media_jobs"
+}
+
+func supportsMedia(connection inference.Connection, profile string) bool {
+	return connection.MediaJobs && (profile != media.PromptWAVProfile || connection.PromptWAV)
+}
+
+func (b *Broker) SubmitPromptMedia(ctx context.Context, l *slog.Logger, owner, submission, format, prompt string) (json.RawMessage, error) {
+	stage, err := b.Media.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer CloseMediaStage(l, stage)
+	if err = stage.GeneratedPrompt(format, prompt); err != nil {
+		return nil, err
+	}
+	return b.SubmitMedia(ctx, l, stage, owner, submission, "")
+}
+
+func CloseMediaStage(l *slog.Logger, stage *media.Stage) {
+	if err := stage.Close(); err != nil {
+		l.Error("media.cleanup_failed", "stage", "admission", "cause", err.Error())
+	}
+}
+
 func (b *Broker) SubmitMedia(ctx context.Context, l *slog.Logger, p *media.Stage, owner, submission, target string) (json.RawMessage, error) {
 	if err := inference.VersionAndID(1, submission); err != nil {
 		return nil, err
@@ -46,13 +75,13 @@ func (b *Broker) SubmitMedia(ctx context.Context, l *slog.Logger, p *media.Stage
 		workers, _ := candidates(s, nil, inference.RequestInput{WorkerID: target}, false, "")
 		var selected *inference.State
 		for _, w := range workers {
-			if w.Connection.MediaJobs && available(s, w.WorkerID, "") {
+			if supportsMedia(w.Connection, p.Record.Profile) && available(s, w.WorkerID, "") {
 				selected = w
 				break
 			}
 		}
 		if selected == nil {
-			return nil, inference.Reject("no_ready_worker", 503, "required_capability", "media_jobs")
+			return nil, inference.Reject("no_ready_worker", 503, "required_capability", mediaCapability(p.Record.Profile))
 		}
 		id, err := auth.ID(b.random)
 		if err != nil {
@@ -107,36 +136,52 @@ func mediaAssignment(s *inference.State, id string, f MediaFence, allowReceipt b
 	return j, nil
 }
 
-// Open the authorized file inside the transaction so cleanup cannot change which file a successful request reads.
-func (b *Broker) ReadMedia(ctx context.Context, l *slog.Logger, owner, id string, download bool) (MediaStatus, fs.File, error) {
+func (b *Broker) inspectMedia(ctx context.Context, l *slog.Logger, owner, id, operation string, inspect func(*inference.State, *inference.Job, *[]inferenceEvent) error) (MediaStatus, error) {
 	var result MediaStatus
-	var file fs.File
-	_, err := b.run(ctx, l, inference.Ref{JobID: id, Principal: "media:" + owner}, "media_read", download, func(s *inference.State, _ *[]inferenceEvent) (any, error) {
+	principal := "media:" + owner
+	if owner == "" {
+		principal = "media:link"
+	}
+	_, err := b.run(ctx, l, inference.Ref{JobID: id, Principal: principal}, operation, nil, func(s *inference.State, events *[]inferenceEvent) (any, error) {
 		j := s.Jobs[id]
-		if j == nil || j.Media == nil || j.Media.Owner != owner {
+		if j == nil || j.Media == nil || (owner != "" && j.Media.Owner != owner) {
 			return nil, inference.Reject("media_not_found", 404)
 		}
 		result = mediaStatus(s.Experiments[j.ExperimentID], j)
-		if download {
-			if j.Media.ExpiresAt == nil {
-				return nil, inference.Reject("artifact_not_ready", 409)
-			}
-			if !s.Now.Before(*j.Media.ExpiresAt) {
-				return nil, inference.Reject("artifact_expired", 410)
-			}
-			var err error
-			file, err = b.Media.Open(id, "artifact")
-			if err != nil {
-				return nil, err
-			}
-		}
-		return result, nil
+		return result, inspect(s, j, events)
 	})
+	return result, err
+}
+
+// Open the authorized file inside the transaction so cleanup cannot change which file a successful request reads.
+func (b *Broker) ReadMedia(ctx context.Context, l *slog.Logger, owner, id string, download bool) (MediaStatus, fs.File, error) {
+	if owner == "" {
+		return MediaStatus{}, nil, inference.Reject("model_client_required", 401)
+	}
+	var file fs.File
+	result, err := b.inspectMedia(ctx, l, owner, id, "media_read", func(s *inference.State, j *inference.Job, _ *[]inferenceEvent) error {
+		if !download {
+			return nil
+		}
+		if j.Media.ExpiresAt == nil {
+			return inference.Reject("artifact_not_ready", 409)
+		}
+		if !s.Now.Before(*j.Media.ExpiresAt) {
+			return inference.Reject("artifact_expired", 410)
+		}
+		var err error
+		file, err = b.Media.Open(id, "artifact")
+		return err
+	})
+	return result, closeOnMediaError(file, err), err
+}
+
+func closeOnMediaError(file fs.File, err error) fs.File {
 	if err != nil && file != nil {
 		file.Close()
-		file = nil
+		return nil
 	}
-	return result, file, err
+	return file
 }
 
 func (b *Broker) MediaInput(ctx context.Context, l *slog.Logger, worker, id, name string, f MediaFence) (fs.File, string, error) {
