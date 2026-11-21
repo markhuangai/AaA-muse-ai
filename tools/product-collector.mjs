@@ -75,7 +75,7 @@ export class ReleaseCollector extends Collector {
       this.report = { schema_version: 2, suite: 'release', evidence_kind: this.evidenceKind, origin: this.origin, run_id: this.uuid(), started_at: this.stamp(),
         source: { service_sha: status.build.revision, image_digest: artifact.image_digest, service_version: status.build.version, worker_version: status.build.worker_package.version,
           worker_sha256: status.build.worker_package.sha256, installer_sha256: artifact.installer_sha256 }, status_receipt: status, workers, cases: [], cycles: [], native_cases: [],
-        observations: observations.entries, exports: [], checkpoints: {}, qualifications: {}, outcome: 'incomplete', verdict: 'inconclusive' };
+        observations: observations.entries, exports: [], checkpoints: {}, outcome: 'incomplete', verdict: 'inconclusive' };
     }
     await this.save();
   }
@@ -119,27 +119,15 @@ export class ReleaseCollector extends Collector {
     }
     await native.save();
     const [readiness, tool] = native.report.cases;
-    const qualification = { readiness_experiment_id: readiness.experiment_id, tool_experiment_id: tool.experiment_id };
-    const approved = await this.api(`/api/v1/admin/workers/${worker.worker_id}/qualifications`, 'POST', { protocol_version: 1, submission_id: this.uuid(), action: 'approve',
-      evidence_kind: this.evidenceKind === 'live' ? 'live' : 'controlled', evidence_reference: `release ${this.report.run_id}; independently observed ${phase}/${slot}`, ...qualification });
-    this.report.qualifications[slot] = qualification;
     if (phase === 'baseline') {
-      await this.record(`readiness.${slot}`, { worker_ids: [worker.worker_id], operation_ids: [readiness.experiment_id, tool.experiment_id], native_case_ids: [readiness.id, tool.id], qualification: approved });
+      await this.record(`readiness.${slot}`, { worker_ids: [worker.worker_id], operation_ids: [readiness.experiment_id, tool.experiment_id], native_case_ids: [readiness.id, tool.id] });
       await this.record(`idle.${slot}`, { worker_ids: [worker.worker_id], operation_ids: [readiness.experiment_id], native_case_ids: [readiness.id] });
     }
     await this.save();
   }
-  async select(slot, retainApproval = false) {
-    const { workers } = await this.api('/api/v1/admin/workers');
-    if (retainApproval) need(workers.some(worker => worker.id === this.worker(slot).worker_id && worker.inference_readiness === 'verified' && worker.qualification?.evidence.action === 'approve'), 'retained_worker_approval_required');
-    for (const worker of this.report.workers) {
-      const approve = worker.slot === slot || slot === 'all';
-      need(!approve || this.report.qualifications[worker.slot], 'current_live_qualification_required');
-      const current = workers.find(value => value.id === worker.worker_id);
-      if (approve && current?.inference_readiness === 'verified' || !approve && current?.qualification?.evidence.action === 'withdraw') continue;
-      await this.api(`/api/v1/admin/workers/${worker.worker_id}/qualifications`, 'POST', { protocol_version: 1, submission_id: this.uuid(), action: approve ? 'approve' : 'withdraw',
-        evidence_kind: this.evidenceKind === 'live' ? 'live' : 'controlled', evidence_reference: `release ${this.report.run_id}; select qualified ${slot}`, ...(approve ? this.report.qualifications[worker.slot] : {}) });
-    }
+  async startOnWorker(item) {
+    await this.driver.pin(item, this.worker(item.slot).worker_id);
+    await this.driver.start(item);
   }
   async newCycle(id, slot, protocol = 'chat', stream = false) {
     need(!this.report.cycles.some(item => item.id === id), 'release_cycle_already_started');
@@ -158,19 +146,18 @@ export class ReleaseCollector extends Collector {
       await this.native(slot, 'baseline');
     }
     for (const slot of ['a', 'b']) {
-      await this.select(slot);
       for (const protocol of ['chat', 'responses']) for (const stream of [false, true]) {
         const id = `${slot}.${protocol}.${stream ? 'sse' : 'json'}`;
         if (this.report.cases.some(item => item.id === id)) continue;
         const item = await this.newCycle(id, slot, protocol, stream);
-        await this.driver.start(item); await this.driver.finish(item); await this.driver.followup(item, 'affinity-' + this.random());
+        await this.startOnWorker(item); await this.driver.finish(item); await this.driver.followup(item, 'affinity-' + this.random());
         await this.record(id, await this.correlated(item));
       }
     }
     if (!this.report.cases.some(item => item.id === 'sessions.interleaved')) {
-      await this.select('a'); const a = await this.newCycle('interleave-a', 'a'); await this.driver.start(a);
-      await this.select('b'); const b = await this.newCycle('interleave-b', 'b', 'responses', true); await this.driver.start(b);
-      await this.select('all'); await this.driver.finish(b); await this.driver.finish(a);
+      const a = await this.newCycle('interleave-a', 'a'); await this.startOnWorker(a);
+      const b = await this.newCycle('interleave-b', 'b', 'responses', true); await this.startOnWorker(b);
+      await this.driver.finish(b); await this.driver.finish(a);
       const receipts = [await this.correlated(a), await this.correlated(b)];
       need(receipts[0].conversation_id !== receipts[1].conversation_id && receipts[0].session_id !== receipts[1].session_id, 'release_session_isolation_failed');
       for (const id of ['sessions.interleaved', 'sessions.isolation']) await this.record(id, { cycles: receipts });
@@ -188,13 +175,10 @@ export class ReleaseCollector extends Collector {
     const saved = this.report.checkpoints.broker;
     if (stage === 'broker-prepare') {
       need(!saved, 'broker_checkpoint_already_created');
-      await this.select('a');
-      const item = await this.newCycle('broker-wait', 'a'); await this.driver.start(item); await this.correlated(item);
-      await this.select('all');
-      const { workers } = await this.api('/api/v1/admin/workers');
+      const item = await this.newCycle('broker-wait', 'a'); await this.startOnWorker(item); await this.correlated(item);
       const status = await this.api('/api/v1/admin/status');
       this.report.checkpoints.broker = { before_instance: status.instance_id, pending_call_id: item.call_id, cycle_id: item.id, before_status: status,
-        qualification: workers.find(worker => worker.id === this.worker('a').worker_id).qualification, prepared_at: this.stamp() };
+        prepared_at: this.stamp() };
       await this.save(); await this.log('INFO', 'e2e.owner_checkpoint', { checkpoint: 'broker_restart', pending_call_id: item.call_id, action: 'Owner restarts the qualification service, retaining SQLite and diagnostics volumes; resume with broker-resume.' });
       return;
     }
@@ -204,7 +188,7 @@ export class ReleaseCollector extends Collector {
     need(Date.parse(action.time) > Date.parse(saved.prepared_at) && Date.parse(action.time) <= this.now(), 'owner_restart_time_required');
     saved.after_instance = status.instance_id; saved.after_status = status; saved.resumed_at = this.stamp();
     const { workers } = await this.api('/api/v1/admin/workers');
-    need(workers.some(worker => worker.id === this.worker('a').worker_id && worker.inference_readiness === 'verified' && same(worker.qualification, saved.qualification)), 'retained_worker_approval_required');
+    need(workers.some(worker => worker.id === this.worker('a').worker_id && worker.waiting_for_client_tool > 0), 'retained_worker_tool_wait_required');
     const item = this.report.cycles.find(value => value.id === saved.cycle_id);
     need(item.call_id === saved.pending_call_id, 'pending_tool_identity_changed');
     await this.driver.finish(item); const receipt = await this.correlated(item);
@@ -223,14 +207,10 @@ export class ReleaseCollector extends Collector {
     for (const ref of imports.worker_exports) events.push(...decodeExport(await this.readPrivate(ref.path)).events);
     const recovery = recoveryBoundary(this.report, id, events, { probe: false });
     const worker = this.report.workers.find(value => value.worker_id === recovery.worker_id);
-    await this.select(worker.slot, true);
-    const before = (await this.api('/api/v1/admin/workers')).workers.find(value => value.id === worker.worker_id).qualification;
-    const item = await this.newCycle(kind + '-probe', worker.slot); await this.driver.start(item); await this.driver.finish(item);
+    const item = await this.newCycle(kind + '-probe', worker.slot); await this.startOnWorker(item); await this.driver.finish(item);
     const receipt = await this.correlated(item);
     need(item.turns.every(turn => turn.connection_id === recovery.connection_id && turn.connection_generation === recovery.connection_generation), 'probe_recovery_generation_changed');
-    const after = (await this.api('/api/v1/admin/workers')).workers.find(value => value.id === worker.worker_id).qualification;
-    need(same(before, after), 'recovery_qualification_changed');
-    await this.record(id, { ...receipt, id, observation_ref: observed.source_ref, recovery, qualification: after });
+    await this.record(id, { ...receipt, id, observation_ref: observed.source_ref, recovery });
     await this.record('recovery.hook', { recovery_case_id: id, worker_ids: [worker.worker_id], operation_ids: receipt.operation_ids, observation_ref: observed.source_ref, recovery });
   }
   async replacement() {

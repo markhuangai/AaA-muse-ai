@@ -19,6 +19,8 @@ import (
 
 var workerIDPattern = regexp.MustCompile(`^[0-9a-f]{32}$`)
 
+const workerUpgradeRoute = "/api/v1/worker/upgrade-reservation"
+
 func routeFor(path string) (string, string) {
 	if route, id := mediaRoute(path); route != "" {
 		return route, id
@@ -26,7 +28,7 @@ func routeFor(path string) (string, string) {
 	switch path {
 	case "/api/v1/portal/login", "/api/v1/portal/logout", "/api/v1/portal/session", "/api/v1/portal/settings", "/api/v1/portal/events", "/api/v1/portal/client-keys":
 		return path, ""
-	case mcpRoute, "/v1/models", "/v1/chat/completions", "/v1/responses", "/healthz", "/readyz", "/api/v1/admin/status", "/api/v1/admin/diagnostics/export", "/api/v1/admin/enrollments", "/api/v1/admin/setup-prompts", "/api/v1/worker/enroll", "/api/v1/admin/workers", "/api/v1/worker/status":
+	case mcpRoute, "/v1/models", "/v1/chat/completions", "/v1/responses", "/healthz", "/readyz", "/api/v1/admin/status", "/api/v1/admin/diagnostics/export", "/api/v1/admin/enrollments", "/api/v1/admin/setup-prompts", "/api/v1/worker/enroll", "/api/v1/admin/workers", "/api/v1/worker/status", workerUpgradeRoute:
 		return path, ""
 	}
 	if strings.HasPrefix(path, "/api/v1/admin/workers/") {
@@ -51,7 +53,7 @@ func routeFor(path string) (string, string) {
 
 func routeMethod(route string) string {
 	switch route {
-	case mediaJobs, mediaTrials, mcpRoute:
+	case mediaJobs, mediaTrials, mcpRoute, workerUpgradeRoute:
 		return http.MethodPost
 	case workerMediaArtifact:
 		return http.MethodPut
@@ -191,8 +193,14 @@ func (h *Handler) workerRequest(w *response, r *http.Request, logger *slog.Logge
 		return
 	}
 	if route == "/api/v1/admin/workers/{id}/qualifications" {
-		var input inference.QualificationInput
-		err := decodeInferenceInput(body, &input, "protocol_version", "submission_id", "action", "evidence_reference")
+		w.workerID = id
+		logger.Info("worker.qualification_retired", "worker_id", id, "outcome", "rejected")
+		inferenceError(w, inference.Reject("qualification_retired", 410))
+		return
+	}
+	if route == workerUpgradeRoute {
+		var input service.UpgradeInput
+		err := decodeInferenceInput(body, &input, "protocol_version", "action", "operation_id", "generation")
 		if err != nil {
 			inferenceError(w, err)
 			return
@@ -201,15 +209,12 @@ func (h *Handler) workerRequest(w *response, r *http.Request, logger *slog.Logge
 			inferenceError(w, errors.New("broker_unavailable"))
 			return
 		}
-		data, err := h.Broker.Qualify(r.Context(), logger, id, input)
+		data, err := h.Broker.UpgradeReservation(r.Context(), logger, identity.ID, input)
 		if err != nil {
 			inferenceError(w, err)
 			return
 		}
-		w.workerID = id
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(200)
-		_, _ = w.Write(append(data, '\n'))
+		writeJSON(w, 200, data)
 		return
 	}
 	field := ""

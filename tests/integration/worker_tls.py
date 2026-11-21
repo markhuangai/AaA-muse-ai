@@ -34,6 +34,7 @@ class TLSFixture:
         self.failed_claims = []
         self.allow_statuses = 0
         self.fail_statuses = 0
+        self.worker_route_failures = {}
         self.enrollment_accepted = None
         self.pause_decision = False
         self.decision_captured = threading.Event()
@@ -85,6 +86,8 @@ class TLSFixture:
                 try:
                     body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
                     with fixture.lock:
+                        failures = fixture.worker_route_failures.get(path)
+                        injected = failures.pop(0) if failures else None
                         reject = self.path.endswith("/claim") and fixture.fail_claims > 0
                         if reject:
                             fixture.fail_claims -= 1
@@ -95,6 +98,21 @@ class TLSFixture:
                             elif fixture.fail_statuses:
                                 fixture.fail_statuses -= 1
                                 reject = True
+                    if injected == "disconnect":
+                        self.connection.shutdown(socket.SHUT_RDWR)
+                        return
+                    if injected == 404:
+                        request_id = self.headers.get("X-Request-Id", "fixture-route-404")
+                        with fixture.lock:
+                            fixture.events.append({"event": "fixture.request_rejected", "route": path, "request_id": request_id, "status": 404, "forwarded": False})
+                        payload = b"404 page not found\n"
+                        self.send_response(404)
+                        self.send_header("Content-Type", "text/plain")
+                        self.send_header("Content-Length", str(len(payload)))
+                        self.send_header("X-Request-Id", request_id)
+                        self.end_headers()
+                        self.wfile.write(payload)
+                        return
                     if reject:
                         with fixture.lock:
                             fixture.events.append({"event": "fixture.request_rejected", "route": self.path, "request_id": self.headers.get("X-Request-Id", "fixture-unavailable"), "status": 503, "forwarded": False})

@@ -54,7 +54,7 @@ export function replacementBoundary(workers, originalID, replacementID) {
   const original = workers.find(worker => worker.id === originalID), replacement = workers.find(worker => worker.id === replacementID);
   need(original?.connection_status === 'offline' && original.work_status === 'unknown' && original.current_job === null && original.waiting_for_client_tool === 0,
     'original_worker_must_be_confirmed_offline_without_held_work');
-  need(replacement?.connection_status === 'online' && replacement.work_status === 'idle' && replacement.current_job === null && replacement.waiting_for_client_tool === 0 && replacement.inference_readiness === 'verified',
+  need(replacement?.connection_status === 'online' && replacement.work_status === 'idle' && replacement.current_job === null && replacement.waiting_for_client_tool === 0,
     'healthy_replacement_worker_required');
 }
 

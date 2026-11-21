@@ -28,13 +28,13 @@ class Recovery(Routing):
         self.origins = [self.origin_url]
         self.ready(self.main_service, self.origin_url)
 
-    def fresh_peer(self, worker, qualify=True):
+    def fresh_peer(self, worker):
         self.until(lambda: self.status(worker)["connection_status"] == "offline", "old health lease did not expire", timeout=40)
-        return self.peer(worker, qualify=qualify)
+        return self.peer(worker)
 
     def offline_duration_across_brokers(self):
         worker = self.new_worker()
-        peer = self.peer(worker, qualify=False)
+        peer = self.peer(worker)
         peer.stop()
         self.until(lambda: self.status(worker)["connection_status"] == "offline", "closed peer did not become offline")
         before = self.worker_projection(worker)[0]["offline_for_ms"]
@@ -46,7 +46,7 @@ class Recovery(Routing):
             other = self.worker_projection(worker, origin=origin)[0]
             require(after["connection_status"] == other["connection_status"] == "offline"
                     and other["offline_for_ms"] >= after["offline_for_ms"] >= before, "offline duration was reset across brokers or restart")
-            current = self.peer(worker, qualify=False)
+            current = self.peer(worker)
             recovered, _ = self.worker_projection(worker, origin=origin)
             require(current.opened["connection_generation"] > peer.opened["connection_generation"]
                     and recovered["connection_status"] == "online" and "offline_for_ms" not in recovered, "sibling did not observe the end of the outage")
@@ -116,7 +116,7 @@ class Recovery(Routing):
         self.restored(busy, "claimed_inference")
         self.native("POST", "/api/v1/requests/" + busy["id"] + "/cancel", {"protocol_version": 1, "submission_id": secrets.token_hex(12)})
         require(self.status(worker)["work_status"] == "busy", "cancellation cleared uncertain inference")
-        current = self.fresh_peer(worker, qualify=False)
+        current = self.fresh_peer(worker)
         require(current.opened["connection_generation"] > peer.opened["connection_generation"] and self.status(worker)["work_status"] == "busy", "reconnect erased hold or reused generation")
         _, headers = self.checked("/api/v1/worker/jobs/" + job["id"] + "/claim", worker["credential"], "POST", claim, want=409)
         evidence = self.trace_request(headers["X-Request-Id"], busy["id"])
@@ -131,7 +131,6 @@ class Recovery(Routing):
         safe_job, _, _ = self.claim(worker, current, self.experiment(unclaimed["id"]))
         require(safe_job["id"] == assigned_before["assignment"]["id"] and safe_job["context"] == assigned_before["delivery"], "re-offered unclaimed assignment changed")
         self.decision(worker, current, safe_job, {"type": "final", "text": "unclaimed result"})
-        self.qualify_worker(worker, current)
         self.until(lambda: self.detail(queued)["assignment"] is not None, "restored native queue was not dispatched")
         next_job, _, _ = self.claim(worker, current, self.experiment(queued["id"]))
         require(next_job["generation"] > job["generation"] and next_job["context"]["kind"] == "full" and next_job["context"]["messages"] == before["request"]["input"]["messages"] and next_job["context"]["tools"] == before["request"]["input"]["tools"], "restored native queue lost its context/generation")
@@ -299,7 +298,7 @@ class Recovery(Routing):
         _, headers = self.checked("/api/v1/worker/jobs/" + job["id"] + "/claim", worker["credential"], "POST", claim, want=409)
         traced = self.trace_request(headers["X-Request-Id"], request["id"])
         require(any(e["msg"] == "lease.fenced" and e.get("request_id") == headers["X-Request-Id"] and e["reason"] == "stale_connection" for e in traced), "expired claim fence missing from linked trace")
-        current = self.peer(worker, qualify=False)
+        current = self.peer(worker)
         require(self.status(worker)["work_status"] == "busy", "fresh connection cleared recovered uncertainty")
         current.acknowledge_idle(job)
         current.stop()

@@ -29,13 +29,19 @@ export function validateBody(input?: string): void {
   requireValue(bytes <= limit, 'body_too_large', { max_bytes: limit, observed_bytes: bytes });
 }
 
+function controlRouteUnavailable(status: number, route: string, data: ObjectValue, credential: string): boolean {
+  return !!credential && status === 404 && typeof data.error !== 'string' &&
+    ['/api/v1/worker/status', '/api/v1/worker/events', '/api/v1/worker/heartbeat'].includes(route);
+}
+
 export class Transport {
   constructor(readonly endpoint: string, readonly credential: string, readonly logger: Logger, readonly sys: System, readonly net: Network = network, readonly productVersion = VERSION) { origin(endpoint); }
   compatibility(response: Response, route: string, data: ObjectValue = {}): void {
     const declared = response.headers.get('x-muse-service-version');
     const major = (value: string): string | undefined => /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(dev|rc)\.(0|[1-9][0-9]*))?$/.exec(value)?.[1];
     if (declared !== null) requireValue(major(declared) !== undefined, 'invalid_service_version');
-    const retryable = response.status === 429 || response.status >= 500 || (route.endsWith('/events') && response.status === 409);
+    const retryable = response.status === 429 || response.status >= 500 || (route.endsWith('/events') && response.status === 409) ||
+      controlRouteUnavailable(response.status, route, data, this.credential);
     if (declared === null && retryable && data.error !== 'update_required') return;
     const checked = route.endsWith('/enroll') || (route.endsWith('/status') && !this.credential) || route.endsWith('/events') || route.endsWith('/claim');
     if (data.error === 'update_required' || (checked && major(this.productVersion) !== (declared === null ? '0' : major(declared)))) {
@@ -88,11 +94,12 @@ export class Transport {
         const validation = responseValidation ? { response_validation_cause: responseValidation } : {};
         await this.logger.log('DEBUG', 'worker.http_exchange', { ...correlation, ...validation, request_id: requestId, endpoint: this.endpoint, route, method, attempt, duration_ms: this.sys.now() - started, http_status: response.status, input: input === undefined ? null : parse(input), output: responseValidation ? raw : data });
         this.compatibility(response, route, data);
-        if (!response.ok) throw new Failure(response.status === 401 ? 'worker_unauthorized' : 'broker_rejected', { ...correlation, ...validation, request_id: requestId, http_status: response.status, reason: typeof data.error === 'string' ? data.error : 'invalid_error_response' }, response.status === 429 || response.status >= 500);
+        if (!response.ok) throw new Failure(response.status === 401 ? 'worker_unauthorized' : 'broker_rejected', { ...correlation, ...validation, request_id: requestId, route, method, http_status: response.status, reason: typeof data.error === 'string' ? data.error : 'invalid_error_response' }, response.status === 429 || response.status >= 500 || controlRouteUnavailable(response.status, route, data, this.credential));
         return { data, requestId, status: response.status };
       } catch (error) {
         const failure = error instanceof Failure ? error : new Failure('broker_unreachable', { cause: cause(error), request_id: requestId }, !/CERT|TLS|SSL/.test(cause(error)));
-        if (!failure.retryable || attempt >= attempts) throw failure;
+        // An unstructured control-route 404 must return the subscriber to reconciliation.
+        if (!failure.retryable || failure.fields.http_status === 404 || attempt >= attempts) throw failure;
         await this.logger.log('WARN', 'worker.http_retrying', { ...correlation, ...failure.fields, endpoint: this.endpoint, route, method, attempt, delay_ms: attempt * 1000, cause: failure.code, duration_ms: this.sys.now() - started });
         await this.sys.wait(attempt * 1000);
       } finally { this.net.clearTimer(timer); }
@@ -106,7 +113,8 @@ export class Transport {
     let timer = this.net.setTimer(abort, 10_000);
     let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
     try {
-      const headers: Record<string, string> = { Authorization: 'Bearer ' + this.credential, Accept: 'text/event-stream', 'X-Muse-Media-Jobs': '1', 'X-Muse-Prompt-Wav': '1', 'X-Muse-Worker-Version': this.productVersion };
+      const requestedID = this.sys.uuid();
+      const headers: Record<string, string> = { Authorization: 'Bearer ' + this.credential, Accept: 'text/event-stream', 'X-Request-Id': requestedID, 'X-Muse-Media-Jobs': '1', 'X-Muse-Prompt-Wav': '1', 'X-Muse-Worker-Version': this.productVersion };
       if (modelReport !== undefined) {
         const report = Buffer.from(encode(modelReport));
         if (report.length <= maxModelReportBytes) {
@@ -115,14 +123,28 @@ export class Transport {
           await this.logger.log('WARN', 'worker.model_report_rejected', { cause: 'model_report_too_large', outcome: 'unavailable' });
         }
       }
-      const response = await this.net.fetch(this.endpoint + '/api/v1/worker/events', { redirect: 'manual', signal: controller.signal, headers });
+      const route = '/api/v1/worker/events';
+      const response = await this.net.fetch(this.endpoint + route, { redirect: 'manual', signal: controller.signal, headers });
       this.net.clearTimer(timer);
-      const requestId = response.headers.get('x-request-id') ?? '';
+      const requestId = response.headers.get('x-request-id') || requestedID;
       requireValue(response.status < 300 || response.status >= 400, 'redirect_forbidden');
       let rejection: ObjectValue = {};
-      if (response.status === 426) rejection = object(parse(await this.body(response)));
-      this.compatibility(response, '/api/v1/worker/events', rejection);
-      if (response.status !== 200) throw new Failure(response.status === 401 ? 'worker_unauthorized' : 'stream_rejected', { request_id: requestId, http_status: response.status }, response.status === 409 || response.status === 429 || response.status >= 500);
+      let validation: ObjectValue = {};
+      if (response.status === 404 || response.status === 426) {
+        timer = this.net.setTimer(abort, 10_000);
+        const raw = await this.body(response);
+        this.net.clearTimer(timer);
+        try { rejection = object(parse(raw)); }
+        catch (error) {
+          if (response.status === 426 || !(error instanceof Failure)) throw error;
+          validation = { response_validation_cause: error.code };
+        }
+        await this.logger.log('DEBUG', 'worker.http_exchange', { ...validation, route, method: 'GET', request_id: requestId, endpoint: this.endpoint,
+          http_status: response.status, output: validation.response_validation_cause ? raw : rejection, input: null });
+      }
+      this.compatibility(response, route, rejection);
+      if (response.status !== 200) throw new Failure(response.status === 401 ? 'worker_unauthorized' : 'stream_rejected', { ...validation, route, request_id: requestId, http_status: response.status, ...(typeof rejection.error === 'string' && { reason: rejection.error }) },
+        response.status === 409 || response.status === 429 || response.status >= 500 || controlRouteUnavailable(response.status, route, rejection, this.credential));
       requireValue(response.headers.get('content-type')?.split(';')[0].trim() === 'text/event-stream' && response.body, 'invalid_stream_response');
       reader = response.body.getReader();
       const decoder = new TextDecoder('utf8', { fatal: true });

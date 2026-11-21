@@ -16,7 +16,7 @@ export async function releaseHarness(t) {
   const source = { schema_version: 1, entries, worker_exports: [] };
   const write = () => fs.writeFile(observations, JSON.stringify(source), { mode: 0o600 }); await write();
   const evidence = await openEvidence(join(directory, 'evidence'), { stderr: line => logs.push(JSON.parse(line)) });
-  const h = { directory, fixture, requests, logs, entries, imports, write, source, qualifications: {}, instance: 'process-one', offline: false, badNative: false,
+  const h = { directory, fixture, requests, logs, entries, imports, write, source, instance: 'process-one', offline: false, badNative: false,
     connections: { a: { connection_id: 'connection-worker-a', connection_generation: 2 }, b: { connection_id: 'connection-worker-b', connection_generation: 2 } } };
   const status = { ...fixture.report.status_receipt, configuration: { limits: { max_jobs: 4, in_flight_per_worker: 1 } } };
   const access = { workers: fixture.report.workers.map(({ slot, worker_id, account_ref }) => ({ slot, worker_id, account_ref })), keys: { a: 'Bearer client-a', b: 'Bearer client-b' }, portal_password_file: join(directory, 'portal-password') };
@@ -53,14 +53,19 @@ export async function releaseHarness(t) {
     requests.push({ path: parsed.pathname, search: parsed.search, method: options.method, body });
     let value;
     if (parsed.pathname === '/api/v1/admin/status') value = { ...status, instance_id: h.instance };
-    else if (parsed.pathname === '/api/v1/admin/workers') value = { workers: access.workers.map(worker => ({ id: worker.worker_id, work_status: h.offline && worker.slot === 'a' ? 'unknown' : 'idle', current_job: null, waiting_for_client_tool: 0,
-      connection_status: h.offline && worker.slot === 'a' ? 'offline' : 'online', qualification: h.qualifications[worker.worker_id],
-      inference_readiness: h.qualifications[worker.worker_id]?.evidence.action === 'approve' ? 'verified' : h.qualifications[worker.worker_id] ? 'withdrawn' : 'unverified' })) };
-    else if (parsed.pathname.includes('/qualifications')) {
-      const workerID = parsed.pathname.split('/')[5];
-      value = { id: 'qualification-' + requests.length, worker_id: workerID, ...h.connections[workerID.at(-1)], evidence: body };
-      h.qualifications[workerID] = value;
+    else if (parsed.pathname === '/api/v1/admin/workers') value = { workers: access.workers.map(worker => ({
+      id: worker.worker_id, work_status: h.offline && worker.slot === 'a' ? 'unknown' : 'idle', current_job: null,
+      connection_status: h.offline && worker.slot === 'a' ? 'offline' : 'online',
+      waiting_for_client_tool: h.instance === 'process-two' && worker.slot === 'a' ? 1 : 0,
+    })) };
+    else if (parsed.pathname === '/api/v1/requests') {
+      const key = options.headers.Authorization;
+      const target = key === access.keys.a ? 'worker-a' : key === access.keys.b ? 'worker-b' : undefined;
+      if (target !== body.worker_id) return new Response('', { status: 404 });
+      value = { id: 'pin-' + requests.length, state: 'completed', session_id: options.headers['X-Muse-Session-Id'],
+        worker_id: target, output: { type: 'final', text: body.messages.at(-1).text.slice('Reply with exactly: '.length) } };
     }
+    else if (parsed.pathname.includes('/qualifications')) return new Response('{"error":"qualification_retired"}', { status: 410 });
     else if (parsed.pathname.includes('/diagnostics/export')) {
       value = parsed.searchParams.has('request_id') ? await protocol.management(parsed.pathname + parsed.search) : exportFixture(fixture.broker);
     } else if (parsed.pathname.startsWith('/api/v1/admin/requests/')) {

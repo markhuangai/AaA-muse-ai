@@ -1,55 +1,51 @@
 package httpapi
 
 import (
-	"context"
-	"encoding/json"
 	"net/http"
 	"testing"
 
-	"github.com/markhuangai/AaA-muse-ai/internal/inference"
+	"github.com/markhuangai/AaA-muse-ai/internal/service"
 )
 
-func TestQualificationHTTPAuthorityAndAutomaticAdmission(t *testing.T) {
-	h, m, w, key := inferenceHTTPFixture(t)
-	c := onlineHTTP(t, h, w.ID)
-	input := nativeHTTPInput(w.ID)
-	input.WorkerID = ""
-	input.Tools = []inference.Tool{}
-	nativeHTTP(t, h, "POST", "/api/v1/requests", "", input, 503)
-	data, err := h.Broker.Create(context.Background(), h.Logger, inference.Create{Version: 1, SubmissionID: "ready", WorkerID: w.ID, Messages: []inference.Item{{Type: "message", Role: "user", Text: "independent-random-challenge"}}, Tools: []inference.Tool{}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	var e inference.Experiment
-	if err = json.Unmarshal(data, &e); err != nil {
-		t.Fatal(err)
-	}
-	claim := apiJSON(t, h, "POST", "/api/v1/worker/jobs/"+e.CurrentJobID+"/claim", key, inference.Claim{Version: 1, SubmissionID: "ready-claim", ConnectionID: c.ID, ConnectionGeneration: c.Generation}, 200)
-	job := m.states[w.ID].Jobs[e.CurrentJobID]
-	apiJSON(t, h, "POST", "/api/v1/worker/jobs/"+job.ID+"/decisions", key, inference.Submit{Claim: inference.Claim{Version: 1, SubmissionID: "ready-answer", ConnectionID: c.ID, ConnectionGeneration: c.Generation}, ConversationID: job.ConversationID, Generation: job.Generation, LeaseID: claim["lease_id"].(string), ContextReceiptID: job.Context.ReceiptID, Decision: inference.Item{Type: "final", Text: "independent-random-challenge"}}, 200)
+func TestRetiredQualificationAndAutomaticAdmission(t *testing.T) {
+	h, _, w, key := inferenceHTTPFixture(t)
+	onlineHTTP(t, h, w.ID)
 	path := "/api/v1/admin/workers/" + w.ID + "/qualifications"
-	q := inference.QualificationInput{Version: 1, SubmissionID: "approval", Action: "approve", EvidenceKind: "controlled", EvidenceReference: "controlled software; not live qualification", ReadinessExperimentID: e.ID}
 	for _, credential := range []string{key, "client-private-sentinel", "portal-private-sentinel", ""} {
-		apiJSON(t, h, http.MethodPost, path, credential, q, 401)
+		apiJSON(t, h, http.MethodPost, path, credential, nil, 401)
 	}
 	apiJSON(t, h, http.MethodGet, path, "admin-private-sentinel", nil, 405)
-	apiJSON(t, h, http.MethodPost, path, "admin-private-sentinel", map[string]any{"protocol_version": 1}, 400)
-	result := apiJSON(t, h, http.MethodPost, path, "admin-private-sentinel", q, 200)
-	if result["evidence"].(map[string]any)["evidence_kind"] != "controlled" {
-		t.Fatal("evidence provenance omitted")
+	retired := apiJSON(t, h, http.MethodPost, path, "admin-private-sentinel", map[string]any{"action": "approve"}, 410)
+	if retired["error"] != "qualification_retired" {
+		t.Fatal(retired)
 	}
-	apiJSON(t, h, http.MethodPost, path, "admin-private-sentinel", q, 200)
-	status := apiJSON(t, h, http.MethodGet, "/api/v1/worker/status", key, nil, 200)
-	if status["inference_readiness"] != "verified" {
-		t.Fatal("broker readiness not projected")
-	}
+	input := nativeHTTPInput(w.ID)
+	input.WorkerID = ""
 	v, _ := nativeHTTP(t, h, http.MethodPost, "/api/v1/requests", "auto", input, 202)
-	if v.WorkerID != w.ID {
-		t.Fatal("automatic route missing")
+	status := apiJSON(t, h, http.MethodGet, "/api/v1/worker/status", key, nil, 200)
+	if v.WorkerID != w.ID || status["inference_readiness"] != "unverified" || len(status["qualification_history"].([]any)) != 0 {
+		t.Fatal("automatic route required or fabricated approval", v, status)
 	}
-	apiJSON(t, h, http.MethodPost, path, "admin-private-sentinel", inference.QualificationInput{Version: 1, SubmissionID: "withdraw", Action: "withdraw", EvidenceReference: "withdraw approval"}, 200)
-	input.SubmissionID = "new"
-	nativeHTTP(t, h, http.MethodPost, "/api/v1/requests", "new", input, 503)
-	h.Broker = nil
-	apiJSON(t, h, http.MethodPost, path, "admin-private-sentinel", q, 503)
+}
+
+func TestWorkerUpgradeReservationHTTPAuthority(t *testing.T) {
+	h, _, w, key := inferenceHTTPFixture(t)
+	onlineHTTP(t, h, w.ID)
+	input := service.UpgradeInput{Version: 1, Action: "acquire", OperationID: "upgrade"}
+	for _, forbidden := range []string{"admin-private-sentinel", "client-private-sentinel", ""} {
+		apiJSON(t, h, http.MethodPost, workerUpgradeRoute, forbidden, input, 401)
+	}
+	apiJSON(t, h, http.MethodPost, workerUpgradeRoute, key, map[string]any{"protocol_version": 1}, 400)
+	apiJSON(t, h, http.MethodPost, workerUpgradeRoute, key, map[string]any{"protocol_version": 1, "generation": 0, "action": "acquire", "operation_id": "upgrade", "worker_id": w.ID}, 400)
+	reply := apiJSON(t, h, http.MethodPost, workerUpgradeRoute, key, input, 200)
+	status := apiJSON(t, h, http.MethodGet, "/api/v1/worker/status", key, nil, 200)
+	if reply["generation"] != status["upgrade_reservation_generation"] || status["work_status"] != "upgrading" {
+		t.Fatal("lease not reflected in status", reply, status)
+	}
+	input.Generation, input.Action = 1, "release"
+	apiJSON(t, h, http.MethodPost, workerUpgradeRoute, key, input, 200)
+	status = apiJSON(t, h, http.MethodGet, "/api/v1/worker/status", key, nil, 200)
+	if status["work_status"] != "idle" {
+		t.Fatal(status)
+	}
 }

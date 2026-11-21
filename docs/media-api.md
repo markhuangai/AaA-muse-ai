@@ -1,6 +1,6 @@
 # Media jobs
 
-An authenticated model client submits a video or generated WAV job, polls its status and downloads the original artifact. An enrolled worker with approved readiness, the appropriate media capability and free capacity receives the assignment through its subscriber. The client can retrieve the file for ten minutes after verified storage. All paths use the operator's HTTPS origin.
+An authenticated model client submits a video or generated WAV job, polls its status and downloads the original artifact. The broker assigns media work to an enrolled worker with a current authenticated heartbeat, an advertised capability for the requested format, and a free slot. The client can retrieve the file for ten minutes after verified storage. All paths use the operator's HTTPS origin.
 
 ## Client requests
 
@@ -23,7 +23,7 @@ curl --fail --header @"$CLIENT_HEADER" --output river.mp4 \
 
 JSON accepts an optional `format` of `mp4` or `wav`. The default is `mp4`. For a WAV submit `{"submission_id":"audio-001","format":"wav","prompt":"Make a short recording introducing the trail guide."}`. Muse receives the brief and chooses an available producer. The installed worker must advertise support for prompt-to-WAV jobs.
 
-The submission response is HTTP 202 with `job_id`, status, profile and timestamps. Repeating the same submission ID, prompt and image under the same owner returns the original job. Changed inputs under that ID return 409. An approved online media worker must have capacity. The job deadline is 15 minutes from admission.
+The submission response is HTTP 202 with `job_id`, status, profile and timestamps. Repeating the same submission ID, prompt and image under the same owner returns the original job. Changed inputs under that ID return 409. The broker requires a compatible free slot at admission. The job deadline is 15 minutes from admission.
 
 Multipart accepts one static WebP, PNG or JPEG, up to 8 MiB and 16 million pixels. Prompt text is limited to 4 KiB of UTF-8. JSON prompt-only jobs generate a private still with native Muse and animate it using the same prompt. The worker uses the existing five-second wake hook. On a media wake, Muse follows the authenticated `job-show` action and signals native completion with `media-finish`. The subscriber then streams the bounded original file through the service origin. Each transfer has a 120-second deadline.
 

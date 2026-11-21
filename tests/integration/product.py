@@ -57,6 +57,8 @@ class PackedModel:
                         decision = {"type": "tool_call", "call_id": "product-" + pending["job_id"], "name": "read_file", "arguments": {"path": path}}
                     elif user.startswith("aaa-product:echo:"):
                         decision = {"type": "final", "text": user[len("aaa-product:echo:"):]}
+                    elif user.startswith("Reply with exactly: "):
+                        decision = {"type": "final", "text": user.removeprefix("Reply with exactly: ")}
                     elif user.startswith("ready-"):
                         decision = {"type": "final", "text": user}
                     elif user.startswith("aaa-product:hold:"):
@@ -119,7 +121,7 @@ class Product(WorkerRecovery, History):
                 self.add(case.pop("id"), **{k: v for k, v in case.items() if k != "outcome"})
         return receipt
 
-    def qualify_packed(self, worker):
+    def native_trials(self, worker):
         challenge = "ready-" + secrets.token_hex(24)
         ready = self.create(worker, challenge, tools=False, messages=[{"type": "message", "role": "user", "text": challenge}])
         self.until(lambda: self.experiment(ready["id"])["state"] == "completed", "packed readiness did not complete", timeout=30)
@@ -131,10 +133,6 @@ class Product(WorkerRecovery, History):
         self.checked("/api/v1/admin/experiments/" + trial["id"] + "/tool-results", self.admin, "POST", {
             "protocol_version": 1, "submission_id": secrets.token_hex(12), "call_id": call["call_id"], "output": fixture.read_bytes().decode()}, want=202)
         self.until(lambda: self.experiment(trial["id"])["state"] == "completed", "packed qualification final missing", timeout=30)
-        worker["qualification"] = {"readiness_experiment_id": ready["id"], "tool_experiment_id": trial["id"]}
-        self.checked("/api/v1/admin/workers/" + worker["worker"]["id"] + "/qualifications", self.admin, "POST", {
-            "protocol_version": 1, "submission_id": secrets.token_hex(12), "action": "approve", "evidence_kind": "controlled",
-            "evidence_reference": "Real packed installer/subscriber with controlled decisions; not live Muse.", **worker["qualification"]})
         return ready, trial
 
     def client_flow(self, phase, cycle=None):
@@ -146,7 +144,7 @@ class Product(WorkerRecovery, History):
             fixtures[name] = {"id": secrets.token_hex(12), "owner": "client_driver", "created_at": datetime.now(timezone.utc).isoformat(), "path": str(path), "contents": contents}
         fixture = self.private("product-client-" + phase + ".json", json.dumps({"origin": self.origin_url, "admin": "Bearer " + self.admin,
             "keys": {"a": "Bearer " + self.client, "b": "Bearer " + self.other_client}, "directory": str(self.root.resolve()), "phase": phase,
-            "workers": [{"slot": w["slot"], "worker_id": w["worker"]["id"], "qualification": w["qualification"]} for w in self.workers], "fixtures": fixtures, "cycle": cycle}))
+            "workers": [{"slot": w["slot"], "worker_id": w["worker"]["id"]} for w in self.workers], "fixtures": fixtures, "cycle": cycle}))
         result = subprocess.run(["node", "tests/integration/product-client.mjs", "--fixture", str(fixture)], capture_output=True, text=True, timeout=420)
         self.private("product-client-" + phase + ".log", result.stdout + result.stderr)
         receipt = json.loads((self.root / ("product-client-" + phase + "-receipt.json")).read_text())
@@ -187,7 +185,6 @@ class Product(WorkerRecovery, History):
 
     def restart_and_replace(self):
         prepared = self.client_flow("prepare-restart")["cycles"][0]
-        qualifications = {worker["slot"]: self.status(worker)["qualification"] for worker in self.workers}
         before = self.checked("/api/v1/admin/status", self.admin)[0]
         checkpoint = self.product_checkpoints["broker"] = {"cycle_id": prepared["id"], "pending_call_id": prepared["call_id"],
             "before_instance": before["instance_id"], "before_status": before, "prepared_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds")}
@@ -206,7 +203,7 @@ class Product(WorkerRecovery, History):
         for worker in self.workers:
             self.online(worker)
             current = self.status(worker)
-            require(current["inference_readiness"] == "verified" and current["qualification"] == qualifications[worker["slot"]], "broker restart lost or rewrote worker approval")
+            require(not current["qualification_history"], "broker restart fabricated approval")
         resumed = self.client_flow("resume-restart", prepared)["cycles"][0]
         checkpoint["completed_request_id"] = resumed["turns"][1]["operation_id"]
         self.add("recovery.tool-dedup", call_id=resumed["call_id"], client_tool_executions=resumed["client_tool_executions"], request_ids=[t["request_id"] for t in resumed["turns"]])
@@ -235,7 +232,7 @@ class Product(WorkerRecovery, History):
              "reinstalled": False, "reenrolled": False, "manual_message": False, "connection_id": recovered["connection_id"], "connection_generation": recovered["connection_generation"]}])
         self.models = [PackedModel(self, a).start(), PackedModel(self, b).start()]
         probe = self.client_flow("worker-recovery")["cases"][0]
-        require(self.status(b)["qualification"] == qualifications["b"], "worker recovery changed approval")
+        require(not self.status(b)["qualification_history"], "worker recovery fabricated approval")
         require(all(turn["connection_id"] == recovered["connection_id"] and turn["connection_generation"] == recovered["connection_generation"] for turn in self.cycles[-1]["turns"]), "client probe did not use recovered connection")
         self.add("recovery.hook", recovery_case_id="recovery.worker", worker_ids=[b["worker"]["id"]], operation_ids=probe["operation_ids"], one_consumer=True, supported_refresh_qualified=False)
         for model in self.models:
@@ -246,11 +243,11 @@ class Product(WorkerRecovery, History):
         self.models = [PackedModel(self, a).start(), recovered_model]
         watchdog_probe = self.client_flow("watchdog-recovery")
         require(recovered_model.verified_wake.is_set(), "watchdog client flow lacks a verified single genuine wake")
-        require(self.status(b)["qualification"] == qualifications["b"], "watchdog client probe required a changed approval")
+        require(not self.status(b)["qualification_history"], "watchdog recovery fabricated approval")
         require(all(turn["connection_id"] == recovered["connection_id"] and turn["connection_generation"] == recovered["connection_generation"]
                     for turn in watchdog_probe["cycles"][0]["turns"]), "watchdog client did not use the recovered connection")
         self.receipt("recovery.watchdog", worker_id=b["worker"]["id"], connection_generation=recovered["connection_generation"],
-                     operation_ids=watchdog_probe["cases"][0]["operation_ids"], one_consumer=True, approval_preserved=True, wake_once=True)
+                     operation_ids=watchdog_probe["cases"][0]["operation_ids"], one_consumer=True, dispatched_without_qualification=True, wake_once=True)
         self.stop(a)
         self.proxy.interrupt()
         self.until(lambda: self.status(a)["connection_status"] == "offline", "stopped replacement worker remained healthy", timeout=45)
@@ -294,7 +291,7 @@ class Product(WorkerRecovery, History):
                 "state_mode": "0700", "key_file_mode": "0600", "worker_version": self.package["version"], "worker_sha256": self.package["sha256"],
                 "actual_permissions": ["controlled-container-shell"], "observer": "controlled-product-runner", "source_ref": "product-install-" + worker["slot"] + ".json"})
             self.models.append(PackedModel(self, worker).start())
-            ready, trial = self.qualify_packed(worker)
+            ready, trial = self.native_trials(worker)
             self.add("readiness." + worker["slot"], worker_ids=[worker["worker"]["id"]], operation_ids=[ready["id"], trial["id"]], evidence_kind="controlled")
             self.add("idle." + worker["slot"], worker_ids=[worker["worker"]["id"]], operation_ids=[ready["id"]], controlled_hook=True)
         matrix = self.client_flow("matrix")

@@ -92,7 +92,7 @@ class Routing(History):
         evidence = matched[0]["evidence"]
         if reason == "no_ready_worker":
             require(evidence["candidates"] and all(c["eligibility_reason"] for c in evidence["candidates"]), "rejection omitted causal eligibility exclusions")
-        action = "record matching worker qualification"
+        action = "restore an authenticated online subscriber"
         self.private("routing-diagnosis-" + request_id + ".json", json.dumps({"cause": reason, "evidence": matched, "corrective_action": action}))
 
     def diagnose_operation(self, request, event_name, action):
@@ -104,47 +104,28 @@ class Routing(History):
 
     def eligibility(self):
         worker = self.new_worker()
-        peer = self.peer(worker, qualify=False)
-        _, headers = self.submit(self.request_input(), want=503)
+        body = self.request_input(tools=True)
+        _, headers = self.submit(body, "eligible", want=503)
         self.diagnose_dispatch(headers["X-Request-Id"], "dispatch.rejected", "no_ready_worker")
-        self.qualify_worker(worker, peer, tools=False)
-        _, headers = self.submit(self.request_input(tools=True), want=503)
-        self.diagnose_dispatch(headers["X-Request-Id"], "dispatch.rejected", "no_ready_worker")
-        approval, body = self.qualify_worker(worker, peer)
+        peer = self.peer(worker)
         path = "/api/v1/admin/workers/" + worker["worker"]["id"] + "/qualifications"
         for key in (worker["credential"], self.client, self.portal):
-            self.checked(path, key, "POST", body, want=401)
-        replay, _ = self.checked(path, self.admin, "POST", body)
-        require(replay["id"] == approval["id"], "qualification retry added authority")
-        self.checked(path, self.admin, "POST", {**body, "evidence_reference": "conflicting"}, want=409)
-        other = self.new_worker()
-        other_peer = self.peer(other, qualify=False)
-        other_path = "/api/v1/admin/workers/" + other["worker"]["id"] + "/qualifications"
-        self.checked(other_path, self.admin, "POST", body, want=409)
-        request, _ = self.submit(self.request_input(), "eligible")
-        self.deliver(worker, peer, request, {"type": "final", "text": "eligible answer"})
+            self.checked(path, key, "POST", {}, want=401)
+        self.checked(path, self.admin, "POST", {}, want=410)
+        request, _ = self.submit(body, "eligible")
+        shown = self.deliver(worker, peer, request, {"type": "final", "text": "eligible answer"})
+        require("qualification" not in shown and not self.status(worker)["qualification_history"], "routing fabricated approval")
         self.read_native(request)
         peer.stop()
-        replacement = self.peer(worker, qualify=False)
-        recovered = self.status(worker)
-        require(recovered["inference_readiness"] == "verified" and recovered["qualification"] == approval, "reconnection lost or rewrote worker approval")
+        replacement = self.peer(worker)
         request, _ = self.submit(self.request_input(tools=True), "automatic-recovery")
         shown = self.deliver(worker, replacement, request, {"type": "final", "text": "automatic recovery answer"})
-        require(shown["qualification"] == approval and shown["connection_generation"] == replacement.opened["connection_generation"] > approval["connection_generation"], "recovered assignment lost historical approval or current fencing")
+        require(shown["connection_generation"] == replacement.opened["connection_generation"] > peer.opened["connection_generation"], "recovered assignment lost fencing")
         require(self.read_native(request)[0]["output"]["text"] == "automatic recovery answer", "client work failed after reconnect")
-        self.checked(path, self.admin, "POST", {**body, "submission_id": secrets.token_hex(12)}, want=409)
-        withdrawal = {"protocol_version": 1, "submission_id": secrets.token_hex(12), "action": "withdraw", "evidence_reference": "controlled withdrawal"}
-        self.checked(path, self.admin, "POST", withdrawal)
-        self.checked(other_path, self.admin, "POST", withdrawal, want=409)
-        require(self.status(other)["inference_readiness"] == "unverified", "cross-worker withdrawal falsely changed authority")
+        self.checked("/api/v1/admin/workers/" + worker["worker"]["id"] + "/revoke", self.admin, "POST", {})
         self.submit(self.request_input(), want=503)
         replacement.stop()
-        withdrawn = self.peer(worker, qualify=False)
-        require(self.status(worker)["inference_readiness"] == "withdrawn", "reconnect restored withdrawn approval")
-        self.submit(self.request_input(), want=503)
-        withdrawn.stop()
-        other_peer.stop()
-        self.receipt("routing.eligibility_provenance_and_reconnect", heartbeat_is_not_readiness=True, synthetic_peer=True, automatic_client_recovery=True, qualification_id=approval["id"])
+        self.receipt("routing.online_eligibility_and_reconnect", synthetic_peer=True, automatic_client_recovery=True)
 
     def competing_requests(self):
         pair = self.new_pair()
@@ -160,7 +141,7 @@ class Routing(History):
             results = list(pool.map(lambda entry: self.claim(*entry), [(aw, ap, self.experiment(a["id"])), (bw, bp, self.experiment(b["id"]))]))
         aj, bj = results[0][0], results[1][0]
         require(aj["context"]["messages"] == a_input["messages"] and bj["context"]["messages"] == b_input["messages"], "contexts crossed sessions")
-        require(aj["qualification"]["evidence"]["evidence_kind"] == "controlled", "assignment qualification omitted")
+        require("qualification" not in aj and "qualification" not in bj, "new assignment contains archived qualification")
         self.checked("/api/v1/worker/jobs/" + aj["id"], bw["credential"], want=404)
         self.claim(aw, ap, self.experiment(a["id"]), want=409)
         c_body = {**self.request_input("C-only"), "worker_id": a["worker_id"]}
@@ -269,15 +250,14 @@ class Routing(History):
         inputs = [e for e in exports if e.get("operation_id") == large["id"] and e["msg"] == "inference.context"]
         require(inputs and "x" * 18000 in json.dumps(inputs) and self.admin not in json.dumps(inputs), "chunk reconstruction omitted admitted context or exposed a credential")
         worker, peer = by_id[large["worker_id"]]
-        path = "/api/v1/admin/workers/" + large["worker_id"] + "/qualifications"
-        self.checked(path, self.admin, "POST", {"protocol_version": 1, "submission_id": secrets.token_hex(12), "action": "withdraw", "evidence_reference": "stop queued dispatch"})
-        self.claim(worker, peer, self.experiment(large["id"]), want=503)
-        self.checked("/api/v1/worker/jobs/" + self.experiment(large["id"])["current_job_id"], worker["credential"], want=503)
+        reservation = {"protocol_version": 1, "generation": 0, "action": "acquire", "operation_id": secrets.token_hex(16)}
+        rejected, _ = self.checked("/api/v1/worker/upgrade-reservation", worker["credential"], "POST", reservation, want=409)
+        require(rejected["error"] == "worker_busy", "upgrade reserved an assigned queue slot")
         for container in (self.main_service, self.secondary):
             operational = self.logs(container)
             require('"level":"DEBUG"' not in operational, "DEBUG leaked to INFO operational output")
             self.assert_private(operational)
-        self.receipt("routing.storage_rollback_capture_and_withdrawal", sqlite_code="1811", protected_debug=True, chunk_reconstruction=True)
+        self.receipt("routing.storage_rollback_capture_and_reserved_slot", sqlite_code="1811", protected_debug=True, chunk_reconstruction=True)
 
     def offline_boundaries(self):
         for boundary in ("first-turn", "safe", "context", "claimed", "tool-wait"):

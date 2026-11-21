@@ -11,7 +11,7 @@ import (
 
 func TestPortalCancelUnassignedAndClaimedPreservesSiblingAndUncertainty(t *testing.T) {
 	b, m, logger, logs := inferenceFixture()
-	connection := connectNative(t, b, m, logger, "worker-a")
+	connection := connectInference(t, b, m, logger, "worker-a")
 	first := admitted(t, b, "alice", "held-session", autoInput("held-first"))
 	job := nativeJob(t, b, m, connection, first)
 	queued := admitted(t, b, "alice", "queued-session", autoInput("queued-first"))

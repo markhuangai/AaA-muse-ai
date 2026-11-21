@@ -1,12 +1,3 @@
-export interface Qualification {
-  id: string;
-  created_at: string;
-  connection_id: string;
-  connection_generation: number;
-  capabilities: string[];
-  evidence: { action: string; evidence_kind?: string; evidence_reference: string };
-}
-
 interface ModelReport {
   model_name?: string;
   context_window_tokens?: number;
@@ -25,9 +16,6 @@ export interface Worker {
   current_job: { job_id: string; generation: number } | null;
   waiting_for_client_tool: number;
   last_heartbeat_at: string | null;
-  inference_readiness: string;
-  qualification?: Qualification | null;
-  qualification_history: Qualification[];
   model_report?: ModelReport;
 }
 
@@ -45,14 +33,6 @@ export const object = (value: unknown): value is Record<string, unknown> => !!va
 const date = (value: unknown): value is string => typeof value === 'string' && Number.isFinite(Date.parse(value));
 const optionalDate = (value: unknown) => value === null || date(value);
 const integer = (value: unknown) => Number.isSafeInteger(value) && Number(value) >= 0;
-const strings = (value: unknown) => Array.isArray(value) && value.every(item => typeof item === 'string');
-
-function qualification(value: unknown): value is Qualification {
-  return object(value) && typeof value.id === 'string' && date(value.created_at) && typeof value.connection_id === 'string' &&
-    integer(value.connection_generation) && strings(value.capabilities) && object(value.evidence) &&
-    typeof value.evidence.action === 'string' && typeof value.evidence.evidence_reference === 'string' &&
-    (value.evidence.evidence_kind === undefined || typeof value.evidence.evidence_kind === 'string');
-}
 
 function modelReport(value: unknown): value is ModelReport {
   return object(value) && date(value.reported_at) &&
@@ -67,9 +47,7 @@ export function isWorker(value: unknown): value is Worker {
     typeof value.connection_status === 'string' && (value.offline_for_ms === undefined || integer(value.offline_for_ms)) &&
     typeof value.work_status === 'string' &&
     (value.current_job === null || (object(value.current_job) && typeof value.current_job.job_id === 'string' && integer(value.current_job.generation))) &&
-    integer(value.waiting_for_client_tool) && optionalDate(value.last_heartbeat_at) && typeof value.inference_readiness === 'string' &&
-    (value.qualification == null || qualification(value.qualification)) &&
-    Array.isArray(value.qualification_history) && value.qualification_history.every(qualification) &&
+    integer(value.waiting_for_client_tool) && optionalDate(value.last_heartbeat_at) &&
     (value.model_report === undefined || modelReport(value.model_report));
 }
 

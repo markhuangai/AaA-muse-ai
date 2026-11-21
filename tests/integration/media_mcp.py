@@ -112,9 +112,8 @@ class MCPMedia:
         require(status == 403 and headers.get("X-Request-Id") is None and
                 {"event": "fixture.host_rejected", "route": "/mcp", "forwarded": False} in self.proxy.events,
                 "proxy failed to reject and record an unconfigured host")
-        old = self.peer(self.new_worker(), qualify=False, headers={"X-Muse-Media-Jobs": "1"})
+        old = self.peer(self.new_worker(), headers={"X-Muse-Media-Jobs": "1"})
         try:
-            self.qualify_worker(old.worker, old, tools=False)
             result = self.mcp_call("generate_wav", {"prompt": "controlled WAV", "submission_id": secrets.token_hex(16)})
             require(result.get("error") == "no_ready_worker", "video-only worker received generated WAV")
             event = self.mcp_rejection(result["_request_id"], "mcp.tool_rejected", "no_ready_worker", owner="fixture-client")
@@ -214,14 +213,15 @@ class MCPMedia:
                     "rejected MCP boundary lost its job correlation")
         return event
 
-    def mcp_text(self, worker, secret_path):
-        secret = secret_path.rsplit("/", 1)[-1]
-        fields = {"prompt": "controlled text echo", "submission_id": secrets.token_hex(16)}
-        final_text = fields["prompt"] + " " + secret
-        self.proxy.lose_mcp_reply = True
+    def mcp_text(self, worker, secret_path=None):
+        prompt = "controlled text echo" if secret_path else "Connection check. Reply with exactly: pong"
+        fields = {"prompt": prompt, "submission_id": secrets.token_hex(16)}
+        final_text = prompt + " " + secret_path.rsplit("/", 1)[-1] if secret_path else "pong"
+        self.proxy.lose_mcp_reply = bool(secret_path)
+        require(not self.status(worker)["qualification_history"], "MCP regression assumes a fresh unqualified worker")
         started = time.monotonic()
         with ThreadPoolExecutor(max_workers=1) as client:
-            pending = client.submit(self.mcp_call, "ask_muse", fields, offline=True)
+            pending = client.submit(self.mcp_call, "ask_muse", fields, offline=bool(secret_path))
             snapshot = worker["state"] / "pending.json"
 
             def claimed():
@@ -236,11 +236,15 @@ class MCPMedia:
             request_id = view["operation_id"]
             require(view["context"]["messages"] == [{"type": "message", "role": "user", "text": fields["prompt"]}]
                     and view["context"]["tools"] == [], "MCP text changed the prompt or enabled host tools")
-            time.sleep(max(0, 32 - (time.monotonic() - started)))
+            if secret_path:
+                time.sleep(max(0, 32 - (time.monotonic() - started)))
             self.cli(worker, "decision-submit", "--job-id", identity, "--input", "-",
                      input_text=json.dumps({"type": "final", "text": final_text}))
-            pending.result()
-        require(self.proxy.mcp_reply_lost.is_set(), "five-minute MCP route failed before the ordinary write timeout")
+            first = pending.result()
+        if secret_path:
+            require(self.proxy.mcp_reply_lost.is_set(), "five-minute MCP route failed before the ordinary write timeout")
+        else:
+            require(first["text"] == "pong" and first["request_id"] == request_id, "first call did not complete on a fresh worker")
         answer = self.mcp_call("ask_muse", fields)
         require(answer["request_id"] == request_id and answer["text"] == final_text, "lost reply re-executed or changed the accepted answer")
         http_events = self.mcp_diagnostic("request_id", answer["_request_id"], self.origin_url)
@@ -253,4 +257,7 @@ class MCPMedia:
         self.assert_private(self.logs(self.broker))
         self.assert_private(self.logs(self.sibling))
         self.assert_private(self.cli(worker, "diagnostics-export", "--operation-id", request_id, "--decode").stdout)
-        self.add("mcp.delayed_text_and_lost_reply", delay_seconds=32)
+        if secret_path:
+            self.add("mcp.delayed_text_and_lost_reply", delay_seconds=32)
+        else:
+            self.add("mcp.first_text_without_qualification", one_claim=True, replay_preserved=True)

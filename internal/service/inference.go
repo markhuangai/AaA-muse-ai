@@ -77,9 +77,12 @@ func heldJob(s *inference.State) *inference.Job {
 }
 
 func project(s *inference.State) inference.Projection {
-	p := inference.Projection{InferenceReadiness: readiness(s), Qualification: s.Routing.Latest(), QualificationHistory: append([]inference.Qualification{}, s.Routing.Qualifications...), ConnectionStatus: s.Connection.Status(s.Now), WorkStatus: "unknown", LastHeartbeatAt: s.Connection.LastAckAt, WaitingForTool: s.PendingTools, ModelReport: s.Connection.ModelReport}
+	p := inference.Projection{InferenceReadiness: historicalReadiness(s), Qualification: s.Routing.Latest(), QualificationHistory: append([]inference.Qualification{}, s.Routing.Qualifications...), UpgradeGeneration: s.Routing.UpgradeGeneration(), ConnectionStatus: s.Connection.Status(s.Now), WorkStatus: "unknown", LastHeartbeatAt: s.Connection.LastAckAt, WaitingForTool: s.PendingTools, ModelReport: s.Connection.ModelReport}
 	if p.ConnectionStatus == "online" {
 		p.WorkStatus = "idle"
+	}
+	if s.Routing.Upgrade.Active(s.Now) {
+		p.WorkStatus = "upgrading"
 	}
 	if j := heldJob(s); j != nil {
 		p.WorkStatus = "busy"
@@ -353,6 +356,9 @@ func (b *Broker) run(ctx context.Context, logger *slog.Logger, ref inference.Ref
 			if rejection.Reason == "no_ready_worker" {
 				name = "dispatch.rejected"
 			}
+			if operation == "worker_upgrade_reservation" {
+				name = "worker.upgrade_reservation_rejected"
+			}
 			if rejection.Reason == "session_worker_conflict" {
 				name = "dispatch.pin_conflict"
 			}
@@ -531,7 +537,7 @@ func (b *Broker) Poll(ctx context.Context, logger *slog.Logger, workerID, id str
 		if project(s).WorkStatus == "idle" {
 			jobs := []*inference.Job{}
 			for _, j := range s.Jobs {
-				if j.State == "queued" && nativeEligibility(s, j) == nil {
+				if j.State == "queued" && jobEligibility(s, j) == nil {
 					jobs = append(jobs, j)
 				}
 			}

@@ -20,10 +20,6 @@ func TestMediaReceiptAndOwnership(t *testing.T) {
 	b.Media = media.New(t.TempDir())
 	wid := "worker-a"
 	c := connectInference(t, b, m, logger, wid)
-	ready, tool := qualificationTrials(t, b, m, logger, wid, c)
-	if _, err := b.Qualify(ctx, logger, wid, approvalInput("qualify-media", ready, tool)); err != nil {
-		t.Fatal(err)
-	}
 	makeStage := func(message string) *media.Stage {
 		p, err := b.Media.Begin()
 		if err != nil {

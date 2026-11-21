@@ -11,6 +11,9 @@ import (
 )
 
 func (b *Broker) newJob(s *inference.State, e *inference.Experiment, probe *inference.Probe) (*inference.Job, error) {
+	if err := upgradeBlock(s, e.WorkerID); err != nil {
+		return nil, err
+	}
 	if err := inference.CheckContext(e.Messages, e.Tools); err != nil {
 		return nil, err
 	}
@@ -172,7 +175,7 @@ func (b *Broker) Job(ctx context.Context, logger *slog.Logger, workerID, id stri
 			return nil, inference.Reject("stale_assignment", 409)
 		}
 		if j.State == "queued" {
-			if err := nativeEligibility(s, j); err != nil {
+			if err := jobEligibility(s, j); err != nil {
 				return nil, err
 			}
 		}
@@ -196,7 +199,7 @@ func (b *Broker) Claim(ctx context.Context, logger *slog.Logger, workerID, id st
 		if j == nil {
 			return nil, inference.Reject("inference_not_found", 404)
 		}
-		if err := nativeEligibility(s, j); err != nil {
+		if err := jobEligibility(s, j); err != nil {
 			return nil, err
 		}
 		if held := heldJob(s); held != nil {

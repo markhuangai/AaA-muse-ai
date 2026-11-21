@@ -161,10 +161,10 @@ async function viewports() {
     if (width === 390) await expect(row(fixture.workers.offline_id).locator('.offline-label')).toBeVisible();
     expect(await page.evaluate(() => window.__unsafe === undefined && document.querySelector('tbody img') === null)).toBe(true);
     await expect(row(fixture.workers.transport_id)).toContainText('Online');
-    await expect(row(fixture.workers.transport_id)).toContainText('Not yet qualified');
+    await expect(page.getByRole('columnheader', { name: 'Qualification' })).toHaveCount(0);
     await expect(row(fixture.workers.busy_id)).toContainText('Busy');
     await expect(row(fixture.workers.waiting_id)).toContainText('1 client-tool waits');
-    await expect(row(fixture.workers.reconnected_id)).toContainText('Approved');
+    await expect(row(fixture.workers.reconnected_id)).toContainText('Idle');
     await screenshot(page, 'list', width);
     await page.evaluate(() => scrollTo(0, 100));
     await row(fixture.workers.transport_id).getByRole('button').scrollIntoViewIfNeeded();
@@ -182,7 +182,7 @@ async function viewports() {
     await verifyDrawerDismissal(page, row(fixture.workers.transport_id).getByRole('button'), width, listScroll);
     await openWorker(page, fixture.workers.busy_id);
     await expect(page.getByText(fixture.workers.busy_job_id, { exact: true })).toBeVisible();
-    await expect(page.getByText('Controlled software evidence').first()).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'Inference qualification' })).toHaveCount(0);
     await expect(page.getByText('Installed version', { exact: true }).locator('..')).toContainText('Not reported');
     await expect(page.getByText('Not independently observed', { exact: true })).toBeVisible();
     const acceptedName = `Research agent ${width} 名称`;

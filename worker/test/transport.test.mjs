@@ -72,6 +72,33 @@ test('HTML authorization errors and malformed successful replies remain terminal
   }
 });
 
+test('authenticated control routes pass unstructured 404s to subscriber recovery', async t => {
+  const f = await fixture(t);
+  for (const [route, credential, raw, retryable] of [
+    ['status', KEY, '404 page not found', true],
+    ['heartbeat', KEY, '<html>Gateway</html>', true],
+    ['status', KEY, '{"error":"worker_not_found"}', false],
+    ['status', '', '404 page not found', false],
+    ['jobs/job', KEY, '404 page not found', false],
+  ]) {
+    let requests = 0;
+    const client = new Transport('https://broker.example.test', credential, f.logger, f.state.sys, { ...f.net,
+      fetch: async () => {
+        requests++;
+        return new Response(raw, { status: 404, headers: credential ? {} : { 'X-Muse-Service-Version': '1.2.0' } });
+      } }, '1.2.0');
+    await assert.rejects(client.request('/api/v1/worker/' + route, route === 'heartbeat' ? 'POST' : 'GET'),
+      error => error.code === 'broker_rejected' && error.retryable === retryable);
+    assert.equal(requests, 1);
+  }
+  for (const [raw, retryable] of [['404 page not found', true], ['{"error":"worker_not_found"}', false]]) {
+    const client = new Transport('https://broker.example.test', KEY, f.logger, f.state.sys, { ...f.net,
+      fetch: async () => new Response(raw, { status: 404, headers: { 'X-Muse-Service-Version': '1.2.0' } }) }, '1.2.0');
+    await assert.rejects(async () => { for await (const _ of client.events(new AbortController().signal)) assert.fail('unexpected stream'); },
+      error => error.code === 'stream_rejected' && error.retryable === retryable && !!error.fields.request_id);
+  }
+});
+
 function stream(chunks, contentType = 'text/event-stream') {
   return new Response(new ReadableStream({ start(controller) { for (const chunk of chunks) controller.enqueue(typeof chunk === 'string' ? Buffer.from(chunk) : chunk); controller.close(); } }), { headers: { 'content-type': contentType } });
 }

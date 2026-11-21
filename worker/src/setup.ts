@@ -23,6 +23,14 @@ export async function captureBootstrap(logger: Logger, setupID: string, bootstra
 export class Setup {
   constructor(readonly worker: Worker, readonly io: SetupIO, readonly version: string) {}
   get state(): State { return this.worker.state; }
+  registrationReceipt(root: string, workerID: string): ObjectValue {
+    const paths = installedPaths(root, this.io.home, workerID);
+    return { hook_path: join(paths.hookDirectory, 'detector.sh'), skill_path: join(paths.skillDirectory, 'SKILL.md'), launcher: paths.launcher,
+      state_dir: this.state.root, requested_interval_seconds: 5, watchdog: {
+        id: 'aaa-muse-worker-watchdog', interval_seconds: watchdogSettings.schedule_seconds, timeout_seconds: watchdogSettings.timeout_seconds,
+        command: quote(paths.launcher) + ' watchdog-check --state-dir ' + quote(this.state.root), registration: 'unverified',
+      } };
+  }
   async log(level: 'INFO' | 'WARN' | 'ERROR' | 'DEBUG', event: string, fields: ObjectValue = {}): Promise<void> {
     const saved = await this.state.read('installation.json');
     const installation = saved ? object(parse(saved)) : {};
@@ -121,7 +129,7 @@ export class Setup {
       return undefined;
     }
   }
-  async install(origin: string, input: string, root: string, setupID: string, bootstrap?: string): Promise<ObjectValue> {
+  async install(origin: string, input: string, root: string, setupID: string, bootstrap?: string, enrolledUpgrade = false): Promise<ObjectValue> {
     requireValue(isAbsolute(root) && isAbsolute(this.io.node) && isAbsolute(this.io.entry), 'absolute_install_paths_required');
     identifier(setupID);
     if (bootstrap) await captureBootstrap(this.worker.logger, setupID, bootstrap);
@@ -155,14 +163,24 @@ export class Setup {
       }
       await this.worker.logger.log('INFO', 'setup.preflight_passed', { setup_id: setupID, operation_id: setupID, worker_id: knownWorker,
         stage: 'pre_enrollment', checked_roles: roles, exact_worker_paths: !!knownWorker, enrollment_attempted: false });
-      await this.worker.configure(origin);
-      const newline = input.indexOf('\n');
-      const code = newline < 0 ? input : input.slice(0, newline).trim();
-      const identity = await this.worker.enroll(code);
+      let identity: ObjectValue;
+      let report: Value | undefined;
+      if (enrolledUpgrade) {
+        requireValue(previous && knownWorker && previous.worker_id === knownWorker && previous.setup_id === setupID &&
+          previous.origin === origin && savedConfig?.origin === origin && previous.root === root, 'upgrade_identity_mismatch');
+        const record = await this.worker.identity(await this.worker.load());
+        requireValue(record.id === knownWorker, 'upgrade_identity_mismatch');
+        identity = { worker_id: knownWorker, identity_preserved: true };
+        report = previous.model_report;
+      } else {
+        await this.worker.configure(origin);
+        const newline = input.indexOf('\n');
+        identity = await this.worker.enroll(newline < 0 ? input : input.slice(0, newline).trim());
+        report = await this.modelReport(newline < 0 ? '' : input.slice(newline + 1).trim(), setupID, identifier(identity.worker_id));
+      }
       const id = identifier(identity.worker_id);
-      const report = await this.modelReport(newline < 0 ? '' : input.slice(newline + 1).trim(), setupID, id);
       const installation = { setup_id: setupID, worker_id: id, origin: this.worker.config.origin, package_version: this.version, node: this.io.node, entry: this.io.entry, root, ...(report && { model_report: report }) };
-      await this.state.write('installation.json', encode(installation));
+      if (!enrolledUpgrade) await this.state.write('installation.json', encode(installation));
       const hook = hookTemplate.replaceAll('@LAUNCHER@', quote(launcher)).replaceAll('@STATE@', quote(this.state.root));
       const instructions = skillTemplate.replaceAll('@LAUNCHER@', launcher).replaceAll('@STATE@', this.state.root).replaceAll('@WORKER@', id).replaceAll('@ORIGIN@', text(this.worker.config.origin));
       let assets;
@@ -171,6 +189,7 @@ export class Setup {
         await bin.write('aaa-muse-worker', '#!/usr/bin/env bash\nset -euo pipefail\nexec ' + quote(this.io.node) + ' ' + quote(this.io.entry) + ' "$@"\n', 0o700);
         await assets.hooks.write('detector.sh', hook, 0o700);
         await assets.skill.write('SKILL.md', instructions);
+        if (enrolledUpgrade) await this.state.write('installation.json', encode(installation));
       } catch (error) {
         throw new Failure(cause(error), { ...(error instanceof Failure ? error.fields : {}), stage: 'post_enrollment', worker_id: id,
           corrective_action: 'Correct the asset failure and retain the saved worker identity and credential.' });
@@ -178,11 +197,8 @@ export class Setup {
       await this.log('DEBUG', 'setup.assets', { installation, hook, skill: instructions });
       await this.log('INFO', 'setup.identity_preserved', { identity_preserved: identity.identity_preserved, existing_pid: owner ?? null });
       await this.ensureRunning();
-      return { ...identity, setup_id: setupID, hook_path: assets.hooks.path('detector.sh'), skill_path: assets.skill.path('SKILL.md'), launcher,
-        state_dir: this.state.root, requested_interval_seconds: 5, watchdog: {
-          id: 'aaa-muse-worker-watchdog', interval_seconds: watchdogSettings.schedule_seconds, timeout_seconds: watchdogSettings.timeout_seconds,
-          command: quote(launcher) + ' watchdog-check --state-dir ' + quote(this.state.root), registration: 'unverified',
-        }, inference_readiness: 'unverified', muse_wake: 'unverified', supported_refresh: 'unverified' };
+      return { ...identity, setup_id: setupID, ...this.registrationReceipt(root, id),
+        inference_readiness: 'unverified', muse_wake: 'unverified', supported_refresh: 'unverified' };
     });
   }
   async runtimeError(reason: string): Promise<never> {

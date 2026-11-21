@@ -50,6 +50,11 @@ class Responses(Chat):
         return self.value(result)["output"][0]["content"][0]["text"]
 
     def sqlite_concurrency(self, secondary):
+        for bot in self.bots:
+            with bot.peer.condition:
+                bot.peer.condition.wait_for(lambda: bot.peer.replies or bot.peer.errors, timeout=15)
+                require(bot.peer.replies and bot.peer.replies[0]["status"] == 200 and not bot.peer.errors,
+                        "controlled worker did not receive its initial heartbeat response")
         before = time.monotonic()
         expires = before + 180
         since = datetime.now(timezone.utc)
@@ -155,7 +160,7 @@ class Responses(Chat):
         def p95(values):
             return sorted(values)[(95 * len(values) + 99) // 100 - 1]
 
-        self.receipt("responses.sqlite_concurrent_read_write", brokers=2, qualified_workers=2, overlapping_requests=peak,
+        self.receipt("responses.sqlite_concurrent_read_write", brokers=2, online_workers=2, overlapping_requests=peak,
                      completed=len(calls), samples_per_timing=len(calls), successful_history_reads=reads,
                      max_heartbeat_gap_ms=round(1000 * max(heartbeat_gaps)), duration_ms=round(1000 * (finished - before)),
                      completed_per_second=round(len(calls) / (finished - before), 3),

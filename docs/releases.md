@@ -155,17 +155,26 @@ service's paired release receipt to obtain the exact version and trusted archive
 digest. Align product majors by upgrading the service or installing its paired
 worker; installing an arbitrary globally latest worker can remain incompatible.
 
-Before changing the installation, inspect current work and retained journals.
-Wait for a known idle state. Preserve unresolved work, accepted receipts and the
-worker credential. Retain the verified IDs and settings of the installation's
-watchdog and hook. Suspend them before stopping the identified subscriber with
-the supported Muse shell controls. Run the verified installer with the retained
-state and identity. A different running version and terminal-stop evidence each
-require operator diagnosis.
+Use the verified enrolled-upgrade helper below to inspect work and retained
+journals and reserve the worker's slot before suspending its hook and watchdog.
+The helper preserves the worker credential and accepted receipts. It verifies
+the subscriber before stopping it and runs the installer with the saved state
+and identity.
 
 Verify the installed CLI version, archive provenance and protected modes.
 Restore and read back the same hook and watchdog. With owner approval, update
 the identified legacy job in place to use the new receipt's `watchdog-check`
 command and exact hook ID and path. Verify one subscriber and its current
-authenticated heartbeat. Retain the worker's approved capability across
-authenticated reconnects. Initial approval still requires independent proof.
+authenticated heartbeat. The worker resumes dispatch after its authenticated heartbeat and the release of its upgrade reservation.
+
+### Existing worker upgrade prompt
+
+Send this message once to each existing installation after all broker processes sharing its SQLite store run the fixed paired release. The archive pin comes from the enrolled worker's authenticated status. Download the advertised HTTPS archive into a private temporary directory. After checking its SHA-256, extract only the helper with `tar -xOzf "$archive" package/setup/upgrade-enrolled.sh > upgrade-enrolled.sh` in that directory. Keep the archive available for all three helper commands.
+
+> Upgrade this existing AaA Muse worker in place. Use its saved installation and launcher. Run authenticated `status` privately and read the version, URL and SHA-256 from `worker.worker_package`. Verify the archive against that pin before executing any of its contents. If `package/setup/upgrade-enrolled.sh` is absent, report that the fixed paired release is still needed and leave the installation running.
+>
+> Inventory this installation’s native hook and watchdog, including disabled entries. Verify ownership and required permissions before interruption. Run the verified helper as `bash upgrade-enrolled.sh prepare ARCHIVE STATE_DIR`, using the actual archive and existing state paths. If already current and healthy, verify registrations and finish without restarting. If busy, wait and retry. Stop on conflicting registrations or unsafe state.
+>
+> Once the helper confirms the reservation, save and suspend only the identified registrations. Run `apply` with the same archive and state directory. Let the helper stop the verified subscriber and handle any evidenced outage latch. Restore and read back the same registrations. Update an identified legacy watchdog in place. For an older hook-only installation, register exactly one missing five-minute watchdog from the verified receipt, with its 300-second timeout. On an aborted attempt, run `cancel` and restore the saved registrations where safe. Report the installed version and the fresh heartbeat generation for one subscriber, or the specific blocker. Keep credentials, job contents and raw logs private.
+
+The reservation is renewable and expires after 120 seconds without renewal. A fenced attempt leaves the process alone. Re-run prepare after restoring the original registrations. Cancel releases only the installation's own attempt. The verified helper can archive a legacy malformed status 404 latch when the protected diagnostics prove its origin. An ambiguous or genuine terminal stop requires inspection of the retained evidence.

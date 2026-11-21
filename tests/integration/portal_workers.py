@@ -23,7 +23,7 @@ class PortalWorkers(Portal, History):
     def activity_fixtures(self):
         offline = self.named_worker('Archive <img src=x onerror="window.__unsafe=1">')
         report_header = "X-Muse-Worker-Model-Report"
-        offline_peer = self.peer(offline, qualify=False, headers={report_header: "!invalid"})
+        offline_peer = self.peer(offline, headers={report_header: "!invalid"})
         offline_peer.stop()
         self.until(lambda: self.status(offline)["connection_status"] == "offline", "closed subscriber did not become offline")
         self.offline_diagnosis(offline, offline_peer, "stream_closed")
@@ -36,11 +36,10 @@ class PortalWorkers(Portal, History):
         transport = self.named_worker("Studio subscriber")
         report = {"model_name": "Controlled Muse", "context_window_tokens": 350000, "reported_at": "2026-11-18T00:00:00Z"}
         encoded = base64.urlsafe_b64encode(json.dumps(report).encode()).decode().rstrip("=")
-        self.peer(transport, qualify=False, headers={report_header: encoded})
+        self.peer(transport, headers={report_header: encoded})
         require(self.status(transport)["model_report"] == report and self.status(transport)["inference_readiness"] == "unverified", "connection report conferred readiness or changed its values")
         busy = self.named_worker("Research subscriber")
-        busy_peer = self.peer(busy, qualify=False)
-        self.qualify_worker(busy, busy_peer, tools=False)
+        busy_peer = self.peer(busy)
         experiment = self.create(busy, "Controlled held assignment", tools=False, timeout=1800)
         job, _, _ = self.claim(busy, busy_peer, experiment)
         waiting = self.named_worker("Client-tool subscriber")
@@ -50,12 +49,11 @@ class PortalWorkers(Portal, History):
         self.read_native(request)
         require(self.status(waiting)["waiting_for_client_tool"] == 1, "controlled tool wait was not observed")
         reconnected = self.named_worker("Reconnected subscriber")
-        previous = self.peer(reconnected, qualify=False)
-        approval, _ = self.qualify_worker(reconnected, previous, tools=False)
+        previous = self.peer(reconnected)
         previous.stop()
-        self.peer(reconnected, qualify=False)
+        self.peer(reconnected)
         recovered = self.status(reconnected)
-        require(recovered["inference_readiness"] == "verified" and recovered["qualification"] == approval, "reconnection lost or rewrote worker approval")
+        require(recovered["connection_status"] == "online" and not recovered["qualification_history"], "reconnect failed or created approval")
         self.receipt("portal.workers_controlled_activity", heartbeat_is_not_readiness=True, live_qualification=False)
         return {"offline_id": offline["worker"]["id"], "transport_id": transport["worker"]["id"],
                 "busy_id": busy["worker"]["id"], "busy_job_id": job["id"], "waiting_id": waiting["worker"]["id"], "reconnected_id": reconnected["worker"]["id"]}
@@ -78,7 +76,7 @@ class PortalWorkers(Portal, History):
     def worker_browser(self, phase, workers):
         if phase == "actions":
             reconnecting = self.named_worker("Offline timer fixture")
-            initial = self.peer(reconnecting, qualify=False)
+            initial = self.peer(reconnecting)
             initial.stop()
             self.until(lambda: self.status(reconnecting)["connection_status"] == "offline", "timer fixture did not become offline")
             workers = {**workers, "reconnect_id": reconnecting["worker"]["id"]}
@@ -94,7 +92,7 @@ class PortalWorkers(Portal, History):
                             signal = self.root / "worker-browser-resume-subscriber"
                             self.until(lambda: signal.exists() or process.poll() is not None, "browser did not reach the offline timer check", timeout=300)
                             if signal.exists():
-                                peer = self.peer(reconnecting, qualify=False)
+                                peer = self.peer(reconnecting)
                                 self.private("worker-browser-subscriber-ready", "")
                         process.wait(timeout=300)
                     finally:

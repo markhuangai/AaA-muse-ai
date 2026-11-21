@@ -23,7 +23,7 @@ test('replacement rejects held work, tool waits, missing metadata and an unavail
     [1, 'connection_status', 'offline'], [1, 'work_status', 'unknown'], [1, 'work_status', 'busy'],
     [1, 'current_job', { job_id: 'other-job' }], [1, 'current_job', undefined],
     [1, 'waiting_for_client_tool', 1], [1, 'waiting_for_client_tool', undefined],
-    [1, 'inference_readiness', 'withdrawn'], [1, 'inference_readiness', undefined],
+    [1, 'work_status', 'upgrading'],
   ]) {
     const workers = replacementWorkers(); workers[index][field] = value;
     assert.throws(() => replacementBoundary(workers, 'worker-a', 'worker-b'));

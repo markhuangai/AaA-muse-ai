@@ -1,5 +1,5 @@
 import * as fs from 'node:fs/promises';
-import { constants } from 'node:fs';
+import { constants, readFileSync } from 'node:fs';
 import { join, resolve, isAbsolute } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { Failure, cause, requireValue } from './errors.js';
@@ -18,8 +18,14 @@ export interface System {
 export const system: System = {
   now: Date.now, uuid: randomUUID, uid: process.getuid?.() ?? -1, pid: process.pid,
   alive(pid) {
-    try { process.kill(pid, 0); return true; }
-    catch (error) { return cause(error) === 'ESRCH' ? false : undefined; }
+    try {
+      process.kill(pid, 0);
+      if (process.platform !== 'linux') return true;
+      const stat = readFileSync('/proc/' + pid + '/stat', 'utf8');
+      const processState = stat[stat.lastIndexOf(')') + 2];
+      return processState !== 'Z' && processState !== 'X';
+    }
+    catch (error) { return ['ESRCH', 'ENOENT'].includes(cause(error)) ? false : undefined; }
   },
   wait: ms => new Promise(resolveWait => setTimeout(resolveWait, ms)),
 };
@@ -74,6 +80,12 @@ export class State {
   }
   async remove(name: string): Promise<void> {
     if (await this.read(name) !== undefined) await this.io.unlink(this.path(name));
+  }
+  async archive(name: string, archived: string, content: string): Promise<void> {
+    requireValue((await this.read(name)) === content && (await this.read(archived)) === undefined, 'archive_state_changed');
+    await this.io.rename(this.path(name), this.path(archived));
+    const directory = await this.io.open(this.root, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+    try { await directory.sync(); } finally { await directory.close(); }
   }
   async child(name: string): Promise<State> {
     const child = new State(this.path(name), this.io, this.sys);

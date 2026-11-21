@@ -30,6 +30,11 @@ func loadRouting(ctx context.Context, tx *sql.Tx, s *inference.State) error {
 	return decodeInference(data, &s.Routing)
 }
 
+func saveRouting(ctx context.Context, tx *sql.Tx, worker string, data []byte) error {
+	_, err := tx.ExecContext(ctx, "INSERT INTO aaa_worker_routing(worker_id,data) VALUES(?1,?2) ON CONFLICT(worker_id) DO UPDATE SET data=EXCLUDED.data", worker, data)
+	return err
+}
+
 func loadConnection(ctx context.Context, tx *sql.Tx, s *inference.State) error {
 	var data []byte
 	err := tx.QueryRowContext(ctx, "SELECT data FROM aaa_worker_connections WHERE worker_id=?1", s.WorkerID).Scan(&data)
@@ -170,7 +175,7 @@ func (r *Repository) withinRouting(ctx context.Context, ref inference.Ref, apply
 				return err
 			}
 			if !bytes.Equal(data, routing[id]) {
-				if _, err = tx.ExecContext(ctx, "INSERT INTO aaa_worker_routing(worker_id,data) VALUES(?1,?2) ON CONFLICT(worker_id) DO UPDATE SET data=EXCLUDED.data", id, data); err != nil {
+				if err = saveRouting(ctx, tx, id, data); err != nil {
 					return err
 				}
 			}

@@ -8,7 +8,7 @@ function packaging(t, change = {}) {
   const f = fixture(t);
   const source = { source_sha: 'a'.repeat(40), source_dirty: false, package_version: '0.1.0-dev.0' };
   const metadata = { name: '@markhuangai/aaa-muse-worker', version: '0.1.0-dev.0', ...change.metadata };
-  const assets = ['install.sh', 'private-directory.sh', 'hook.sh', 'SKILL.md'];
+  const assets = ['install.sh', 'upgrade-enrolled.sh', 'private-directory.sh', 'hook.sh', 'SKILL.md'];
   for (const asset of assets) f.write('worker/setup/' + asset, 'package fixture');
   for (const [path, raw] of Object.entries({ 'worker/package.json': JSON.stringify(metadata), 'worker/dist/build.json': JSON.stringify(source), 'worker/dist/main.js': 'compiled-worker', 'worker/LICENSE': 'Apache-2.0', 'worker/README.md': 'worker' })) f.write(path, raw);
   const calls = [];
