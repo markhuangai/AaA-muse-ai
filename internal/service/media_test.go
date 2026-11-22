@@ -19,7 +19,6 @@ func TestMediaReceiptAndOwnership(t *testing.T) {
 	ctx := context.Background()
 	b.Media = media.New(t.TempDir())
 	wid := "worker-a"
-	c := connectInference(t, b, m, logger, wid)
 	makeStage := func(message string) *media.Stage {
 		p, err := b.Media.Begin()
 		if err != nil {
@@ -33,9 +32,6 @@ func TestMediaReceiptAndOwnership(t *testing.T) {
 		return p
 	}
 	message := "private request text with distinctive sentinel"
-	_, err := b.SubmitMedia(ctx, logger, makeStage(message), "alice", "create-media", "")
-	requireInferenceReason(t, err, "no_ready_worker")
-	m.states[wid].Connection.MediaJobs = true
 	data, err := b.SubmitMedia(ctx, logger, makeStage(message), "alice", "create-media", "")
 	status := decodeResult[MediaStatus](t, data, err)
 	if status.DeadlineAt.Sub(status.CreatedAt) != 15*time.Minute {
@@ -51,8 +47,7 @@ func TestMediaReceiptAndOwnership(t *testing.T) {
 	requireInferenceReason(t, err, "media_not_found")
 	_, _, err = b.ReadMedia(ctx, logger, "alice", status.ID, true)
 	requireInferenceReason(t, err, "artifact_not_ready")
-	data, err = b.Claim(ctx, logger, wid, status.ID, inference.Claim{Version: 1, ConnectionID: c.ID, ConnectionGeneration: c.Generation, SubmissionID: "media-claim"})
-	j := decodeResult[inference.Job](t, data, err)
+	j := startFixtureJob(t, b, m, wid, status.ID)
 	f := MediaFence{j.ConnectionID, j.ConnectionGeneration, j.Generation, j.LeaseID}
 	file, kind, err := b.MediaInput(ctx, logger, wid, j.ID, "prompt", f)
 	if err != nil || !strings.HasPrefix(kind, "text/plain") {

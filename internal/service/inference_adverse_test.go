@@ -164,8 +164,10 @@ func TestHealthDeadlinesRevocationAndFailures(t *testing.T) {
 func TestAdmissionInvalidDecisionsAndContextBases(t *testing.T) {
 	b, m, log, _ := inferenceFixture()
 	ctx := context.Background()
-	_, err := b.Create(ctx, log, inference.Create{Version: 1, SubmissionID: "offline", WorkerID: "worker-a", Messages: []inference.Item{{Type: "message", Role: "user", Text: "x"}}, Tools: []inference.Tool{}})
-	requireInferenceReason(t, err, "worker_offline")
+	data, err := b.Create(ctx, log, inference.Create{Version: 1, SubmissionID: "offline", WorkerID: "worker-a", Messages: []inference.Item{{Type: "message", Role: "user", Text: "x"}}, Tools: []inference.Tool{}})
+	if queued := decodeResult[inference.Experiment](t, data, err); queued.State != "queued" || queued.CurrentJobID == "" {
+		t.Fatal("offline targeted experiment was not durably admitted")
+	}
 	c := connectInference(t, b, m, log, "worker-a")
 	connectInference(t, b, m, log, "worker-b")
 	a := createInference(t, b, log, "worker-a", "a", 0)
@@ -185,7 +187,7 @@ func TestAdmissionInvalidDecisionsAndContextBases(t *testing.T) {
 	_, err = b.Decide(ctx, log, "worker-a", j.ID, bad)
 	requireInferenceReason(t, err, "stale_assignment")
 	d := submission(j, c, "tool", inference.Item{Type: "tool_call", CallID: "call", Name: "read_file", Arguments: map[string]any{"path": "fixture"}})
-	data, err := b.Decide(ctx, log, "worker-a", j.ID, d)
+	data, err = b.Decide(ctx, log, "worker-a", j.ID, d)
 	decodeResult[inference.Experiment](t, data, err)
 	_, err = b.ToolResult(ctx, log, a.ID, inference.ToolResult{Version: 1, SubmissionID: "wrong-call", CallID: "foreign"})
 	requireInferenceReason(t, err, "tool_result_linkage_conflict")

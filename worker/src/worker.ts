@@ -183,7 +183,7 @@ export class Worker {
       if (prior) {
         const id = identifier(object(parse(prior)).submission_id);
         const saved = object(parse((await journals.read(`operation-${id}.json`))!));
-        if (saved.state !== 'rejected') {
+        if (saved.state !== 'rejected' || (kind === 'decision' && j.native_job_id)) {
           requireValue(saved.decision_input === decisionInput, 'pending_submission_conflict', { submission_id: id, expected: 'identical_pending_decision' });
           return saved;
         }
@@ -250,13 +250,13 @@ export class Worker {
     await this.publish(current, text(current.state), 'context_shown');
     return { protocol_version: 1, ...correlation(current), state: current.state, context: current.context };
   }
-  async submit(id: string, input: string): Promise<ObjectValue> {
+  async submit(id: string, input: string, brief?: ObjectValue): Promise<ObjectValue> {
     let current: ObjectValue | undefined;
     let operation: ObjectValue | undefined;
     try {
       const transport = await this.load();
-      await this.identity(transport);
-      current = await this.getJob(transport, id);
+      if (!brief) await this.identity(transport);
+      current = brief ?? await this.getJob(transport, id);
       requireValue(!current.media, 'media_upload_required');
       try {
         validateBody(input);

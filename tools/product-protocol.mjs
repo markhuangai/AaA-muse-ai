@@ -1,6 +1,6 @@
 import { model, readSSE, validateCompletion } from './openai-conformance.mjs';
 import { readResponseSSE, validateResponse } from './responses-conformance.mjs';
-import { decodeExport, identifier, need, same } from './qualification-evidence.mjs';
+import { decodeExport, identifier, instant, need, same } from './qualification-evidence.mjs';
 import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 
@@ -133,9 +133,13 @@ export class ProductProtocol {
       const detail = await management('/api/v1/admin/requests/' + admitted.operation_id), execution = detail.execution;
       need(identifier(execution?.worker_id) && identifier(execution.current_job_id), 'product_assignment_missing');
       const assignment = detail.assignment;
-      need(identifier(assignment?.connection_id) && assignment.connection_generation > 0 && assignment.generation > 0, 'product_assignment_missing');
+      need(assignment?.generation > 0, 'product_assignment_missing');
+      const authority = assignment.launch_id ? { claim_id: assignment.lease_id, launch_id: assignment.launch_id, native_job_id: assignment.native_job_id } :
+        { connection_id: assignment.connection_id, connection_generation: assignment.connection_generation };
+      need(assignment.launch_id ? Object.values(authority).every(identifier) && instant(assignment.started_at) :
+        identifier(assignment.connection_id) && assignment.connection_generation > 0, 'product_assignment_missing');
       Object.assign(turn, { operation_id: admitted.operation_id, worker_id: execution.worker_id, job_id: execution.current_job_id, conversation_id: detail.request.conversation_id,
-        connection_id: assignment.connection_id, connection_generation: assignment.connection_generation, generation: assignment.generation });
+        ...authority, generation: assignment.generation });
       operations.push(turn.operation_id); workers.push(turn.worker_id); conversations.push(turn.conversation_id); contexts.push(detail.delivery);
     }
     need(conversations.length && new Set(conversations).size === 1, 'product_session_identity_changed');

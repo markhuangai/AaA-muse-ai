@@ -15,60 +15,71 @@ import time
 import urllib.parse
 
 from history import History
+from inference import PullPeer
 from service import require
 
 
-class DecisionPeer:
-    def __init__(self, harness, worker, peer):
-        self.h, self.worker, self.peer = harness, worker, peer
+class DecisionPeer(PullPeer):
+    def __init__(self, harness, worker):
+        super().__init__(harness, worker)
         self.stopped = threading.Event()
-        self.jobs, self.errors = [], []
-        self.seen = {e["data"].get("job_id") for e in peer.events}
+        self.errors = []
         self.thread = threading.Thread(target=self.run, daemon=True)
 
     def start(self):
+        if self.stopped.is_set():
+            require(not self.thread.is_alive() and self.active is None and not self.errors,
+                    "cannot resume an unsettled controlled peer")
+            self.stopped.clear()
+            self.thread = threading.Thread(target=self.run, daemon=True)
         self.thread.start()
         return self
 
     def run(self):
         try:
-            while not self.stopped.wait(0.02):
-                with self.peer.condition:
-                    pending = [e["data"] for e in self.peer.events if e["type"] == "job.available" and e["data"]["job_id"] not in self.seen]
-                for available in pending:
-                    identity = available["job_id"]
-                    self.seen.add(identity)
-                    experiment = self.h.experiment(available["experiment_id"])
-                    job, _, _ = self.h.claim(self.worker, self.peer, experiment)
-                    self.jobs.append(job)
-                    messages = job["context"]["messages"]
-                    last = messages[-1]
-                    user = next((m["text"] for m in reversed(messages) if m.get("role") == "user"), "")
-                    if last["type"] == "tool_result":
-                        decision = {"type": "final", "text": last["output"]}
-                    elif user.startswith("aaa-chat:hold:"):
+            while not self.stopped.wait(0.15):
+                with self.condition:
+                    if self.active is not None:
                         continue
-                    elif user.startswith("aaa-chat:tool:"):
-                        decision = {"type": "tool_call", "call_id": "call-" + job["id"], "name": "read_file", "arguments": {"path": user[len("aaa-chat:tool:"):]}}
-                    elif user.startswith("aaa-chat:delay:"):
-                        delay, text = user[len("aaa-chat:delay:"):].split(":", 1)
-                        if self.stopped.wait(float(delay)):
-                            return
-                        decision = {"type": "final", "text": text}
-                    elif user.startswith("aaa-chat:echo:"):
-                        decision = {"type": "final", "text": user[len("aaa-chat:echo:"):]}
-                    else:
-                        require(user.startswith("aaa-chat:text:"), "controlled peer received an unsupported test request")
-                        decision = {"type": "final", "text": user[len("aaa-chat:text:"):]}
-                    self.h.decision(self.worker, self.peer, job, decision)
+                job = self.pull()
+                if job is None:
+                    continue
+                messages = job["context"]["messages"]
+                last = messages[-1]
+                user = next((m["text"] for m in reversed(messages) if m.get("role") == "user"), "")
+                if last["type"] == "tool_result":
+                    decision = {"type": "final", "text": last["output"]}
+                elif user.startswith("aaa-chat:hold:"):
+                    continue
+                elif user.startswith("aaa-chat:tool:"):
+                    decision = {"type": "tool_call", "call_id": "call-" + job["id"], "name": "read_file", "arguments": {"path": user[len("aaa-chat:tool:"):]}}
+                elif user.startswith("aaa-chat:delay:"):
+                    delay, text = user[len("aaa-chat:delay:"):].split(":", 1)
+                    if self.stopped.wait(float(delay)):
+                        return
+                    decision = {"type": "final", "text": text}
+                elif user.startswith("aaa-chat:echo:"):
+                    decision = {"type": "final", "text": user[len("aaa-chat:echo:"):]}
+                else:
+                    require(user.startswith("aaa-chat:text:"), "controlled peer received an unsupported test request")
+                    decision = {"type": "final", "text": user[len("aaa-chat:text:"):]}
+                self.submit(job, decision)
         except Exception as error:
-            self.errors.append(type(error).__name__ + ": " + str(error))
+            with self.condition:
+                self.errors.append(type(error).__name__ + ": " + str(error))
+                self.condition.notify_all()
+
+    def pull(self):
+        origins = getattr(self.h, "origins", None) or [self.h.origin_url]
+        origin = origins[len(self.pulls) % len(origins)]
+        grant = self.poll(origin)
+        return self.begin(grant, origin)[0] if grant is not None else None
 
     def stop(self):
         self.stopped.set()
         self.thread.join(timeout=6)
         require(not self.thread.is_alive(), "controlled decision peer did not stop")
-        self.h.private("chat-peer-" + self.worker["worker"]["id"] + ".json", json.dumps({"jobs": self.jobs, "errors": self.errors}))
+        self.h.private("chat-peer-" + self.worker["worker"]["id"] + ".json", json.dumps({"jobs": self.jobs, "pulls": self.pulls, "errors": self.errors}))
         require(not self.errors, "controlled decision peer failed; inspect private evidence")
 
 
@@ -79,8 +90,7 @@ class Chat(History):
 
     def new_bot(self):
         worker = self.new_worker()
-        peer = self.peer(worker)
-        bot = DecisionPeer(self, worker, peer).start()
+        bot = DecisionPeer(self, worker).start()
         self.bots.append(bot)
         return bot
 
@@ -198,10 +208,10 @@ class Chat(History):
                 action = "replay the accepted completion in the same session; do not regenerate inference"
             else:
                 held = next(e for e in selected if e["msg"] == "recovery.uncertain" and e["reason"] in (cause, "operator_cancelled"))
-                require(held["busy_hold"] and held["remote_outcome"] == "unknown" and held["job_id"] and held["worker_id"] and held["generation"] > 0 and held["connection_generation"] > 0 and held["deadline_at"], "uncertain-work diagnosis lacks held assignment authority")
+                require(held["busy_hold"] and held["remote_outcome"] == "unknown" and held["job_id"] and held["worker_id"] and held["generation"] > 0 and held["claim_id"] and held["deadline_at"], "uncertain-work diagnosis lacks held assignment authority")
                 if cause == "deadline_exceeded":
                     require(any(e["msg"] == "job.deadline_exceeded" and e["job_id"] == held["job_id"] for e in selected), "deadline cause is not in the operation logs")
-                evidence.update({"job_id": held["job_id"], "worker_id": held["worker_id"], "generation": held["generation"], "connection_generation": held["connection_generation"], "busy_hold": True, "remote_outcome": "unknown"})
+                evidence.update({"job_id": held["job_id"], "worker_id": held["worker_id"], "generation": held["generation"], "claim_id": held["claim_id"], "busy_hold": True, "remote_outcome": "unknown"})
                 action = held["corrective_action"]
         else:
             raise AssertionError("unsupported diagnostic conclusion")
@@ -301,7 +311,7 @@ class Chat(History):
             bot, job = self.job_for(marker)
             status, _, _ = self.chat(self.chat_body("different"), "serialized", origin=second_origin)
             require(status == 409, "overlapping session turn admitted")
-            self.decision(bot.worker, bot.peer, job, {"type": "final", "text": "one turn"})
+            bot.submit(job, {"type": "final", "text": "one turn"})
             self.answer(pending.result(timeout=10))
         self.receipt("chat.owned_affinity_serialization_and_independence", broker_processes=2, distinct_owners=True, healthy_pin_preserved=True)
 
@@ -318,7 +328,7 @@ class Chat(History):
             for index, (bot, job) in enumerate(assignments):
                 other = "B" if index == 0 else "A"
                 require("parallel-owner-" + other not in json.dumps(job["context"]), "simultaneous initial context crossed sessions")
-                self.decision(bot.worker, bot.peer, job, {"type": "tool_call", "call_id": "parallel-call-" + str(index), "name": "read_file", "arguments": {"path": str(fixtures[index])}})
+                bot.submit(job, {"type": "tool_call", "call_id": "parallel-call-" + str(index), "name": "read_file", "arguments": {"path": str(fixtures[index])}})
             first = [future.result(timeout=12) for future in pending]
         messages = [json.loads(result[2])["choices"][0]["message"] for result in first]
         results = [path.read_bytes().decode() for path in fixtures]
@@ -393,7 +403,7 @@ class Chat(History):
             self.until(terminated, "abort termination evidence missing")
             require(terminal[0]["level"] == "INFO", "client abort has wrong diagnostic level")
             self.diagnose_chat(terminal[0]["request_id"], terminal[0]["msg"], "request_context_cancelled")
-            bot.peer.acknowledge_idle(job)
+            bot.settle(job)
             marker = "aaa-chat:hold:deadline-" + str(stream)
             with ThreadPoolExecutor(max_workers=1) as pool:
                 pending = pool.submit(self.chat, self.chat_body(marker, stream), "deadline-" + str(stream))
@@ -404,7 +414,7 @@ class Chat(History):
             require(status == 504 and json.loads(raw)["error"]["code"] == "deadline_exceeded", "deadline did not produce explicit OpenAI error")
             self.diagnose_chat(headers["X-Request-Id"], "chat.stream_terminated" if stream else "chat.request_terminated", "deadline_exceeded")
             require(self.detail_id(job["experiment_id"])["assignment"]["held"], "deadline dropped uncertain busy hold")
-            bot.peer.acknowledge_idle(job)
+            bot.settle(job)
         self.receipt("chat.abort_and_native_deadline", both_stream_settings=True, fixture_deadline_advanced=True, uncertain_holds_preserved=True)
 
     def output_boundary_fault(self):
@@ -417,7 +427,7 @@ class Chat(History):
                 bot, job = self.job_for(marker)
                 constraint = "chat_output_start_fixture"
                 self.reject_writes(constraint, "aaa_model_requests", "NEW.id='" + job["experiment_id"] + "' AND json_extract(CAST(NEW.data AS TEXT),'$.output_started_at') IS NOT NULL")
-                self.decision(bot.worker, bot.peer, job, {"type": "final", "text": "retained accepted answer"})
+                bot.submit(job, {"type": "final", "text": "retained accepted answer"})
                 status, headers, raw = pending.result(timeout=12)
             require(status == 503 and isinstance(json.loads(raw)["error"], dict), "failed boundary exposed output")
             events = self.diagnose_chat(headers["X-Request-Id"], "chat.stream_terminated" if stream else "chat.request_terminated", "output_boundary_failed")
@@ -457,7 +467,7 @@ class Chat(History):
         reader.start()
         require(ready.wait(2), "delivery interruption reader did not start")
         output = "x" * (768 * 1024)
-        self.decision(bot.worker, bot.peer, job, {"type": "final", "text": output})
+        bot.submit(job, {"type": "final", "text": output})
         reader.join(timeout=20)
         require(not reader.is_alive() and received and not failures, "controlled delivery interruption failed")
         require(b"[DONE]" not in received[0], "interruption happened after successful stream termination")
@@ -482,10 +492,10 @@ class Chat(History):
             pending = pool.submit(self.chat, self.chat_body(marker, True), "lost-worker")
             bot, job = self.job_for(marker)
             bot.stop()
-            bot.peer.stop()
+            self.expire_job(job, (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat())
             status, headers, raw = pending.result(timeout=12)
-        require(status == 503 and json.loads(raw)["error"]["code"] == "worker_disconnected", "worker loss was hidden or retried")
-        self.diagnose_chat(headers["X-Request-Id"], "chat.stream_terminated", "worker_disconnected")
+        require(status == 504 and json.loads(raw)["error"]["code"] == "deadline_exceeded", "unobservable work did not respect its deadline")
+        self.diagnose_chat(headers["X-Request-Id"], "chat.stream_terminated", "deadline_exceeded")
         detail = self.detail_id(job["experiment_id"])
         require(detail["request"]["state"] == "interrupted" and detail["assignment"]["held"], "worker loss erased uncertainty")
         require(sum(j["experiment_id"] == job["experiment_id"] for b in self.bots for j in b.jobs) == 1, "worker loss launched overlapping inference")

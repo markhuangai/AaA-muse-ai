@@ -36,7 +36,7 @@ test('setup prepares only an owned private asset directory and identifies refuse
 
 test('production process adapter uses real native runtime output and rejects errors', async t => {
   const f = await fixture(t); const io = setupIO(f.state.root);
-  assert.match(await io.asset('SKILL.md'), /client-tool/);
+  assert.match(await io.asset('SKILL.md'), /calling client executes/);
   const runtime = f.state.path('runtime.sh');
   await f.state.write('runtime.sh', 'wake(){ printf "wake:%s\\n" "$1"; }; silent(){ printf "silent:%s\\n" "$1"; };\n');
   assert.equal(await io.emit(runtime, 'wake', 'exact message'), 'wake:exact message\n');

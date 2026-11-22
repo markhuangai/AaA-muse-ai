@@ -53,6 +53,21 @@ export async function latestCompleteRC({ github, context, token, fetcher = fetch
     .sort((a, b) => releaseVersion(b.tag_name.slice(1)).rc - releaseVersion(a.tag_name.slice(1)).rc);
   const release = candidates[0];
   need(release && candidates[1]?.tag_name !== release.tag_name, 'product_release_latest_rc_unavailable', { active_series: activeBase });
+  return verifyRC({ github, context, token, fetcher, release });
+}
+
+export function historicalRC(tag) {
+  return isRCTag(tag) && releaseVersion(tag.slice(1)).major === 0;
+}
+
+export async function verifyHistoricalRC({ github, context, token, fetcher, releases, tag }) {
+  const matches = releases.filter(release => historicalRC(tag) && release.tag_name === tag &&
+    !release.draft && release.prerelease && hasCompletionMarker(release));
+  need(matches.length === 1, 'product_release_historical_rc_unavailable', { expected_rc: tag });
+  return verifyRC({ github, context, token, fetcher, release: matches[0] });
+}
+
+async function verifyRC({ github, context, token, fetcher, release }) {
   const { manifest, manifestSHA256 } = await readProductRelease(release, fetcher);
   need(manifest.publication_kind === 'rc', 'product_release_rc_manifest_required');
   await verifyMainSource({ github, context, manifest });
@@ -73,6 +88,14 @@ export function requireCurrentRC(prepared, selected) {
 export function requireStableTarget(version, prior) {
   need(isNextStable(version, prior?.version), 'product_release_stable_version_step_invalid', {
     observed_version: version, prior_stable_version: prior?.version ?? null, active_series: nextRCBase(prior),
+  });
+}
+
+export function requireCutoverMajor(version, prereleaseTag) {
+  const source = releaseVersion(prereleaseTag?.slice(1));
+  const target = releaseVersion(version);
+  need(source && target && source.major === target.major, 'product_release_source_target_major_mismatch', {
+    source_rc: prereleaseTag, observed_version: version,
   });
 }
 
@@ -101,7 +124,22 @@ export async function prepareStableRelease({ github, context, prereleaseTag, ver
     }
     need(!stable.exists || startedPromotion, 'product_release_version_destination_conflict', { destination: version, observed_digest: stable.digest });
 
-    if (!startedPromotion) {
+    const recoveryOnly = !startedPromotion && historicalRC(prereleaseTag);
+    if (recoveryOnly) {
+      requireCutoverMajor(version, prereleaseTag);
+      operation = 'historical_bundle_selection';
+      selected = await verifyHistoricalRC({ github, context, token, fetcher, releases, tag: prereleaseTag });
+      if (prepared) requireCurrentRC(prepared, selected);
+      prepared ??= { ...selected, ...identity, candidate_ready: false };
+      const recovery = await candidateRecovery({ github, context, prepared });
+      need(recovery, 'product_release_original_bundle_unavailable');
+      prepared.recovery_only = true;
+      prepared.resume_run_id = recovery.run_id;
+      prepared.resume_artifact_id = recovery.artifact_id;
+      if (prepared.candidate_ready) await verifyPublished({ tag, sourceSHA: prepared.source_sha,
+        manifestSHA256: prepared.manifest_sha256, token, fetcher });
+    } else if (!startedPromotion) {
+      requireCutoverMajor(version, prereleaseTag);
       operation = 'latest_rc_selection';
       const prior = await latestStableRelease(releases, fetcher);
       selected = await latestCompleteRC({ github, context, token, fetcher, releases, prior });
@@ -118,6 +156,7 @@ export async function prepareStableRelease({ github, context, prereleaseTag, ver
       prepared = { ...selected, ...identity, candidate_ready: false };
       const recovery = await candidateRecovery({ github, context, prepared });
       prepared.resume_run_id = recovery?.run_id ?? null;
+      prepared.resume_artifact_id = recovery?.artifact_id ?? null;
       if (!recovery) {
         const { versions } = await npmPackage({ token, fetcher });
         need(!target && !versions[version], 'product_release_version_destination_conflict', {
@@ -190,8 +229,9 @@ export async function candidateRecovery({ github, context, prepared }) {
   need(run.workflow_id === workflow.id && run.event === 'workflow_dispatch' && run.head_branch === 'main' &&
     run.repository.full_name === repository && run.head_repository.full_name === repository, 'product_release_resume_run_untrusted');
   const artifacts = await github.paginate(github.rest.actions.listWorkflowRunArtifacts, { ...context.repo, run_id: runID, per_page: 100 });
-  const matches = artifacts.filter(artifact => artifact.name === bundleName(prepared) && !artifact.expired);
-  need(matches.length === 1, 'product_release_original_bundle_unavailable');
+  const matches = artifacts.filter(artifact => artifact.name === bundleName(prepared));
+  need(matches.length === 1 && !matches[0].expired && Number.isSafeInteger(matches[0].id) && matches[0].id > 0,
+    'product_release_original_bundle_unavailable');
   logEvent(null, 'info', 'product.release.bundle_resumed', { ...releaseOperation(context),
     source_sha: prepared.source_sha, version: prepared.version, source_rc: prepared.source_rc, original_run_id: runID, artifact_id: matches[0].id });
   return { run_id: runID, artifact_id: matches[0].id };

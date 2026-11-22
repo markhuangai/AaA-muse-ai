@@ -10,6 +10,7 @@ import (
 
 	"database/sql"
 	"github.com/markhuangai/AaA-muse-ai/internal/inference"
+	"github.com/markhuangai/AaA-muse-ai/internal/media"
 )
 
 const recoveryRequests = `SELECT m.id FROM aaa_model_requests m
@@ -54,7 +55,7 @@ func resolveInference(ctx context.Context, tx *sql.Tx, ref *inference.Ref) error
 	var err error
 	if ref.JobID != "" {
 		var data []byte
-		err = tx.QueryRowContext(ctx, "SELECT worker_id, experiment_id, data FROM aaa_inference_jobs WHERE id=?1", ref.JobID).Scan(&wid, &exp, &data)
+		err = tx.QueryRowContext(ctx, "SELECT COALESCE(worker_id,''), experiment_id, data FROM aaa_inference_jobs WHERE id=?1", ref.JobID).Scan(&wid, &exp, &data)
 		if err == nil {
 			var job inference.Job
 			if err = decodeInference(data, &job); err != nil {
@@ -90,15 +91,18 @@ func (r *Repository) WithinInference(ctx context.Context, ref inference.Ref, app
 			return err
 		}
 		s := &inference.State{WorkerID: ref.WorkerID, Experiments: map[string]*inference.Experiment{}, Jobs: map[string]*inference.Job{}}
-		var revoked *int64
-		err := tx.QueryRowContext(ctx, "SELECT revoked_at FROM aaa_workers WHERE id=?1", ref.WorkerID).Scan(&revoked)
-		if errors.Is(err, sql.ErrNoRows) {
-			return inference.Reject("worker_not_found", 404)
+		var err error
+		if ref.WorkerID != "" || ref.ExperimentID == "" {
+			var revoked, lastContact *int64
+			err = tx.QueryRowContext(ctx, "SELECT revoked_at,last_contact_at FROM aaa_workers WHERE id=?1", ref.WorkerID).Scan(&revoked, &lastContact)
+			if errors.Is(err, sql.ErrNoRows) {
+				return inference.Reject("worker_not_found", 404)
+			}
+			if err != nil {
+				return err
+			}
+			s.Revoked, s.LastContactAt = revoked != nil, instant(lastContact)
 		}
-		if err != nil {
-			return err
-		}
-		s.Revoked = revoked != nil
 		if s.Revoked && ref.WorkerAuth != "" {
 			return inference.Reject("worker_revoked", 401, "correlation", ref.Correlation, "expected_worker_id", ref.WorkerID, "observed_worker_id", ref.WorkerAuth)
 		}
@@ -112,6 +116,14 @@ func (r *Repository) WithinInference(ctx context.Context, ref inference.Ref, app
 			}
 		} else if !errors.Is(err, sql.ErrNoRows) {
 			return err
+		}
+		if ref.PollProjection {
+			var polled *int64
+			err = tx.QueryRowContext(ctx, "SELECT last_poll_at FROM aaa_worker_polls WHERE worker_id=?1", ref.WorkerID).Scan(&polled)
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return err
+			}
+			s.LastPollAt = instant(polled)
 		}
 		if err = loadInference(ctx, tx, ref, s); err != nil {
 			return err
@@ -161,10 +173,16 @@ func (r *Repository) WithinInference(ctx context.Context, ref inference.Ref, app
 }
 
 func loadInference(ctx context.Context, tx *sql.Tx, ref inference.Ref, s *inference.State) error {
-	rows, err := tx.QueryContext(ctx, `SELECT data FROM aaa_experiments WHERE (worker_id=?1 OR (worker_id IS NULL AND ?1='')) AND
+	var rows *sql.Rows
+	var err error
+	if ref.Single {
+		rows, err = tx.QueryContext(ctx, "SELECT data FROM aaa_experiments WHERE id=?1", ref.ExperimentID)
+	} else {
+		rows, err = tx.QueryContext(ctx, `SELECT data FROM aaa_experiments WHERE (worker_id=?1 OR (worker_id IS NULL AND ?1='')) AND
 		(state NOT IN ('completed','cancelled','interrupted') OR id=?2 OR id IN
 		(SELECT experiment_id FROM aaa_inference_jobs WHERE id=?3 OR held)
 		OR (?4 AND id IN (`+recoveryRequests+`))) ORDER BY id`, s.WorkerID, ref.ExperimentID, ref.BaseJobID, ref.Recovery)
+	}
 	if err != nil {
 		return err
 	}
@@ -218,10 +236,15 @@ func loadInference(ctx context.Context, tx *sql.Tx, ref inference.Ref, s *infere
 			ids = append(ids, id)
 		}
 	}
-	rows, err = tx.QueryContext(ctx, `SELECT data, CASE WHEN ?4 THEN context ELSE NULL END FROM aaa_inference_jobs
-		WHERE worker_id=?1 AND (state IN ('queued','claimed') OR held OR id=?2 OR id=?3 OR
+	if ref.Single {
+		rows, err = tx.QueryContext(ctx, `SELECT data, CASE WHEN ?2 THEN context ELSE NULL END FROM aaa_inference_jobs
+			WHERE id=COALESCE(NULLIF(?3,''),(SELECT current_job_id FROM aaa_experiments WHERE id=?1))`, ref.ExperimentID, ref.Full, ref.JobID)
+	} else {
+		rows, err = tx.QueryContext(ctx, `SELECT data, CASE WHEN ?4 THEN context ELSE NULL END FROM aaa_inference_jobs
+		WHERE worker_id IS NULLIF(?1,'') AND (state IN ('queued','claimed') OR held OR id=?2 OR id=?3 OR
 		id=(SELECT current_job_id FROM aaa_experiments WHERE id=?5)
 		OR experiment_id IN (SELECT value FROM json_each(?6))) ORDER BY id`, s.WorkerID, ref.JobID, ref.BaseJobID, ref.Full, ref.ExperimentID, idList(ids))
+	}
 	if err != nil {
 		return err
 	}
@@ -353,10 +376,21 @@ func saveInference(ctx context.Context, tx *sql.Tx, ref inference.Ref, s *infere
 		if j.Media != nil && j.Media.ExpiresAt != nil {
 			expires = j.Media.ExpiresAt.UnixMicro()
 		}
-		if _, err = tx.ExecContext(ctx, `INSERT INTO aaa_inference_jobs(id,worker_id,experiment_id,state,held,created_at,has_media,media_expires_at,data,context)
-			VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
-			ON CONFLICT(id) DO UPDATE SET state=excluded.state,held=excluded.held,has_media=excluded.has_media,media_expires_at=excluded.media_expires_at,data=excluded.data`,
-			id, j.WorkerID, j.ExperimentID, j.State, j.Held, j.CreatedAt.UnixMicro(), j.Media != nil, expires, data, delivery); err != nil {
+		capability := 0
+		if j.Media != nil {
+			capability = 1
+			if j.Media.Profile == media.PromptWAVProfile {
+				capability = 2
+			}
+		}
+		var pinCheck any
+		if j.PinCheckAt != nil {
+			pinCheck = j.PinCheckAt.UnixMicro()
+		}
+		if _, err = tx.ExecContext(ctx, `INSERT INTO aaa_inference_jobs(id,worker_id,experiment_id,state,held,created_at,has_media,media_expires_at,data,context,deadline_at,capability,pin_check_at)
+			VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
+			ON CONFLICT(id) DO UPDATE SET worker_id=excluded.worker_id,state=excluded.state,held=excluded.held,has_media=excluded.has_media,media_expires_at=excluded.media_expires_at,data=excluded.data,pin_check_at=excluded.pin_check_at`,
+			id, nullableWorker(j.WorkerID), j.ExperimentID, j.State, j.Held, j.CreatedAt.UnixMicro(), j.Media != nil, expires, data, delivery, j.DeadlineAt.UnixMicro(), capability, pinCheck); err != nil {
 			return err
 		}
 	}

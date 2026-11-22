@@ -22,7 +22,7 @@ const timeout = 120_000;
 
 function assignmentHeaders(t: Transport, j: ObjectValue): Record<string, string> {
   return { Authorization: 'Bearer ' + t.credential, 'X-Muse-Worker-Version': t.productVersion,
-    'X-Muse-Connection-Id': identifier(j.connection_id), 'X-Muse-Connection-Generation': String(integer(j.connection_generation)),
+    'X-Muse-Connection-Id': j.connection_id === '' ? '' : identifier(j.connection_id), 'X-Muse-Connection-Generation': String(integer(j.connection_generation)),
     'X-Muse-Generation': String(integer(j.generation)), 'X-Muse-Lease-Id': identifier(j.lease_id) };
 }
 
@@ -34,8 +34,18 @@ async function transfer<T>(t: Transport, job: ObjectValue, path: string, options
       ...options, redirect: 'manual', signal: controller.signal, headers: { ...assignmentHeaders(t, job), ...options.headers },
     });
     if (!response.ok) {
-      await response.body?.cancel();
-      throw new Failure('media_transfer_rejected', { http_status: response.status, request_id: response.headers.get('x-request-id') ?? '', stage: path }, response.status === 429 || response.status >= 500);
+      let reason = 'unverified_response';
+      if (response.status >= 400 && response.status < 500 && response.headers.get('content-type')?.startsWith('application/json')) {
+        const raw = await t.body(response, 4096);
+        try {
+          const code = object(parse(raw)).error;
+          if (typeof code === 'string' && /^[a-z_]{1,80}$/.test(code)) reason = code;
+        } catch (error) {
+          if (!(error instanceof Failure)) throw error;
+          reason = error.code;
+        }
+      } else await response.body?.cancel();
+      throw new Failure('media_transfer_rejected', { http_status: response.status, request_id: response.headers.get('x-request-id') ?? '', stage: path, reason }, response.status === 429 || response.status >= 500);
     }
     return await consume(response);
   } finally { t.net.clearTimer(timer); }
@@ -185,17 +195,19 @@ async function hashFile(file: FileHandle): Promise<{ sha256: string; size: numbe
   return { sha256: hash.digest('hex'), size };
 }
 
-export async function finishMedia(worker: Worker, id: string): Promise<ObjectValue> {
+export async function finishMedia(worker: Worker, id: string, brief?: ObjectValue): Promise<ObjectValue> {
   const t = await worker.load();
-  const j = await worker.getJob(t, id);
+  const j = brief ?? await worker.getJob(t, id);
   const [name] = fileType(j);
   if (j.state === 'accepted') return { job_id: id, state: 'accepted' };
   requireValue(j.state === 'claimed' && j.held === true, 'assignment_not_active');
   const spool = await (await worker.state.child('media')).child(id);
-  return spool.withLock('prepare', async () => {
+  const finished = await spool.withLock('prepare', async () => {
     const saved = await journal(spool);
-    requireValue(saved && boundTo(j, saved, t), 'media_assignment_changed');
+    requireValue(saved, 'media_generation_not_started');
+    requireValue(boundTo(j, saved, t), 'media_assignment_changed');
     requireValue(saved.state === 'generating' || saved.state === 'ready', 'media_generation_not_started');
+    const replay = saved.state === 'ready';
     if (saved.state === 'generating') {
       const directory = await mediaFiles(spool, saved, id);
       const file = await openOutput(directory, name);
@@ -205,8 +217,17 @@ export async function finishMedia(worker: Worker, id: string): Promise<ObjectVal
       await spool.write('progress.json', encode(saved));
       await worker.logger.log('INFO', 'worker.media_upload_queued', { ...correlation(j), ...receipt });
     }
-    return { job_id: id, state: saved.state };
+    return { job_id: id, state: saved.state, replay };
   });
+  if (!brief) return { job_id: id, state: finished.state };
+  try {
+    const receipt = await uploadPrepared(worker, t, spool, j, false, finished.replay);
+    requireValue(receipt, 'terminal_receipt_unverified');
+    return receipt;
+  } catch (error) {
+    await worker.logger.log('WARN', 'worker.media_transfer_pending', { ...correlation(j), cause: cause(error), ...(error instanceof Failure ? error.fields : {}), local_output: 'preserved' });
+    throw error;
+  }
 }
 
 async function clearLegacyInputs(spool: State): Promise<void> {
@@ -217,34 +238,50 @@ async function clearLegacyInputs(spool: State): Promise<void> {
 }
 
 async function reconcileJob(worker: Worker, t: Transport, spool: State, id: string): Promise<boolean> {
+  const current = await worker.getJob(t, id);
+  return Boolean(await uploadPrepared(worker, t, spool, current, true));
+}
+
+async function uploadPrepared(worker: Worker, t: Transport, spool: State, j: ObjectValue, cleanup: boolean, replay = false): Promise<ObjectValue | undefined> {
+  const id = identifier(j.id);
   const saved = await journal(spool);
-  if (!saved) return false;
-  const j = await worker.getJob(t, id);
+  if (!saved) return undefined;
   requireValue(boundTo(j, saved, t), 'media_assignment_changed');
   const [name, kind] = fileType(j);
   const legacy = saved.temporary_directory === undefined;
   if (j.state === 'cancelled' || j.state === 'interrupted') {
     if (legacy) await spool.withLock('prepare', () => clearLegacyInputs(spool));
-    if (legacy || j.held) return false;
+    if (legacy || j.held) return undefined;
     await spool.remove('progress.json');
-    return true;
+    return { discarded: true };
   }
   if (saved.state !== 'ready') {
     if (j.state === 'claimed' && saved.state === 'generating') await mediaFiles(spool, saved, id);
-    return false;
+    return undefined;
   }
   const size = integer(saved.size), hash = text(saved.sha256);
+  let receipt: ObjectValue = { accepted: true, job_id: id, sha256: hash, size };
   if (j.state === 'claimed') {
-    const directory = await mediaFiles(spool, saved, id);
-    const f = await openOutput(directory, name);
-    try {
-      const body = Readable.toWeb(Readable.from(fileChunks(f)));
-      const options = {method: 'PUT', duplex: 'half', body: body as BodyInit, headers: { 'Content-Type': kind, 'Content-Length': String(size), 'X-Muse-Artifact-Sha256': hash }};
-      await transfer(t, j, 'artifact', options, async res => {
-        const ack = object(parse(await t.body(res, 4096)));
-        requireValue(ack.accepted === true && ack.job_id === id && ack.sha256 === hash && integer(ack.size) === size && Number.isFinite(Date.parse(text(ack.expires_at))), 'invalid_media_receipt');
-      });
-    } finally { await f.close(); }
+    const readReceipt = async (response: Response) => {
+      const ack = object(parse(await t.body(response, 4096)));
+      requireValue(ack.job_id === id && ack.sha256 === hash && integer(ack.size) === size &&
+        (ack.accepted === false || (ack.accepted === true && Number.isFinite(Date.parse(text(ack.expires_at))))), 'invalid_media_receipt');
+      return ack;
+    };
+    const pending = replay ? await transfer(t, j, 'media/receipt', { method: 'GET', headers: {
+      'X-Muse-Artifact-Sha256': hash, 'X-Muse-Artifact-Size': String(size),
+    } }, readReceipt) : undefined;
+    if (pending?.accepted === true) receipt = pending;
+    else {
+      const directory = await mediaFiles(spool, saved, id);
+      const file = await openOutput(directory, name);
+      try {
+        const body = Readable.toWeb(Readable.from(fileChunks(file)));
+        const options = { method: 'PUT', duplex: 'half', body: body as BodyInit, headers: { 'Content-Type': kind, 'Content-Length': String(size), 'X-Muse-Artifact-Sha256': hash } };
+        receipt = await transfer(t, j, 'artifact', options, readReceipt);
+        requireValue(receipt.accepted === true, 'invalid_media_receipt');
+      } finally { await file.close(); }
+    }
   } else {
     const artifact = object(object(j.media).artifact);
     requireValue(j.state === 'accepted' && artifact.sha256 === hash && integer(artifact.size) === size, 'invalid_media_receipt');
@@ -255,8 +292,8 @@ async function reconcileJob(worker: Worker, t: Transport, spool: State, id: stri
   }
   await worker.publish(j, 'completed', 'media_upload_confirmed');
   await worker.logger.log('INFO', 'worker.media_upload_confirmed', { ...correlation(j), sha256: hash, bytes: size, local_output: legacy ? 'deleted' : 'system_tmp' });
-  await spool.remove('progress.json');
-  return true;
+  if (cleanup) await spool.remove('progress.json');
+  return receipt;
 }
 
 export async function drainMedia(worker: Worker, t: Transport): Promise<void> {

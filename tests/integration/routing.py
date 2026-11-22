@@ -7,6 +7,7 @@ import secrets
 import subprocess
 
 from history import History
+from inference import PullPeer
 from service import require
 
 
@@ -36,15 +37,8 @@ class Routing(History):
             if current["state"] not in ("completed", "cancelled", "interrupted"):
                 self.native("POST", "/api/v1/requests/" + request["id"] + "/cancel", {"protocol_version": 1, "submission_id": secrets.token_hex(12)})
         self.requests = []
-        for peer in self.peers:
-            if peer.thread.is_alive():
-                peer.stop()
         workers = [self.new_worker(), self.new_worker()]
-        return [(worker, self.peer(worker)) for worker in workers]
-
-    def assigned(self, request):
-        self.until(lambda: self.detail(request)["assignment"] is not None, "queued native request was not assigned", timeout=15)
-        return self.read_native(request)[0]
+        return [(worker, self.pull_peer(worker)) for worker in workers]
 
     def filtered_events(self, name, identity):
         events = []
@@ -79,21 +73,10 @@ class Routing(History):
             owners = {e["client_id"] for e in own if e.get("client_id")}
             conversations = {e["conversation_id"] for e in own if e.get("conversation_id")}
             require(owners == {"fixture-client"} and len(conversations) == 1, "async operation crossed owner/conversation correlation")
-            assignments = [e for e in own if e["msg"] in ("dispatch.assigned", "job.claimed", "request.context_delivery_started")]
-            require(all(e.get("job_id") and e.get("worker_id") and e.get("connection_generation", 0) > 0 and "generation" in e for e in assignments), "async assignment omitted worker/job/generation linkage")
+            assignments = [e for e in own if e["msg"] in ("job.claimed", "job.work_started", "request.context_delivery_started")]
+            require(all(e.get("job_id") and e.get("worker_id") and e.get("generation", 0) > 0 for e in assignments), "native assignment omitted worker/job/generation linkage")
         self.private("routing-trace-" + request_id + ".json", json.dumps({"request_id": request_id, "operation_ids": operations, "events": events}))
         return events
-
-    def diagnose_dispatch(self, request_id, event, reason):
-        events = self.trace_request(request_id)
-        matched = [value for value in events if value.get("request_id") == request_id and value["msg"] == event]
-        require(len(matched) == 1 and matched[0]["reason"] == reason and matched[0]["level"] == "WARN", "routing failure is not diagnosable from logs")
-        require(any(value.get("request_id") == request_id and value["msg"] == "inference.exchange" and value["level"] == "DEBUG" for value in events), "protected rejected input missing")
-        evidence = matched[0]["evidence"]
-        if reason == "no_ready_worker":
-            require(evidence["candidates"] and all(c["eligibility_reason"] for c in evidence["candidates"]), "rejection omitted causal eligibility exclusions")
-        action = "restore an authenticated online subscriber"
-        self.private("routing-diagnosis-" + request_id + ".json", json.dumps({"cause": reason, "evidence": matched, "corrective_action": action}))
 
     def diagnose_operation(self, request, event_name, action):
         events = self.trace_request(self.admission_headers[request["id"]]["X-Request-Id"], request["id"])
@@ -103,105 +86,73 @@ class Routing(History):
         return events
 
     def eligibility(self):
-        worker = self.new_worker()
         body = self.request_input(tools=True)
-        _, headers = self.submit(body, "eligible", want=503)
-        self.diagnose_dispatch(headers["X-Request-Id"], "dispatch.rejected", "no_ready_worker")
-        peer = self.peer(worker)
+        queued, _ = self.submit(body, "eligible")
+        require(queued["state"] == "queued" and not queued["worker_id"], "no-worker admission did not queue")
+        worker = self.new_worker()
+        peer = PullPeer(self, worker)
         path = "/api/v1/admin/workers/" + worker["worker"]["id"] + "/qualifications"
         for key in (worker["credential"], self.client, self.portal):
             self.checked(path, key, "POST", {}, want=401)
         self.checked(path, self.admin, "POST", {}, want=410)
-        request, _ = self.submit(body, "eligible")
-        shown = self.deliver(worker, peer, request, {"type": "final", "text": "eligible answer"})
+        shown = self.deliver(worker, peer, queued, {"type": "final", "text": "eligible answer"})
         require("qualification" not in shown and not self.status(worker)["qualification_history"], "routing fabricated approval")
-        self.read_native(request)
-        peer.stop()
-        replacement = self.peer(worker)
-        request, _ = self.submit(self.request_input(tools=True), "automatic-recovery")
-        shown = self.deliver(worker, replacement, request, {"type": "final", "text": "automatic recovery answer"})
-        require(shown["connection_generation"] == replacement.opened["connection_generation"] > peer.opened["connection_generation"], "recovered assignment lost fencing")
-        require(self.read_native(request)[0]["output"]["text"] == "automatic recovery answer", "client work failed after reconnect")
+        self.silence(worker, 605)
+        require(self.worker_projection(worker)[0]["connection_status"] == "offline", "controlled gap did not change presence")
+        recovered, _ = self.submit(self.request_input(tools=True), "automatic-recovery")
+        self.deliver(worker, peer, recovered, {"type": "final", "text": "automatic recovery answer"})
+        require(self.read_native(recovered)[0]["output"]["text"] == "automatic recovery answer", "client work failed after polling resumed")
         self.checked("/api/v1/admin/workers/" + worker["worker"]["id"] + "/revoke", self.admin, "POST", {})
-        self.submit(self.request_input(), want=503)
-        replacement.stop()
-        self.receipt("routing.online_eligibility_and_reconnect", synthetic_peer=True, automatic_client_recovery=True)
+        self.checked("/api/v1/worker/pull", worker["credential"], "POST", peer.poll_input(), want=401)
+        self.receipt("routing.queue_before_enrollment_and_poll_recovery", controlled_peer=True, automatic_client_recovery=True)
 
     def competing_requests(self):
-        pair = self.new_pair()
-        by_id = {worker["worker"]["id"]: (worker, peer) for worker, peer in pair}
-        a_input, b_input = self.request_input("A-only"), self.request_input("B-only")
+        (worker_a, peer_a), (worker_b, peer_b) = self.new_pair()
+        id_a, id_b = worker_a["worker"]["id"], worker_b["worker"]["id"]
+        open_input = self.request_input("open before targeted")
+        open_request, _ = self.submit(open_input, "open")
+        target_input = {**self.request_input("targeted context"), "worker_id": id_a}
+        target, _ = self.submit(target_input, "target", origin=self.origins[1])
         with ThreadPoolExecutor(max_workers=2) as pool:
-            admitted = list(pool.map(lambda entry: self.submit(entry[0], entry[1], origin=entry[2]), [(a_input, "A", self.origins[0]), (b_input, "B", self.origins[1])]))
-        a, b = admitted[0][0], admitted[1][0]
-        require(a["worker_id"] != b["worker_id"], "idle workers not distributed")
-        aw, ap = by_id[a["worker_id"]]
-        bw, bp = by_id[b["worker_id"]]
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            results = list(pool.map(lambda entry: self.claim(*entry), [(aw, ap, self.experiment(a["id"])), (bw, bp, self.experiment(b["id"]))]))
-        aj, bj = results[0][0], results[1][0]
-        require(aj["context"]["messages"] == a_input["messages"] and bj["context"]["messages"] == b_input["messages"], "contexts crossed sessions")
-        require("qualification" not in aj and "qualification" not in bj, "new assignment contains archived qualification")
-        self.checked("/api/v1/worker/jobs/" + aj["id"], bw["credential"], want=404)
-        self.claim(aw, ap, self.experiment(a["id"]), want=409)
-        c_body = {**self.request_input("C-only"), "worker_id": a["worker_id"]}
-        c, _ = self.submit(c_body, "C")
-        d, _ = self.submit(self.request_input("D-only"), "D")
-        require(not c["worker_id"] and not d["worker_id"] and self.detail(c)["assignment"] is None, "busy workers received early assignments")
-        conversation, _ = self.checked("/api/v1/admin/conversations/" + c["conversation_id"], self.admin)
-        require(conversation["worker_id"] is None, "explicit constraint became an unassigned conversation identity")
-        waiting = self.diagnose_operation(c, "dispatch.queued", "wait for the selected worker capacity; do not move an established pin")
-        queued = next(e for e in waiting if e["msg"] == "dispatch.queued" and e.get("operation_id") == c["id"])
-        selected = next(candidate for candidate in queued["candidates"] if candidate["worker_id"] == a["worker_id"])
-        require(selected["exclusion_reason"] == "worker_capacity" and not selected["capacity_available"] and selected["reservations"], "stall lacks causal reservation evidence")
-        self.decision(aw, ap, aj, {"type": "final", "text": "A-only answer"})
-        assigned_c = self.assigned(c)
-        require(assigned_c["worker_id"] == aw["worker"]["id"] and not self.read_native(d)[0]["worker_id"], "FIFO or one-worker reservation failed")
-        self.decision(bw, bp, bj, {"type": "final", "text": "B-only answer"})
-        assigned_d = self.assigned(d)
-        require(assigned_d["worker_id"] == bw["worker"]["id"], "independent worker failed to progress")
-        self.deliver(aw, ap, assigned_c, {"type": "final", "text": "C-only answer"})
-        self.deliver(bw, bp, assigned_d, {"type": "final", "text": "D-only answer"})
-        for expected in (a["worker_id"], b["worker_id"]):
-            balanced, _ = self.submit(self.request_input("least-recent"), "balance-" + secrets.token_hex(6))
-            require(balanced["worker_id"] == expected, "least-recent choice failed with both workers available")
-            selected_worker, selected_peer = by_id[balanced["worker_id"]]
-            self.deliver(selected_worker, selected_peer, balanced, {"type": "final", "text": "balanced"})
-            trace = self.diagnose_operation(balanced, "dispatch.assigned", "selection follows the recorded dispatch timestamps")
-            evidence = next(e for e in trace if e["msg"] == "dispatch.assigned" and e.get("operation_id") == balanced["id"])
-            require(all("last_dispatched_at" in candidate and candidate["capacity_available"] for candidate in evidence["candidates"] if not candidate["eligibility_reason"]), "selection ordering/capacity inputs absent")
-        busy, _ = self.submit({**self.request_input("other work on pinned worker"), "worker_id": a["worker_id"]}, "busy-pin")
-        busy_job, _, _ = self.claim(aw, ap, self.experiment(busy["id"]))
-        canonical = a_input["messages"] + [{"type": "message", "role": "assistant", "text": "A-only answer"}, {"type": "message", "role": "user", "text": "A next"}]
-        followup = {**self.request_input(), "messages": canonical}
-        pinned, _ = self.submit(followup, "A")
-        require(pinned["worker_id"] == a["worker_id"], "completed session lost its healthy pin")
-        require(self.detail(pinned)["assignment"] is None, "busy established pin was assigned early")
-        independent, _ = self.submit(self.request_input("independent beyond blocked pin"), "beyond-blocked")
-        require(independent["worker_id"] == b["worker_id"], "older blocked pin starved independent session")
-        self.deliver(bw, bp, independent, {"type": "final", "text": "independent completed"})
-        self.decision(aw, ap, busy_job, {"type": "final", "text": "worker freed"})
-        self.assigned(pinned)
-        self.checked("/api/v1/admin/workers/" + a["worker_id"], self.admin, "PATCH", {"name": "renamed without moving identity"})
-        self.deliver(aw, ap, pinned, {"type": "final", "text": "A next answer"})
-        wrong = {**self.request_input(), "worker_id": b["worker_id"], "messages": canonical + [{"type": "message", "role": "assistant", "text": "A next answer"}, {"type": "message", "role": "user", "text": "conflict"}]}
-        _, headers = self.submit(wrong, "A", want=409)
+            targeted = pool.submit(self.claim, worker_a, peer_a, self.experiment(target["id"]), origin=self.origins[0])
+            opened = pool.submit(self.claim, worker_b, peer_b, self.experiment(open_request["id"]), origin=self.origins[1])
+            target_job, _, _ = targeted.result()
+            open_job, _, _ = opened.result()
+        require(target_job["context"]["messages"] == target_input["messages"] and open_job["context"]["messages"] == open_input["messages"], "targeted priority or canonical isolation failed")
+        foreign = {"protocol_version": 1, "claim_id": target_job["lease_id"], "generation": target_job["generation"], "launch_id": "foreign", "native_job_id": "foreign"}
+        self.checked("/api/v1/worker/jobs/" + target_job["id"] + "/start", worker_b["credential"], "POST", foreign, want=404)
+        held_probe = peer_a.poll_input()
+        blocked, _ = self.checked("/api/v1/worker/pull", worker_a["credential"], "POST", held_probe)
+        require(blocked["job"] is None, "new pull granted a second slot")
+        peer_a.pulls.append({"sequence": held_probe["sequence"]})
+        self.decision(worker_a, peer_a, target_job, {"type": "final", "text": "Targeted answer"})
+        self.decision(worker_b, peer_b, open_job, {"type": "final", "text": "Open answer"})
+        open_first, _ = self.submit(self.request_input("independent before pin"), "independent")
+        canonical = target_input["messages"] + [{"type": "message", "role": "assistant", "text": "Targeted answer"}, {"type": "message", "role": "user", "text": "next"}]
+        pinned, _ = self.submit({**self.request_input(), "messages": canonical}, "target")
+        require(pinned["worker_id"] == id_a, "completed conversation lost its pin")
+        independent = self.deliver(worker_b, peer_b, open_first, {"type": "final", "text": "Independent response"})
+        require(independent["worker_id"] == id_b and peer_b.poll(self.origins[1]) is None, "open work was blocked or another worker's pin escaped")
+        self.checked("/api/v1/admin/workers/" + id_a, self.admin, "PATCH", {"name": "renamed without moving identity"})
+        job = self.deliver(worker_a, peer_a, pinned, {"type": "final", "text": "Pinned answer"})
+        require(job["context"]["messages"] == canonical, "pinned continuation lost full canonical history")
+        wrong = {**self.request_input(), "worker_id": id_b, "messages": canonical + [{"type": "message", "role": "assistant", "text": "Pinned answer"}, {"type": "message", "role": "user", "text": "conflict"}]}
+        _, headers = self.submit(wrong, "target", want=409)
         events = self.trace_request(headers["X-Request-Id"])
-        require(any(e["msg"] == "dispatch.pin_conflict" and e.get("request_id") == headers["X-Request-Id"] for e in events), "pin conflict evidence missing")
-        self.private("routing-pin-diagnosis.json", json.dumps({"cause": "session_worker_conflict", "corrective_action": "retain the owned healthy pin or start a new independent session"}))
-        self.read_native(a, key=self.other_client, want=404)
+        require(any(event["msg"] == "dispatch.pin_conflict" for event in events), "pin conflict evidence missing")
+        self.diagnose_operation(pinned, "job.work_started", "retain the existing worker pin and follow its claim")
+        self.read_native(target, key=self.other_client, want=404)
         self.receipt("routing.concurrent_workers_fifo_and_persistent_pins", worker_count=2, broker_processes=2, contexts_isolated=True)
 
     def queue_without_global_cap(self):
-        self.new_pair()
+        (worker, _), _ = self.new_pair()
         requests = []
         for i in range(10):
             body = self.request_input("capacity-" + str(i))
             if i == 9:
-                body["worker_id"] = requests[0]["worker_id"]
+                body["worker_id"] = worker["worker"]["id"]
             requests.append(self.submit(body, "capacity-" + str(i))[0])
-        require(len({r["worker_id"] for r in requests[:2]}) == 2 and all(r["worker_id"] for r in requests[:2]), "independent workers did not each reserve a job")
-        require(not any(r["worker_id"] or self.detail(r)["assignment"] for r in requests[2:]), "a busy worker received another assignment")
+        require(all(not r["worker_id"] and r["state"] == "queued" for r in requests), "admission granted work without a pull")
         original = self.detail(requests[-1])["request"]["input"]
         require(not requests[-1]["worker_id"] and "worker_id" in original, "constrained queue fixture was not unassigned")
         for origin in self.origins:
@@ -213,7 +164,7 @@ class Routing(History):
         self.until(lambda: self.read_native(deadline)[0]["state"] == "interrupted", "unassigned request never expired", timeout=8)
         observed = self.read_native(deadline)[0]
         require(observed["reason"] == "deadline_exceeded", "unassigned deadline reason missing")
-        events = self.diagnose_operation(deadline, "job.deadline_exceeded", "deadline expired in the queue; inspect recorded reservations before a fresh admission")
+        events = self.diagnose_operation(deadline, "job.deadline_exceeded", "the queue deadline expired before a worker pulled; inspect scheduler and compatibility evidence")
         require(any(e["msg"] == "job.deadline_exceeded" and e.get("operation_id") == deadline["id"] for e in events), "deadline final disposition missing")
         self.receipt("routing.queue_retry_cancel_and_deadline", admitted=10, deadline_from_admission=True)
 
@@ -227,8 +178,7 @@ class Routing(History):
         self.receipt("routing.same_session_race", admitted=1, rejected=7)
 
     def adverse_diagnostics(self):
-        pair = self.new_pair()
-        by_id = {worker["worker"]["id"]: (worker, peer) for worker, peer in pair}
+        (worker, peer), _ = self.new_pair()
         self.reject_writes("routing_test_failure", "aaa_model_requests", "NEW.client_id='fixture-client'", "INSERT")
         retry_body = self.request_input("storage failure")
         try:
@@ -242,81 +192,77 @@ class Routing(History):
         require(len(details) == 1 and "routing_test_failure" in details[0]["detail"], "protected storage cause missing")
         self.private("routing-storage-diagnosis.json", json.dumps({"cause": "routing_test_failure", "sqlite_code": "1811", "transaction_outcome": "rolled_back", "corrective_action": "repair the failing storage constraint, then retry the original submission"}))
         admitted, _ = self.submit(retry_body, "storage")
-        worker, peer = by_id[admitted["worker_id"]]
         self.deliver(worker, peer, admitted, {"type": "final", "text": "one successful admission"})
         self.read_native(admitted)
         large, _ = self.submit(self.request_input("large private context " + "x" * 18000 + self.admin), "large-context")
+        large_job, _, _ = self.claim(worker, peer, self.experiment(large["id"]))
         exports = self.trace_request(self.admission_headers[large["id"]]["X-Request-Id"], large["id"])
         inputs = [e for e in exports if e.get("operation_id") == large["id"] and e["msg"] == "inference.context"]
         require(inputs and "x" * 18000 in json.dumps(inputs) and self.admin not in json.dumps(inputs), "chunk reconstruction omitted admitted context or exposed a credential")
-        worker, peer = by_id[large["worker_id"]]
-        reservation = {"protocol_version": 1, "generation": 0, "action": "acquire", "operation_id": secrets.token_hex(16)}
-        rejected, _ = self.checked("/api/v1/worker/upgrade-reservation", worker["credential"], "POST", reservation, want=409)
-        require(rejected["error"] == "worker_busy", "upgrade reserved an assigned queue slot")
+        self.decision(worker, peer, large_job, {"type": "final", "text": "large context accepted"})
+        self.checked("/api/v1/worker/upgrade-reservation", worker["credential"], "POST", {}, want=404)
         for container in (self.main_service, self.secondary):
             operational = self.logs(container)
             require('"level":"DEBUG"' not in operational, "DEBUG leaked to INFO operational output")
             self.assert_private(operational)
-        self.receipt("routing.storage_rollback_capture_and_reserved_slot", sqlite_code="1811", protected_debug=True, chunk_reconstruction=True)
+        self.receipt("routing.storage_rollback_and_claim_capture", sqlite_code="1811", protected_debug=True, chunk_reconstruction=True)
 
     def offline_boundaries(self):
-        for boundary in ("first-turn", "safe", "context", "claimed", "tool-wait"):
-            pair = self.new_pair()
-            by_id = {worker["worker"]["id"]: (worker, peer) for worker, peer in pair}
-            initial = self.request_input("initial", tools=boundary == "tool-wait")
+        for boundary in ("safe", "revoked", "granted", "started", "tool-wait"):
+            (worker, peer), (replacement, replacement_peer) = self.new_pair()
+            initial = self.request_input("initial " + boundary, tools=boundary == "tool-wait", timeout=1800)
             request, _ = self.submit(initial, "offline-" + boundary)
-            worker, peer = by_id[request["worker_id"]]
-            if boundary == "first-turn":
-                old = self.experiment(request["id"])
-                peer.stop()
-                current, _ = self.read_native(request)
-                require(current["worker_id"] == request["worker_id"] and self.detail(request)["assignment"]["id"] == old["current_job_id"], "first assignment moved without a prior final answer")
-                trace = self.diagnose_operation(request, "dispatch.queued", "initial assignment has no safe prior final; await its worker or deadline without reassignment")
-                require(any(e["msg"] == "dispatch.queued" and e.get("prior_decision_type") == "none" and e.get("reassign_allowed") is False for e in trace), "first-turn hold lacks its decision reason")
-                self.receipt("routing.offline_first_turn", reassigned=False, synthetic_peer=True)
-                continue
             call = {"type": "tool_call", "call_id": "accepted-call", "name": "read_file", "arguments": {"path": "client-only"}}
-            first = call if boundary == "tool-wait" else {"type": "message", "role": "assistant", "text": "completed before offline"}
-            decision = call if boundary == "tool-wait" else {"type": "final", "text": "completed before offline"}
+            decision = call if boundary == "tool-wait" else {"type": "final", "text": "completed before silence"}
+            first = call if boundary == "tool-wait" else {"type": "message", "role": "assistant", "text": decision["text"]}
             self.deliver(worker, peer, request, decision)
-            self.read_native(request)
             suffix = {"type": "tool_result", "call_id": "accepted-call", "output": "exact accepted client result"} if boundary == "tool-wait" else {"type": "message", "role": "user", "text": "next turn"}
-            next_input = {**self.request_input(), "messages": initial["messages"] + [first, suffix]}
+            next_input = {**self.request_input(timeout=1800), "messages": initial["messages"] + [first, suffix]}
+            if boundary == "revoked":
+                worker_id = worker["worker"]["id"]
+                self.checked("/api/v1/admin/workers/" + worker_id + "/revoke", self.admin, "POST")
+                self.silence(worker, 605)
+                self.submit({**next_input, "submission_id": secrets.token_hex(12), "worker_id": worker_id}, request["session_id"], want=409)
+                self.checked("/api/v1/worker/pull", worker["credential"], "POST", peer.poll_input(), want=401)
+                pending, _ = self.submit(next_input, request["session_id"])
+                job = self.deliver(replacement, replacement_peer, pending, {"type": "final", "text": "history on live replacement"})
+                adopted, _ = self.read_native(pending)
+                require(job["context"]["messages"] == next_input["messages"] and adopted["conversation_id"] == request["conversation_id"] and
+                        adopted["worker_id"] == replacement["worker"]["id"], "revoked offline pin lost its safe continuation or canonical history")
+                events = self.diagnose_operation(pending, "dispatch.reassigned", "the revoked offline worker cannot resume this session")
+                moved = next(event for event in events if event["msg"] == "dispatch.reassigned")
+                require(moved["expected_worker_id"] == worker_id and moved["observed_worker_id"] == replacement["worker"]["id"] and
+                        moved["claim_id"] == job["lease_id"] and moved["job_id"] == job["id"] and moved["operation_id"] == pending["id"] and
+                        moved["reason"] == "offline_before_claim_and_context" and moved["context_delivery_started"] is False,
+                        "broker evidence could not identify the safe replacement of the revoked pin")
+                self.receipt("routing.offline_revoked_pin_replacement", full_history=True, revoked_authority_preserved=True)
+                continue
+            if boundary == "safe":
+                self.silence(worker, 605)
             pending, _ = self.submit(next_input, request["session_id"])
             old = self.experiment(pending["id"])
-            if boundary == "context":
-                self.checked("/api/v1/worker/jobs/" + old["current_job_id"], worker["credential"])
-            if boundary == "claimed":
-                claimed, _, _ = self.claim(worker, peer, old)
             if boundary == "safe":
-                peer.reply = False
-                self.until(lambda: self.status(worker)["connection_status"] == "offline", "health reply window did not mark worker offline", timeout=40)
+                self.until(lambda: self.experiment(pending["id"])["current_job_id"] != old["current_job_id"], "safe pin was not released", timeout=15)
+                replacement_job = self.deliver(replacement, replacement_peer, pending, {"type": "final", "text": "full history replay"})
+                moved, _ = self.read_native(pending)
+                require(moved["worker_id"] == replacement["worker"]["id"] and moved["conversation_id"] == request["conversation_id"], "safe replacement lost the owned session")
+                require(replacement_job["id"] != old["current_job_id"] and replacement_job["context"]["messages"] == next_input["messages"], "safe movement did not fence the prior job or retain full history")
+                self.diagnose_operation(pending, "dispatch.pin_released", "the old queued pin was released before any grant")
             else:
-                peer.stop()
-            if boundary == "safe":
-                self.until(lambda: self.read_native(pending)[0]["worker_id"] != worker["worker"]["id"], "safe offline assignment was not moved", timeout=15)
-                moved = self.read_native(pending)[0]
-                require(moved["worker_id"] != worker["worker"]["id"] and moved["conversation_id"] == request["conversation_id"], "safe offline pin did not move")
-                replacement, replacement_peer = by_id[moved["worker_id"]]
-                new_job = self.detail(moved)["assignment"]
-                require(new_job["id"] != old["current_job_id"], "old queued assignment not fenced")
-                self.checked("/api/v1/worker/jobs/" + old["current_job_id"], worker["credential"], want=409)
-                self.deliver(replacement, replacement_peer, moved, {"type": "final", "text": "full history replay"})
-                require(self.detail(moved)["delivery"]["messages"] == next_input["messages"], "safe movement changed full history")
-            else:
+                if boundary == "granted":
+                    require(peer.poll()["job_id"] == old["current_job_id"], "wrong protected grant")
+                elif boundary == "started":
+                    claimed, _, _ = self.claim(worker, peer, old)
+                self.silence(worker, 605)
+                require(replacement_peer.poll() is None, "another worker polled a protected claim or tool pin")
                 current, _ = self.read_native(pending)
-                require(current["worker_id"] == worker["worker"]["id"], "unsafe assignment moved")
-                if boundary == "claimed":
-                    require(current["state"] == "interrupted" and self.status(worker)["work_status"] == "busy", "uncertain inference lost busy hold")
+                require(current["worker_id"] == worker["worker"]["id"], "protected work moved when worker was silent")
+                if boundary == "started":
+                    self.cancel(pending["id"])
                     self.decision(worker, peer, claimed, {"type": "final", "text": "late"}, want=409)
-            event = {"safe": "dispatch.reassigned", "context": "request.context_delivery_started", "claimed": "job.interrupted", "tool-wait": "dispatch.queued"}[boundary]
-            action = {"safe": "old queued assignment was fenced; continue the full-history replacement", "context": "context was exposed; await the original worker or deadline without automatic replay", "claimed": "retain uncertainty and busy hold until the exact idle acknowledgement; recovery belongs to issue 21", "tool-wait": "retain the original tool-session worker; never execute the accepted client tool again"}[boundary]
-            events = self.diagnose_operation(pending, event, action)
-            if boundary == "claimed":
-                require(any(e["msg"] == "job.interrupted" and e.get("remote_outcome") == "unknown" and e.get("busy_hold") for e in events), "uncertain cause/hold cannot be reconstructed")
-            if boundary == "safe":
-                require(any(e["msg"] == "dispatch.reassigned" and e.get("operation_id") == pending["id"] for e in events), "reassignment reason missing")
-            self.receipt("routing.offline_" + boundary, full_history=True, synthetic_peer=True)
+                    require(self.worker_projection(worker)[0]["work_status"] == "busy", "cancellation released an uncertain execution")
+                    peer.settle(claimed, "cancelled")
+            self.receipt("routing.offline_" + boundary, full_history=True, controlled_peer=True)
 
 
 def main():

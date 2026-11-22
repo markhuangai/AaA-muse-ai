@@ -161,7 +161,11 @@ func (h *Handler) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 			captureKind = w.captureReason
 		}
 		logger.Debug("request.exchange", "method", r.Method, "role", role, "status", w.code, "response", w.body.String(), "response_capture", captureKind, "outcome", outcome, "write_error", detail, "attempted_bytes", w.attempted, "written_bytes", w.written)
-		logger.Info("request.completed", "method", r.Method, "role", role, "status", w.code, "outcome", outcome, "duration_ms", h.Now().Sub(started).Milliseconds())
+		level := slog.LevelInfo
+		if route == "/api/v1/worker/pull" && w.code == http.StatusOK && outcome == "completed" {
+			level = slog.LevelDebug
+		}
+		logger.Log(r.Context(), level, "request.completed", "method", r.Method, "role", role, "status", w.code, "outcome", outcome, "duration_ms", h.Now().Sub(started).Milliseconds())
 		if action, resource := portalWorkerAction(route); portalSessionID != "" && action != "" {
 			resourceID := w.enrollmentID
 			if resource == "worker" {
@@ -262,13 +266,17 @@ func (h *Handler) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 			logger = logger.With("portal_session_id", identity.ID)
 		}
 		if route != mcpRoute && role == "unauthenticated" && strings.HasPrefix(authorization, "Bearer ") && strings.HasPrefix(credential, auth.WorkerPrefix) && h.Workers != nil {
-			record, err := h.Workers.Authenticate(r.Context(), logger, credential)
-			w.workerID = record.ID
-			if err != nil {
-				workerError(w, err)
-				return
+			if route == "/api/v1/worker/pull" {
+				role = "worker"
+			} else {
+				record, err := h.Workers.Authenticate(r.Context(), logger, credential)
+				w.workerID = record.ID
+				if err != nil {
+					workerError(w, err)
+					return
+				}
+				role, identity = "worker", viewWorker(record)
 			}
-			role, identity = "worker", viewWorker(record)
 		}
 		if role != expectedRole && !(expectedRole == "management" && role == "portal_session" && route != mediaTrials) {
 			event := "auth.denied"
@@ -365,7 +373,7 @@ func (h *Handler) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 	default:
 		if adminHistoryRoute(route) || strings.HasPrefix(route, "/api/v1/requests") {
 			h.historyRequest(w, r, logger, route, requestedWorker, clientID, body)
-		} else if strings.Contains(route, "/experiments") || route == "/api/v1/worker/events" || route == "/api/v1/worker/heartbeat" || strings.HasPrefix(route, "/api/v1/worker/jobs/") {
+		} else if strings.Contains(route, "/experiments") || route == "/api/v1/worker/pull" || strings.HasPrefix(route, "/api/v1/worker/jobs/") {
 			h.inferenceRequest(w, r, logger, route, requestedWorker, identity, body)
 		} else {
 			h.workerRequest(w, r, logger, route, requestedWorker, identity, body)

@@ -1,7 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import * as fs from 'node:fs/promises';
-import { execute } from '../dist/cli.js';
 import { Subscriber } from '../dist/subscriber.js';
 import { Worker } from '../dist/worker.js';
 import { State } from '../dist/state.js';
@@ -14,9 +13,7 @@ function stream() {
   return new Response(new ReadableStream({ start(c) { c.enqueue(Buffer.from(frames.map(([type, data], i) => `id: recovery-${i}\nevent: ${type}\ndata: ${encode(data)}\n\n`).join(''))); } }), { headers: { 'content-type': 'text/event-stream' } });
 }
 const unavailable = () => new Response('{"error":"controlled_outage"}', { status: 503, headers: { 'x-request-id': 'outage-request' } });
-function adapters(f) {
-  return { files: f.state.io, system: f.state.sys, network: f.net, env: {}, home: () => f.state.root, nodeVersion: process.version, input: async () => '', stdout() {}, stderr: line => f.output.push(line), signal: new AbortController().signal, metadata: async () => ({ source_sha: 'unit', source_dirty: true }) };
-}
+const retiredRun = worker => new Subscriber(worker).run(new AbortController().signal, true);
 async function events(f) {
   const raw = await f.logger.capture.export({}, true);
   const values = raw.trimEnd().split('\n').map(JSON.parse);
@@ -130,7 +127,7 @@ test('major changes permit receipt and busy-hold reconciliation before rejecting
   await assert.rejects(fs.lstat(f.state.path('daemon.lock')), { code: 'ENOENT' });
 });
 
-test('a rejected duplicate background command cannot create or overwrite the owner stop, launch, or lock', async t => {
+test('the retired subscriber rejects duplicate background ownership without replacing its journals', async t => {
   for (const prior of [undefined, encode({ cause: 'retained_terminal_failure', requires_operator_action: true })]) {
     const f = await fixture(t); await enrolled(f);
     const release = await f.state.lock('daemon', false);
@@ -139,7 +136,7 @@ test('a rejected duplicate background command cannot create or overwrite the own
       await f.state.write('launch.json', encode({ pid: f.state.sys.pid, worker_id: ID }));
       const launch = await f.state.read('launch.json');
       const owner = await (new State(f.state.path('daemon.lock'), fs, f.state.sys)).read('owner.json');
-      assert.equal(await execute(['run', '--background', '--state-dir', f.state.root], adapters(f)), 1);
+      await assert.rejects(retiredRun(f.worker), /subscriber_already_running/);
       assert.equal(await f.state.read('run-stop.json'), prior);
       assert.equal(await f.state.read('launch.json'), launch);
       assert.equal(await (new State(f.state.path('daemon.lock'), fs, f.state.sys)).read('owner.json'), owner);
@@ -148,19 +145,18 @@ test('a rejected duplicate background command cannot create or overwrite the own
   }
 });
 
-test('only an owning background process records terminal failures and existing stops remain unchanged', async t => {
+test('the retired subscriber persisted failures only while owning the daemon lock', async t => {
   for (const failure of ['revocation', 'tls', 'local_json']) {
     const f = await fixture(t); await enrolled(f);
     if (failure === 'revocation') f.broker.denied = true;
     if (failure === 'tls') f.net.fetch = async () => { throw Object.assign(new Error('private error'), { code: 'CERT_HAS_EXPIRED' }); };
     if (failure === 'local_json') await f.state.write('config.json', '{"origin":');
-    const io = adapters(f);
-    assert.equal(await execute(['run', '--background', '--state-dir', f.state.root], io), 1);
+    await assert.rejects(retiredRun(f.worker));
     const marker = await f.state.read('run-stop.json');
     assert.equal(parse(marker).requires_operator_action, true);
     assert.equal(parse(marker).pid.raw, String(f.state.sys.pid));
     const calls = f.broker.calls.length;
-    assert.equal(await execute(['run', '--background', '--state-dir', f.state.root], io), 1);
+    await assert.rejects(retiredRun(f.worker), /subscriber_terminal_stop/);
     assert.equal(await f.state.read('run-stop.json'), marker);
     assert.equal(f.broker.calls.length, calls);
     const log = await events(f);
@@ -219,14 +215,13 @@ test('invalid journal ownership and missing operations fail explicitly without c
   }
 });
 
-test('terminal-marker storage failure remains visible and releases daemon ownership', async t => {
+test('terminal-marker storage failure releases retired daemon ownership', async t => {
   const f = await fixture(t); await enrolled(f); f.broker.denied = true;
-  const io = adapters(f);
-  io.files = { ...fs, open: async (path, ...args) => {
+  const files = { ...fs, open: async (path, ...args) => {
     if (path.includes('/.run-stop.json.')) throw Object.assign(new Error('marker full'), { code: 'ENOSPC' });
     return fs.open(path, ...args);
   } };
-  assert.equal(await execute(['run', '--background', '--state-dir', f.state.root], io), 1);
+  await assert.rejects(retiredRun(new Worker(new State(f.state.root, files, f.state.sys), f.logger, f.net)));
   assert(f.output.map(JSON.parse).some(e => e.msg === 'setup.recovery_marker_failed' && e.cause === 'ENOSPC'));
   const release = await f.state.lock('daemon', false); await release();
 });

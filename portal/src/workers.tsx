@@ -3,7 +3,7 @@ import type { Worker, EnrollmentKind } from './worker-api';
 import type { WorkersController, WorkersView } from './worker-controller';
 
 export const timestamp = (value: string | null) => value ? new Date(value).toISOString().replace('T', ' ').replace(/\.\d+Z$/, ' UTC') : 'Not observed';
-const states: Record<string, string> = { online: 'Online', offline: 'Offline', connecting: 'Connecting', not_observed: 'Not observed', idle: 'Idle', busy: 'Busy', upgrading: 'Upgrading', unknown: 'Unknown' };
+const states: Record<string, string> = { recent: 'Recent contact', quiet: 'Quiet', offline: 'Offline', not_observed: 'Never seen', idle: 'Idle', busy: 'Busy', unknown: 'Unknown', pending_native_start: 'Pending native start', started: 'Execution started', terminal_receipt: 'Result accepted; awaiting settlement', recovery_pending: 'Recovery pending' };
 const stateName = (value: string) => states[value] ?? value;
 
 function formatOfflineDuration(milliseconds: number) {
@@ -62,12 +62,12 @@ function WorkerDetail({ worker, controller, view }: { worker: Worker; controller
         </dl>
         <button className="danger-action" aria-disabled={disabled} onClick={() => { if (!disabled) setConfirming(true); }}>Revoke worker</button>
       </section>
-      <section className="data-panel"><h3>Subscriber connection</h3><dl className="identity-list">
-        <div><dt>Subscriber</dt><dd>{stateName(worker.connection_status)}</dd></div>
+      <section className="data-panel"><h3>Broker contact</h3><dl className="identity-list">
+        <div><dt>Contact status</dt><dd>{stateName(worker.connection_status)}</dd></div>
         <div><dt>Last contact</dt><dd>{timestamp(worker.last_contact_at)}</dd></div>
-        <div><dt>Last heartbeat</dt><dd>{timestamp(worker.last_heartbeat_at)}</dd></div>
+        <div><dt>Last work poll</dt><dd>{timestamp(worker.last_poll_at ?? null)}</dd></div>
         <div><dt>Installed version</dt><dd>Not reported</dd></div>
-      </dl><p className="field-note">Contact and heartbeat describe authenticated transport. They do not establish model readiness.</p>
+      </dl><p className="field-note">Contact becomes Quiet after one minute and Offline after ten. A scheduled tick can run late.</p>
       <h4>Reported by Muse during setup</h4>
       <dl className="identity-list">
         <div><dt>Model</dt><dd>{worker.model_report?.model_name ?? 'Not reported'}</dd></div>
@@ -78,9 +78,16 @@ function WorkerDetail({ worker, controller, view }: { worker: Worker; controller
       <section className="data-panel"><h3>Broker activity</h3><dl className="identity-list">
         <div><dt>Work state</dt><dd>{stateName(worker.work_status)}</dd></div>
         <div><dt>Current assignment</dt><dd>{worker.current_job ? <><code>{worker.current_job.job_id}</code> · generation {worker.current_job.generation}</> : 'None observed'}</dd></div>
+        {worker.current_claim && <>
+          <div><dt>Claim ID</dt><dd><code>{worker.current_claim.claim_id}</code></dd></div>
+          <div><dt>Last observed stage</dt><dd>{stateName(worker.claim_stage ?? 'unknown')}</dd></div>
+          <div><dt>Claimed at</dt><dd>{timestamp(worker.current_claim.claimed_at)}</dd></div>
+          <div><dt>Deadline</dt><dd>{timestamp(worker.current_claim.deadline_at)}</dd></div>
+          <div><dt>Started at</dt><dd>{timestamp(worker.claim_started_at ?? null)}</dd></div>
+        </>}
         <div><dt>Client-tool waits</dt><dd className="num">{worker.waiting_for_client_tool}</dd></div>
         <div><dt>Background wake</dt><dd>Not independently observed</dd></div>
-      </dl><p className="field-note">Busy means the broker retains an assignment. Tool waits depend on the calling client. Offline does not establish whether remote work stopped.</p></section>
+      </dl><p className="field-note">Busy workers do not pull. The broker cannot see local run observations in real time. Offline does not release the claim or prove the work stopped.</p></section>
     </div>
     <dialog ref={dialog} aria-labelledby="revoke-title" aria-describedby="revoke-description" onCancel={event => { event.stopPropagation(); setConfirming(false); }} onClose={() => setConfirming(false)}>
       <h2 id="revoke-title">Revoke this worker?</h2><p className="confirm-identity">{worker.name}<br /><code>{worker.id}</code></p><p id="revoke-description">This blocks access for every copy of this worker credential. Registration and history are retained. Remote activity may remain unknown.</p>
@@ -143,17 +150,17 @@ export function Workers({ controller }: { controller: WorkersController }) {
     {!selected && <WorkerNotices view={view} />}
     {!view.actionMessage && view.actionRequestID && view.enrollmentMessage && <Correlation request={view.actionRequestID} operation={view.actionOperationID} />}
     <section className="worker-list" aria-label="Registered workers" aria-busy={view.loading}>
-      <p className="scope-note">Online workers can take new work as their slots free up.</p>
+      <p className="scope-note">Workers pull queued jobs on scheduled checks when their slots are free.</p>
       {view.workers === null ? <p className="empty-state">{view.loading ? 'Loading registered workers…' : 'Worker information is unavailable. Use Refresh workers to retry.'}</p> : view.workers.length === 0 ? <p className="empty-state">No workers have access. Use enrollment to add a worker.</p> :
-        <table className="workers-table"><thead><tr><th scope="col">Worker identity</th><th scope="col">Subscriber</th><th scope="col">Offline for</th><th scope="col">Broker activity</th></tr></thead><tbody>{view.workers.map(worker => <tr key={worker.id}>
+        <table className="workers-table"><thead><tr><th scope="col">Worker identity</th><th scope="col">Broker contact</th><th scope="col">Offline for</th><th scope="col">Broker activity</th></tr></thead><tbody>{view.workers.map(worker => <tr key={worker.id}>
           <td><button className="worker-name" aria-haspopup="dialog" aria-disabled={!!view.pending} onClick={event => {
             if (view.pending) return;
             opener.current = event.currentTarget; controller.select(worker.id);
           }}>{worker.name}</button><code className="worker-id">{worker.id}</code></td>
-          <td><span className={`status ${worker.connection_status === 'online' ? 'healthy' : ''}`}>{stateName(worker.connection_status)}</span><span className="row-note">Contact {timestamp(worker.last_contact_at)}</span></td>
+          <td><span className={`status ${worker.connection_status === 'recent' ? 'healthy' : ''}`}>{stateName(worker.connection_status)}</span><span className="row-note">Contact {timestamp(worker.last_contact_at)}</span></td>
           <td className="offline-duration">
             <span className="offline-label" aria-hidden="true">Offline for</span>
-            <span className="num">{worker.connection_status === 'online' || worker.offline_for_ms === undefined ? '-' :
+            <span className="num">{worker.connection_status !== 'offline' || worker.offline_for_ms === undefined ? '-' :
               formatOfflineDuration(worker.offline_for_ms + (view.stale ? 0 : Math.max(0, view.offlineClock - worker.receivedAt)))}</span>
           </td>
           <td>{stateName(worker.work_status)}<span className="row-note">{worker.waiting_for_client_tool} client-tool waits</span></td>

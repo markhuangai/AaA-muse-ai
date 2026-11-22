@@ -108,7 +108,7 @@ function Timeline({ controller, view }: { controller: HistoryController; view: H
       {entry.provenance === 'unavailable' && <p className="field-note">Legacy provenance is unavailable; this is a retained snapshot.</p>}
       <AssignmentWorkers entry={entry} view={view} />
       {entry.item && <><p className="row-note">{entry.item.source === 'client_provided' ? 'Client-provided context' : entry.item.source === 'server_observed' ? 'Decision accepted by the service' : 'Recorded item; source not established'}</p><pre>{json(entry.item)}</pre></>}
-      {entry.details && <details open={entry.kind === 'dispatch.reassigned' || entry.kind === 'portal.cancel_result'}><summary>Recorded event details</summary><pre>{json(entry.details)}</pre></details>}
+      {entry.details && <details open={entry.kind === 'dispatch.reassigned' || entry.kind === 'dispatch.pin_released' || entry.kind === 'portal.cancel_result'}><summary>Recorded event details</summary><pre>{json(entry.details)}</pre></details>}
     </li>)}</ol>}
     <Paging read={read} label="Timeline" next={() => void controller.page('timeline', 'next')} previous={() => void controller.page('timeline', 'previous')} first={() => void controller.page('timeline', 'first')} />
   </section>;

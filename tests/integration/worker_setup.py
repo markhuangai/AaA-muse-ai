@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import argparse
-from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import http.server
 import json
@@ -15,6 +14,7 @@ import urllib.parse
 import urllib.request
 
 from inference import Inference
+from native_cron import NativeCronFixture
 from service import LABEL, require
 from worker_tls import TLSFixture
 
@@ -73,7 +73,7 @@ class Assets:
         self.thread.join(timeout=5)
 
 
-class WorkerSetup(Inference):
+class WorkerSetup(NativeCronFixture, Inference):
     def __init__(self, args):
         super().__init__(args)
         self.package = json.loads(Path(args.package_receipt).read_text())
@@ -98,7 +98,7 @@ class WorkerSetup(Inference):
             *temp_mount,
             "-e", "HOME=/home/worker", "-e", "TMPDIR=/home/worker/tmp", "-e", "CURL_CA_BUNDLE=/fixture/ca.pem",
             "-e", "NODE_EXTRA_CA_CERTS=/fixture/ca.pem", self.fixture_image, "bash", "-c", "mkdir -m 700 -p /home/worker/tmp; exec sleep infinity").stdout.strip())
-        return {"container": identity, "home": home, "state": home / ".local/state/aaa-muse-worker"}
+        return {"container": identity, "home": home, "state": home / ".local/state/aaa-muse-worker-v1"}
 
     def command(self, environment, args, input_text=None, want=0, extra=()):
         result = self.docker("exec", "-i", *extra, environment["container"], *args, input_text=input_text, success=False, timeout=180)
@@ -117,12 +117,8 @@ class WorkerSetup(Inference):
         self.diagnose(headers["X-Request-Id"], "setup.prompt_created")
         return result
 
-    def install(self, environment, prompt, fallback=False, corrupt=False, bad_node=False, want=0, model_report=None, state_home=None):
+    def install(self, environment, prompt, fallback=False, corrupt=False, bad_node=False, want=0, state_home=None):
         script = prompt["setup_prompt"].split("```bash\n", 1)[1].split("```", 1)[0]
-        if model_report is not None:
-            slot = "\n{}\nAAA_MUSE_ENROLLMENT\n"
-            require(script.count(slot) == 1, "setup report placeholder is missing")
-            script = script.replace(slot, "\n" + model_report + "\nAAA_MUSE_ENROLLMENT\n")
         path = "/fixture/bin:/usr/bin:/bin" if fallback else "/fixture/bin:/usr/local/bin:/usr/bin:/bin"
         extra = ["-e", "PATH=" + path]
         if state_home is not None:
@@ -139,7 +135,6 @@ class WorkerSetup(Inference):
             environment["worker"] = {"id": environment["receipt"]["worker_id"]}
             environment["credential"] = (environment["state"] / "credential.key").read_text().strip()
             self.secrets.append(environment["credential"])
-            self.until(lambda: self.status(environment)["connection_status"] == "online", "installed subscriber did not become online", timeout=30)
         self.assert_private(result.stdout + result.stderr)
         return result
 
@@ -179,7 +174,10 @@ class WorkerSetup(Inference):
                      cause=rejection["cause"], corrective_action="Remove the credential from the optional setup report.")
 
     def cli(self, environment, *args, input_text=None, want=0):
-        return self.command(environment, [environment["receipt"]["launcher"], args[0], "--state-dir", "/home/worker/.local/state/aaa-muse-worker", *args[1:]], input_text=input_text, want=want)
+        return self.command(environment, [environment["receipt"]["launcher"], *args], input_text=input_text, want=want)
+
+    def native_cli(self, worker, *args, input_text=None, want=0):
+        return self.cli(worker, *args, input_text=input_text, want=want).stdout
 
     def hook(self, environment, dry=False, want=0):
         runtime = environment["home"] / "runtime.sh"
@@ -194,11 +192,11 @@ class WorkerSetup(Inference):
     def prepare_setgid_fixture(self, env, prompt):
         home = env["home"]
         parents = {home / ".local": 0o2770, home / ".local/share": 0o2700, home / ".local/state": 0o2700,
-                   home / "hooks/scripts": 0o2770, home / "workspace/skills": 0o2700}
+                   home / "workspace/skills": 0o2700}
         for path, mode in parents.items():
             path.mkdir(parents=True, exist_ok=True)
             path.chmod(mode)
-        leaf = home / ".local/share/aaa-muse-worker"
+        leaf = home / ".local/share/aaa-muse-worker-v1"
         uid = os.getuid()
 
         def refused(reason, mode, owner):
@@ -235,7 +233,7 @@ class WorkerSetup(Inference):
         leaf.unlink()
         leaf.mkdir(mode=0o700)
         other_uid = 65534 if uid != 65534 else 65533
-        container_path = "/home/worker/.local/share/aaa-muse-worker"
+        container_path = "/home/worker/.local/share/aaa-muse-worker-v1"
         try:
             self.docker("exec", "--user", "0:0", env["container"], "chown", str(other_uid), container_path)
             refused("wrong_directory_owner", leaf.stat().st_mode & 0o7777, other_uid)
@@ -247,229 +245,113 @@ class WorkerSetup(Inference):
         return parents
 
     def asset_directory_recovery(self):
-        env = self.environment("asset-directory-recovery")
-        home = env["home"]
-        data_parent = home / ".local/share"
-        data_parent.mkdir(parents=True)
-        data_parent.chmod(0o2700)
-        (home / "hooks").mkdir()
-        alternate = home / "alternate-hooks"
-        alternate.mkdir()
-        hooks = home / "hooks/scripts"
-        hooks.symlink_to("../alternate-hooks")
-        first = self.prompt()
-        def diagnosis(stderr, role, stage, observed, cause, worker_id=None):
-            records = [json.loads(line) for line in stderr.splitlines() if line.startswith('{')]
-            require(any(e.get("msg") == "worker.state_unsafe" and e["level"] == "ERROR" and
-                        e.get("worker_id") == worker_id and e["setup_id"] == first["enrollment_id"] and e["stage"] == stage and
-                        e["capability"] == role and e["observed_state"] == observed and e["cause"] == cause for e in records),
-                    "worker directory refusal lost stage, identity or cause")
+        worker = self.environment("asset-directory-recovery")
+        prompt = self.prompt()
+        skills = worker["home"] / "workspace/skills"
+        skills.mkdir(parents=True, mode=0o700)
+        observed = {}
 
-        rejected = self.install(env, first, want=1)
-        diagnosis(rejected.stderr, "hook_directory", "pre_enrollment", f"mode_777_uid_{os.getuid()}", "wrong_directory_type")
-        require(not (env["state"] / "credential.key").exists() and not list(alternate.iterdir()), "preflight wrote assets or used enrollment")
-        hooks.unlink()
-        hooks.mkdir()
-        hooks.chmod(0o2700)
-        skills = home / "workspace/skills"
-        skills.mkdir(parents=True)
-        skills.chmod(0o2700)
-        def block_final_asset(worker_id):
+        def block_asset(worker_id):
             leaf = skills / ("aaa-muse-worker-" + worker_id)
             leaf.mkdir(mode=0o700)
             (leaf / ".retained").write_text("operator fixture")
             leaf.chmod(0o2700)
+            observed.update(worker_id=worker_id, leaf=leaf)
 
-        self.proxy.enrollment_accepted = block_final_asset
+        self.proxy.enrollment_accepted = block_asset
         try:
-            late = self.install(env, first, want=1)
+            result = self.install(worker, prompt, want=1)
         finally:
             self.proxy.enrollment_accepted = None
-        saved = json.loads((env["state"] / "installation.json").read_text())
-        worker_id = saved["worker_id"]
-        credential = (env["state"] / "credential.key").read_text().strip()
+        require(observed and not (worker["state"] / "installation.json").exists(), "incomplete assets authorized a checker")
+        credential = (worker["state"] / "credential.key").read_text().strip()
         self.secrets.append(credential)
-        require(self.checked("/api/v1/worker/status", credential)[0]["id"] == worker_id, "late failure lost its authenticated worker")
-        require(not (env["state"] / "launch.json").exists(), "late asset failure launched the subscriber")
-        diagnosis(late.stderr, "skill_directory", "post_enrollment", f"mode_2700_uid_{os.getuid()}", "directory_not_empty", worker_id)
-        skill = skills / ("aaa-muse-worker-" + worker_id)
-        marker = skill / ".retained"
-        require(skill.stat().st_mode & 0o7777 == 0o2700 and marker.read_text() == "operator fixture", "failed skill setup changed populated state")
+        self.assert_private(result.stderr)
+        require(self.checked("/api/v1/worker/status", credential)[0]["id"] == observed["worker_id"], "late failure lost its authenticated worker")
+        marker = observed["leaf"] / ".retained"
+        require(marker.read_text() == "operator fixture", "directory refusal changed existing contents")
         marker.unlink()
-        self.install(env, first)
-        require(env["receipt"]["identity_preserved"] and env["worker"]["id"] == worker_id and env["credential"] == credential,
-                "setup recovery replaced the enrolled worker")
-        require(skill.stat().st_mode & 0o7777 == 0o700 and hooks.stat().st_mode & 0o7777 == 0o2700 and
-                skills.stat().st_mode & 0o7777 == 0o2700, "asset recovery changed parent modes or skipped the leaf correction")
-        records = [json.loads(line) for line in self.cli(env, "diagnostics-export", "--operation-id", first["enrollment_id"], "--decode").stdout.splitlines()]
-        require(records[0]["complete"] and not records[0]["omissions"], "setup directory export incomplete")
-        require({e.get("stage") for e in records if e.get("msg") == "worker.state_unsafe"} >= {"pre_enrollment", "post_enrollment"},
-                "protected setup export lost the two distinct refusals")
-        self.receipt("setup.asset_directory_recovery", worker_id=worker_id, hook_and_skill_diagnosed=True,
-                     same_code_usable_after_preflight=True, identity_preserved=True)
+        self.install(worker, prompt)
+        require(worker["receipt"]["identity_preserved"] and worker["credential"] == credential and worker["worker"]["id"] == observed["worker_id"],
+                "retry enrolled a replacement after a skill directory refusal")
+        records = [json.loads(line) for line in self.native_cli(worker, "diagnostics-export", "--decode").splitlines()]
+        require(records[0]["complete"] and any(e.get("msg") == "worker.state_unsafe" and e.get("capability") == "skill_directory" and
+                e.get("worker_id") == observed["worker_id"] and e.get("cause") == "directory_not_empty" for e in records),
+                "protected setup export did not explain the skill refusal")
+        self.receipt("setup.asset_directory_recovery", identity_preserved=True, failure_held_before_native_registration=True)
 
     def exercise(self):
         status, _, _ = self.api("/api/v1/admin/setup-prompts", self.client, "POST", {})
         require(status == 401, "client authority generated setup prompt")
-        primary = self.environment("primary")
+        worker = self.environment("primary", mount_system_tmp=True)
         initial = self.prompt()
         prompt = initial["setup_prompt"]
-        require(all(fragment in prompt for fragment in ("Before running the bootstrap", "native cron listing tool", "including disabled jobs",
-                "aaa-muse-worker-watchdog", "300-second timeout", "in-place update", "Re-list after any uncertain write",
-                "Setup remains incomplete", "single enabled five-second hook by ID, path and interval", "owning chat")),
-                "real generated prompt lost the watchdog registration contract")
-        parents = self.prepare_setgid_fixture(primary, initial)
-        self.install(primary, initial, model_report=json.dumps({"model_name": "Controlled Muse", "context_window_tokens": 350000}))
-        first_id = primary["worker"]["id"]
-        first_pid = json.loads((primary["state"] / "launch.json").read_text())["pid"]
-        status = self.status(primary)
-        report = status["model_report"]
-        require(report["model_name"] == "Controlled Muse" and report["context_window_tokens"] == 350000 and report["reported_at"], "setup report did not reach own worker status")
-        require(status["inference_readiness"] == "unverified", "setup report granted qualification")
-        admin = self.checked("/api/v1/admin/workers", self.admin)[0]["workers"]
-        require(admin[0]["id"] == first_id and admin[0]["model_report"] == report, "admin and worker report snapshots differ")
-        body = {"model": "muse-ai", "messages": [{"role": "user", "content": "x" * 1048576}]}
-        code, _, _ = self.api("/v1/chat/completions", self.client, "POST", body)
-        require(code == 413, "reported context window changed the broker body limit")
-        home = primary["home"]
-        data = home / ".local/share/aaa-muse-worker"
-        hook = home / "hooks/scripts" / ("aaa-muse-worker-" + first_id)
-        skill = home / "workspace/skills" / ("aaa-muse-worker-" + first_id)
-        for path in (data, primary["state"], hook, skill):
-            require(path.is_dir() and not path.is_symlink() and path.stat().st_mode & 0o7777 == 0o700 and
-                    path.stat().st_uid == os.getuid(), "worker directory is not private and owned")
-        require((primary["state"] / "credential.key").stat().st_mode & 0o7777 == 0o600, "installed worker key permissions differ")
-        watchdog = primary["receipt"]["watchdog"]
-        require(watchdog == {"id": "aaa-muse-worker-watchdog", "interval_seconds": 300, "timeout_seconds": 300,
-                            "registration": "unverified", "command": "'" + primary["receipt"]["launcher"] + "' watchdog-check --state-dir '" +
-                            primary["receipt"]["state_dir"] + "'"}, "installer did not return the exact scheduler action")
+        require(all(fragment in prompt for fragment in ("Request the actual permissions", "including disabled jobs", 'every: "1m"',
+                    "execution.kind=agent", "After a write or uncertain reply", "Setup is incomplete", "one finite native agent runonce")),
+                    "broker prompt lost the native checker read-back contract")
+        parents = self.prepare_setgid_fixture(worker, initial)
+        legacy = worker["home"] / ".local/state/aaa-muse-worker"
+        legacy.mkdir(mode=0o700)
+        legacy_marker = legacy / "operator-fixture"
+        legacy_marker.write_text("retained major zero state")
+        self.install(worker, initial)
+        require(worker["receipt"]["cron_registration"] == "pending" and self.status(worker)["connection_status"] == "not_observed", "setup falsely claimed a scheduled execution")
+        require(worker["state"].stat().st_mode & 0o7777 == 0o700 and (worker["state"] / "credential.key").stat().st_mode & 0o7777 == 0o600,
+                "installer did not enforce private state permissions")
         for path, mode in parents.items():
             require(path.stat().st_mode & 0o7777 == mode, "installer changed a parent mode")
-        for path, key in [(hook / "detector.sh", "hook_path"), (skill / "SKILL.md", "skill_path")]:
-            require(path.is_file() and primary["receipt"][key] == "/home/worker/" + str(path.relative_to(home)), "installer returned the wrong asset")
-        self.receipt("setup.setgid_install", exact_modes=True, rc1_leftover=True, parents_preserved=True, worker_id=first_id)
-
-        self.hook(primary, dry=True)
-        require(not (primary["state"] / "hook-poll.json").exists(), "dry run recorded a genuine poll")
-        require(json.loads(self.hook(primary).stdout)["action"] == "silent", "idle hook woke model")
-        request, _ = self.checked("/api/v1/requests", self.client, "POST", {
-            "protocol_version": 1, "submission_id": "setup-detector-cue",
-            "messages": [{"type": "message", "role": "user", "text": "synthetic setup detector cue"}],
-            "tools": [],
-        }, want=202)
-        require(request["worker_id"] == first_id, "fresh subscriber did not receive client work")
-        experiment = self.experiment(request["id"])
-        self.until(lambda: (primary["state"] / "pending.json").exists() and bool(json.loads((primary["state"] / "pending.json").read_text())["jobs"]), "subscriber did not publish setup cue")
-        original_poll = (primary["state"] / "hook-poll.json").read_bytes()
-        original_wake = (primary["state"] / "hook-emission.json").read_bytes()
-        notice = self.command(primary, ["bash", "-c", watchdog["command"]])
-        require(json.loads(notice.stdout)["notices"] == [{"kind": "actionable_work", "count": 1}], "watchdog leaked or consumed actionable work")
-        require(not self.command(primary, ["bash", "-c", watchdog["command"]]).stdout, "repeat watchdog reported the same job")
-        require((primary["state"] / "hook-poll.json").read_bytes() == original_poll and
-                (primary["state"] / "hook-emission.json").read_bytes() == original_wake, "watchdog wrote hook state")
-        require(json.loads(self.hook(primary).stdout)["action"] == "wake", "actionable cue did not emit native wake")
-        require(json.loads(self.hook(primary).stdout)["action"] == "silent", "unchanged cue emitted duplicate wake")
-        self.cli(primary, "job-show", "--job-id", experiment["current_job_id"])
-        require(json.loads(self.hook(primary).stdout)["action"] == "silent", "context read emitted a duplicate wake for unchanged assignment")
-        self.cli(primary, "decision-submit", "--job-id", experiment["current_job_id"], "--input", "-", input_text=json.dumps({"type": "final", "text": "synthetic fixture answer"}))
-        self.receipt("setup.shipped_hook", real_runtime_functions=True, deduplicated=True, synthetic_model_decision=True)
-
-        self.command(primary, ["bash", "-c", 'kill -TERM "$1"', "setup-recovery-test", str(first_pid)])
-        self.until(lambda: not (primary["state"] / "daemon.lock").exists(), "owned subscriber did not stop")
-        self.hook(primary)
-        second_pid = json.loads((primary["state"] / "launch.json").read_text())["pid"]
-        require(second_pid != first_pid and (primary["state"] / "credential.key").read_text().strip() == primary["credential"], "recovery changed identity or failed to restart")
-        self.until(lambda: self.status(primary)["connection_status"] == "online", "recovered subscriber not online")
-        require(self.status(primary)["model_report"] == report, "reconnect replaced the original report snapshot")
-        self.receipt("setup.model_report_snapshot", preserved_on_reconnect=True, still_unverified=True)
-        repeated = [self.prompt(), self.prompt()]
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            list(pool.map(lambda prompt: self.install(dict(primary), prompt), repeated))
-        require(json.loads((primary["state"] / "launch.json").read_text())["pid"] == second_pid, "repeat install duplicated subscriber")
-        workers = self.checked("/api/v1/admin/workers", self.admin)[0]["workers"]
-        require(len(workers) == 1 and workers[0]["id"] == first_id, "repeat install allocated another identity")
-        self.receipt("setup.fresh_repeat_concurrent", worker_id=first_id, package_sha256=self.package["sha256"], one_consumer=True)
-        key = primary["state"] / "credential.key"
+        require(legacy_marker.read_text() == "retained major zero state", "fresh setup altered a major-zero installation")
+        self.checker(worker)
+        registration = (worker["state"] / "cron-installation.json").read_bytes()
+        self.install(worker, initial)
+        require(worker["receipt"]["identity_preserved"] and (worker["state"] / "cron-installation.json").read_bytes() == registration, "install retry changed checker or worker")
+        require(self.tick(worker)["outcome"] == "idle", "installed checker did not perform an empty authenticated pull")
+        workers, _ = self.checked("/api/v1/admin/workers", self.admin)
+        require(len(workers["workers"]) == 1 and workers["workers"][0]["id"] == worker["worker"]["id"], "setup retry consumed another enrollment")
+        require(not (worker["state"] / "launch.json").exists() and not (worker["home"] / "hooks").exists(), "native install left a daemon or hook")
+        key = worker["state"] / "credential.key"
         key.chmod(0o644)
-        self.cli(primary, "doctor", want=1)
-        key.chmod(0o600)
-        exported = self.cli(primary, "diagnostics-export", "--decode").stdout
-        records = [json.loads(line) for line in exported.splitlines()]
-        require(records[0]["complete"], "setup diagnostic capture incomplete")
-        require(any(e.get("msg") == "setup.wake_emitted" and e.get("setup_id") for e in records), "wake evidence missing")
-        require(any(e.get("msg") == "setup.assets" and e.get("level") == "DEBUG" and "client-tool" in e.get("skill", "") for e in records), "complete protected assets absent")
-        require(any(e.get("msg") == "worker.state_unsafe" and e.get("expected_mode") == "600" and e.get("observed_mode") == "644" for e in records), "unsafe state is not diagnosable from logs")
-        self.private("setup-diagnosis.json", json.dumps({"cause": "credential mode 0644; repair to 0600", "events": records}))
-        self.receipt("setup.recovery_and_log_only_diagnosis", identity_preserved=True, muse_refresh_qualified=False)
+        try:
+            self.cli(worker, "doctor", want=1)
+        finally:
+            key.chmod(0o600)
+        evidence = [json.loads(line) for line in self.native_cli(worker, "diagnostics-export", "--decode").splitlines()]
+        require(evidence[0]["complete"] and any(e.get("msg") == "setup.native_checker_verified" and e.get("checker_job_id") == worker["checker"] for e in evidence) and
+                any(e.get("msg") == "worker.state_unsafe" and e.get("expected_mode") == "600" and e.get("observed_mode") == "644" for e in evidence),
+                "protected setup evidence did not prove read-back or unsafe mode")
+        self.receipt("setup.native_checker_install", interval="1m", protected_state=True, same_registration_on_retry=True, scheduler_fixture="controlled")
 
         corrupt = self.environment("corrupt")
         result = self.install(corrupt, self.prompt(), corrupt=True, want=1)
-        events = [json.loads(line) for line in result.stderr.splitlines() if line.startswith('{')]
-        require(any(e.get("msg") == "setup.digest_mismatch" and e["expected_digest"] != e["observed_digest"] and not e["execution_started"] for e in events), "corruption not diagnosed before execution")
-        require(not (corrupt["state"] / "credential.key").exists(), "corrupt package executed enrollment")
+        records = [json.loads(line) for line in result.stderr.splitlines() if line.startswith('{')]
+        require(not (corrupt["state"] / "credential.key").exists() and any(e.get("msg") == "setup.digest_mismatch" and
+                e["expected_digest"] != e["observed_digest"] and not e["execution_started"] for e in records), "archive corruption was not refused before enrollment")
         capture_failure = self.environment("capture-failure")
         prompt = self.prompt()
         script = prompt["setup_prompt"].split("```bash\n", 1)[1].split("```", 1)[0]
         result = self.command(capture_failure, ["bash"], input_text="trap '' XFSZ\nulimit -f 0\n" + script, want=1)
-        events = [json.loads(line) for line in result.stderr.splitlines() if line.startswith('{')]
-        require(any(e.get("cause") == "receipt_append_failed" and e.get("stage") == "bootstrap" and e.get("protected_capture_unavailable") for e in events), "bootstrap append failure has no independent emergency diagnostic")
+        records = [json.loads(line) for line in result.stderr.splitlines() if line.startswith('{')]
+        require(any(e.get("cause") == "receipt_append_failed" and e.get("stage") == "bootstrap" and e.get("protected_capture_unavailable") for e in records),
+                "bootstrap append failure has no independent emergency diagnostic")
         setup_id = '8' * 32
         script = 'receipt=/home/worker/tmp/write-failure.ndjson\n: > "$receipt"\nchmod 600 "$receipt"\ntrap \'\' XFSZ\nulimit -f 0\n'
         script += 'bash /fixture/install.sh /fixture/worker.tgz ' + self.package["version"] + ' ' + self.package["sha256"] + ' ' + self.proxy.origin + ' ' + setup_id + ' "$receipt"\n'
         result = self.command(capture_failure, ["bash"], input_text=script, want=1)
-        events = [json.loads(line) for line in result.stderr.splitlines() if line.startswith('{')]
-        require(any(e.get("cause") == "receipt_append_failed" and e.get("stage") == "installer" and e.get("protected_capture_unavailable") for e in events), "installer append failure has no independent emergency diagnostic")
+        records = [json.loads(line) for line in result.stderr.splitlines() if line.startswith('{')]
+        require(any(e.get("cause") == "receipt_append_failed" and e.get("stage") == "installer" and e.get("protected_capture_unavailable") for e in records),
+                "installer append failure has no independent emergency diagnostic")
         self.receipt("setup.capture_append_failures", bootstrap_and_installer=True, stopped_before_execution=True)
+
         fallback = self.environment("fallback")
-        fallback_prompt = self.prompt()
-        self.install(fallback, fallback_prompt, fallback=True, model_report=json.dumps({"model_name": primary["credential"]}))
-        require("model_report" not in self.status(fallback), "unsafe report reached worker status")
-        exported = self.cli(fallback, "diagnostics-export", "--decode").stdout
-        records = [json.loads(line) for line in exported.splitlines()]
-        require(records[0]["complete"], "model report rejection capture incomplete")
-        self.diagnose_rejected_report(records, fallback_prompt["enrollment_id"], fallback["worker"]["id"])
-        invalid_prompt = self.prompt()
-        self.install(fallback, invalid_prompt, fallback=True, model_report="{")
-        require("model_report" not in self.status(fallback), "malformed setup report reached worker status")
-        exported = self.cli(fallback, "diagnostics-export", "--decode").stdout
-        require(any(e.get("msg") == "setup.model_report_rejected" and e.get("setup_id") == invalid_prompt["enrollment_id"]
-                    and e.get("cause") == "invalid_json" for e in map(json.loads, exported.splitlines())),
-                "malformed setup report was omitted without its diagnosis")
-        node = json.loads((fallback["state"] / "installation.json").read_text())["node"]
-        require(node.startswith('/home/worker/.local/share/aaa-muse-worker/runtime/'), "fallback used preinstalled Node")
-        require(self.command(fallback, [node, "--version"]).stdout.strip() == "v24.22.2", "downloaded Node did not execute at exact pinned version")
+        self.install(fallback, self.prompt(), fallback=True)
+        nodes = list((fallback["home"] / ".local/share/aaa-muse-worker-v1/runtime").glob("node.*/node"))
+        require(len(nodes) == 1 and nodes[0].is_file() and self.command(fallback, ["/home/worker/" + str(nodes[0].relative_to(fallback["home"])), "--version"]).stdout.strip() == "v24.22.2",
+                "downloaded runtime did not execute at the pinned version")
         bad_node = self.environment("bad-node")
         result = self.install(bad_node, self.prompt(), fallback=True, bad_node=True, want=1)
-        require('"stage":"node"' in result.stderr and '"execution_started":false' in result.stderr, "bad Node archive ran before verification")
-        require(not (bad_node["state"] / "credential.key").exists(), "bad runtime enrolled a worker")
+        require('"stage":"node"' in result.stderr and '"execution_started":false' in result.stderr and not (bad_node["state"] / "credential.key").exists(),
+                "invalid runtime bytes were not rejected before enrollment")
         self.receipt("setup.corruption_and_pinned_node", node_sha256=NODE_SHA, fallback_executed=True, corrupted_node_rejected=True)
-
-        self.checked("/api/v1/admin/workers/" + first_id + "/revoke", self.admin, "POST")
-        self.until(lambda: (primary["state"] / "run-stop.json").exists(), "revoked subscriber did not retain terminal outcome", timeout=35)
-        self.hook(primary, want=1)
-        self.install(primary, self.prompt(), want=1)
-        workers = self.checked("/api/v1/admin/workers", self.admin)[0]["workers"]
-        require(len(workers) == 2, "revoked setup silently enrolled another identity")
-        self.receipt("setup.revocation_boundary", no_reenrollment=True)
-
-        old_journals = {file.name: file.read_bytes() for file in (primary["state"] / "journals").glob("*.json")}
-        require(bool(old_journals), "old installation has no durable operation journal")
-        fresh_container, fresh_origin, _ = self.launch(state_volume=self.volume("fresh-sqlite"))
-        self.ready(fresh_container, fresh_origin)
-        self.proxy.target = urllib.parse.urlsplit(fresh_origin)
-        self.origin_url = fresh_origin
-        require(self.checked("/api/v1/admin/workers", self.admin)[0]["workers"] == [], "new SQLite volume retained old workers")
-        require(self.api("/api/v1/worker/status", primary["credential"])[0] == 401, "fresh SQLite accepted an old credential")
-        fresh_prompt = self.prompt()
-        self.install(primary, fresh_prompt, want=1)
-        require(self.checked("/api/v1/admin/workers", self.admin)[0]["workers"] == [], "old state silently used a new code")
-        fresh = {"container": primary["container"], "state": primary["home"] / "sqlite-cutover" / "aaa-muse-worker"}
-        self.install(fresh, fresh_prompt, state_home="/home/worker/sqlite-cutover")
-        workers = self.checked("/api/v1/admin/workers", self.admin)[0]["workers"]
-        require(len(workers) == 1 and workers[0]["id"] == fresh["worker"]["id"] != first_id, "fresh setup did not produce one distinct worker")
-        require({file.name: file.read_bytes() for file in (primary["state"] / "journals").glob("*.json")} == old_journals,
-                "fresh enrollment changed the prior installation's journals")
-        self.receipt("setup.sqlite_fresh_start", old_credential_denied=True, fresh_enrollment=True, journal_preserved=True)
         self.asset_directory_recovery()
 
 

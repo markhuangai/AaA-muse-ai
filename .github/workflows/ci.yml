@@ -224,7 +224,7 @@ jobs:
         run: make test-service
       - name: Worker enrollment, revocation, and diagnosis
         run: make test-worker-auth
-      - name: Inference turns, SSE health, and client-tool continuation
+      - name: Native work pulls, fenced starts, and client-tool continuation
         run: make test-inference
       - name: Owned canonical history, request timelines and diagnostics
         run: make test-history
@@ -427,7 +427,7 @@ jobs:
         run: npm ci --ignore-scripts --no-audit --no-fund
       - name: Check worker types
         run: npm run check --workspace worker
-      - name: Packed CLI with real HTTPS, SSE and SQLite
+      - name: Packed cron helper with real HTTPS and SQLite
         run: make test-worker-transport
       - name: Worker startup outages, abrupt crashes, receipt replay and uncertainty
         run: make test-worker-recovery
@@ -452,7 +452,7 @@ jobs:
         run: npm ci --ignore-scripts --no-audit --no-fund
       - name: Build and verify Node 24 archive
         run: make worker-package
-      - name: Shipped installer, hook, recovery and protected diagnostics
+      - name: Shipped installer, cron registration, and protected diagnostics
         run: make test-worker-setup
       - uses: actions/setup-node@v7
         with:

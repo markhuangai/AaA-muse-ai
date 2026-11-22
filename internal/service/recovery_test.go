@@ -205,18 +205,15 @@ func TestRecoveryFailureDoesNotLogRestoration(t *testing.T) {
 func TestRecoveryContextOnlyHasApplicableCorrectiveAction(t *testing.T) {
 	b, m, log, logs := inferenceFixture()
 	ctx := context.Background()
-	connectInference(t, b, m, log, "worker-a")
+	connection := connectInference(t, b, m, log, "worker-a")
 	v := admitted(t, b, "alice", "context-only", requestInput("context-only"))
-	e := m.states["worker-a"].Experiments[v.ID]
-	if _, err := b.Job(ctx, log, "worker-a", e.CurrentJobID); err != nil {
-		t.Fatal(err)
-	}
+	job := nativeJob(t, b, m, connection, v)
 	logs.Reset()
 	if err := b.Recover(ctx, log); err != nil {
 		t.Fatal(err)
 	}
 	r := m.states["worker-a"].Requests[v.ID]
-	if r.Output != nil || r.ContextDeliveryStarted == nil || r.ContextDeliveryWritten != nil || r.State != "queued" {
+	if r.Output != nil || r.ContextDeliveryStarted == nil || r.ContextDeliveryWritten != nil || r.State != "inference" || !m.states[job.WorkerID].Jobs[job.ID].Held {
 		t.Fatal("context-only recovery invented inference or output")
 	}
 	found := false
@@ -227,7 +224,7 @@ func TestRecoveryContextOnlyHasApplicableCorrectiveAction(t *testing.T) {
 		}
 		if event["last_boundary"] == "context_delivery" {
 			found = true
-			if event["reason"] != "delivery_completion_receipt_missing" || event["decision_available"] != false || !bytes.Contains([]byte(event["corrective_action"].(string)), []byte("same unclaimed job")) {
+			if event["reason"] != "delivery_completion_receipt_missing" || event["decision_available"] != false || !bytes.Contains([]byte(event["corrective_action"].(string)), []byte("exact native execution")) {
 				t.Fatal("context diagnosis assumes a nonexistent decision")
 			}
 		}

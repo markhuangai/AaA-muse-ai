@@ -26,9 +26,8 @@ const askMCP = `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"
 
 func TestMCPTextOutputBoundaries(t *testing.T) {
 	h, db, worker, key := inferenceHTTPFixture(t)
-	c := onlineHTTP(t, h, worker.ID)
 	answer := "exact answer muse_download_" + strings.Repeat("A", 43)
-	completeChatOnWait(t, h, db, c, key, inference.Item{Type: "final", Text: answer})
+	completeChatOnWait(t, h, db, key, inference.Item{Type: "final", Text: answer})
 	failed := &chatWriter{ResponseRecorder: httptest.NewRecorder(), failWrite: true}
 	h.ServeHTTP(failed, mcpRequest(askMCP))
 	var id string
@@ -64,11 +63,8 @@ func TestMCPTextOutputBoundaries(t *testing.T) {
 }
 
 func TestMCPTransportAndMediaAdmission(t *testing.T) {
-	h, db, worker, _ := inferenceHTTPFixture(t)
-	onlineHTTP(t, h, worker.ID)
+	h, db, _, _ := inferenceHTTPFixture(t)
 	h.Broker.Media = media.New(t.TempDir())
-	connection := &db.states[worker.ID].Connection
-	connection.MediaJobs, connection.PromptWAV = true, true
 	const generate = `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"generate_wav","arguments":{"prompt":"rain","submission_id":"shared-input"}}}`
 	for _, tc := range []struct {
 		want      int
@@ -95,11 +91,11 @@ func TestMCPTransportAndMediaAdmission(t *testing.T) {
 			t.Fatalf("MCP HTTP status %d, want %d", out.Code, tc.want)
 		}
 	}
-	if len(db.states[worker.ID].Jobs) != 1 {
+	if len(db.states[""].Jobs) != 1 {
 		t.Fatal("MCP admission did not create exactly one job")
 	}
 	var id string
-	for _, j := range db.states[worker.ID].Jobs {
+	for _, j := range db.states[""].Jobs {
 		id = j.ID
 		if j.Media.Profile != media.PromptWAVProfile {
 			t.Fatal("generate_wav selected wrong profile")
@@ -114,8 +110,7 @@ func TestMCPTransportAndMediaAdmission(t *testing.T) {
 }
 
 func TestMCPLegacyDisconnectCancelsText(t *testing.T) {
-	h, db, worker, _ := inferenceHTTPFixture(t)
-	onlineHTTP(t, h, worker.ID)
+	h, db, _, _ := inferenceHTTPFixture(t)
 	r := mcpRequest(askMCP)
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
@@ -125,7 +120,7 @@ func TestMCPLegacyDisconnectCancelsText(t *testing.T) {
 		return ctx.Err()
 	}
 	h.ServeHTTP(httptest.NewRecorder(), r.WithContext(ctx))
-	for _, item := range db.states[worker.ID].Requests {
+	for _, item := range db.states[""].Requests {
 		if item.State != "cancelled" || item.Output != nil {
 			t.Fatal("legacy HTTP disconnect left unfinished MCP work")
 		}
@@ -150,7 +145,6 @@ func TestMCPAdmissionFailures(t *testing.T) {
 		t.Fatal("MCP continued after it could not set the wait deadline")
 	}
 	for _, tc := range []struct{ body, reason string }{
-		{askMCP, "no_ready_worker"},
 		{strings.ReplaceAll(askMCP, "question", " "), "invalid_prompt"},
 		{strings.ReplaceAll(askMCP, "one-text", "!"), "invalid_submission_id"},
 		{`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"generate_video","arguments":{"prompt":"rain","submission_id":"media"}}}`, "service_unavailable"},

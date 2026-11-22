@@ -14,6 +14,8 @@ from service import SQLITE_STATE, require
 CONFIG = "/etc/aaa-muse-ai"
 MEDIA = "/var/lib/aaa-muse-ai/media"
 DIAGNOSTICS = "/var/lib/aaa-muse-ai/diagnostics"
+STATE_BIND = "sqlite-v1"
+MEDIA_BIND = "media-v1"
 BASE = Path("compose.yaml").resolve()
 NAMED = Path("compose.named-volumes.yaml").resolve()
 
@@ -145,7 +147,7 @@ def check_missing_bind_sources(p):
         p.h.receipt("compose.bind_declarations", engine=platform, missing_source_runtime="not_exercised")
         return
     p.compose("up", "-d", "service", success=False)
-    require(not (p.dir / "sqlite").exists() and not (p.dir / "media").exists(), "Compose created missing host sources")
+    require(not (p.dir / STATE_BIND).exists() and not (p.dir / MEDIA_BIND).exists(), "Compose created missing host sources")
     p.h.receipt("compose.bind_declarations", missing_source_runtime="rejected")
 
 
@@ -157,7 +159,7 @@ def fresh_install(h):
         p.config.write_text(sample.replace("client-keys: {}", "client-keys:\n  fixture-client: " + h.client))
         p.compose("up", "-d", "service", overrides={"MUSE_SERVICE_USER": ""}, success=False)
         check_missing_bind_sources(p)
-        for name in ("sqlite", "media"):
+        for name in (STATE_BIND, MEDIA_BIND):
             (p.dir / name).mkdir(mode=0o755)
             (p.dir / name).chmod(0o755)
 
@@ -177,20 +179,20 @@ def fresh_install(h):
                     "unsafe YAML reason or observed owner missing")
             p.config.unlink()
         wrong.rename(p.config)
-        nested = p.dir / "media" / "nested"
+        nested = p.dir / MEDIA_BIND / "nested"
         nested.mkdir()
         link = nested / "link"
         link.symlink_to(p.config)
         p.compose("up", "-d", "service", success=False)
         event = p.logs("prepare-mounts", "symlink")
         require(event["target"] == MEDIA and event["stage"] == "validate_entries"
-                and stat.S_IMODE((p.dir / "sqlite").stat().st_mode) == 0o755,
+                and stat.S_IMODE((p.dir / STATE_BIND).stat().st_mode) == 0o755,
                 "nested symlink did not stop preparation before mode changes")
         link.unlink()
         nested.rmdir()
         p.compose("up", "-d", "service", overrides={"MUSE_SERVICE_USER": "0:10001"}, success=False)
         p.logs("prepare-mounts", "invalid_service_user")
-        mount = f"type=bind,source={p.dir / 'sqlite'},target=/fixture"
+        mount = f"type=bind,source={p.dir / STATE_BIND},target=/fixture"
         h.docker("run", "--rm", "--user", "0:0", "--mount", mount, "--entrypoint", "/bin/sh", h.args.image,
                  "-ec", 'touch /fixture/retained; chown 0:0 /fixture')
         try:
@@ -198,12 +200,12 @@ def fresh_install(h):
             event = p.logs("prepare-mounts", "populated_directory_owner_mismatch")
             require(event["target"] == SQLITE_STATE and event["observed"]["uid"] == 0
                     and event["expected"]["uid"] == os.getuid(), "incompatible data ownership is not diagnosable")
-            require((p.dir / "sqlite" / "retained").exists() and (p.dir / "sqlite").stat().st_uid == 0,
+            require((p.dir / STATE_BIND / "retained").exists() and (p.dir / STATE_BIND).stat().st_uid == 0,
                     "failed preparation changed populated storage")
         finally:
             h.docker("run", "--rm", "--user", "0:0", "--mount", mount, "--entrypoint", "/bin/sh", h.args.image,
                      "-ec", 'chown "$1" /fixture; unlink /fixture/retained', "restore-fixture", owner)
-        require(not (p.dir / "sqlite" / "broker.sqlite3").exists(), "broker started before mount validation")
+        require(not (p.dir / STATE_BIND / "broker.sqlite3").exists(), "broker started before mount validation")
         h.receipt("compose.fail_before_database", unsafe_yaml=True, invalid_identity=True)
 
         p.config.chmod(0o644)
@@ -217,10 +219,13 @@ def fresh_install(h):
                 "broker does not run as the host creator")
         require(h.request(origin, "/api/v1/admin/status", h.admin)[0] == 200, "supplied management key failed")
         require(h.request(origin, "/v1/models", h.client)[0] == 200, "supplied model-client key failed")
+        prompt = "controlled media storage"
         code, _, reply = json_request(h, origin, "/api/v1/media/jobs", h.client,
-                                      {"submission_id": secrets.token_hex(16), "prompt": "controlled media storage"})
-        require(code == 503 and json.loads(reply)["error"] == "no_ready_worker" and not list((p.dir / "media").iterdir()),
-                "media staging did not write and clean the prompt before routing")
+                                      {"submission_id": secrets.token_hex(16), "prompt": prompt})
+        job = json.loads(reply)
+        require(code == 202 and job["status"] == "queued" and
+                (p.dir / MEDIA_BIND / job["job_id"] / "prompt").read_text() == prompt,
+                "media did not retain its exact input in the fresh namespace while workers were absent")
         code, _, reply = json_request(h, origin, "/api/v1/portal/login", data={"password": h.portal})
         require(code == 200, "supplied portal password failed")
         session, key = json.loads(reply)["session_token"], "test-compose-key-" + secrets.token_hex(24)
@@ -228,9 +233,9 @@ def fresh_install(h):
         require(json_request(h, origin, "/api/v1/portal/client-keys", session, {"name": "via-portal", "key": key})[0] == 201,
                 "portal could not save into the Compose configuration directory")
         require(p.config.stat().st_ino != inode, "portal did not atomically replace config.yaml")
-        for name in ("config", "sqlite", "media"):
+        for name in ("config", STATE_BIND, MEDIA_BIND):
             require(stat.S_IMODE((p.dir / name).stat().st_mode) == 0o700, "host directory is not private")
-        for path in (p.config, *(p.dir / "sqlite").glob("broker.sqlite3*")):
+        for path in (p.config, *(p.dir / STATE_BIND).glob("broker.sqlite3*")):
             info = path.stat()
             require((info.st_uid, info.st_gid, stat.S_IMODE(info.st_mode)) == (os.getuid(), os.getgid(), 0o600),
                     "host config or SQLite file has the wrong owner or mode")

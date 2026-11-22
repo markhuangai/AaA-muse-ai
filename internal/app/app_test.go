@@ -3,6 +3,7 @@ package app
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -292,12 +293,14 @@ func TestRuntimeCaptureFailureStopsService(t *testing.T) {
 		return l, err
 	}
 	result := make(chan int, 1)
-	go func() { result <- Run(context.Background(), nil, service.Build{}, d) }()
+	go func() { result <- Run(t.Context(), nil, service.Build{}, d) }()
 	var origin string
 	select {
 	case origin = <-address:
-	case <-time.After(3 * time.Second):
-		t.Fatal("startup stalled")
+	case code := <-result:
+		t.Fatalf("startup exited before listening (status %d)", code)
+	case <-time.After(10 * time.Second):
+		t.Fatal("startup did not listen within 10 seconds")
 	}
 	client := &http.Client{Timeout: time.Second}
 	response, err := client.Get("http://" + origin + "/healthz")
@@ -322,6 +325,68 @@ func TestRuntimeCaptureFailureStopsService(t *testing.T) {
 	}
 	if !strings.Contains(errout.String(), "diagnostics.capture_failed") || !strings.Contains(errout.String(), "filesystem_permission_denied") {
 		t.Fatal("missing corrective cause")
+	}
+}
+
+func TestRunRefusesLegacyMediaWithoutDeletingFiles(t *testing.T) {
+	d, output, _, _ := fixtureDependencies(t, false)
+	d.MediaDir = t.TempDir()
+	if err := os.Chmod(d.MediaDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	legacy := filepath.Join(d.MediaDir, "legacy-artifact.mp4")
+	if err := os.WriteFile(legacy, []byte("original installation"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	d.Listen = func(string, string) (net.Listener, error) {
+		t.Fatal("started serving against a legacy media namespace")
+		return nil, errors.New("unexpected listener")
+	}
+	if result := Run(t.Context(), nil, service.Build{}, d); result != 1 {
+		t.Fatalf("legacy media namespace startup status %d", result)
+	}
+	if saved, err := os.ReadFile(legacy); err != nil || string(saved) != "original installation" {
+		t.Fatal("legacy asset was changed by the startup check", err)
+	}
+	if !strings.Contains(output.String(), "media.namespace_rejected") || !strings.Contains(output.String(), d.MediaDir) {
+		t.Fatal("startup failed without identifying the specific media namespace")
+	}
+}
+
+func TestRunRefusesLegacySQLiteWithoutChangingItsLedger(t *testing.T) {
+	d, output, _, _ := fixtureDependencies(t, false)
+	directory := t.TempDir()
+	if err := os.Chmod(directory, 0700); err != nil {
+		t.Fatal(err)
+	}
+	d.DatabasePath = filepath.Join(directory, "legacy.sqlite3")
+	legacy, err := sql.Open("sqlite", d.DatabasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer legacy.Close()
+	if _, err = legacy.ExecContext(t.Context(), `CREATE TABLE aaa_schema_migrations (version INTEGER PRIMARY KEY, checksum TEXT NOT NULL);
+		INSERT INTO aaa_schema_migrations VALUES (1,'original-schema'), (2,'original-portal');`); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.Chmod(d.DatabasePath, 0600); err != nil {
+		t.Fatal(err)
+	}
+	d.OpenDB = func(ctx context.Context, path string) (Repository, error) { return sqlite.Open(ctx, path) }
+	d.Listen = func(string, string) (net.Listener, error) {
+		t.Fatal("started serving against a legacy SQLite store")
+		return nil, errors.New("unexpected listener")
+	}
+	if result := Run(t.Context(), nil, service.Build{}, d); result != 1 {
+		t.Fatalf("legacy SQLite startup status %d", result)
+	}
+	var version int
+	var checksum string
+	if err = legacy.QueryRowContext(t.Context(), "SELECT version,checksum FROM aaa_schema_migrations ORDER BY version DESC LIMIT 1").Scan(&version, &checksum); err != nil || version != 2 || checksum != "original-portal" {
+		t.Fatal("startup changed the legacy schema ledger", version, checksum, err)
+	}
+	if !strings.Contains(output.String(), "db.fresh_store_required") || !strings.Contains(output.String(), d.DatabasePath) {
+		t.Fatal("startup did not identify the legacy store or its corrective action")
 	}
 }
 

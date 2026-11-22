@@ -1,24 +1,14 @@
 import { join, isAbsolute } from 'node:path';
 import { State } from './state.js';
 import { Worker } from './worker.js';
-import type { Logger } from './diagnostics.js';
 import { Failure, cause, requireValue } from './errors.js';
 import { encode, parse, object, text, integer, identifier, type ObjectValue, type Value } from './json.js';
 import { maxModelReportBytes } from './protocol.js';
 import type { SetupIO } from './setup-os.js';
 import { beginHookPoll, finishHookPoll, installedPaths, readActionable, readObject, readOwnership, watchdogSettings } from './health.js';
+import { captureBootstrap } from './install-io.js';
 
 const quote = (value: string): string => "'" + value.replaceAll("'", "'\"'\"'") + "'";
-
-export async function captureBootstrap(logger: Logger, setupID: string, bootstrap: string): Promise<void> {
-  identifier(setupID);
-  for (const line of bootstrap.trim().split('\n')) {
-    requireValue(Buffer.byteLength(line) <= 6144, 'bootstrap_record_too_large');
-    const event = object(parse(line));
-    requireValue(event.setup_id === setupID && ['INFO', 'ERROR'].includes(text(event.level)), 'invalid_bootstrap_record');
-    await logger.log(event.level as 'INFO' | 'ERROR', text(event.msg), { ...event, setup_id: setupID, operation_id: setupID });
-  }
-}
 
 export class Setup {
   constructor(readonly worker: Worker, readonly io: SetupIO, readonly version: string) {}

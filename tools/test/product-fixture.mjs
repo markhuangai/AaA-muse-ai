@@ -16,7 +16,7 @@ export function responseValue(id, output, tool = false, fields = {}) {
     }], ...fields };
 }
 
-export function productFixture(live = false) {
+export function productFixture(live = false, extraCycles = []) {
   const report = { schema_version: 2, suite: 'release', evidence_kind: live ? 'live' : 'synthetic', run_id: 'product-fixture', started_at: stamp(0), finished_at: stamp(2000), outcome: 'passed', verdict: live ? 'pass' : 'inconclusive',
     source: { service_sha: 'a'.repeat(40), image_digest: 'sha256:' + 'b'.repeat(64), service_version: '0.1.0-rc.7', worker_version: '0.1.0-rc.7', worker_sha256: 'c'.repeat(64), installer_sha256: 'd'.repeat(64) },
     workers: ['a', 'b'].map(slot => ({ slot, worker_id: 'worker-' + slot, account_ref: 'account-' + slot, installed_version: '0.1.0-rc.7', installed_sha256: 'c'.repeat(64) })), cases: [], cycles: [], exports: [], observations: [],
@@ -25,9 +25,9 @@ export function productFixture(live = false) {
   const broker = [], workers = [];
   const observation = fields => ({ time: stamp(1000), observer: 'synthetic-native-observer', source_ref: 'synthetic-native-ref', ...fields });
   const addCase = (id, fields = {}) => report.cases.push({ id, outcome: 'passed', finished_at: stamp(900), ...fields });
-  for (const [index, id] of [...cycleIDs, 'interleave-a', 'interleave-b', 'broker-wait'].entries()) {
+  for (const [index, id] of [...cycleIDs, 'interleave-a', 'interleave-b', 'broker-wait', ...extraCycles].entries()) {
     const slug = id.replaceAll('.', '-');
-    const slot = id === 'broker-wait' ? 'a' : id.startsWith('interleave') ? id.at(-1) : id[0], protocol = id.includes('responses') || id === 'interleave-b' ? 'responses' : 'chat', stream = id.endsWith('sse');
+    const slot = id === 'broker-wait' || extraCycles.includes(id) ? 'a' : id.startsWith('interleave') ? id.at(-1) : id[0], protocol = id.includes('responses') || id === 'interleave-b' ? 'responses' : 'chat', stream = id.endsWith('sse');
     const item = cycle({ id, slot, protocol, stream, session: 'session-' + slug, fixture: { id: 'fixture-' + slug, path: 'client-' + id + '.txt', owner: 'client_driver', contents: 'random-' + id + '\r\nexact 😀\n', created_at: stamp(1) } });
     const make = protocol === 'chat' ? chatValue : responseValue;
     const first = make(slug + '-tool', item.fixture.path, true), final = make(slug + '-final', item.fixture.contents);

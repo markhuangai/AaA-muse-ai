@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import argparse
-import base64
 import json
 import os
 from pathlib import Path
@@ -22,41 +21,33 @@ class PortalWorkers(Portal, History):
 
     def activity_fixtures(self):
         offline = self.named_worker('Archive <img src=x onerror="window.__unsafe=1">')
-        report_header = "X-Muse-Worker-Model-Report"
-        offline_peer = self.peer(offline, headers={report_header: "!invalid"})
-        offline_peer.stop()
-        self.until(lambda: self.status(offline)["connection_status"] == "offline", "closed subscriber did not become offline")
-        self.offline_diagnosis(offline, offline_peer, "stream_closed")
-        rejected, _ = self.diagnose(offline_peer.request_id, "worker.model_report_rejected")
-        require(rejected["cause"] == "invalid_model_report_encoding" and rejected["level"] == "WARN"
-                and rejected["worker_id"] == offline["worker"]["id"]
-                and rejected["connection_generation"] == offline_peer.opened["connection_generation"], "invalid report diagnosis lost its connection")
-        require("model_report" not in self.status(offline), "ill-formed report reached the worker projection")
-        self.receipt("portal.worker_model_report_rejection", cause=rejected["cause"], request_id=offline_peer.request_id, corrective_action="Supply a valid setup report on the next connection.")
-        transport = self.named_worker("Studio subscriber")
-        report = {"model_name": "Controlled Muse", "context_window_tokens": 350000, "reported_at": "2026-11-18T00:00:00Z"}
-        encoded = base64.urlsafe_b64encode(json.dumps(report).encode()).decode().rstrip("=")
-        self.peer(transport, headers={report_header: encoded})
-        require(self.status(transport)["model_report"] == report and self.status(transport)["inference_readiness"] == "unverified", "connection report conferred readiness or changed its values")
-        busy = self.named_worker("Research subscriber")
-        busy_peer = self.peer(busy)
+        never = self.named_worker("Unstarted native cron")
+        transport = self.named_worker("Studio native cron")
+        quiet = self.named_worker("Delayed native cron")
+        self.pull_peer(offline)
+        self.pull_peer(transport)
+        self.pull_peer(quiet)
+        self.silence(offline, 605)
+        self.silence(quiet, 65)
+        require(self.worker_projection(never)[0]["connection_status"] == "not_observed", "enrollment invented an authenticated work poll")
+        require(self.worker_projection(offline)[0]["connection_status"] == "offline", "silent worker did not become offline")
+        require(self.worker_projection(quiet)[0]["connection_status"] == "quiet", "late idle checker did not become quiet")
+        require(self.worker_projection(transport)[0]["inference_readiness"] == "unverified", "work poll fabricated readiness")
+        busy = self.named_worker("Research native cron")
+        busy_peer = self.pull_peer(busy)
         experiment = self.create(busy, "Controlled held assignment", tools=False, timeout=1800)
         job, _, _ = self.claim(busy, busy_peer, experiment)
-        waiting = self.named_worker("Client-tool subscriber")
-        waiting_peer = self.peer(waiting)
+        self.silence(busy, 605)
+        waiting = self.named_worker("Client-tool native cron")
+        waiting_peer = self.pull_peer(waiting)
         request, _ = self.submit(self.input(waiting, timeout=1800), "portal-controlled-tool-wait")
         self.deliver(waiting, waiting_peer, request, {"type": "tool_call", "call_id": "portal-client-read", "name": "read_file", "arguments": {"path": "client-only-controlled-fixture.txt"}})
         self.read_native(request)
         require(self.status(waiting)["waiting_for_client_tool"] == 1, "controlled tool wait was not observed")
-        reconnected = self.named_worker("Reconnected subscriber")
-        previous = self.peer(reconnected)
-        previous.stop()
-        self.peer(reconnected)
-        recovered = self.status(reconnected)
-        require(recovered["connection_status"] == "online" and not recovered["qualification_history"], "reconnect failed or created approval")
-        self.receipt("portal.workers_controlled_activity", heartbeat_is_not_readiness=True, live_qualification=False)
+        self.receipt("portal.workers_controlled_activity", poll_is_not_qualification=True, live_qualification=False)
         return {"offline_id": offline["worker"]["id"], "transport_id": transport["worker"]["id"],
-                "busy_id": busy["worker"]["id"], "busy_job_id": job["id"], "waiting_id": waiting["worker"]["id"], "reconnected_id": reconnected["worker"]["id"]}
+                "busy_id": busy["worker"]["id"], "busy_job_id": job["id"], "waiting_id": waiting["worker"]["id"],
+                "never_id": never["worker"]["id"], "quiet_id": quiet["worker"]["id"]}
 
     def expiry_and_role_boundaries(self):
         expired = self.issue()
@@ -76,32 +67,27 @@ class PortalWorkers(Portal, History):
     def worker_browser(self, phase, workers):
         if phase == "actions":
             reconnecting = self.named_worker("Offline timer fixture")
-            initial = self.peer(reconnecting)
-            initial.stop()
-            self.until(lambda: self.status(reconnecting)["connection_status"] == "offline", "timer fixture did not become offline")
+            timer = self.pull_peer(reconnecting)
+            self.silence(reconnecting, 605)
+            require(self.worker_projection(reconnecting)[0]["connection_status"] == "offline", "timer fixture did not become offline")
             workers = {**workers, "reconnect_id": reconnecting["worker"]["id"]}
         fixture = self.private("worker-browser-" + phase + ".json", json.dumps({"origin": self.origin_url, "browser_origin": self.browser_proxy.origin, "password": self.portal,
             "source_sha": self.args.source_sha, "container": self.main_service, "database": self.db, "owner": self.owner,
             "directory": str(self.root.resolve()), "phase": phase, "workers": workers, "pin": self.checked("/api/v1/admin/status", self.admin)[0]["build"]["worker_package"]}))
-        peer = None
-        try:
-            with (self.root / ("worker-browser-" + phase + ".log")).open("w") as log:
-                with subprocess.Popen(["node", "tests/portal/workers.mjs", "--fixture", str(fixture)], stdout=log, stderr=subprocess.STDOUT) as process:
-                    try:
-                        if phase == "actions":
-                            signal = self.root / "worker-browser-resume-subscriber"
-                            self.until(lambda: signal.exists() or process.poll() is not None, "browser did not reach the offline timer check", timeout=300)
-                            if signal.exists():
-                                peer = self.peer(reconnecting)
-                                self.private("worker-browser-subscriber-ready", "")
-                        process.wait(timeout=300)
-                    finally:
-                        if process.poll() is None:
-                            process.kill()
-                            process.wait()
-        finally:
-            if peer is not None:
-                peer.stop()
+        with (self.root / ("worker-browser-" + phase + ".log")).open("w") as log:
+            with subprocess.Popen(["node", "tests/portal/workers.mjs", "--fixture", str(fixture)], stdout=log, stderr=subprocess.STDOUT) as process:
+                try:
+                    if phase == "actions":
+                        signal = self.root / "worker-browser-resume-poll"
+                        self.until(lambda: signal.exists() or process.poll() is not None, "browser did not reach the offline timer check", timeout=300)
+                        if signal.exists():
+                            require(timer.poll() is None, "offline timer fixture unexpectedly claimed work")
+                            self.private("worker-browser-poll-ready", "")
+                    process.wait(timeout=300)
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                        process.wait()
         secret_path = self.root / ("worker-browser-secrets-" + phase + ".json")
         if secret_path.exists():
             self.secrets.extend(json.loads(secret_path.read_text()))

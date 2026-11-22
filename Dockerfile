@@ -23,7 +23,7 @@ COPY cmd ./cmd
 COPY internal ./internal
 ARG SOURCE_SHA=development
 ARG SOURCE_DIRTY=true
-ARG PRODUCT_VERSION=0.1.0-dev.0
+ARG PRODUCT_VERSION=1.0.0-dev.0
 ARG WORKER_SHA256
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.revision=${SOURCE_SHA} -X main.dirty=${SOURCE_DIRTY} -X main.version=${PRODUCT_VERSION} -X main.workerSHA256=${WORKER_SHA256}" -o /out/service ./cmd/service
 
@@ -41,7 +41,7 @@ COPY --from=frontend /src/node_modules/@fontsource/geist/LICENSE /usr/share/aaa-
 COPY --from=frontend /src/node_modules/@fontsource/geist-mono/LICENSE /usr/share/aaa-muse-ai/licenses/geist-mono-OFL.txt
 ARG SOURCE_SHA=development
 ARG SOURCE_DIRTY=true
-ARG PRODUCT_VERSION=0.1.0-dev.0
+ARG PRODUCT_VERSION=1.0.0-dev.0
 LABEL org.opencontainers.image.source="https://github.com/markhuangai/AaA-muse-ai" \
       org.opencontainers.image.revision="${SOURCE_SHA}" \
       org.opencontainers.image.version="${PRODUCT_VERSION}" \

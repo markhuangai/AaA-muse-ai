@@ -28,7 +28,7 @@ func routeFor(path string) (string, string) {
 	switch path {
 	case "/api/v1/portal/login", "/api/v1/portal/logout", "/api/v1/portal/session", "/api/v1/portal/settings", "/api/v1/portal/events", "/api/v1/portal/client-keys":
 		return path, ""
-	case mcpRoute, "/v1/models", "/v1/chat/completions", "/v1/responses", "/healthz", "/readyz", "/api/v1/admin/status", "/api/v1/admin/diagnostics/export", "/api/v1/admin/enrollments", "/api/v1/admin/setup-prompts", "/api/v1/worker/enroll", "/api/v1/admin/workers", "/api/v1/worker/status", workerUpgradeRoute:
+	case mcpRoute, "/v1/models", "/v1/chat/completions", "/v1/responses", "/healthz", "/readyz", "/api/v1/admin/status", "/api/v1/admin/diagnostics/export", "/api/v1/admin/enrollments", "/api/v1/admin/setup-prompts", "/api/v1/worker/enroll", "/api/v1/admin/workers", "/api/v1/worker/status":
 		return path, ""
 	}
 	if strings.HasPrefix(path, "/api/v1/admin/workers/") {
@@ -53,7 +53,7 @@ func routeFor(path string) (string, string) {
 
 func routeMethod(route string) string {
 	switch route {
-	case mediaJobs, mediaTrials, mcpRoute, workerUpgradeRoute:
+	case mediaJobs, mediaTrials, mcpRoute:
 		return http.MethodPost
 	case workerMediaArtifact:
 		return http.MethodPut
@@ -63,7 +63,7 @@ func routeMethod(route string) string {
 		return http.MethodPost
 	case "/api/v1/admin/workers/{id}":
 		return http.MethodPatch
-	case "/api/v1/requests", "/api/v1/requests/{id}/cancel", "/api/v1/admin/experiments", "/api/v1/admin/experiments/{id}/cancel", "/api/v1/admin/experiments/{id}/tool-results", "/api/v1/worker/heartbeat", "/api/v1/worker/jobs/{id}/claim", "/api/v1/worker/jobs/{id}/decisions":
+	case "/api/v1/requests", "/api/v1/requests/{id}/cancel", "/api/v1/admin/experiments", "/api/v1/admin/experiments/{id}/cancel", "/api/v1/admin/experiments/{id}/tool-results", "/api/v1/worker/jobs/{id}/decisions", "/api/v1/worker/pull", "/api/v1/worker/jobs/{id}/start", "/api/v1/worker/jobs/{id}/interrupt":
 		return http.MethodPost
 	default:
 		return http.MethodGet
@@ -196,25 +196,6 @@ func (h *Handler) workerRequest(w *response, r *http.Request, logger *slog.Logge
 		w.workerID = id
 		logger.Info("worker.qualification_retired", "worker_id", id, "outcome", "rejected")
 		inferenceError(w, inference.Reject("qualification_retired", 410))
-		return
-	}
-	if route == workerUpgradeRoute {
-		var input service.UpgradeInput
-		err := decodeInferenceInput(body, &input, "protocol_version", "action", "operation_id", "generation")
-		if err != nil {
-			inferenceError(w, err)
-			return
-		}
-		if h.Broker == nil {
-			inferenceError(w, errors.New("broker_unavailable"))
-			return
-		}
-		data, err := h.Broker.UpgradeReservation(r.Context(), logger, identity.ID, input)
-		if err != nil {
-			inferenceError(w, err)
-			return
-		}
-		writeJSON(w, 200, data)
 		return
 	}
 	field := ""

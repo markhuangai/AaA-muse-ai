@@ -19,6 +19,36 @@ import (
 
 func hash(data []byte) string { v := sha256.Sum256(data); return hex.EncodeToString(v[:]) }
 
+func TestPrepareNamespaceRefusesOldFilesAndSharesFreshRoot(t *testing.T) {
+	old := t.TempDir()
+	artifact := filepath.Join(old, "legacy-artifact")
+	if err := os.WriteFile(artifact, []byte("legacy bytes"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := New(old).PrepareNamespace(); !errors.Is(err, ErrFreshNamespace) {
+		t.Fatalf("legacy volume was not refused: %v", err)
+	}
+	if data, err := os.ReadFile(artifact); err != nil || string(data) != "legacy bytes" {
+		t.Fatal("guard did not preserve legacy media")
+	}
+	fresh := t.TempDir()
+	ready := make(chan error, 2)
+	for range 2 {
+		go func() { ready <- New(fresh).PrepareNamespace() }()
+	}
+	for range 2 {
+		if err := <-ready; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(fresh, "new-artifact"), []byte("new bytes"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := New(fresh).PrepareNamespace(); err != nil {
+		t.Fatalf("a sibling could not reopen the initialized namespace: %v", err)
+	}
+}
+
 func TestOpenJobFiles(t *testing.T) {
 	root := t.TempDir()
 	store := New(root)

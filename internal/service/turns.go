@@ -11,9 +11,6 @@ import (
 )
 
 func (b *Broker) newJob(s *inference.State, e *inference.Experiment, probe *inference.Probe) (*inference.Job, error) {
-	if err := upgradeBlock(s, e.WorkerID); err != nil {
-		return nil, err
-	}
 	if err := inference.CheckContext(e.Messages, e.Tools); err != nil {
 		return nil, err
 	}
@@ -35,6 +32,9 @@ func (b *Broker) newJob(s *inference.State, e *inference.Experiment, probe *infe
 		}
 		if probe.Kind == "delta" {
 			base := s.Jobs[probe.BaseReceiptID]
+			if nativeClaim(base) {
+				return nil, inference.Reject("native_full_context_required", 409)
+			}
 			if base == nil || base.ExperimentID != e.ID || base.State != "accepted" || base.ConnectionID != s.Connection.ID || base.ConnectionGeneration != s.Connection.Generation || base.Context.HistoryCount > len(e.Messages) {
 				return nil, inference.Reject("invalid_context_base", 409)
 			}
@@ -73,9 +73,6 @@ func (b *Broker) Create(ctx context.Context, logger *slog.Logger, c inference.Cr
 		}
 		if s.Revoked {
 			return nil, inference.Reject("worker_revoked", 409)
-		}
-		if s.Connection.Status(s.Now) != "online" {
-			return nil, inference.Reject("worker_offline", 409)
 		}
 		id, err := auth.ID(b.random)
 		if err != nil {
@@ -239,8 +236,14 @@ func (b *Broker) Decide(ctx context.Context, logger *slog.Logger, workerID, id s
 		if j.Media != nil {
 			return nil, inference.Reject("media_upload_required", 409)
 		}
-		if err := assignmentConnection(s, j, d.ConnectionID, d.ConnectionGeneration, d.Generation); err != nil {
-			return nil, err
+		if nativeClaim(j) {
+			if j.StartedAt == nil || !s.Now.Before(j.DeadlineAt) {
+				return nil, inference.Reject("stale_assignment", 409)
+			}
+		} else {
+			if err := assignmentConnection(s, j, d.ConnectionID, d.ConnectionGeneration, d.Generation); err != nil {
+				return nil, err
+			}
 		}
 		if j.State != "claimed" || !j.Held || j.Generation != d.Generation || j.LeaseID != d.LeaseID || j.ConnectionID != d.ConnectionID || j.ConnectionGeneration != d.ConnectionGeneration || j.ConversationID != d.ConversationID || j.Context.ReceiptID != d.ContextReceiptID {
 			return nil, inference.Reject("stale_assignment", 409, "expected_generation", j.Generation, "observed_generation", d.Generation, "expected_state", j.State, "expected_connection_generation", s.Connection.Generation, "observed_connection_generation", d.ConnectionGeneration, "observed_context_receipt", d.ContextReceiptID, "expected_context_receipt", j.Context.ReceiptID)
@@ -268,8 +271,15 @@ func (b *Broker) Decide(ctx context.Context, logger *slog.Logger, workerID, id s
 		if err := b.acceptHistory(s, e, d.Decision); err != nil {
 			return nil, err
 		}
-		j.State, j.Held = "accepted", false
+		j.State, j.Held = "accepted", nativeClaim(j)
 		e.RemoteOutcome = "decision_observed"
+		if nativeClaim(j) {
+			accepted, err := json.Marshal(e)
+			if err != nil {
+				return nil, err
+			}
+			j.Outcome = &inference.WorkOutcome{JobID: j.ID, ClaimID: j.LeaseID, State: j.State, Accepted: accepted}
+		}
 		event(events, slog.LevelInfo, "decision.accepted", s, j, "decision_type", d.Decision.Type, "call_id", d.Decision.CallID, "experiment_state", e.State)
 		event(events, slog.LevelDebug, "inference.decision", s, j, "decision", d.Decision, "tools", e.Tools, "canonical_messages", e.Messages)
 		return e, nil

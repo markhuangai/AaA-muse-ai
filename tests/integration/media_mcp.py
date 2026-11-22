@@ -13,6 +13,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from inference import PullPeer
 from service import require
 
 
@@ -112,14 +113,12 @@ class MCPMedia:
         require(status == 403 and headers.get("X-Request-Id") is None and
                 {"event": "fixture.host_rejected", "route": "/mcp", "forwarded": False} in self.proxy.events,
                 "proxy failed to reject and record an unconfigured host")
-        old = self.peer(self.new_worker(), headers={"X-Muse-Media-Jobs": "1"})
-        try:
-            result = self.mcp_call("generate_wav", {"prompt": "controlled WAV", "submission_id": secrets.token_hex(16)})
-            require(result.get("error") == "no_ready_worker", "video-only worker received generated WAV")
-            event = self.mcp_rejection(result["_request_id"], "mcp.tool_rejected", "no_ready_worker", owner="fixture-client")
-            require(event["evidence"]["required_capability"] == "prompt_wav", "capability rejection lost its cause")
-        finally:
-            old.stop()
+        video_only = PullPeer(self, self.new_worker())
+        result = self.mcp_call("generate_wav", {"prompt": "controlled WAV", "submission_id": secrets.token_hex(16)})
+        require(result.get("status") == "queued" and video_only.poll(media_jobs=True) is None,
+                "media admission required presence or granted a WAV to a video-only worker")
+        self.checked("/api/v1/admin/experiments/" + result["job_id"] + "/cancel", self.admin, "POST",
+                     {"protocol_version": 1, "submission_id": secrets.token_hex(16)})
         self.add("mcp.discovery_authority_and_worker_capability")
 
     def mcp_generated_wav(self, worker):
@@ -137,9 +136,8 @@ class MCPMedia:
             self.mcp_rejection(changed["_request_id"], "mcp.tool_rejected", "submission_conflict", owner="fixture-client")
             pending = self.mcp_call("download_wav", {"job_id": identity})
             require(pending.get("retry_after_seconds") == 60 and "download_url" not in pending, "pending audio produced a URL")
-            self.until(lambda: (worker["state"] / "cues" / (identity + ".json")).exists(), "WAV assignment missing", timeout=30)
-            self.hook(worker)
-            shown = json.loads(self.cli(worker, "job-show", "--job-id", identity).stdout)
+            self.claim_work(worker, identity)
+            shown = self.start_work(worker)
             spool, progress = self.worker_media_directory(worker, identity, shown)
             output = spool / Path(shown["output_path"]).name
             require(shown["action"] == "generate_wav_from_prompt" and shown["prompt"] == fields["prompt"]
@@ -149,7 +147,7 @@ class MCPMedia:
             expected = self.render("wav", "-f", "lavfi", "-i", f"sine=frequency={frequency}:duration=0.25", "-c:a", "pcm_s16le")
             output.write_bytes(expected)
             self.cli(worker, "media-finish", "--job-id", identity)
-            self.until(lambda: not progress.exists(), "WAV upload acknowledgement did not reach the installed worker", timeout=35)
+            require(self.observe(worker, "completed")["outcome"] == "settled" and not progress.exists(), "WAV acknowledgement did not settle the native claim")
             path = self.ready_link(identity, "wav", expected)
             view = self.checked("/api/v1/media/jobs/" + identity, self.client)[0]
             digest = hashlib.sha256(expected).hexdigest()
@@ -165,11 +163,10 @@ class MCPMedia:
 
     def reject_malformed_wav(self, worker, identity):
         route = "/api/v1/worker/jobs/" + identity
-        assigned = self.checked(route, worker["credential"])[0]
+        assigned = worker["work"]["grant"]
+        require(assigned["job_id"] == identity, "malformed upload fixture lost its native claim")
         bad = b"controlled bytes without a WAV container"
-        headers = {"X-Muse-Connection-Id": assigned["connection_id"],
-                   "X-Muse-Connection-Generation": str(assigned["connection_generation"]),
-                   "X-Muse-Generation": str(assigned["generation"]), "X-Muse-Lease-Id": assigned["lease_id"],
+        headers = {"X-Muse-Generation": str(assigned["generation"]), "X-Muse-Lease-Id": assigned["claim_id"],
                    "X-Muse-Artifact-Sha256": hashlib.sha256(bad).hexdigest(), "Content-Type": "audio/wav"}
         status, reply, _ = self.proxy_exchange_bytes(route + "/artifact", worker["credential"], bad, headers)
         require(status == 422, "non-WAV bytes published as WAV")
@@ -222,17 +219,21 @@ class MCPMedia:
         started = time.monotonic()
         with ThreadPoolExecutor(max_workers=1) as client:
             pending = client.submit(self.mcp_call, "ask_muse", fields, offline=bool(secret_path))
-            snapshot = worker["state"] / "pending.json"
+            grants = []
 
-            def claimed():
-                if snapshot.exists():
-                    return next((job["job_id"] for job in json.loads(snapshot.read_text())["jobs"] if job["state"] == "pending"), None)
-                return None
+            def pulled():
+                grant = self.tick(worker)
+                if grant["outcome"] == "prepare":
+                    grants.append(grant)
+                    return True
+                require(grant["outcome"] == "idle", "MCP controlled checker was not available")
+                return False
 
-            self.until(claimed, "MCP text work did not reach the packed worker", timeout=15)
-            identity = claimed()
-            self.hook(worker)
-            view = json.loads(self.cli(worker, "job-show", "--job-id", identity).stdout)
+            self.until(pulled, "MCP text work did not reach the packed worker", timeout=15)
+            grant, = grants
+            identity = grant["job_id"]
+            self.work_definition(worker, grant)
+            view = self.start_work(worker)
             request_id = view["operation_id"]
             require(view["context"]["messages"] == [{"type": "message", "role": "user", "text": fields["prompt"]}]
                     and view["context"]["tools"] == [], "MCP text changed the prompt or enabled host tools")
@@ -240,6 +241,7 @@ class MCPMedia:
                 time.sleep(max(0, 32 - (time.monotonic() - started)))
             self.cli(worker, "decision-submit", "--job-id", identity, "--input", "-",
                      input_text=json.dumps({"type": "final", "text": final_text}))
+            require(self.observe(worker, "completed")["outcome"] == "settled", "MCP text worker did not settle its native claim")
             first = pending.result()
         if secret_path:
             require(self.proxy.mcp_reply_lost.is_set(), "five-minute MCP route failed before the ordinary write timeout")

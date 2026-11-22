@@ -49,15 +49,47 @@ class Responses(Chat):
     def text(self, result):
         return self.value(result)["output"][0]["content"][0]["text"]
 
+    def queue_expiry_without_polls(self):
+        body = {"protocol_version": 1, "submission_id": "queue-expiry-without-polls", "timeout_seconds": 2,
+                "messages": [{"type": "message", "role": "user", "text": "Unclaimed controlled request"}], "tools": []}
+        admitted, _ = self.native("POST", "/api/v1/requests", body, want=202)
+        require(admitted["state"] == "queued", "admission required an available worker")
+
+        def swept():
+            events, _ = self.collect_chat_logs("operation_id", admitted["id"])
+            return any(event["msg"] == "job.deadline_exceeded" and event["operation"] == "sweep" and
+                       not event["busy_hold"] for event in events)
+
+        self.until(swept, "background sweep did not expire unclaimed work without worker contact", timeout=8)
+        terminal, _ = self.native("GET", "/api/v1/requests/" + admitted["id"], origin=self.origins[1])
+        require(terminal["state"] == "interrupted" and terminal["reason"] == "deadline_exceeded",
+                "unclaimed work had the wrong terminal outcome")
+        assignment = self.detail_id(admitted["id"])["assignment"]
+        require(not assignment["held"] and assignment["claimed_at"] is None, "unobserved work acquired a claim")
+        self.receipt("responses.queue_expiry_without_polls", brokers=2, eligible_workers=0,
+                     request_deadline_seconds=2, cause=terminal["reason"])
+
     def sqlite_concurrency(self, secondary):
-        for bot in self.bots:
-            with bot.peer.condition:
-                bot.peer.condition.wait_for(lambda: bot.peer.replies or bot.peer.errors, timeout=15)
-                require(bot.peer.replies and bot.peer.replies[0]["status"] == 200 and not bot.peer.errors,
-                        "controlled worker did not receive its initial heartbeat response")
+        for index in range(24):
+            marker = f"sqlite-history-prefill-{index}"
+            value, _ = self.answer(self.chat(self.chat_body("aaa-chat:text:" + marker), marker, origin=self.origins[index % 2]))
+            require(value == marker, "history prefill did not complete through a real worker claim")
+        history_watermark = int(self.sql("SELECT count(*) FROM aaa_model_requests;").strip())
+        require(history_watermark >= 24, "poll sampling started before history was populated")
+        since = datetime.now(timezone.utc)
+        watermark = time.monotonic()
+
+        def idle_after_watermark():
+            seen = set()
+            for bot in self.bots:
+                with bot.condition:
+                    require(not bot.errors and bot.thread.is_alive(), "a controlled worker failed during history prefill")
+                    seen.update(pull["origin"] for pull in bot.pulls if pull["started"] >= watermark and not pull["claimed"])
+            return seen == set(self.origins)
+
+        self.until(idle_after_watermark, "both brokers must serve empty pulls on populated history before the mixed workload")
         before = time.monotonic()
         expires = before + 180
-        since = datetime.now(timezone.utc)
         gate = threading.Barrier(11, timeout=10)
         stop = threading.Event()
 
@@ -104,23 +136,49 @@ class Responses(Chat):
         require(finished < expires and finished - before >= 60 and len(calls) == 30 and reads > 0,
                 "mixed workload did not complete with sustained overlapping storage traffic")
 
-        heartbeat_gaps = []
+        poll_samples = []
         for bot in self.bots:
-            with bot.peer.condition:
-                prior = [reply["at"] for reply in bot.peer.replies if reply["at"] < before and reply["status"] == 200]
-                active = [reply for reply in bot.peer.replies if before <= reply["at"] <= finished]
-                require(prior and active and all(reply["status"] == 200 for reply in active)
-                        and not bot.peer.errors and bot.peer.thread.is_alive(), "a controlled worker missed its real health checks")
-                marks = [prior[-1], *(reply["at"] for reply in active), finished]
-                heartbeat_gaps.extend(right - left for left, right in zip(marks, marks[1:]))
-        require(max(heartbeat_gaps) < 30, "worker crossed its 30-second health window")
+            with bot.condition:
+                active = [pull for pull in bot.pulls if watermark <= pull["started"] and pull["at"] <= finished]
+                require(any(pull["claimed"] for pull in active) and not bot.errors and bot.thread.is_alive(),
+                        "a controlled worker did not claim real work")
+                poll_samples.extend(active)
+        idle_pulls = [pull["duration_ms"] for pull in poll_samples if not pull["claimed"]]
+        claimed_pulls = [pull["duration_ms"] for pull in poll_samples if pull["claimed"]]
+        require(idle_pulls and len(claimed_pulls) == 30, "incomplete idle and claimed pull measurements")
+        require(self.sql("SELECT count(*) FROM aaa_worker_polls;").strip() == "2", "latest poll receipts grew with the number of pulls")
 
         events = [json.loads(line) for container in (self.main_service, secondary)
                   for line in self.logs(container).splitlines() if line.startswith("{")]
         window = [event for event in events if since <= datetime.fromisoformat(event["time"]) <= until]
         errors = [event for event in window if (event["msg"] == "request.completed" and event["status"] >= 400)
-                  or event.get("cause") == "database_busy" or event["msg"] == "worker.stream_closed"]
-        require(not errors, "normal concurrent traffic logged a lock failure, HTTP error or closed worker stream")
+                  or event.get("cause") == "database_busy" or event["msg"] == "worker.pull_failed"]
+        require(not errors, "normal concurrent traffic logged a lock failure or HTTP error")
+        pulls_by_id = {item["request_id"]: item for item in poll_samples}
+        require(len(pulls_by_id) == len(poll_samples), "pull requests lacked distinct correlation IDs")
+        timings = {}
+        query = urllib.parse.urlencode({"since": since.isoformat(), "until": until.isoformat()})
+        for index, origin in enumerate(self.origins):
+            status, _, raw = self.api("/api/v1/admin/diagnostics/export?" + query, self.admin, origin=origin)
+            require(status == 200, "concurrent pull timing export unavailable")
+            metadata, captured = self.decode_export(raw)
+            require(metadata["complete"], "concurrent pull timing capture was incomplete")
+            self.assert_private(raw.decode())
+            self.private(f"sqlite-concurrency-{index}.ndjson", raw.decode())
+            kinds = set()
+            for event in captured:
+                identity = event.get("request_id")
+                if event["msg"] != "worker.pull_timing" or identity not in pulls_by_id:
+                    continue
+                sample = pulls_by_id[identity]
+                require(identity not in timings and sample["origin"] == origin and event["sequence"] == sample["sequence"] and
+                        event["replayed"] is False and event["queue_lookup_us"] >= 0 and event["transaction_acquire_us"] >= 0,
+                        "sampled poll did not match one fresh indexed transaction on its serving broker")
+                kinds.add(sample["claimed"])
+                timings[identity] = event
+            require(kinds == {False, True}, "a broker lacks correlated empty and claimed pulls on populated history")
+        require(timings.keys() == pulls_by_id.keys() and len({event["instance_id"] for event in timings.values()}) == 2,
+                "poll timings do not correlate with both broker instances")
         admissions = [event for event in events if event["msg"] == "history.reconciled"
                       and event.get("request_id") in calls and event.get("operation") == "request_create"]
         request_ids = {event["request_record_id"] for event in admissions}
@@ -139,13 +197,16 @@ class Responses(Chat):
         def observations(name):
             return [event for event in events if event["msg"] == name and event.get("operation_id") in request_ids]
 
-        claims, decisions, queue = (observations(name) for name in ("job.claimed", "decision.accepted", "dispatch.assigned"))
+        claims, decisions, queue = (observations(name) for name in ("job.claimed", "decision.accepted", "dispatch.queued"))
         require(all(len(items) == 30 and {event["operation_id"] for event in items} == request_ids for items in (claims, decisions, queue))
                 and len({event["worker_id"] for event in claims}) == 2 and {event["job_id"] for event in claims} == {event["job_id"] for event in decisions},
                 "claims, decisions or queue assignments were duplicated, missing, or limited to one worker")
+        require({event["request_id"] for event in claims} == {sample["request_id"] for sample in poll_samples if sample["claimed"]},
+                "measured grants did not match the 30 workload claims")
         by_request = {event["operation_id"]: event for event in claims}
         windows = {}
         for identity in request_ids:
+            self.until(lambda: not self.detail_id(identity)["assignment"]["held"], "worker did not settle accepted work")
             detail = self.detail_id(identity)
             job, request = detail["assignment"], detail["request"]
             require(job["id"] == by_request[identity]["job_id"] and not job["held"] and request["state"] == "completed",
@@ -162,11 +223,13 @@ class Responses(Chat):
 
         self.receipt("responses.sqlite_concurrent_read_write", brokers=2, online_workers=2, overlapping_requests=peak,
                      completed=len(calls), samples_per_timing=len(calls), successful_history_reads=reads,
-                     max_heartbeat_gap_ms=round(1000 * max(heartbeat_gaps)), duration_ms=round(1000 * (finished - before)),
+                     duration_ms=round(1000 * (finished - before)),
                      completed_per_second=round(len(calls) / (finished - before), 3),
                      admission_p95_ms=p95([item["duration_ms"] for item in admissions]),
-                     claim_p95_ms=p95([item["duration_ms"] for item in claims]),
-                     queue_p95_ms=p95([item["queue_wait_ms"] for item in queue]), client_p95_ms=p95(list(calls.values())),
+                     populated_history_watermark=history_watermark, idle_pull_samples=len(idle_pulls), claimed_pull_samples=len(claimed_pulls),
+                     idle_pull_p95_ms=p95(idle_pulls), claimed_pull_p95_ms=p95(claimed_pulls),
+                     transaction_acquire_p95_us=p95([item["transaction_acquire_us"] for item in timings.values()]),
+                     indexed_lookup_p95_us=p95([item["queue_lookup_us"] for item in timings.values()]), client_p95_ms=p95(list(calls.values())),
                      sqlite_busy_errors=0, host_platform=platform.system(), host_arch=platform.machine(),
                      docker_version=self.docker("version", "--format", "{{.Server.Version}}").stdout.strip())
 
@@ -257,7 +320,9 @@ class Responses(Chat):
                 uncertain = next(e for e in selected if e["msg"] == "recovery.uncertain" and e.get("busy_hold") and e.get("last_boundary") == "claimed_inference")
                 claimed = next(e for e in selected if e["msg"] == "job.claimed" and e["job_id"] == uncertain["job_id"])
                 causal = next(e for e in selected if e["msg"] in ("job.interrupted", "job.deadline_exceeded", "experiment.cancelled") and e["job_id"] == uncertain["job_id"] and e.get("busy_hold"))
-                require(uncertain["automatic_replay"] is False and uncertain["remote_outcome"] == "unknown" and claimed["generation"] == uncertain["generation"] > 0 and claimed["connection_generation"] == uncertain["connection_generation"] > 0, "uncertain assignment generation or no-retry proof missing")
+                require(uncertain["automatic_replay"] is False and uncertain["remote_outcome"] == "unknown" and
+                        claimed["generation"] == uncertain["generation"] > 0 and claimed["claim_id"] == uncertain["claim_id"],
+                        "uncertain native claim identity or no-retry proof missing")
                 require(causal["reason"] == ("operator_cancelled" if reason == "request_context_cancelled" else reason), "terminal cause differs from assignment cause")
                 action = uncertain["corrective_action"]
                 require(action, "uncertain operation lacks logged corrective action")
@@ -379,9 +444,11 @@ class Responses(Chat):
         require(conflict[0] == 409, "conflicting accepted result admitted")
         self.diagnose_response(conflict[1]["X-Request-Id"], "responses.item_conflict", "history_prefix_conflict")
         for candidate in self.bots:
-            require(candidate.peer.thread.is_alive() and not candidate.peer.errors, "replacement requires healthy fixture peers: " + json.dumps(candidate.peer.errors))
+            require(candidate.thread.is_alive() and not candidate.errors, "replacement requires healthy fixture peers")
         bot.stop()
-        bot.peer.stop()
+        worker_id = bot.worker["worker"]["id"]
+        elapsed = int((datetime.now(timezone.utc) - timedelta(minutes=10, seconds=1)).timestamp() * 1_000_000)
+        self.sql(f"UPDATE aaa_workers SET last_contact_at={elapsed} WHERE id='{worker_id}';")
         replacement = self.response(self.body("aaa-chat:echo:replacement-complete", previous_response_id=completed["id"]))
         require(self.text(replacement) == "replacement-complete", "eligible replacement failed")
         replacement_bot, job = self.job_for("aaa-chat:echo:replacement-complete")
@@ -393,10 +460,10 @@ class Responses(Chat):
         for operation in operations:
             more, _ = self.collect_chat_logs("operation_id", operation)
             events.extend(more)
-        require(any(e["msg"] == "dispatch.reassigned" for e in events) and any(e["msg"] == "inference.context" and e["context"]["messages"] == messages for e in events), "replacement cannot be reconstructed from logs")
-        reassigned = next(e for e in events if e["msg"] == "dispatch.reassigned")
-        require(reassigned["expected_worker_id"] != reassigned["observed_worker_id"] and reassigned["reason"] == "offline_before_claim_and_context", "replacement cause missing")
-        self.receipt("responses.log_only_diagnosis", request_id=replacement[1]["X-Request-Id"], event="dispatch.reassigned", cause=reassigned["reason"], corrective_action="continue the logged full-history replacement without executing accepted tools again")
+        require(any(e["msg"] == "dispatch.pin_released" for e in events) and any(e["msg"] == "inference.context" and e["context"]["messages"] == messages for e in events), "replacement cannot be reconstructed from logs")
+        reassigned = next(e for e in events if e["msg"] == "dispatch.pin_released")
+        require(reassigned["previous_worker_id"] == worker_id and reassigned["prior_job_id"] != job["id"] and reassigned["reason"] == "offline_before_claim_and_context", "replacement cause missing")
+        self.receipt("responses.log_only_diagnosis", request_id=replacement[1]["X-Request-Id"], event="dispatch.pin_released", cause=reassigned["reason"], corrective_action="continue the logged full-history replacement without executing accepted tools again")
         self.receipt("responses.safe_replacement_full_history", client_tool_executions=1, accepted_call_id=call["call_id"], full_context_items=len(messages))
 
     def deadline_abort_and_storage(self):
@@ -410,7 +477,7 @@ class Responses(Chat):
         require(self.value(result, failed=True)["error"]["code"] == "deadline_exceeded", "admitted deadline lacked failure lifecycle")
         self.diagnose_response(result[1]["X-Request-Id"], "responses.stream_terminated", "deadline_exceeded")
         require(self.detail_id(job["experiment_id"])["assignment"]["held"], "deadline freed uncertain remote inference")
-        bot.peer.acknowledge_idle(job)
+        bot.settle(job)
         self.until(lambda: self.status(bot.worker)["work_status"] == "idle", "deadline hold was not acknowledged")
         target = urllib.parse.urlsplit(self.origin_url)
         connection = socket.create_connection((target.hostname, target.port), timeout=10)
@@ -428,7 +495,7 @@ class Responses(Chat):
         self.until(aborted, "Responses client-abort evidence missing")
         require(terminal[0]["level"] == "INFO" and self.detail_id(job["experiment_id"])["assignment"]["held"], "abort lost severity or uncertainty")
         self.diagnose_response(terminal[0]["request_id"], "responses.stream_terminated", "request_context_cancelled")
-        bot.peer.acknowledge_idle(job)
+        bot.settle(job)
         self.until(lambda: self.status(bot.worker)["work_status"] == "idle", "abort hold was not acknowledged")
         marker = "aaa-chat:hold:responses-storage"
         body = self.body(marker, True)
@@ -436,7 +503,7 @@ class Responses(Chat):
             pending = pool.submit(self.response, body, "responses-storage")
             bot, job = self.job_for(marker)
             self.reject_writes("responses_output_fixture", "aaa_model_requests", "NEW.id='" + job["experiment_id"] + "' AND json_extract(CAST(NEW.data AS TEXT),'$.output_started_at') IS NOT NULL")
-            self.decision(bot.worker, bot.peer, job, {"type": "final", "text": "retained-storage-answer"})
+            bot.submit(job, {"type": "final", "text": "retained-storage-answer"})
             result = pending.result(timeout=12)
         require(result[0] == 503 and not result[1]["Content-Type"].startswith("text/event-stream"), "failed exposure boundary emitted lifecycle")
         self.diagnose_response(result[1]["X-Request-Id"], "responses.stream_terminated", "output_boundary_failed")
@@ -470,7 +537,7 @@ class Responses(Chat):
         reader = threading.Thread(target=interrupt, daemon=True)
         reader.start()
         output = "x" * (768 * 1024)
-        self.decision(bot.worker, bot.peer, job, {"type": "final", "text": output})
+        bot.submit(job, {"type": "final", "text": output})
         reader.join(timeout=20)
         require(not reader.is_alive() and received and not failures and b"event: response.completed" not in received[0], "partial Responses delivery fixture failed")
         terminal = []
@@ -490,13 +557,12 @@ class Responses(Chat):
         for bot in self.bots:
             if bot.thread.is_alive():
                 bot.stop()
-            if bot.peer.thread.is_alive():
-                bot.peer.stop()
         self.docker("restart", self.main_service)
         self.origin_url = self.origin(self.main_service)
         self.origins[0] = self.origin_url
         self.ready(self.main_service, self.origin_url)
-        self.new_bot()
+        for bot in self.bots:
+            bot.start()
         next_result = self.response(self.body("aaa-chat:echo:after-restart", instructions="after-restart-only", previous_response_id=self.last["id"]))
         require(self.text(next_result) == "after-restart", "restart lost owned response reference")
         bot, job = self.job_for("aaa-chat:echo:after-restart")
@@ -506,11 +572,11 @@ class Responses(Chat):
             pending = pool.submit(self.response, self.body(marker, True), "responses-worker-loss")
             bot, job = self.job_for(marker)
             bot.stop()
-            bot.peer.stop()
+            self.expire_job(job, (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat())
             result = pending.result(timeout=12)
         failed = self.value(result, failed=True)
-        require(failed["error"]["code"] == "worker_disconnected" and self.detail_id(job["experiment_id"])["assignment"]["held"], "worker loss hid uncertainty")
-        self.diagnose_response(result[1]["X-Request-Id"], "responses.stream_terminated", "worker_disconnected")
+        require(failed["error"]["code"] == "deadline_exceeded" and self.detail_id(job["experiment_id"])["assignment"]["held"], "worker loss hid uncertainty")
+        self.diagnose_response(result[1]["X-Request-Id"], "responses.stream_terminated", "deadline_exceeded")
         require(sum(j["experiment_id"] == job["experiment_id"] for b in self.bots for j in b.jobs) == 1, "claimed worker loss retried inference")
         self.receipt("responses.restart_and_claimed_failure", durable_reference=True, uncertain_hold=True, no_automatic_retry=True)
 
@@ -545,6 +611,7 @@ def main():
         secondary, other_origin, _ = h.launch(h.configuration())
         h.ready(secondary, other_origin)
         h.origins = [h.origin_url, other_origin]
+        h.queue_expiry_without_polls()
         for _ in range(2):
             h.new_bot()
         h.sqlite_concurrency(secondary)

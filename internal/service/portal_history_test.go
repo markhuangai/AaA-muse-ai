@@ -21,7 +21,7 @@ func TestPortalCancelUnassignedAndClaimedPreservesSiblingAndUncertainty(t *testi
 	input := inference.Cancel{Version: 1, SubmissionID: "portal-cancel-queued"}
 	data, err := b.Cancel(context.Background(), logger, queued.ID, input)
 	cancelled := decodeResult[inference.Experiment](t, data, err)
-	if cancelled.State != "cancelled" || cancelled.RemoteOutcome != "not_started" || m.states[""].Requests[queued.ID].State != "cancelled" || !m.states[first.WorkerID].Jobs[job.ID].Held {
+	if cancelled.State != "cancelled" || cancelled.RemoteOutcome != "not_started" || m.states[""].Requests[queued.ID].State != "cancelled" || !m.states[job.WorkerID].Jobs[job.ID].Held {
 		t.Fatal("queued cancellation lost state or disturbed the held sibling")
 	}
 	again, err := b.Cancel(context.Background(), logger, queued.ID, input)
@@ -30,16 +30,14 @@ func TestPortalCancelUnassignedAndClaimedPreservesSiblingAndUncertainty(t *testi
 	}
 	data, err = b.Cancel(context.Background(), logger, first.ID, inference.Cancel{Version: 1, SubmissionID: "portal-cancel-held"})
 	cancelled = decodeResult[inference.Experiment](t, data, err)
-	if cancelled.RemoteOutcome != "unknown" || !m.states[first.WorkerID].Jobs[job.ID].Held {
+	if cancelled.RemoteOutcome != "unknown" || !m.states[job.WorkerID].Jobs[job.ID].Held {
 		t.Fatal("claimed cancellation invented remote stopping")
 	}
-	_, err = b.Decide(context.Background(), logger, first.WorkerID, job.ID, submission(job, connection, "late-decision", inference.Item{Type: "final", Text: "late"}))
+	_, err = b.Decide(context.Background(), logger, job.WorkerID, job.ID, submission(job, inference.Connection{}, "late-decision", inference.Item{Type: "final", Text: "late"}))
 	requireInferenceReason(t, err, "stale_assignment")
-	ack := &inference.Assignment{JobID: job.ID, Generation: job.Generation, LeaseID: job.LeaseID}
 	m.now = m.now.Add(11 * time.Second)
-	heartbeatInference(t, b, logger, connection, first.WorkerID, ack)
-	if m.states[first.WorkerID].Jobs[job.ID].Held || m.states[first.WorkerID].Experiments[first.ID].RemoteOutcome != "unknown" {
-		t.Fatal("idle acknowledgement changed uncertainty or failed to release capacity")
+	if receipt := settleFixtureJob(t, b, job); receipt.State != "cancelled" || m.states[job.WorkerID].Jobs[job.ID].Held {
+		t.Fatal("confirmed stop did not release the cancelled native claim")
 	}
 	if !strings.Contains(logs.String(), "portal.cancel_result") || !strings.Contains(logs.String(), `"busy_hold":true`) || !strings.Contains(logs.String(), `"observed_state":"cancelled"`) {
 		t.Fatal("cancellation lacks actual state and busy-hold evidence")

@@ -285,6 +285,7 @@ func TestIssuedCredentialWriteFailureIsDiagnosable(t *testing.T) {
 	code := issueHTTP(t, h)
 	body, _ := json.Marshal(map[string]string{"enrollment_code": code})
 	r := httptest.NewRequest("POST", "/api/v1/worker/enroll", bytes.NewReader(body))
+	r.Header.Set(service.WorkerVersionHeader, service.DevelopmentVersion)
 	writer := &failWriter{header: http.Header{}, after: 0}
 	h.ServeHTTP(writer, r)
 	if len(repo.records) != 1 {

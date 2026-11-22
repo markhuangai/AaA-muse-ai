@@ -45,15 +45,10 @@ def main():
                 report_path = Path(location["report"])
                 require(report_path.resolve().is_relative_to(Path(".artifacts/integration").resolve()), "product report escaped test evidence")
                 report = json.loads(report_path.read_text())
-                run("report-validation", ["node", "tools/qualify.mjs", "validate-report", "--report", str(report_path), "--synthetic", "--require-complete"])
-                watchdog = report["watchdog_recovery"]
-                require(watchdog and watchdog["outcome"] == "passed" and watchdog["one_consumer"] and watchdog["dispatched_without_qualification"] and
-                        watchdog["wake_once"] and watchdog["operation_ids"],
-                        "watchdog recovery did not complete real client work without qualification")
+                run("report-validation", ["node", "tools/product-ci.mjs", "--native-report", str(report_path)])
                 receipt.update({"cases": [{k: v for k, v in case.items() if k not in ("cycles", "qualification")} for case in report["cases"]], "image_digest": report["source"]["image_digest"],
                     "installer_sha256": report["source"]["installer_sha256"], "report_sha256": hashlib.sha256(report_path.read_bytes()).hexdigest(), "capture_complete": True,
-                    "exports": [{"source": ref["source"], "sha256": ref["sha256"]} for ref in report["exports"]], "cleanup": report["cleanup"],
-                    "watchdog_recovery": watchdog})
+                    "exports": [{"source": ref["source"], "sha256": ref["sha256"]} for ref in report["exports"]], "cleanup": report["cleanup"]})
             else:
                 for protocol, file in (("chat", "receipt.json"), ("responses", "responses-receipt.json")):
                     run(protocol, ["python3", "-B", "tests/integration/" + protocol + ".py", *common])

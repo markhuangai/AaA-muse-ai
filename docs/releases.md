@@ -5,14 +5,13 @@ accepts every worker in its product major. Minor and patch releases keep that
 worker contract in both version orders. Product versions and
 `protocol_version: 1` identify separate contracts.
 
-New workers advertise `X-Muse-Worker-Version` on HTTP and SSE requests. Services
-return `X-Muse-Service-Version`. Incompatible enrollment, subscriptions and
-claims return HTTP 426 `update_required` before granting new authority. Malformed
+Workers advertise `X-Muse-Worker-Version` on HTTPS requests. Services
+return `X-Muse-Service-Version`. Incompatible enrollment, pulls and
+starts return HTTP 426 `update_required` before granting new authority. Malformed
 or duplicate version headers return 400. Only major-zero services accept an
 absent legacy header. Legacy status never proves an exact installed version.
 New nonzero workers preflight a legacy server before sending an enrollment code.
-Status, old job reads, heartbeats and decision receipts retain their original
-ownership, lease and fencing rules; compatibility is not authentication.
+Major 1 uses native cron and a fresh store; do not reuse a major-0 worker or its configuration. Compatibility is not authentication.
 
 At INFO, `worker.compatibility_accepted` records the boundary and legacy status;
 WARN `worker.update_required` records service/worker versions, recommended
@@ -26,8 +25,8 @@ into the diagnostic request or report. Missing captures remain incomplete.
 
 Successful CI for an eligible merge to main triggers the paired publisher. It
 increments the active patch series' RC number using the reserved Git tags and
-reuses the same version for a retry of the same source. The initial series is
-`0.1.0-rc.N`. A completed stable promotion starts the next patch series at
+reuses the same version for a retry of the same source. While stable is major 0,
+new paired prereleases use `1.0.0-rc.N`. A completed major-1 stable promotion starts the next patch series at
 `rc.0`. The publisher packs and verifies the worker, embeds that archive's digest and
 the shared version in the service image, smoke-tests the image, and checks the
 same worker bytes on the minimum Node runtime. Service-only releases still
@@ -58,11 +57,11 @@ the owner's authorization and the repository's human merge gate.
 
 An administrator dispatches **Publish stable release** from `main`. Enter the exact
 latest complete paired RC tag and the stable product version. For example, when
-`v0.1.0-rc.16` is the latest complete RC:
+`v1.0.0-rc.0` is the latest complete RC:
 
 ```sh
 gh workflow run release.yml --repo markhuangai/AaA-muse-ai --ref main \
-  -f prerelease_tag=v0.1.0-rc.16 -f stable_version=0.1.1
+  -f prerelease_tag=v1.0.0-rc.0 -f stable_version=1.0.0
 ```
 
 The dispatch authorizes stable publication. The job verifies the named RC,
@@ -71,10 +70,11 @@ artifact. If a newer complete RC appears before the first stable write, review
 that RC and dispatch again with its tag. A conflicting marker or artifact blocks
 the run.
 
-A stable version can advance one patch, minor, or major, with lower components
-reset. The initial release baseline is `0.1.0`. The historical `v0.1.0` candidate
-already reserves that npm version. The first available targets are `0.1.1`,
-`0.2.0`, and `1.0.0`. Version conflicts require an eligible unused version.
+The native-cron source is for major 1. A selected major-1 RC cannot build or
+promote a new major-0 version. The initial target for this cutover is `1.0.0`.
+The historical `v0.1.0` candidate still reserves its npm version. Version
+conflicts require an eligible unused version; never republish historical bytes
+under an existing tag.
 After a complete `1.0.0` publication, the next eligible merge starts the
 `1.0.1-rc.0` series. A major release requires a manual worker upgrade.
 
@@ -115,8 +115,10 @@ destinations or missing original bytes stop recovery. Once the versioned stable
 image matches the saved intent, that promotion can finish even if a newer RC
 has shipped. A saved intent by itself still requires the latest RC check.
 Another started and incomplete stable promotion blocks a new one.
-A historical dispatch verifies the exact release and leaves the active
-`latest` tags in place.
+A major-zero RC cannot start a new build or stable promotion. With its exact
+original run and artifact ID, recovery can finish a frozen candidate's
+version-scoped destinations without moving shared release aliases. An already
+started stable promotion uses its original verified intent as before.
 
 Collect the exact job log with `gh run view RUN_ID --job JOB_ID --log` and filter
 `product.release.*` or `worker.release.*` events by `operation_id`. INFO records
@@ -148,33 +150,26 @@ candidate source, version, image, installed workers and installer. Keep the
 report and exports private. Historical promotion receipts retain their original
 qualification evidence.
 
-## Manual worker upgrade
+## Major-1 clean cutover
 
 An incompatible worker never downloads or installs replacement code. Use the
-service's paired release receipt to obtain the exact version and trusted archive
-digest. Align product majors by upgrading the service or installing its paired
-worker; installing an arbitrary globally latest worker can remain incompatible.
+service's paired release receipt for the exact version and trusted archive
+digest. Major 1 does not reuse major-0 configuration, keys, worker enrollment,
+job history or download references. Start with fresh configuration, storage and
+media mounts. Keep the original installation and its data intact unless the
+owner separately authorizes retirement.
 
-Use the verified enrolled-upgrade helper below to inspect work and retained
-journals and reserve the worker's slot before suspending its hook and watchdog.
-The helper preserves the worker credential and accepted receipts. It verifies
-the subscriber before stopping it and runs the installer with the saved state
-and identity.
+Before retiring an old installation, identify its exact broker configuration,
+storage mounts, worker state directories and goal-owned registrations. Reconcile
+outstanding work against the old broker and verify that no producer is still
+active before stopping its runtime. Ambiguous work remains held. Do not disable
+registrations belonging to other goals or remove shared storage. If major 1
+refuses an existing mount, correct that installation's mount mapping; do not
+erase data to clear the refusal.
 
-Verify the installed CLI version, archive provenance and protected modes.
-Restore and read back the same hook and watchdog. With owner approval, update
-the identified legacy job in place to use the new receipt's `watchdog-check`
-command and exact hook ID and path. Verify one subscriber and its current
-authenticated heartbeat. The worker resumes dispatch after its authenticated heartbeat and the release of its upgrade reservation.
-
-### Existing worker upgrade prompt
-
-Send this message once to each existing installation after all broker processes sharing its SQLite store run the fixed paired release. The archive pin comes from the enrolled worker's authenticated status. Download the advertised HTTPS archive into a private temporary directory. After checking its SHA-256, extract only the helper with `tar -xOzf "$archive" package/setup/upgrade-enrolled.sh > upgrade-enrolled.sh` in that directory. Keep the archive available for all three helper commands.
-
-> Upgrade this existing AaA Muse worker in place. Use its saved installation and launcher. Run authenticated `status` privately and read the version, URL and SHA-256 from `worker.worker_package`. Verify the archive against that pin before executing any of its contents. If `package/setup/upgrade-enrolled.sh` is absent, report that the fixed paired release is still needed and leave the installation running.
->
-> Inventory this installation’s native hook and watchdog, including disabled entries. Verify ownership and required permissions before interruption. Run the verified helper as `bash upgrade-enrolled.sh prepare ARCHIVE STATE_DIR`, using the actual archive and existing state paths. If already current and healthy, verify registrations and finish without restarting. If busy, wait and retry. Stop on conflicting registrations or unsafe state.
->
-> Once the helper confirms the reservation, save and suspend only the identified registrations. Run `apply` with the same archive and state directory. Let the helper stop the verified subscriber and handle any evidenced outage latch. Restore and read back the same registrations. Update an identified legacy watchdog in place. For an older hook-only installation, register exactly one missing five-minute watchdog from the verified receipt, with its 300-second timeout. On an aborted attempt, run `cancel` and restore the saved registrations where safe. Report the installed version and the fresh heartbeat generation for one subscriber, or the specific blocker. Keep credentials, job contents and raw logs private.
-
-The reservation is renewable and expires after 120 seconds without renewal. A fenced attempt leaves the process alone. Re-run prepare after restoring the original registrations. Cancel releases only the installation's own attempt. The verified helper can archive a legacy malformed status 404 latch when the protected diagnostics prove its origin. An ambiguous or genuine terminal stop requires inspection of the retained evidence.
+Use a fresh enrollment prompt from the major-1 portal. Verify the archive,
+private state modes and exactly one enabled goal-owned native agent cron at
+`every: "1m"`. Read back its job ID and action, then check the authenticated
+first poll. A green native run is not a job receipt. Use the claim-bound native
+work run and the broker's terminal receipt to reconcile work. The old release
+bundles and their verification records remain available for historical recovery.

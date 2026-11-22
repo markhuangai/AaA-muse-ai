@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import { verifyPublished } from './release-verify.mjs';
-import { latestCompleteRC, listReleases, releaseOperation, requireCurrentRC, requireStableTarget, verifyMainSource, verifyReleaseDispatch } from './release-control.mjs';
+import { historicalRC, latestCompleteRC, listReleases, releaseOperation, requireCurrentRC, requireCutoverMajor, requireStableTarget, verifyMainSource, verifyReleaseDispatch } from './release-control.mjs';
 import { latestStableRelease, promotionReceipt, readProductRelease, readReleaseAsset, releaseAsset, verifyPromotionReceipt } from './release-history.mjs';
 import { isFinalVersion } from './release-versions.mjs';
 import { registryImage, npmVersion, ensureAsset } from './release-io.mjs';
@@ -56,6 +56,7 @@ export async function promoteStable({ github, context, prepared, manifestSHA256,
     need(!release.immutable && release.tag_name === 'v' + version, 'product_release_promotion_release_unavailable');
     const releases = await listReleases({ github, context });
     const prior = await latestStableRelease(releases, fetcher);
+    if (!existing.exists || !releaseAsset(release, 'promotion-intent.json')) requireCutoverMajor(version, source_rc.tag);
     requireStableTarget(version, prior);
     for (const other of releases) {
       const otherVersion = other.tag_name?.slice(1);
@@ -70,6 +71,7 @@ export async function promoteStable({ github, context, prepared, manifestSHA256,
     const intentBytes = jsonBytes(intent);
     const intentName = 'promotion-intent.json';
     const priorIntent = releaseAsset(release, intentName);
+    need(!historicalRC(source_rc.tag) || (priorIntent && existing.exists), 'product_release_historical_candidate_only');
     if (priorIntent) {
       const bytes = await readReleaseAsset(release, intentName, fetcher);
       const { schema_version, qualification_sha256 } = JSON.parse(bytes);

@@ -2,7 +2,7 @@ import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { publishRelease, ReleaseFailure } from './worker-release.mjs';
-import { latestCompleteRC, listReleases, releaseOperation, requireCurrentRC, verifyReleaseDispatch } from './release-control.mjs';
+import { candidateRecovery, historicalRC, latestCompleteRC, listReleases, releaseOperation, requireCurrentRC, requireCutoverMajor, verifyHistoricalRC, verifyReleaseDispatch } from './release-control.mjs';
 import { completionMarker, hasCompletionMarker, latestStableRelease, readProductRelease } from './release-history.mjs';
 import { candidateNpmTag, compareVersions, isFinalVersion } from './release-versions.mjs';
 import { preparedImageTag, verifyBundle } from './release-bundle.mjs';
@@ -32,14 +32,24 @@ export async function publishCandidate({ github, context, prepared, directory, t
   const imageOptions = { ...npmOptions, actor: context.actor };
   try {
     await verifyReleaseDispatch({ github, context });
+    requireCutoverMajor(prepared.version, prepared.source_rc?.tag);
+    const recoveryOnly = historicalRC(prepared.source_rc.tag);
+    const releases = await listReleases({ github, context });
+    if (recoveryOnly) {
+      requireCurrentRC(prepared, await verifyHistoricalRC({ github, context, releases, fetcher, token, tag: prepared.source_rc.tag }));
+      const recovery = await candidateRecovery({ github, context, prepared });
+      need(recovery && recovery.run_id === prepared.resume_run_id && recovery.artifact_id === prepared.resume_artifact_id,
+        'product_release_original_bundle_unavailable');
+      missing.splice(missing.indexOf('npm_candidate'), 1);
+    } else {
+      const prior = await latestStableRelease(releases, fetcher);
+      requireCurrentRC(prepared, await latestCompleteRC({ github, context, releases, prior, fetcher, token }));
+    }
     const bundle = bundleCheck(directory, prepared, { read, execute });
     const packageVersion = bundle.worker.package + '@' + prepared.version;
     const scopedTag = candidateNpmTag(prepared.version);
     const tagNpm = tag => runProcess('npm', ['dist-tag', 'add', packageVersion, tag, '--registry', 'https://npm.pkg.github.com'],
       { env: { ...process.env, NODE_AUTH_TOKEN: token }, stdio: ['ignore', 'ignore', 'pipe'] });
-    const releases = await listReleases({ github, context });
-    const prior = await latestStableRelease(releases, fetcher);
-    requireCurrentRC(prepared, await latestCompleteRC({ github, context, releases, prior, fetcher, token }));
     const tags = imageTags({ ...prepared, publication_kind: 'candidate' });
     missing.push(...tags);
     operation = 'destination_reconciliation';
@@ -59,7 +69,7 @@ export async function publishCandidate({ github, context, prepared, directory, t
     logEvent(null, missing.length ? 'warn' : 'info', 'product.release.reconciled', { ...fields(), outcome: 'incomplete' });
     operation = 'candidate_distribution_preflight'; destination = 'npm_candidate';
     const { tags: existingNpmTags } = await npmVersion(prepared.version, npmOptions);
-    await verifyCandidateAlias(releases, prepared.version, existingNpmTags.candidate, fetcher);
+    if (!recoveryOnly) await verifyCandidateAlias(releases, prepared.version, existingNpmTags.candidate, fetcher);
     destination = scopedTag;
     verifyScopedNpmTag(existingNpmTags[scopedTag], prepared.version);
     if (!imageDigest) {
@@ -119,12 +129,14 @@ export async function publishCandidate({ github, context, prepared, directory, t
     need(!markers.length || (markers.length === 1 && markers[0] === marker), 'product_release_completion_conflict');
     if (!markers.length) await github.rest.repos.updateRelease({ ...context.repo, release_id: release.id, body: (release.body ?? '') + '\n\n' + marker + '\n\nCandidate publication complete; live qualification is not established.' });
     complete('completion_marker');
-    operation = 'candidate_alias_publication'; destination = 'npm_candidate';
-    const old = (await npmVersion(prepared.version, npmOptions)).tags.candidate;
-    const desired = await verifyCandidateAlias(await listReleases({ github, context }), prepared.version, old, fetcher);
-    if (old !== desired) tagNpm('candidate');
-    need((await npmVersion(prepared.version, npmOptions)).tags.candidate === desired, 'product_release_candidate_distribution_missing');
-    complete('npm_candidate');
+    if (!recoveryOnly) {
+      operation = 'candidate_alias_publication'; destination = 'npm_candidate';
+      const old = (await npmVersion(prepared.version, npmOptions)).tags.candidate;
+      const desired = await verifyCandidateAlias(await listReleases({ github, context }), prepared.version, old, fetcher);
+      if (old !== desired) tagNpm('candidate');
+      need((await npmVersion(prepared.version, npmOptions)).tags.candidate === desired, 'product_release_candidate_distribution_missing');
+      complete('npm_candidate');
+    }
     logEvent(null, 'info', 'product.release.candidate_completed', { ...fields(), ...verified.receipt, outcome: 'complete' });
     return verified.receipt;
   } catch (error) {

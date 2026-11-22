@@ -47,6 +47,63 @@ type Assignment struct {
 	LeaseID    string `json:"lease_id"`
 }
 
+type Pull struct {
+	Version     int       `json:"protocol_version"`
+	Sequence    int64     `json:"sequence"`
+	Checker     string    `json:"checker_job_id"`
+	Occurrence  string    `json:"checker_run_id"`
+	ScheduledAt time.Time `json:"scheduled_at"`
+	EnteredAt   time.Time `json:"entered_at"`
+	MediaJobs   bool      `json:"media_jobs"`
+	PromptWAV   bool      `json:"prompt_wav"`
+}
+
+type Grant struct {
+	JobID       string    `json:"job_id"`
+	OperationID string    `json:"operation_id"`
+	ClaimID     string    `json:"claim_id"`
+	Generation  int64     `json:"generation"`
+	ClaimedAt   time.Time `json:"claimed_at"`
+	DeadlineAt  time.Time `json:"deadline_at"`
+}
+
+type PullResult struct {
+	Job *Grant `json:"job"`
+}
+
+type PullTiming struct {
+	Acquire     time.Duration
+	Select      time.Duration
+	PreviousPin string
+}
+
+type WorkStart struct {
+	Version    int    `json:"protocol_version"`
+	ClaimID    string `json:"claim_id"`
+	Generation int64  `json:"generation"`
+	LaunchID   string `json:"launch_id"`
+	NativeJob  string `json:"native_job_id"`
+}
+
+type Interruption struct {
+	Version      int    `json:"protocol_version"`
+	SubmissionID string `json:"submission_id"`
+	ClaimID      string `json:"claim_id"`
+	Generation   int64  `json:"generation"`
+	LaunchID     string `json:"launch_id"`
+	NativeJob    string `json:"native_job_id"`
+	NativeRun    string `json:"native_run_id"`
+	Reason       string `json:"reason"`
+}
+
+type WorkOutcome struct {
+	JobID    string          `json:"job_id"`
+	ClaimID  string          `json:"claim_id"`
+	State    string          `json:"state"`
+	Reason   string          `json:"reason,omitempty"`
+	Accepted json.RawMessage `json:"accepted,omitempty"`
+}
+
 type Heartbeat struct {
 	Version      int         `json:"protocol_version"`
 	ConnectionID string      `json:"connection_id"`
@@ -156,6 +213,12 @@ type Job struct {
 	CreatedAt            time.Time      `json:"created_at"`
 	DeadlineAt           time.Time      `json:"deadline_at"`
 	ClaimedAt            *time.Time     `json:"claimed_at"`
+	StartedAt            *time.Time     `json:"started_at,omitempty"`
+	LaunchID             string         `json:"launch_id,omitempty"`
+	NativeJob            string         `json:"native_job_id,omitempty"`
+	PinCheckAt           *time.Time     `json:"pin_check_at,omitempty"`
+	ReroutedFrom         string         `json:"rerouted_from,omitempty"`
+	Outcome              *WorkOutcome   `json:"work_outcome,omitempty"`
 	LeaseExpiresAt       *time.Time     `json:"lease_expires_at"`
 	Generation           int64          `json:"generation"`
 	LeaseID              string         `json:"lease_id"`
@@ -223,8 +286,12 @@ type Projection struct {
 	InferenceReadiness   string          `json:"inference_readiness"`
 	Qualification        *Qualification  `json:"qualification,omitempty"`
 	QualificationHistory []Qualification `json:"qualification_history"`
-	UpgradeGeneration    int64           `json:"upgrade_reservation_generation"`
 	ModelReport          *ModelReport    `json:"model_report,omitempty"`
+	LastPollAt           *time.Time      `json:"last_poll_at"`
+	Claim                *Grant          `json:"current_claim"`
+	ClaimAgeMS           *int64          `json:"claim_age_ms,omitempty"`
+	ClaimStage           string          `json:"claim_stage,omitempty"`
+	ClaimStartedAt       *time.Time      `json:"claim_started_at,omitempty"`
 }
 
 type Receipt struct {
@@ -249,6 +316,8 @@ type Ref struct {
 	CountPendingTools                        bool
 	HistoryInputCount                        int
 	Responses                                bool
+	Single                                   bool
+	PollProjection                           bool
 }
 
 type State struct {
@@ -257,6 +326,8 @@ type State struct {
 	Revoked               bool
 	Now                   time.Time
 	Connection            Connection
+	LastPollAt            *time.Time
+	LastContactAt         *time.Time
 	Experiments           map[string]*Experiment
 	Jobs                  map[string]*Job
 	Receipt               *Receipt

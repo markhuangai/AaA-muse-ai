@@ -3,14 +3,15 @@ package httpapi
 import (
 	"bytes"
 	"encoding/json"
-	"io"
-	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/markhuangai/AaA-muse-ai/internal/config"
+	"github.com/markhuangai/AaA-muse-ai/internal/inference"
 	"github.com/markhuangai/AaA-muse-ai/internal/service"
 )
 
@@ -54,76 +55,47 @@ func TestWorkerCompatibilityRejectsBeforeEnrollmentAndRetainsCode(t *testing.T) 
 	}
 }
 
-func TestSubscriptionAndClaimCompatibilityPreservesAuthorityAndReceipts(t *testing.T) {
+func TestPullAndStartCompatibilityPreservesAuthorityAndReceipts(t *testing.T) {
 	for _, versions := range [][2]string{{"1.2.0", "1.0.0"}, {"1.0.0", "1.9.0"}} {
 		t.Run(versions[0]+"_"+versions[1], func(t *testing.T) {
-			h, store, worker, key := inferenceHTTPFixture(t)
-			h.Service = service.New(nil, config.Defaults(), service.Build{Version: versions[0], WorkerPackage: service.PairedWorker(versions[0], strings.Repeat("a", 64))}, "instance", h.Now, h.Logger)
-			request := func(method, path, version string, input any) *httptest.ResponseRecorder {
-				data, _ := json.Marshal(input)
-				r := httptest.NewRequest(method, path, bytes.NewReader(data))
-				if method == "GET" {
-					r.Body = http.NoBody
-				}
-				r.Header.Set("Authorization", "Bearer "+key)
-				r.Header.Set(service.WorkerVersionHeader, version)
-				w := httptest.NewRecorder()
-				h.ServeHTTP(w, r)
-				return w
-			}
-			if request("GET", "/api/v1/worker/events", "2.0.0", nil).Code != 426 || len(store.states) != 0 {
-				t.Fatal("incompatible subscription changed connection authority")
-			}
-			status := request("GET", "/api/v1/worker/status", versions[1], nil)
-			var own map[string]any
-			if status.Code != 200 || json.Unmarshal(status.Body.Bytes(), &own) != nil || own["worker_package"].(map[string]any)["version"] != versions[0] {
-				t.Fatal("status lacks actionable paired release identity")
-			}
-			server := httptest.NewServer(h)
-			r, _ := http.NewRequest("GET", server.URL+"/api/v1/worker/events", nil)
-			r.Header.Set("Authorization", "Bearer "+key)
-			r.Header.Set(service.WorkerVersionHeader, versions[1])
-			response, err := (&http.Client{Timeout: 3 * time.Second}).Do(r)
-			if err != nil {
-				server.Close()
+			root := t.TempDir()
+			if err := os.Chmod(root, 0700); err != nil {
 				t.Fatal(err)
 			}
-			body, err := io.ReadAll(response.Body)
-			response.Body.Close()
-			server.Close()
-			if err != nil || response.StatusCode != 200 || !bytes.Contains(body, []byte("event: connection.opened")) || store.states[worker.ID].Connection.Generation != 1 {
-				t.Fatal("compatible subscription failed", err)
+			handler := pullHTTP(t, filepath.Join(root, "broker.sqlite3"))
+			handler.Service = service.New(nil, config.Defaults(), service.Build{Version: versions[0], WorkerPackage: service.PairedWorker(versions[0], strings.Repeat("a", 64))}, "instance", handler.Now, handler.Logger)
+			key := enrollNative(t, handler)
+			queued, err := handler.Broker.SubmitRequest(t.Context(), handler.Logger, "client", "compatibility-session", inference.RequestInput{
+				Version: 1, SubmissionID: "compat-request", Messages: []inference.Item{{Type: "message", Role: "user", Text: "compatibility fixture"}}, Tools: []inference.Tool{},
+			})
+			if err != nil {
+				t.Fatal(err)
 			}
-			connection := onlineHTTP(t, h, worker.ID)
-			experiment := apiJSON(t, h, "POST", "/api/v1/admin/experiments", "admin-private-sentinel", map[string]any{"protocol_version": 1, "submission_id": "compat-create", "worker_id": worker.ID, "messages": []any{map[string]any{"type": "message", "role": "user", "text": "compatibility fixture"}}, "tools": []any{}}, 201)
-			job := experiment["current_job_id"].(string)
-			claim := map[string]any{"protocol_version": 1, "submission_id": "compat-claim", "connection_id": connection.ID, "connection_generation": connection.Generation}
-			before, _ := json.Marshal(store.states[worker.ID])
-			if request("POST", "/api/v1/worker/jobs/"+job+"/claim", "2.0.0", claim).Code != 426 {
-				t.Fatal("incompatible claim accepted")
+			stamp := time.Now().UTC()
+			input := inference.Pull{Version: 1, Sequence: 1, Checker: "compat-checker", Occurrence: "compat-tick", ScheduledAt: stamp, EnteredAt: stamp}
+			const pull = "/api/v1/worker/pull"
+			for _, version := range []string{"", "0.9.0", "2.0.0"} {
+				nativeResponse(t, nativePostVersion(handler, pull, key, version, input), 426, nil)
 			}
-			after, _ := json.Marshal(store.states[worker.ID])
-			if !bytes.Equal(before, after) {
-				t.Fatal("rejected claim changed assignment state")
+			var granted inference.PullResult
+			nativeResponse(t, nativePostVersion(handler, pull, key, versions[1], input), 200, &granted)
+			if granted.Job == nil || granted.Job.OperationID != queued.ID {
+				t.Fatal("rejected pull changed claim or poll sequence")
 			}
-			if response := request("POST", "/api/v1/worker/jobs/"+job+"/claim", versions[1], claim); response.Code != 200 {
-				t.Fatal("compatible claim rejected", response.Body.String())
-			}
-			before, _ = json.Marshal(store.states[worker.ID])
-			if request("GET", "/api/v1/worker/events", "2.0.0", nil).Code != 426 {
-				t.Fatal("incompatible reconnect accepted")
-			}
-			after, _ = json.Marshal(store.states[worker.ID])
-			if !bytes.Equal(before, after) || !store.states[worker.ID].Jobs[job].Held {
-				t.Fatal("rejected reconnect changed busy hold or generation")
-			}
-			j := store.states[worker.ID].Jobs[job]
-			decision := map[string]any{"protocol_version": 1, "submission_id": "compat-decision", "connection_id": connection.ID, "connection_generation": connection.Generation, "conversation_id": j.ConversationID, "generation": j.Generation, "lease_id": j.LeaseID, "context_receipt_id": j.Context.ReceiptID, "decision": map[string]any{"type": "final", "text": "preserved accepted receipt"}}
-			accepted := request("POST", "/api/v1/worker/jobs/"+job+"/decisions", versions[1], decision)
-			h.Service = service.New(nil, config.Defaults(), service.Build{Version: "2.0.0"}, "instance", h.Now, h.Logger)
-			replayed := request("POST", "/api/v1/worker/jobs/"+job+"/decisions", versions[1], decision)
-			if accepted.Code != 200 || replayed.Code != 200 || accepted.Body.String() != replayed.Body.String() {
-				t.Fatal("major change blocked accepted receipt reconciliation")
+			jobPath := "/api/v1/worker/jobs/" + granted.Job.JobID
+			start := inference.WorkStart{Version: 1, ClaimID: granted.Job.ClaimID, Generation: granted.Job.Generation, LaunchID: "compat-launch", NativeJob: "compat-native"}
+			nativeResponse(t, nativePostVersion(handler, jobPath+"/start", key, "0.9.0", start), 426, nil)
+			var brief inference.Job
+			nativeResponse(t, nativePostVersion(handler, jobPath+"/start", key, versions[1], start), 200, &brief)
+			decision := inference.Submit{Claim: inference.Claim{Version: 1, SubmissionID: "compat-decision"}, ConversationID: brief.ConversationID, Generation: brief.Generation,
+				LeaseID: brief.LeaseID, ContextReceiptID: brief.Context.ReceiptID, Decision: inference.Item{Type: "final", Text: "preserved accepted receipt"}}
+			accepted := nativePostVersion(handler, jobPath+"/decisions", key, versions[1], decision)
+			nativeResponse(t, accepted, 200, nil)
+			handler.Service = service.New(nil, config.Defaults(), service.Build{Version: "2.0.0"}, "instance", handler.Now, handler.Logger)
+			replayed := nativePostVersion(handler, jobPath+"/decisions", key, versions[1], decision)
+			nativeResponse(t, replayed, 200, nil)
+			if !bytes.Equal(accepted.Body.Bytes(), replayed.Body.Bytes()) {
+				t.Fatal("major change altered an accepted receipt")
 			}
 		})
 	}

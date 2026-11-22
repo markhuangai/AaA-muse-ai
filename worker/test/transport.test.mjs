@@ -100,7 +100,7 @@ test('authenticated control routes pass unstructured 404s to subscriber recovery
 });
 
 function stream(chunks, contentType = 'text/event-stream') {
-  return new Response(new ReadableStream({ start(controller) { for (const chunk of chunks) controller.enqueue(typeof chunk === 'string' ? Buffer.from(chunk) : chunk); controller.close(); } }), { headers: { 'content-type': contentType } });
+  return new Response(new ReadableStream({ start(controller) { for (const chunk of chunks) controller.enqueue(typeof chunk === 'string' ? Buffer.from(chunk) : chunk); controller.close(); } }), { headers: { 'content-type': contentType, 'X-Muse-Service-Version': '1.0.0' } });
 }
 test('SSE parses fragmented UTF-8, multiline data, CRLF, comments and coalesced frames', async t => {
   const f = await fixture(t);
@@ -129,7 +129,9 @@ test('SSE rejects bad protocol, bounded frames, TLS failures and incomplete stre
     [() => { throw Object.assign(new Error(), { code: 'CERT_HAS_EXPIRED' }); }, 'stream_interrupted'],
   ];
   for (const [response, expected] of cases) {
-    const client = new Transport('https://example.test', KEY, f.logger, f.state.sys, { ...f.net, fetch: async () => response() });
+    const client = new Transport('https://example.test', KEY, f.logger, f.state.sys, { ...f.net, fetch: async () => {
+      const reply = response(); reply.headers.set('X-Muse-Service-Version', '1.0.0'); return reply;
+    } });
     await assert.rejects(async () => { for await (const _ of client.events(new AbortController().signal)) {} }, new RegExp(expected));
   }
   const stopped = new AbortController(); stopped.abort();

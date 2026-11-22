@@ -2,10 +2,11 @@ import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, cpSync } from 'node:fs';
-import { resolve, join } from 'node:path';
+import { basename, resolve, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const workerDirectory = fileURLToPath(new URL('../', import.meta.url));
+const legacyModules = new Set(['health', 'setup', 'setup-os', 'subscriber', 'upgrade', 'upgrade-evidence', 'watchdog']);
 
 export function packageWorker(args = process.argv.slice(2), { directory = workerDirectory, execute = execFileSync } = {}) {
   const root = resolve(directory, '..');
@@ -20,10 +21,15 @@ export function packageWorker(args = process.argv.slice(2), { directory = worker
   const owned = mkdtempSync(join(artifacts, 'pack-'));
   const staging = join(owned, 'staging');
   mkdirSync(staging, { mode: 0o700 });
-  for (const name of ['dist', 'setup', 'LICENSE', 'README.md']) cpSync(join(directory, name), join(staging, name), { recursive: true });
   const metadata = JSON.parse(readFileSync(join(directory, 'package.json'), 'utf8'));
   const source = JSON.parse(readFileSync(join(directory, 'dist/build.json'), 'utf8'));
+  const major = metadata.version.split('.', 1)[0];
+  assert(major !== '0' && major === source.package_version.split('.', 1)[0], 'package major must match the native worker source');
   metadata.version = source.package_version;
+  for (const name of ['dist', 'setup', 'LICENSE', 'README.md']) {
+    cpSync(join(directory, name), join(staging, name), { recursive: true, filter: path => name !== 'dist' || !legacyModules.has(basename(path).split('.', 1)[0]) });
+  }
+  const assets = ['setup/install.sh', 'setup/private-directory.sh', 'setup/SKILL.md'];
   writeFileSync(join(staging, 'package.json'), JSON.stringify(metadata, null, 2) + '\n', { mode: 0o600 });
   const result = JSON.parse(execute('npm', ['pack', staging, '--ignore-scripts', '--json', '--pack-destination', owned], { cwd: directory, encoding: 'utf8' }))[0];
   assert.equal(result.name, metadata.name);
@@ -32,7 +38,9 @@ export function packageWorker(args = process.argv.slice(2), { directory = worker
   for (const file of result.files) assert(/^(dist\/|setup\/|package.json$|LICENSE$|README.md$)/.test(file.path), `unexpected package path: ${file.path}`);
   assert(result.files.some(file => file.path === 'dist/main.js'));
   assert(result.files.some(file => file.path === 'dist/build.json'));
-  for (const path of ['setup/install.sh', 'setup/upgrade-enrolled.sh', 'setup/private-directory.sh', 'setup/hook.sh', 'setup/SKILL.md']) assert(result.files.some(file => file.path === path));
+  for (const path of assets) assert(result.files.some(file => file.path === path));
+  assert(!result.files.some(file => ['setup/upgrade-enrolled.sh', 'setup/hook.sh'].includes(file.path) ||
+    (file.path.startsWith('dist/') && legacyModules.has(basename(file.path).split('.', 1)[0]))));
   const archive = join(owned, result.filename);
   verifyArchive(archive, metadata.version, source.source_sha, owned, { execute, directory });
   const receipt = { outcome: 'passed', package: metadata.name, version: metadata.version, archive, sha256: createHash('sha256').update(readFileSync(archive)).digest('hex'), source, runtime: process.version, files: result.files.map(file => file.path), owned_directory: owned };

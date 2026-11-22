@@ -69,7 +69,7 @@ test('setup preserves identity, protects executable assets, and owns one subscri
   assert.equal((await fs.stat(first.skill_path)).mode & 0o777, 0o600);
   assert(!(await fs.readFile(first.skill_path, 'utf8')).includes(KEY));
   assert.match(await fs.readFile(first.hook_path, 'utf8'), /HATCH_HOOK_DRY_RUN/);
-  assert.match(await fs.readFile(first.skill_path, 'utf8'), /calling client's machine/);
+  assert.match(await fs.readFile(first.skill_path, 'utf8'), /calling client executes/);
   const second = await f.install();
   assert.equal(second.identity_preserved, true); assert.equal(await f.state.read('credential.key'), key); assert.equal(f.launches(), 1);
   await assert.rejects(new Setup(f.worker, f.io, '0.1.0-rc.99').install('https://broker.example.test', CODE, join(f.state.root, 'installed'), SETUP), /running_version_change_requires_operator_action/);
@@ -151,20 +151,18 @@ test('preflight checks an existing asset target before reusing enrollment', asyn
   await fs.chmod(target, 0o600);
 });
 
-test('setup CLI shares actual setup state and background failures retain a terminal marker', async t => {
+test('setup CLI installs protected worker state without starting a daemon or enabling a hook', async t => {
   const f = await setupFixture(t); const output = [];
   const io = { files: fs, system: f.state.sys, setup: f.io, network: f.net, env: { HATCH_HOOK_RUNTIME: '/runtime' }, home: () => f.state.root, nodeVersion: process.version,
     input: async name => name === '-' ? CODE : encode({ level: 'INFO', msg: 'setup.archive_verified', setup_id: SETUP }), stdout: line => output.push(line), stderr: line => f.output.push(line), signal: new AbortController().signal, metadata: async () => ({ source_sha: 'unit' }) };
   const call = (...args) => execute([args[0], '--state-dir', f.state.root, ...args.slice(1)], io);
   assert.equal(await call('setup'), 1);
   assert.equal(await call('setup', '--origin', 'https://broker.example.test', '--code-stdin', '--install-dir', join(f.state.root, 'installed'), '--setup-id', SETUP, '--bootstrap', '/receipt'), 0);
-  assert.equal(await call('hook-check'), 0); assert.equal(JSON.parse(output.at(-1)).action, 'silent');
-  assert.equal(await call('hook-check', '--runtime-error', 'missing_functions'), 1);
-  await assert.rejects(f.setup.runtimeError('invalid'), /invalid_runtime_error/);
-  await f.stop(); f.broker.denied = true;
-  assert.equal(await call('run', '--background'), 1);
-  assert.equal(JSON.parse(await f.state.read('run-stop.json')).requires_operator_action, true);
+  assert.equal(JSON.parse(output.at(-1)).cron_registration, 'pending');
   assert.equal(await call('hook-check'), 1);
+  assert.equal(await call('run', '--background'), 1);
+  assert.equal(await f.state.read('run-stop.json'), undefined);
+  assert.equal(await f.state.read('hook-poll.json'), undefined);
 });
 
 test('bootstrap imports remain bounded and exact to their setup operation', async t => {

@@ -15,13 +15,18 @@ const remember = secret => { secrets.push(secret); save(`worker-browser-secrets-
 const pause = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
 let browser;
 
-async function control(path, { method = 'GET', key, body, cookie } = {}) {
+async function control(path, { method = 'GET', key, body, cookie, workerVersion } = {}) {
   const headers = { 'Content-Type': 'application/json' };
   if (cookie) Object.assign(headers, browserSessionHeaders(cookie, fixture.origin));
   if (key) headers.Authorization = `Bearer ${key}`;
+  if (workerVersion) headers['X-Muse-Worker-Version'] = workerVersion;
   const response = await fetch(fixture.origin + path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(10_000) });
   const data = response.status === 204 ? null : await response.json();
   return { response, data };
+}
+
+function enroll(code) {
+  return control('/api/v1/worker/enroll', { method: 'POST', workerVersion: fixture.pin.version, body: { enrollment_code: code } });
 }
 
 async function login(page) {
@@ -160,11 +165,12 @@ async function viewports() {
     await expect(row(fixture.workers.offline_id).locator('.offline-duration .num')).toHaveText(/^\d+h \d+m \d+s$/);
     if (width === 390) await expect(row(fixture.workers.offline_id).locator('.offline-label')).toBeVisible();
     expect(await page.evaluate(() => window.__unsafe === undefined && document.querySelector('tbody img') === null)).toBe(true);
-    await expect(row(fixture.workers.transport_id)).toContainText('Online');
+    await expect(row(fixture.workers.never_id)).toContainText('Never seen');
+    await expect(row(fixture.workers.quiet_id)).toContainText('Quiet');
     await expect(page.getByRole('columnheader', { name: 'Qualification' })).toHaveCount(0);
     await expect(row(fixture.workers.busy_id)).toContainText('Busy');
     await expect(row(fixture.workers.waiting_id)).toContainText('1 client-tool waits');
-    await expect(row(fixture.workers.reconnected_id)).toContainText('Idle');
+    await expect(row(fixture.workers.transport_id)).toContainText('Idle');
     await screenshot(page, 'list', width);
     await page.evaluate(() => scrollTo(0, 100));
     await row(fixture.workers.transport_id).getByRole('button').scrollIntoViewIfNeeded();
@@ -172,9 +178,7 @@ async function viewports() {
     expect(listScroll).toBeGreaterThan(0);
     await openWorker(page, fixture.workers.transport_id);
     await expect(page.getByRole('heading', { name: 'Reported by Muse during setup' })).toBeVisible();
-    await expect(page.getByText('Controlled Muse', { exact: true })).toBeVisible();
-    await expect(page.getByText('350,000 tokens', { exact: true })).toBeVisible();
-    await expect(page.getByText('2026-11-18 00:00:00 UTC', { exact: true })).toBeVisible();
+    await expect(page.getByText('Last work poll', { exact: true }).locator('..')).not.toContainText('Not reported');
     await page.keyboard.press('Escape');
     await expect(row(fixture.workers.transport_id).getByRole('button')).toBeFocused();
     expect(await page.evaluate(() => scrollY)).toBe(listScroll);
@@ -182,6 +186,8 @@ async function viewports() {
     await verifyDrawerDismissal(page, row(fixture.workers.transport_id).getByRole('button'), width, listScroll);
     await openWorker(page, fixture.workers.busy_id);
     await expect(page.getByText(fixture.workers.busy_job_id, { exact: true })).toBeVisible();
+    await expect(page.getByText('Execution started', { exact: true })).toBeVisible();
+    await expect(page.getByText('Deadline', { exact: true })).toBeVisible();
     await expect(page.getByRole('heading', { name: 'Inference qualification' })).toHaveCount(0);
     await expect(page.getByText('Installed version', { exact: true }).locator('..')).toContainText('Not reported');
     await expect(page.getByText('Not independently observed', { exact: true })).toBeVisible();
@@ -214,7 +220,7 @@ async function viewports() {
     const text = page.getByLabel('Complete setup prompt', { exact: true });
     expect((await text.inputValue()) === generated.data.setup_prompt).toBe(true);
     expect(generated.data.worker_package.version).toBe(fixture.pin.version); expect(generated.data.worker_package.sha256).toBe(fixture.pin.sha256);
-    expect(generated.data.setup_prompt.includes('hooks.list') && generated.data.setup_prompt.includes('hooks.add') && generated.data.setup_prompt.includes('supported-refresh recovery') && generated.data.setup_prompt.includes('sha256sum')).toBe(true);
+    expect(generated.data.setup_prompt.includes('1m') && generated.data.setup_prompt.includes('cron-confirm') && generated.data.setup_prompt.includes('sha256sum')).toBe(true);
     expect((Date.parse(generated.data.expires_at) - Date.parse(generated.data.created_at)) / 1000).toBe(900);
     await page.getByRole('button', { name: 'Copy complete prompt' }).click();
     await expect(page.getByText('Copied. Keep this single-use enrollment private.')).toBeVisible();
@@ -223,9 +229,9 @@ async function viewports() {
     await page.getByRole('button', { name: 'Copy complete prompt' }).click(); await expect(page.getByText(/Clipboard access failed/)).toBeVisible();
     await page.getByRole('button', { name: 'Select text', exact: true }).click(); await expect(text).toBeFocused();
     expect(await text.evaluate(element => element.selectionEnd - element.selectionStart) === generated.data.setup_prompt.length).toBe(true);
-    const enrolled = await control('/api/v1/worker/enroll', { method: 'POST', body: { enrollment_code: code } });
+    const enrolled = await enroll(code);
     expect(enrolled.response.status).toBe(201); remember(enrolled.data.credential);
-    expect((await control('/api/v1/worker/enroll', { method: 'POST', body: { enrollment_code: code } })).response.status).toBe(409);
+    expect((await enroll(code)).response.status).toBe(409);
     await page.getByLabel('Enrollment format').selectOption('code');
     const token = await action(page, '/api/v1/admin/enrollments', () => page.getByRole('button', { name: 'Generate enrollment code' }).click(), 201);
     remember(token.data.enrollment_code); expect((await page.getByLabel('Single-use enrollment code').inputValue()) === token.data.enrollment_code).toBe(true);
@@ -283,13 +289,13 @@ async function offlineDuration() {
       expect(reads).toBe(before);
       views.push({ page, row, cell, width });
     }
-    save('worker-browser-resume-subscriber', {});
-    await expect.poll(() => existsSync(join(fixture.directory, 'worker-browser-subscriber-ready')), { timeout: 25_000 }).toBe(true);
+    save('worker-browser-resume-poll', {});
+    await expect.poll(() => existsSync(join(fixture.directory, 'worker-browser-poll-ready')), { timeout: 25_000 }).toBe(true);
     for (const { page, row, cell, width } of views) {
       await page.locator('.page-heading').getByRole('button', { name: 'Refresh workers', exact: true }).click();
-      await expect(row.getByText('Online', { exact: true })).toBeVisible();
+      await expect(row.getByText('Recent contact', { exact: true })).toBeVisible();
       await expect(cell).toHaveText('-');
-      passed('portal.worker_offline_timer', { width, seconds_advance_locally: true, no_extra_requests: true, authenticated_reconnect: true });
+      passed('portal.worker_offline_timer', { width, seconds_advance_locally: true, no_extra_requests: true, authenticated_poll: true });
     }
   } finally {
     await Promise.all(contexts.map(context => context.close()));
@@ -324,7 +330,7 @@ async function orderingAndUncertainty(width) {
   await page.getByLabel('Enrollment format').selectOption('code');
   const registration = await action(page, '/api/v1/admin/enrollments', () => page.getByRole('button', { name: 'Generate enrollment code' }).click(), 201);
   remember(registration.data.enrollment_code);
-  const enrolled = await control('/api/v1/worker/enroll', { method: 'POST', body: { enrollment_code: registration.data.enrollment_code } });
+  const enrolled = await enroll(registration.data.enrollment_code);
   expect(enrolled.response.status).toBe(201);
   remember(enrolled.data.credential);
   const offline = enrolled.data.worker.id;

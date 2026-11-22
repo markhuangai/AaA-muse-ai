@@ -36,8 +36,7 @@ func responseRequestBody(stream bool) map[string]any {
 func TestResponsesHTTPProductionLogicAndProtectedEvidence(t *testing.T) {
 	for _, stream := range []bool{false, true} {
 		h, m, worker, key := inferenceHTTPFixture(t)
-		c := onlineHTTP(t, h, worker.ID)
-		completeChatOnWait(t, h, m, c, key, inference.Item{Type: "final", Text: "exact\r\n😀"})
+		completeChatOnWait(t, h, m, key, inference.Item{Type: "final", Text: "exact\r\n😀"})
 		w := &chatWriter{ResponseRecorder: httptest.NewRecorder()}
 		runResponseHTTP(t, h, w, responseRequestBody(stream), "response-session")
 		if w.Code != 200 || w.Header().Get("X-Muse-Session-Id") != "response-session" {
@@ -81,8 +80,7 @@ func TestResponsesHTTPFailedWritesNeverCompleteOrRegenerate(t *testing.T) {
 	for _, mode := range []string{"write", "flush", "start-deadline", "frame-deadline"} {
 		t.Run(mode, func(t *testing.T) {
 			h, m, worker, key := inferenceHTTPFixture(t)
-			c := onlineHTTP(t, h, worker.ID)
-			completeChatOnWait(t, h, m, c, key, inference.Item{Type: "final", Text: "accepted once"})
+			completeChatOnWait(t, h, m, key, inference.Item{Type: "final", Text: "accepted once"})
 			w := &chatWriter{ResponseRecorder: httptest.NewRecorder()}
 			switch mode {
 			case "write":
@@ -148,8 +146,7 @@ func TestResponsesCancellationAfterAcceptanceRetainsOutputWithoutFallback(t *tes
 	for _, boundary := range []string{"before-exposure", "after-created"} {
 		t.Run(boundary, func(t *testing.T) {
 			h, m, worker, key := inferenceHTTPFixture(t)
-			c := onlineHTTP(t, h, worker.ID)
-			completeChatOnWait(t, h, m, c, key, inference.Item{Type: "final", Text: "accepted exactly once"})
+			completeChatOnWait(t, h, m, key, inference.Item{Type: "final", Text: "accepted exactly once"})
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			w := &chatWriter{ResponseRecorder: httptest.NewRecorder()}
@@ -188,8 +185,7 @@ func TestResponsesCancellationAfterAcceptanceRetainsOutputWithoutFallback(t *tes
 
 func TestResponsesHTTPAdmittedFailureAndAbort(t *testing.T) {
 	for _, abort := range []bool{false, true} {
-		h, m, worker, _ := inferenceHTTPFixture(t)
-		onlineHTTP(t, h, worker.ID)
+		h, m, _, _ := inferenceHTTPFixture(t)
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		h.Broker.Wait = func(context.Context, time.Duration) error {
@@ -223,8 +219,7 @@ func TestResponsesHTTPAdmittedFailureAndAbort(t *testing.T) {
 func TestResponsesHTTPEarlyRejectionsAndDependencyFailures(t *testing.T) {
 	for _, mode := range []string{"schema", "session", "broker", "storage", "wait", "encoding"} {
 		t.Run(mode, func(t *testing.T) {
-			h, m, worker, key := inferenceHTTPFixture(t)
-			c := onlineHTTP(t, h, worker.ID)
+			h, m, _, key := inferenceHTTPFixture(t)
 			body := responseRequestBody(false)
 			session := "errors"
 			switch mode {
@@ -239,7 +234,7 @@ func TestResponsesHTTPEarlyRejectionsAndDependencyFailures(t *testing.T) {
 			case "wait":
 				h.Broker.Wait = func(context.Context, time.Duration) error { return errors.New("wait failed") }
 			case "encoding":
-				completeChatOnWait(t, h, m, c, key, inference.Item{Type: "final", Text: "accepted"})
+				completeChatOnWait(t, h, m, key, inference.Item{Type: "final", Text: "accepted"})
 			}
 			w := &chatWriter{ResponseRecorder: httptest.NewRecorder()}
 			runResponseHTTP(t, h, w, body, session)

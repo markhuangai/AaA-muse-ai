@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import http.client
 import json
 import os
@@ -112,6 +112,73 @@ class Peer:
         self.harness.private("peer-" + self.worker["worker"]["id"] + "-" + str(self.opened["connection_generation"]) + ".json", json.dumps({"events": self.events, "replies": self.replies, "errors": self.errors}))
 
 
+class PullPeer:
+    def __init__(self, harness, worker):
+        self.h, self.worker = harness, worker
+        self.checker = "controlled-" + worker["worker"]["id"]
+        self.condition = threading.Condition()
+        self.pulls, self.jobs = [], []
+        self.active = None
+
+    def poll_input(self, *, media_jobs=False, prompt_wav=False):
+        sequence = len(self.pulls) + 1
+        stamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        return {"protocol_version": 1, "sequence": sequence, "checker_job_id": self.checker,
+                "checker_run_id": f"tick-{sequence}", "scheduled_at": stamp, "entered_at": stamp,
+                "media_jobs": media_jobs, "prompt_wav": prompt_wav}
+
+    def poll(self, origin=None, *, media_jobs=False, prompt_wav=False, payload=None):
+        require(self.active is None, "controlled peer attempted a work pull while busy")
+        payload = payload or self.poll_input(media_jobs=media_jobs, prompt_wav=prompt_wav)
+        sequence = payload["sequence"]
+        started = time.monotonic()
+        value, headers = self.h.checked("/api/v1/worker/pull", self.worker["credential"], "POST", payload, origin=origin)
+        grant = value["job"]
+        with self.condition:
+            observed = time.monotonic()
+            self.pulls.append({"at": observed, "started": started, "origin": origin or self.h.origin_url,
+                               "sequence": sequence, "duration_ms": round((observed - started) * 1000, 3),
+                               "claimed": grant is not None, "request_id": headers["X-Request-Id"]})
+            if grant is not None:
+                self.active = grant["job_id"]
+            self.condition.notify_all()
+        return grant
+
+    def begin(self, grant, origin=None):
+        require(self.active == grant["job_id"], "controlled peer tried to start an unowned grant")
+        start = {"protocol_version": 1, "claim_id": grant["claim_id"], "generation": grant["generation"],
+                 "launch_id": "launch-" + grant["job_id"], "native_job_id": "once-" + grant["job_id"]}
+        path = "/api/v1/worker/jobs/" + grant["job_id"]
+        job, headers = self.h.checked(path + "/start", self.worker["credential"], "POST", start, origin=origin)
+        with self.condition:
+            self.jobs.append(job)
+            self.condition.notify_all()
+        return job, headers, start
+
+    def submit(self, job, decision, submission=None, want=200, changes=None):
+        body = {"protocol_version": 1, "submission_id": submission or secrets.token_hex(12),
+                "connection_id": "", "connection_generation": 0, "conversation_id": job["conversation_id"],
+                "generation": job["generation"], "lease_id": job["lease_id"],
+                "context_receipt_id": job["context"]["receipt_id"], "decision": decision, **(changes or {})}
+        path = "/api/v1/worker/jobs/" + job["id"] + "/decisions"
+        value, headers = self.h.checked(path, self.worker["credential"], "POST", body, want=want)
+        if want == 200 and self.active == job["id"]:
+            self.settle(job, "accepted")
+        return value, headers, body
+
+    def settle(self, job, expected=None):
+        body = {"protocol_version": 1, "submission_id": "settle-" + job["id"], "claim_id": job["lease_id"],
+                "generation": job["generation"], "launch_id": job["launch_id"], "native_job_id": job["native_job_id"],
+                "native_run_id": "execution-" + job["id"], "reason": "execution_confirmed_stopped"}
+        path = "/api/v1/worker/jobs/" + job["id"] + "/interrupt"
+        receipt, _ = self.h.checked(path, self.worker["credential"], "POST", body)
+        require(receipt["job_id"] == job["id"] and receipt["claim_id"] == job["lease_id"] and
+                receipt["state"] in ([expected] if expected else ["cancelled", "interrupted"]), "controlled peer did not reconcile its claim")
+        with self.condition:
+            require(self.active == job["id"], "controlled peer cleared the wrong local claim")
+            self.active = None
+
+
 class Inference(WorkerAuth):
     def __init__(self, args):
         super().__init__(args)
@@ -140,12 +207,21 @@ class Inference(WorkerAuth):
         self.peers.append(peer)
         return peer.start()
 
+    def pull_peer(self, worker):
+        peer = PullPeer(self, worker)
+        require(peer.poll() is None, "controlled worker was not initially idle")
+        return peer
+
     def status(self, worker):
         return self.checked("/api/v1/worker/status", worker["credential"])[0]
 
     def worker_projection(self, worker, origin=None):
         workers, headers = self.checked("/api/v1/admin/workers", self.admin, origin=origin)
         return next(item for item in workers["workers"] if item["id"] == worker["worker"]["id"]), headers
+
+    def silence(self, worker, seconds):
+        worker_id = worker["worker"]["id"]
+        self.sql(f"UPDATE aaa_workers SET last_contact_at=CAST(unixepoch('subsec')*1000000 AS INTEGER)-{seconds * 1_000_000} WHERE id='{worker_id}';")
 
     def offline_diagnosis(self, worker, peer, reason):
         projected, headers = self.worker_projection(worker)
@@ -185,11 +261,19 @@ class Inference(WorkerAuth):
         return self.checked("/api/v1/admin/experiments/" + identity, self.admin)[0]
 
     def claim(self, worker, peer, experiment, submission=None, want=200, origin=None):
+        if isinstance(peer, PullPeer):
+            require(submission is None and want == 200, "native claim replay must use the exact pull request")
+            grant = peer.poll(origin)
+            require(grant is not None and grant["job_id"] == experiment["current_job_id"], "controlled pull did not choose the expected job")
+            return peer.begin(grant, origin)
         body = {"protocol_version": 1, "submission_id": submission or secrets.token_hex(12), "connection_id": peer.opened["connection_id"], "connection_generation": peer.opened["connection_generation"]}
         value, headers = self.checked("/api/v1/worker/jobs/" + experiment["current_job_id"] + "/claim", worker["credential"], "POST", body, want=want, origin=origin)
         return value, headers, body
 
     def decision(self, worker, peer, job, decision, submission=None, want=200, changes=None):
+        if isinstance(peer, PullPeer):
+            require(worker["worker"]["id"] == peer.worker["worker"]["id"], "use explicit HTTP for a foreign credential test")
+            return peer.submit(job, decision, submission, want, changes)
         body = {"protocol_version": 1, "submission_id": submission or secrets.token_hex(12), "connection_id": peer.opened["connection_id"], "connection_generation": peer.opened["connection_generation"], "conversation_id": job["conversation_id"], "generation": job["generation"], "lease_id": job["lease_id"], "context_receipt_id": job["context"]["receipt_id"], "decision": decision}
         body.update(changes or {})
         value, headers = self.checked("/api/v1/worker/jobs/" + job["id"] + "/decisions", worker["credential"], "POST", body, want=want)
@@ -211,7 +295,6 @@ class Inference(WorkerAuth):
     def tool_loop(self, worker, peer):
         fixture = self.private("client-only.txt", "client-fixture-" + secrets.token_hex(24) + "\nexact second line\n")
         a = self.create(worker, "Read the client-only fixture")
-        peer.wait("job.available", lambda data: data["job_id"] == a["current_job_id"])
         j, _, _ = self.claim(worker, peer, a)
         require(j["context"]["kind"] == "full" and len(j["context"]["messages"]) == 2, "initial context not full")
         tool = {"type": "tool_call", "call_id": "client-" + secrets.token_hex(8), "name": "read_file", "arguments": {"path": str(fixture), "scale": 1e19}}
@@ -230,13 +313,14 @@ class Inference(WorkerAuth):
         self.decision(worker, peer, bj, {"type": "final", "text": "session-B-only"})
 
         result = fixture.read_text()
-        request = {"protocol_version": 1, "submission_id": secrets.token_hex(12), "call_id": tool["call_id"], "output": result, "context_probe": {"kind": "delta", "base_receipt_id": j["context"]["receipt_id"]}}
-        self.checked("/api/v1/admin/experiments/" + a["id"] + "/tool-results", self.admin, "POST", {**request, "context_probe": {"kind": "delta", "base_receipt_id": bj["id"]}}, want=409)
+        request = {"protocol_version": 1, "submission_id": secrets.token_hex(12), "call_id": tool["call_id"], "output": result}
+        self.checked("/api/v1/admin/experiments/" + a["id"] + "/tool-results", self.admin, "POST",
+                     {**request, "context_probe": {"kind": "delta", "base_receipt_id": j["context"]["receipt_id"]}}, want=409)
         continuation, _ = self.checked("/api/v1/admin/experiments/" + a["id"] + "/tool-results", self.admin, "POST", request, want=202)
         next_job, _, _ = self.claim(worker, peer, continuation)
         context = next_job["context"]
-        require(context["kind"] == "delta" and context["base_prefix"] == 2 and context["base_sha256"] == j["context"]["canonical_sha256"], "delta base receipt differs")
-        require(context["messages"] == [tool, {"type": "tool_result", "call_id": tool["call_id"], "output": result}], "delta omitted/duplicated tool items")
+        require(context["kind"] == "full" and context["base_prefix"] == 0 and context["messages"] ==
+                j["context"]["messages"] + [tool, {"type": "tool_result", "call_id": tool["call_id"], "output": result}], "continuation omitted or duplicated canonical history")
         delivered_result = context["messages"][-1]["output"]
         final, _, final_request = self.decision(worker, peer, next_job, {"type": "final", "text": delivered_result})
         require(final["final_text"] == result and len(final["messages"]) == 5, "final answer/history did not preserve exact client result")
@@ -251,180 +335,133 @@ class Inference(WorkerAuth):
         require(replay_job["context"]["kind"] == "full" and replay_job["context"]["messages"] == final["messages"] and replay_job["conversation_id"] != a["conversation_id"], "fresh conversation did not receive complete canonical replay")
         self.decision(worker, peer, replay_job, {"type": "final", "text": result})
         events = self.export_operation(a["id"])
-        contexts = [e for e in events if e["msg"] == "inference.context"]
+        contexts = [e for e in events if e["msg"] == "inference.context" and e.get("claim_id")]
         require(len(contexts) == 2 and contexts[-1]["context"]["messages"] == context["messages"], "private capture did not retain exact delivered context")
         require(any(e["msg"] == "inference.exchange" and e["level"] == "DEBUG" for e in events), "DEBUG exchanges missing at INFO runtime")
-        self.receipt("inference.client_tool_interleave_delta_replay", experiment=a["id"], session=a["conversation_id"], history_items=5, client_tool_executions=1, synthetic_peer=True)
+        self.receipt("inference.client_tool_interleave_full_replay", experiment=a["id"], session=a["conversation_id"], history_items=5, client_tool_executions=1, synthetic_peer=True)
         self.accepted_retry = (worker, next_job, final_request, a["id"])
 
     def concurrency_and_scope(self, worker, other, peer, second_origin):
-        e = self.create(worker, "concurrent claim", tools=False)
-        def claim(i):
-            body = {"protocol_version": 1, "submission_id": "race-" + secrets.token_hex(8), "connection_id": peer.opened["connection_id"], "connection_generation": peer.opened["connection_generation"]}
-            status, _, value = self.api("/api/v1/worker/jobs/" + e["current_job_id"] + "/claim", worker["credential"], "POST", body, origin=self.origin_url if i % 2 == 0 else second_origin)
-            return status, json.loads(value), body
+        experiment = self.create(worker, "same-poll replay and start race", tools=False)
+        job_id = experiment["current_job_id"]
+        poll = peer.poll_input()
+        path = "/api/v1/worker/pull"
         with ThreadPoolExecutor(max_workers=8) as pool:
-            results = list(pool.map(claim, range(8)))
-        require([r[0] for r in results].count(200) == 1 and [r[0] for r in results].count(409) == 7, "claim race admitted multiple inference turns")
-        _, job, request = next(r for r in results if r[0] == 200)
-        self.checked("/api/v1/worker/jobs/" + job["id"] + "/claim", worker["credential"], "POST", request)
-        for path, method, data in (("/api/v1/worker/jobs/" + job["id"], "GET", None), ("/api/v1/worker/jobs/" + job["id"] + "/claim", "POST", request)):
-            self.checked(path, other["credential"], method, data, want=404)
-        _, headers, _ = self.decision(other, peer, job, {"type": "final", "text": "foreign"}, want=404)
-        self.diagnose(headers["X-Request-Id"], "lease.rejected", "worker_scope_denied")
-        operation = self.export_operation(e["id"])
-        foreign = [event for event in operation if event["msg"] == "lease.rejected" and event.get("reason") == "worker_scope_denied"]
-        require(len(foreign) >= 2 and all(event["conversation_id"] == job["conversation_id"] and event["job_id"] == job["id"] and event["generation"] == job["generation"] for event in foreign), "experiment export omitted foreign assignment evidence")
-        self.checked("/api/v1/worker/heartbeat", other["credential"], "POST", {"protocol_version": 1, "connection_id": peer.opened["connection_id"], "connection_generation": peer.opened["connection_generation"], "challenge_id": "foreign"}, want=409)
-        _, headers, _ = self.decision(worker, peer, job, {"type": "final", "text": "stale"}, want=409, changes={"generation": job["generation"] + 1})
+            granted = pool.submit(peer.poll, payload=poll)
+            replays = [pool.submit(self.checked, path, worker["credential"], "POST", poll, origin=second_origin if index % 2 else self.origin_url)
+                       for index in range(7)]
+            grant = granted.result()
+            require(grant["job_id"] == job_id and all(replay.result()[0]["job"] == grant for replay in replays), "sibling brokers replayed different grants")
+        require(PullPeer(self, other).poll() is None, "foreign worker pulled explicitly targeted work")
+        route = "/api/v1/worker/jobs/" + job_id
+        start = {"protocol_version": 1, "claim_id": grant["claim_id"], "generation": grant["generation"],
+                 "launch_id": "launch-" + job_id, "native_job_id": "once-" + job_id}
+        self.checked(route + "/start", other["credential"], "POST", start, want=404)
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            attempts = [pool.submit(self.api, route + "/start", worker["credential"], "POST", start,
+                                    origin=second_origin if index % 2 else self.origin_url) for index in range(8)]
+            replies = [attempt.result() for attempt in attempts]
+        require(sorted(status for status, _, _ in replies) == [200] + [409] * 7, "duplicate handlers received execution authority")
+        job = json.loads(next(body for status, _, body in replies if status == 200))
+        require(job["lease_id"] == grant["claim_id"] and job["native_job_id"] == start["native_job_id"], "authorized brief lost its claim binding")
+        _, headers, stale = self.decision(worker, peer, job, {"type": "final", "text": "stale"}, want=409, changes={"generation": job["generation"] + 1})
         evidence, _ = self.diagnose(headers["X-Request-Id"], "lease.fenced", "stale_assignment")
         require(evidence["evidence"]["expected_generation"] == job["generation"], "stale generation diagnosis missing")
+        self.checked(route + "/decisions", other["credential"], "POST", {**stale, "generation": job["generation"]}, want=404)
         self.decision(worker, peer, job, {"type": "final", "text": "one accepted result"})
-        self.receipt("inference.atomic_claim_and_scope", attempts=8, accepted=1, other_worker_denied=True)
+        self.receipt("inference.atomic_claim_and_scope", simultaneous_pulls=8, starts=8, authorized=1, other_worker_denied=True)
 
     def cancellation_and_deadline(self, worker, peer):
-        e = self.create(worker, "cancel while computing", tools=False)
-        job, _, _ = self.claim(worker, peer, e)
-        cancelled, _ = self.cancel(e["id"])
-        require(cancelled["state"] == "cancelled" and cancelled["remote_outcome"] == "unknown", "cancellation waited for remote work or hid uncertainty")
-        second = self.create(worker, "queued behind cancelled work", tools=False)
-        self.claim(worker, peer, second, want=409)
-        replies = len(peer.replies)
-        self.until(lambda: len(peer.replies) > replies, "next health check missing", timeout=15)
-        require(self.status(worker)["work_status"] == "busy", "health reply released cancelled job")
+        experiment = self.create(worker, "cancel while computing", tools=False)
+        job, _, _ = self.claim(worker, peer, experiment)
+        cancelled, _ = self.cancel(experiment["id"])
+        require(cancelled["state"] == "cancelled" and cancelled["remote_outcome"] == "unknown", "cancellation hid uncertain native work")
+        following = self.create(worker, "queued behind cancelled work", tools=False)
+        require(self.experiment(following["id"])["state"] == "queued" and self.status(worker)["work_status"] == "busy", "cancelled claim released the slot")
         self.decision(worker, peer, job, {"type": "final", "text": "late cancelled answer"}, want=409)
-        peer.wait("job.cancelled", lambda data: data["job_id"] == job["id"])
-        peer.acknowledge_idle(job)
-        next_job, _, _ = self.claim(worker, peer, second)
-        self.decision(worker, peer, next_job, {"type": "final", "text": "next work after idle"})
-        events = self.export_operation(e["id"])
-        require(any(x["msg"] == "experiment.cancelled" and x["busy_hold"] for x in events) and any(x["msg"] == "worker.idle_confirmed" for x in events), "cancellation/idle timeline incomplete")
+        peer.settle(job, "cancelled")
+        next_job, _, _ = self.claim(worker, peer, following)
+        self.decision(worker, peer, next_job, {"type": "final", "text": "next work after verified stop"})
+        events = self.export_operation(experiment["id"])
+        require(any(event["msg"] == "experiment.cancelled" and event["busy_hold"] for event in events) and
+                any(event["msg"] == "job.work_settled" and not event["busy_hold"] for event in events), "cancellation and stop diagnosis incomplete")
 
         expired = self.create(worker, "short deadline", tools=False, timeout=2)
-        exp_job, _, _ = self.claim(worker, peer, expired)
-        self.until(lambda: self.experiment(expired["id"])["state"] == "interrupted", "deadline did not interrupt turn")
-        self.decision(worker, peer, exp_job, {"type": "final", "text": "too late"}, want=409)
-        events = self.export_operation(expired["id"])
-        failures = [x for x in events if x["msg"] == "job.deadline_exceeded"]
-        require(len(failures) == 1 and failures[0]["level"] == "ERROR" and failures[0]["remote_outcome"] == "unknown" and failures[0]["claimed_at"], "deadline diagnosis incomplete")
-        peer.acknowledge_idle(exp_job)
-        self.receipt("inference.cancellation_deadline_idle_hold", cancelled=e["id"], expired=expired["id"], automatic_retries=0)
+        expiry_job, _, _ = self.claim(worker, peer, expired)
+        self.until(lambda: self.experiment(expired["id"])["state"] == "interrupted", "deadline did not fence active work")
+        self.decision(worker, peer, expiry_job, {"type": "final", "text": "too late"}, want=409)
+        require(self.status(worker)["work_status"] == "busy", "deadline discarded unconfirmed remote work")
+        peer.settle(expiry_job, "interrupted")
+        failures = [event for event in self.export_operation(expired["id"]) if event["msg"] == "job.deadline_exceeded"]
+        require(len(failures) == 1 and failures[0]["level"] == "ERROR" and failures[0]["remote_outcome"] == "unknown" and failures[0]["claimed_at"],
+                "deadline diagnosis omitted actual claim evidence")
+        accepted = self.create(worker, "accepted receipt valid after deadline", tools=False, timeout=3)
+        accepted_job, _, _ = self.claim(worker, peer, accepted)
+        completed, _, submission = self.decision(worker, peer, accepted_job, {"type": "final", "text": "accepted once"})
+        expires = datetime.fromisoformat(accepted_job["deadline_at"].replace("Z", "+00:00")).timestamp()
+        self.until(lambda: time.time() >= expires, "test did not cross the original job deadline", timeout=5)
+        replay, _ = self.checked("/api/v1/worker/jobs/" + accepted_job["id"] + "/decisions", worker["credential"], "POST", submission)
+        require(replay == completed and len(self.experiment(accepted["id"])["messages"]) == 3, "accepted replay after deadline mutated history")
+        self.receipt("inference.cancellation_deadline_and_exact_replay", original_receipt_preserved=True, late_new_results_fenced=True, automatic_retries=0)
 
     def revocation_races(self):
-        for operation in ("claim", "decisions"):
+        for operation in ("start", "decisions"):
             worker = self.new_worker()
-            peer = self.peer(worker)
+            peer = self.pull_peer(worker)
             experiment = self.create(worker, "revocation wins after authentication", tools=False)
+            grant = peer.poll()
+            job_id = grant["job_id"]
             submission = "revoke-race-" + secrets.token_hex(8)
-            request = {"protocol_version": 1, "submission_id": submission, "connection_id": peer.opened["connection_id"], "connection_generation": peer.opened["connection_generation"]}
-            if operation == "decisions":
-                job, _, _ = self.claim(worker, peer, experiment)
-                request.update({"conversation_id": job["conversation_id"], "generation": job["generation"], "lease_id": job["lease_id"], "context_receipt_id": job["context"]["receipt_id"], "decision": {"type": "final", "text": "must not be accepted"}})
-            route = "/api/v1/worker/jobs/" + experiment["current_job_id"] + "/" + operation
-            target = urllib.parse.urlsplit(self.origin_url)
+            if operation == "start":
+                request = {"protocol_version": 1, "claim_id": grant["claim_id"], "generation": grant["generation"],
+                           "launch_id": "launch-" + job_id, "native_job_id": "once-" + job_id}
+            else:
+                job, _, _ = peer.begin(grant)
+                request = {"protocol_version": 1, "submission_id": submission, "connection_id": "", "connection_generation": 0,
+                           "conversation_id": job["conversation_id"], "generation": job["generation"], "lease_id": job["lease_id"],
+                           "context_receipt_id": job["context"]["receipt_id"], "decision": {"type": "final", "text": "must not be accepted"}}
+            origin = urllib.parse.urlsplit(self.origin_url)
             body = json.dumps(request).encode()
-            connection = http.client.HTTPConnection(target.hostname, target.port, timeout=5)
+            connection = http.client.HTTPConnection(origin.hostname, origin.port, timeout=5)
             try:
-                connection.putrequest("POST", route)
+                connection.putrequest("POST", "/api/v1/worker/jobs/" + job_id + "/" + operation)
                 connection.putheader("Authorization", "Bearer " + worker["credential"])
+                connection.putheader("X-Muse-Worker-Version", self.worker_version)
                 connection.putheader("Content-Type", "application/json")
                 connection.putheader("Content-Length", str(len(body)))
                 connection.putheader("Expect", "100-continue")
                 connection.endheaders()
                 with connection.sock.makefile("rb") as interim:
-                    require(interim.readline() == b"HTTP/1.1 100 Continue\r\n" and interim.readline() == b"\r\n",
-                            "worker authentication did not precede the request body")
+                    require(interim.readline() == b"HTTP/1.1 100 Continue\r\n" and interim.readline() == b"\r\n", "worker preflight did not precede body delivery")
                 self.checked("/api/v1/admin/workers/" + worker["worker"]["id"] + "/revoke", self.admin, "POST")
                 connection.send(body)
                 with connection.getresponse() as response:
-                    status, headers = response.status, response.headers
+                    require(response.status == 401, "request authenticated before revocation bypassed durable authority")
+                    request_id = response.headers["X-Request-Id"]
                     response.read()
             finally:
                 connection.close()
-            require(status == 401, "request authenticated before revocation bypassed durable authority")
-            count = self.sql("SELECT count(*) FROM aaa_inference_receipts WHERE principal='worker:" + worker["worker"]["id"] + "' AND submission_id='" + submission + "'; SELECT count(*) FROM aaa_inference_history WHERE experiment_id='" + experiment["id"] + "';").splitlines()
-            require(count == ["0", "2"], "revocation race committed a receipt or appended history")
-            event, _ = self.diagnose(headers["X-Request-Id"], "lease.rejected", "worker_revoked")
-            require(event["conversation_id"] == experiment["conversation_id"], "revocation race lost operation context")
-            peer.stop()
+            self.checked("/api/v1/worker/pull", worker["credential"], "POST", peer.poll_input(), want=401)
+            event, _ = self.diagnose(request_id, "lease.rejected", "worker_revoked")
+            require(event["conversation_id"] == experiment["conversation_id"] and len(self.experiment(experiment["id"])["messages"]) == 2,
+                    "revocation race committed work or lost operation context")
             self.receipt("inference.revocation_after_authentication", operation=operation, accepted_receipts=0, history_items=2)
 
     def restart(self, worker, peer, service):
-        e = self.create(worker, "tool linkage across broker restart")
-        job, _, _ = self.claim(worker, peer, e)
+        experiment = self.create(worker, "tool linkage across broker restart")
+        job, _, _ = self.claim(worker, peer, experiment)
         call_id = "restart-call-" + secrets.token_hex(8)
         self.decision(worker, peer, job, {"type": "tool_call", "call_id": call_id, "name": "read_file", "arguments": {"path": "client-only"}})
-        peer.stop()
         self.docker("restart", service)
         self.origin_url = self.origin(service)
         self.ready(service, self.origin_url)
-        new_peer = self.peer(worker)
-        require(new_peer.opened["connection_generation"] > peer.opened["connection_generation"], "restart reused connection generation")
-        self.checked("/api/v1/worker/heartbeat", worker["credential"], "POST", {"protocol_version": 1, "connection_id": peer.opened["connection_id"], "connection_generation": peer.opened["connection_generation"], "challenge_id": "old"}, want=409)
         result = {"protocol_version": 1, "submission_id": secrets.token_hex(12), "call_id": call_id, "output": "post-restart exact result"}
-        next_e, _ = self.checked("/api/v1/admin/experiments/" + e["id"] + "/tool-results", self.admin, "POST", result, want=202)
-        next_job, _, _ = self.claim(worker, new_peer, next_e)
-        require(next_job["context"]["kind"] == "full" and next_job["context"]["messages"][-1]["call_id"] == call_id, "restart lost full context/tool linkage")
-        self.decision(worker, new_peer, next_job, {"type": "final", "text": next_job["context"]["messages"][-1]["output"]})
-        require(len(self.experiment(e["id"])["messages"]) == 5, "restart duplicated history")
-        self.receipt("inference.restart_tool_wait", experiment=e["id"], call_id=call_id, full_replay=True)
-        return new_peer
-
-    def disconnect_and_revoke(self, worker, peer):
-        e = self.create(worker, "claimed disconnect", tools=False)
-        job, _, _ = self.claim(worker, peer, e)
-        peer.stop()
-        self.until(lambda: self.experiment(e["id"])["state"] == "interrupted", "disconnect did not fence claimed work")
-        self.create(worker, "offline rejected", want=409)
-        reconnect = self.peer(worker)
-        require(self.status(worker)["work_status"] == "busy", "reconnect erased uncertain busy hold")
-        self.decision(worker, peer, job, {"type": "final", "text": "old connection late result"}, want=409)
-        reconnect.acknowledge_idle(job)
-        next_e = self.create(worker, "revoked active subscriber", tools=False)
-        next_job, _, _ = self.claim(worker, reconnect, next_e)
-        self.checked("/api/v1/admin/workers/" + worker["worker"]["id"] + "/revoke", self.admin, "POST")
-        self.decision(worker, reconnect, next_job, {"type": "final", "text": "revoked"}, want=401)
-        self.until(lambda: self.experiment(next_e["id"])["state"] == "interrupted", "revocation left claimed inference active")
-        reconnect.stop()
-        self.receipt("inference.disconnect_reconnect_revocation", busy_hold_preserved=True, stale_output_rejected=True)
-
-    def queued_context_reconnect(self):
-        worker = self.new_worker()
-        peer = self.peer(worker)
-        for kind in ("delta", "full"):
-            e = self.create(worker, "queued " + kind + " context across reconnect")
-            job, _, _ = self.claim(worker, peer, e)
-            call_id = "reconnect-" + kind
-            self.decision(worker, peer, job, {"type": "tool_call", "call_id": call_id, "name": "read_file", "arguments": {"path": "client-only"}})
-            probe = {"kind": kind}
-            if kind == "delta":
-                probe["base_receipt_id"] = job["id"]
-            continuation, _ = self.checked("/api/v1/admin/experiments/" + e["id"] + "/tool-results", self.admin, "POST", {"protocol_version": 1, "submission_id": secrets.token_hex(12), "call_id": call_id, "output": "exact reconnect result", "context_probe": probe}, want=202)
-            queued, _ = self.checked("/api/v1/worker/jobs/" + continuation["current_job_id"], worker["credential"])
-            old_generation = peer.opened["connection_generation"]
-            peer.stop()
-            peer = self.peer(worker)
-            require(peer.opened["connection_generation"] > old_generation, "reconnect reused generation")
-            claimed, headers, request = self.claim(worker, peer, continuation, want=409 if kind == "delta" else 200)
-            if kind == "delta":
-                event, _ = self.diagnose(headers["X-Request-Id"], "lease.rejected", "context_base_connection_changed")
-                require(event["evidence"]["expected_connection_generation"] == old_generation and event["evidence"]["observed_connection_generation"] == peer.opened["connection_generation"], "delta rejection lost base/current connection evidence")
-                stored, _ = self.checked("/api/v1/worker/jobs/" + queued["id"], worker["credential"])
-                require(stored == queued and self.status(worker)["work_status"] == "idle" and len(self.experiment(e["id"])["messages"]) == 4, "rejected delta claim mutated retained delivery/history or busy hold")
-                self.cancel(e["id"])
-            else:
-                require(claimed["context"]["kind"] == "full" and len(claimed["context"]["messages"]) == 4 and claimed["context"]["messages"][-1]["output"] == "exact reconnect result", "full continuation lost canonical context after reconnect")
-                self.decision(worker, peer, claimed, {"type": "final", "text": claimed["context"]["messages"][-1]["output"]})
-        peer.stop()
-        self.receipt("inference.queued_context_reconnect", delta_claim_status=409, full_claim_status=200, rejected_delivery_unchanged=True)
-
-    def missing_health_and_bounds(self, worker):
-        peer = self.peer(worker, reply=False)
-        self.until(lambda: self.status(worker)["connection_status"] == "offline", "missing health replies did not mark offline", timeout=35)
-        self.create(worker, "offline", want=409)
-        self.offline_diagnosis(worker, peer, "health_reply_expired")
-        peer.stop()
-        self.receipt("inference.health_timeout", interval_seconds=10, response_window_seconds=30)
+        continuation, _ = self.checked("/api/v1/admin/experiments/" + experiment["id"] + "/tool-results", self.admin, "POST", result, want=202)
+        next_job, _, _ = self.claim(worker, peer, continuation)
+        require(next_job["context"]["kind"] == "full" and next_job["context"]["messages"][-1]["call_id"] == call_id, "restart lost context or tool linkage")
+        self.decision(worker, peer, next_job, {"type": "final", "text": next_job["context"]["messages"][-1]["output"]})
+        require(len(self.experiment(experiment["id"])["messages"]) == 5, "restart duplicated history")
+        self.receipt("inference.restart_tool_wait", experiment=experiment["id"], call_id=call_id, full_replay=True)
 
     def boundary_and_failure_evidence(self, worker, peer):
         for raw in (b'{}', b'null', b'{"protocol_version":1,"protocol_version":1}', b'{} {}', b'{"messages":[{"type":"image"}]}'):
@@ -474,19 +511,22 @@ class Inference(WorkerAuth):
         arguments = exchanges[0]["input"]["decision"]["arguments"]
         require(len(arguments) == 2 and set(arguments.values()) == {"client-evidence", 9007199254740993}, "redaction overwrote argument evidence or rounded numbers")
         self.cancel(e["id"])
-        failure = self.create(worker, "persistence failure after claim callback", tools=False)
-        submission = "persistence-fault-" + secrets.token_hex(8)
-        self.reject_writes("inference_test_receipt", "aaa_inference_receipts", "NEW.submission_id='" + submission + "'", "INSERT")
+        failure = self.create(worker, "persistence failure after pull reservation", tools=False)
+        poll = peer.poll_input()
+        condition = "NEW.worker_id='" + worker["worker"]["id"] + "' AND NEW.sequence=" + str(poll["sequence"])
+        self.reject_writes("inference_test_poll", "aaa_worker_polls", condition, "UPDATE")
         try:
-            _, headers, _ = self.claim(worker, peer, failure, submission=submission, want=503)
+            _, headers = self.checked("/api/v1/worker/pull", worker["credential"], "POST", poll, want=503)
         finally:
-            self.sql("DROP TRIGGER inference_test_receipt;")
-        events = self.export_operation(failure["id"])
-        failed = [event for event in events if event.get("request_id") == headers["X-Request-Id"] and event["msg"] in ("inference.storage_exchange", "inference.operation_failed")]
-        require(len(failed) == 2 and {event["level"] for event in failed} == {"ERROR", "DEBUG"}, "experiment export omitted persistence failure")
-        require(all(event["sqlite_code"] == "1811" and event["transaction_outcome"] == "rolled_back" and event["conversation_id"] == failure["conversation_id"] and event["job_id"] == failure["current_job_id"] for event in failed), "persistence failure lost cause/transaction/correlation")
+            self.sql("DROP TRIGGER inference_test_poll;")
+        event, _ = self.diagnose(headers["X-Request-Id"], "worker.pull_failed")
+        require(event["level"] == "ERROR" and event["sqlite_code"] == "1811" and event["transaction_outcome"] == "rolled_back" and
+                event["job_id"] == failure["current_job_id"] and event["sequence"] == poll["sequence"], "poll persistence failure lost its cause or reservation")
         require(self.experiment(failure["id"])["state"] == "queued" and self.status(worker)["work_status"] == "idle", "failed persistence left a claimed turn")
-        self.cancel(failure["id"])
+        grant = peer.poll(payload=poll)
+        require(grant["job_id"] == failure["current_job_id"], "rolled back sequence committed a grant")
+        job, _, _ = peer.begin(grant)
+        self.decision(worker, peer, job, {"type": "final", "text": "accepted after rollback"})
         self.receipt("inference.object_key_redaction_and_persistence_failure", log_only_diagnosis=True, rollback_verified=True)
 
 
@@ -507,39 +547,17 @@ def main():
         h.ready(service, h.origin_url)
         secondary, second_origin, _ = h.launch(config)
         h.ready(secondary, second_origin)
-        a, b, unresponsive = h.new_worker(), h.new_worker(), h.new_worker()
-        peer = h.peer(a)
+        a, b = h.new_worker(), h.new_worker()
+        peer = h.pull_peer(a)
         h.tool_loop(a, peer)
         h.concurrency_and_scope(a, b, peer, second_origin)
         h.docker("stop", "--time", "5", secondary)
         require(not h.inspect(secondary)["State"]["Running"], "secondary broker still emits asynchronous diagnostics")
         h.cancellation_and_deadline(a, peer)
-        opened_at = next(event["at"] for event in peer.events if event["type"] == "connection.opened")
-        h.until(lambda: any(event["type"] == "health.challenge" and event["at"] - opened_at > 30 for event in peer.events), "no SSE frame observed after the global write deadline", timeout=45)
-        h.until(lambda: len(peer.replies) >= 4, "health replies missing", timeout=15)
-        from datetime import datetime
-        issued = [datetime.fromisoformat(event["data"]["issued_at"].replace("Z", "+00:00")).timestamp() for event in peer.events if event["type"] == "health.challenge"]
-        require(issued[3] - issued[0] >= 28 and not peer.errors, "health challenges did not use ten-second cadence")
-        intervals = [issued[i + 1] - issued[i] for i in range(3)]
-        reply_intervals = [peer.replies[i + 1]["at"] - peer.replies[i]["at"] for i in range(3)]
-        require(all(9 <= interval <= 15 for interval in intervals), "observed health cadence differs from ten seconds")
-        require(h.status(a)["connection_status"] == "online", "long-lived stream disconnected")
-        late_frame = next(event for event in peer.events if event["type"] == "health.challenge" and event["at"] - opened_at > 30)
-        h.receipt("inference.long_stream", replies=len(peer.replies), observed_seconds=late_frame["at"] - opened_at, intervals_seconds=intervals, reply_completion_intervals_seconds=reply_intervals)
-        from datetime import datetime
-        retry_worker, retry_job, retry_body, retry_experiment = h.accepted_retry
-        expiry = datetime.fromisoformat(retry_job["lease_expires_at"].replace("Z", "+00:00")).timestamp()
-        h.until(lambda: time.time() >= expiry, "accepted receipt lease did not expire", timeout=35)
-        h.checked("/api/v1/worker/jobs/" + retry_job["id"] + "/decisions", retry_worker["credential"], "POST", retry_body)
-        require(len(h.experiment(retry_experiment)["messages"]) == 5, "accepted retry after lease expiry duplicated history")
-        h.receipt("inference.accepted_receipt_after_expiry", original_job=retry_job["id"], history_items=5)
-        peer = h.restart(a, peer, service)
-        h.disconnect_and_revoke(a, peer)
-        h.queued_context_reconnect()
+        h.restart(a, peer, service)
         h.revocation_races()
-        h.missing_health_and_bounds(unresponsive)
         final_worker = h.new_worker()
-        final_peer = h.peer(final_worker)
+        final_peer = h.pull_peer(final_worker)
         h.key_redaction_and_persistence_failure(final_worker, final_peer)
         h.boundary_and_failure_evidence(final_worker, final_peer)
         h.private("results.json", json.dumps({"suite": "inference", "source_sha": args.source_sha, "synthetic_peer": True, "receipts": h.receipts}))

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { releaseFixture } from './test/release-fixture.mjs';
 import { prepareStableRelease, candidateRecovery, bundleName, candidateBuildName } from './release-control.mjs';
 import { chooseVersion } from './worker-release.mjs';
+import { nextRCBase } from './release-history.mjs';
 import { isNextStable, isRCTag, releaseVersion } from './release-versions.mjs';
 
 test('only a trusted main administrator can prepare the latest verified merge', async t => {
@@ -12,7 +13,7 @@ test('only a trusted main administrator can prepare the latest verified merge', 
   assert.equal(result.tree_sha, f.tree);
   assert.equal(result.source_sha, f.source);
   assert.deepEqual(result.source_rc, f.prepared.source_rc);
-  assert.equal(result.tag, 'v0.1.0');
+  assert.equal(result.tag, 'v1.0.0');
   for (const [object, key, value, cause] of [[f.context, 'eventName', 'pull_request', 'untrusted'], [f.context, 'ref', 'refs/heads/other', 'untrusted'],
     [f.state, 'permission', 'write', 'administrator'], [f.state, 'source', 'f'.repeat(40), 'source_identity'],
     [f.state, 'sourceOnMain', false, 'not_on_main'], [f.state, 'merged', false, 'merged_source'],
@@ -29,13 +30,16 @@ test('only a trusted main administrator can prepare the latest verified merge', 
 test('RC allocation moves to the new series without losing reservations for an earlier source', () => {
   const previous = 'a'.repeat(40);
   const current = 'b'.repeat(40);
-  const refs = ['0.1.0-rc.13', '0.1.2-rc.0'].map((version, i) => ({
+  const refs = ['0.1.0-rc.13', '1.0.0-rc.0'].map((version, i) => ({
     ref: 'refs/tags/v' + version, object: { type: 'commit', sha: i === 0 ? previous : current },
   }));
-  assert.equal(chooseVersion([], current, true), '0.1.0-rc.0');
-  assert.equal(chooseVersion(refs.slice(0, 1), current, true, '0.1.2'), '0.1.2-rc.0');
-  assert.equal(chooseVersion(refs, previous, true, '0.1.2'), '0.1.0-rc.13');
-  assert.equal(chooseVersion(refs, 'c'.repeat(40), true, '0.1.2'), '0.1.2-rc.1');
+  const series = nextRCBase({ version: '0.3.2' });
+  assert.equal(series, '1.0.0');
+  assert.equal(chooseVersion([], current, true, nextRCBase(null)), '1.0.0-rc.0');
+  assert.equal(chooseVersion(refs.slice(0, 1), current, true, series), '1.0.0-rc.0');
+  assert.equal(chooseVersion(refs, previous, true, series), '0.1.0-rc.13');
+  assert.equal(chooseVersion(refs, 'c'.repeat(40), true, series), '1.0.0-rc.1');
+  assert.equal(chooseVersion(refs, 'c'.repeat(40), true, nextRCBase({ version: '1.0.0' })), '1.0.1-rc.0');
 });
 
 test('stable target accepts one patch, minor or major step and validates canonical versions', () => {
@@ -51,23 +55,22 @@ test('stable target accepts one patch, minor or major step and validates canonic
 });
 
 test('two inputs stay pinned and an incomplete newer RC does not replace the requested complete RC', async t => {
-  const f = await releaseFixture(t, { version: '0.1.1' });
-  f.state.refs.set('tags/v0.1.0', { object: { type: 'commit', sha: 'b'.repeat(40) } });
-  f.addRC('0.1.0-rc.14', { rcSource: 'b'.repeat(40), complete: false });
+  const f = await releaseFixture(t);
+  f.addRC('1.0.0-rc.14', { rcSource: 'b'.repeat(40), complete: false });
   const prepared = await prepareStableRelease(f);
-  assert.equal(prepared.version, '0.1.1');
+  assert.equal(prepared.version, '1.0.0');
   assert.deepEqual(prepared.source_rc, f.prepared.source_rc);
   assert.equal(prepared.source_sha, f.source);
   assert.equal(prepared.resume_run_id, null);
   assert.equal(prepared.candidate_ready, false);
-  await assert.rejects(prepareStableRelease({ ...f, version: '0.1.0' }), /reserved_for_other_source/);
-  await assert.rejects(prepareStableRelease({ ...f, version: '0.1.2' }), /version_step_invalid/);
+  await assert.rejects(prepareStableRelease({ ...f, version: '0.1.0' }), /source_target_major_mismatch/);
+  await assert.rejects(prepareStableRelease({ ...f, version: '1.0.1' }), /version_step_invalid/);
   await assert.rejects(prepareStableRelease({ ...f, prereleaseTag: 'main' }), /dispatch_inputs_invalid/);
 
-  const rc = f.addRC('0.1.0-rc.15', { rcSource: 'c'.repeat(40) });
+  const rc = f.addRC('1.0.0-rc.15', { rcSource: 'c'.repeat(40) });
   await assert.rejects(prepareStableRelease(f), error => error.fields.expected_rc === f.prereleaseTag &&
     error.fields.observed_rc === rc.release.tag_name);
-  const request = { ...f, prereleaseTag: rc.release.tag_name, version: '0.2.0' };
+  const request = { ...f, prereleaseTag: rc.release.tag_name };
   assert.equal((await prepareStableRelease(request)).source_sha, rc.source);
   rc.release.body = '<!-- aaa-muse-product:verified:conflict -->';
   await assert.rejects(prepareStableRelease(request), /completion_conflict/);
@@ -100,7 +103,7 @@ test('candidate recovery selects original trusted bytes and never rebuilds a res
   await assert.rejects(candidateRecovery(f), error => error.fields.artifact_record_missing === true && error.fields.original_run_id === 70);
   assert(!f.state.refs.has('tags/' + f.prepared.tag)); f.state.historyJobs.clear();
   f.state.runs = []; f.state.artifacts = [];
-  f.state.refs.set('tags/v0.1.0', { object: { type: 'commit', sha: f.source } });
+  f.state.refs.set('tags/' + f.prepared.tag, { object: { type: 'commit', sha: f.source } });
   await assert.rejects(candidateRecovery(f), /original_bundle_unavailable/);
   f.state.runs = [{ id: 70 }, { id: 80 }];
   f.state.artifacts = [{ id: 1, name: bundleName(f.prepared), run_id: 70, expired: false }];
@@ -122,6 +125,6 @@ test('candidate recovery selects original trusted bytes and never rebuilds a res
   delete f.context.runAttempt;
   f.state.originalRuns.set(f.context.runId, { ...f.state.originalRuns.get(70), head_branch: 'main' });
   assert.equal((await candidateRecovery(f)).run_id, f.context.runId);
-  f.state.refs.get('tags/v0.1.0').object.sha = 'f'.repeat(40); await assert.rejects(candidateRecovery(f), /reserved_for_other/);
+  f.state.refs.get('tags/' + f.prepared.tag).object.sha = 'f'.repeat(40); await assert.rejects(candidateRecovery(f), /reserved_for_other/);
   f.github.rest.git.getRef = async () => { throw { status: 403 }; }; await assert.rejects(candidateRecovery(f), error => error.fields.http_status === 403);
 });

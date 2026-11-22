@@ -23,14 +23,17 @@ var schema string
 //go:embed migrations/002_portal_sessions.sql
 var portalSchema string
 
+//go:embed migrations/003_native_pull.sql
+var pullSchema string
+
 const (
-	SchemaVersion = 2
+	SchemaVersion = 3
 	Path          = "/var/lib/aaa-muse-ai/state/broker.sqlite3"
 	BusyTimeoutMS = 2000
 	EngineVersion = "3.54.1"
 )
 
-var migrations = [SchemaVersion]string{schema, portalSchema}
+var migrations = [SchemaVersion]string{schema, portalSchema, pullSchema}
 var migrationChecksums = func() (result [SchemaVersion]string) {
 	for index, migration := range migrations {
 		result[index] = fmt.Sprintf("%x", sha256.Sum256([]byte(migration)))
@@ -84,6 +87,10 @@ func Classify(err error) *Failure {
 }
 
 func Open(ctx context.Context, path string) (*Repository, error) {
+	return OpenWithClock(ctx, path, time.Now)
+}
+
+func OpenWithClock(_ context.Context, path string, now func() time.Time) (*Repository, error) {
 	if err := secureFile(path); err != nil {
 		return nil, &Failure{Reason: "database_file_unavailable", Phase: "open", cause: err}
 	}
@@ -96,7 +103,7 @@ func Open(ctx context.Context, path string) (*Repository, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Repository{db: db, now: time.Now}, nil
+	return &Repository{db: db, now: now}, nil
 }
 
 func secureFile(path string) error {
@@ -185,6 +192,13 @@ func (r *Repository) Bootstrap(ctx context.Context) error {
 		}
 		current := 0
 		if ledger != 0 {
+			var latest int
+			if err := tx.QueryRowContext(ctx, "SELECT COALESCE(max(version),0) FROM aaa_schema_migrations").Scan(&latest); err != nil {
+				return err
+			}
+			if latest == 1 || latest == 2 {
+				return &Failure{Reason: "fresh_store_required", Expected: "empty major-1 store", Observed: "legacy schema " + strconv.Itoa(latest)}
+			}
 			var err error
 			current, err = verifySchema(tx.QueryContext(ctx, "SELECT version, checksum FROM aaa_schema_migrations ORDER BY version"))
 			if err != nil {

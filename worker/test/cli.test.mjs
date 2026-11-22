@@ -4,10 +4,16 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import * as fs from 'node:fs/promises';
 import { execute, argumentsFor, VERSION } from '../dist/cli.js';
-import { fixture, CODE, KEY, JOB, claimed } from './helpers.mjs';
+import { fixture, CODE, KEY, JOB, EXP, claimed } from './helpers.mjs';
 
 function adapters(f, changes = {}) {
   return { files: fs, system: f.state.sys, network: f.net, env: {}, home: () => f.state.root, nodeVersion: process.version, input: async () => CODE, stdout: line => f.stdout.push(line), stderr: line => f.output.push(line), signal: new AbortController().signal, metadata: async () => ({ source_sha: 'unit', source_dirty: true }), ...changes };
+}
+
+async function nativeBrief(f, changes = {}) {
+  const brief = claimed({ connection_id: '', connection_generation: 0, ...changes });
+  await f.state.write('cron-claim.json', JSON.stringify({ job_id: JOB, operation_id: EXP, claim_id: brief.lease_id, launch_id: 'launch', generation: 1, brief }));
+  return brief;
 }
 test('CLI validates options and runtime without echoing unknown argument values', async t => {
   const f = await fixture(t); f.stdout = [];
@@ -37,20 +43,15 @@ test('CLI runs configure, enrollment, context, decision, status, doctor and expo
   assert.equal(JSON.parse(f.stdout.at(-1)).inference_readiness, 'verified');
   assert.equal(JSON.parse(f.stdout.at(-1)).worker.qualification.evidence.evidence_kind, 'controlled');
   f.broker.override = undefined;
-  f.broker.jobs.set(JOB, claimed());
-  f.broker.jobs.get(JOB).context.tools[0].parameters = { type: 'object', properties: { token: { type: 'string' } } };
-  assert.equal(await run('job-show', '--job-id', JOB), 0);
-  assert.equal(JSON.parse(f.stdout.at(-1)).context.tools[0].parameters.properties.token.type, 'string');
+  const brief = await nativeBrief(f);
+  f.broker.jobs.set(JOB, brief);
   io.input = async () => '{"type":"final","text":"answer"}';
   assert.equal(await run('decision-submit', '--job-id', JOB, '--input', '-'), 0);
+  assert.equal(JSON.parse(f.stdout.at(-1)).claim_id, brief.lease_id);
   assert.equal(await run('diagnostics-export', '--decode', '--operation-id', 'd'.repeat(32)), 0);
   const records = f.stdout.at(-1).trimEnd().split('\n').map(JSON.parse); assert.equal(records[0].type, 'export'); assert(records.some(e => e.msg === 'worker.decision_input'));
   assert.equal(await run('diagnostics-export', '--request-id', 'missing', '--since', '2000-01-01T00:00:00Z', '--until', '2100-01-01T00:00:00Z'), 0);
-  for (const command of [['configure'], ['enroll'], ['job-show'], ['decision-submit'], ['decision-submit', '--job-id', JOB, '--input', '-', '--ack-idle']]) assert.equal(await run(...command), 1);
-  f.broker.jobs.set(JOB, claimed({ state: 'interrupted' }));
-  assert.equal(await run('decision-submit', '--job-id', JOB, '--ack-idle'), 0);
-  const stopped = new AbortController(); stopped.abort();
-  assert.equal(await execute(['run', '--state-dir', f.state.root], adapters(f, { signal: stopped.signal })), 0);
+  for (const command of [['configure'], ['enroll'], ['job-show'], ['run'], ['decision-submit'], ['decision-submit', '--job-id', JOB, '--input', '-', '--ack-idle']]) assert.equal(await run(...command), 1);
   assert(!f.stdout.join('').includes(KEY)); assert(!f.output.join('').includes(KEY));
   await fs.chmod(f.state.path('credential.key'), 0o644);
   assert.equal(await run('doctor'), 1); assert.equal(JSON.parse(f.output.at(-1)).msg, 'worker.state_unsafe');
@@ -74,7 +75,8 @@ test('shipped main executes with real process adapters, signals, stdin and files
 test('overlapping CLI decision commands reuse one journal and reject conflicting input before transport', async t => {
   const f = await fixture(t); f.stdout = [];
   await f.worker.configure('https://broker.example.test'); await f.worker.enroll(CODE);
-  f.broker.jobs.set(JOB, claimed());
+  const brief = await nativeBrief(f);
+  f.broker.jobs.set(JOB, brief);
   const input = '{"type":"final","text":"same decision with exact identity"}';
   let release, reached;
   const blocked = new Promise(done => { release = done; });
@@ -93,10 +95,14 @@ test('overlapping CLI decision commands reuse one journal and reject conflicting
   } finally { release(); }
   assert.equal(await first, 0); assert.equal(identical, 0); assert.equal(conflict, 1);
   const posts = f.broker.calls.filter(c => c.path.endsWith('/decisions'));
-  assert.equal(posts.length, 2); assert.equal(posts[0].options.body, posts[1].options.body);
-  const results = f.stdout.map(JSON.parse); assert.equal(results[0].submission_id, results[1].submission_id);
+  assert.equal(posts.length, 1);
+  const results = f.stdout.map(JSON.parse);
+  assert(results.every(result => result.claim_id === brief.lease_id));
+  assert.deepEqual(results.map(result => result.outcome), ['recovery_pending', 'accepted']);
+  assert.equal(results[0].cause, 'result_delivery_active');
   const journals = await f.state.child('journals');
-  const saved = JSON.parse(await journals.read('operation-' + results[0].submission_id + '.json'));
+  const pointer = JSON.parse(await journals.read('decision-' + JOB + '.json'));
+  const saved = JSON.parse(await journals.read('operation-' + pointer.submission_id + '.json'));
   assert.equal(saved.state, 'accepted'); assert.equal(saved.body, posts[0].options.body);
   assert.equal((await f.state.read('credential.key')).trim(), KEY);
 });

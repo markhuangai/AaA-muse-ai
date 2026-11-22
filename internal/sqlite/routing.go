@@ -49,18 +49,18 @@ func loadConnection(ctx context.Context, tx *sql.Tx, s *inference.State) error {
 
 func (r *Repository) routingStates(ctx context.Context, tx *sql.Tx, ref inference.Ref) (*inference.State, error) {
 	s := &inference.State{Experiments: map[string]*inference.Experiment{}, Jobs: map[string]*inference.Job{}, Pool: map[string]*inference.State{}}
-	rows, err := tx.QueryContext(ctx, "SELECT id,revoked_at FROM aaa_workers ORDER BY id")
+	rows, err := tx.QueryContext(ctx, "SELECT id,revoked_at,last_contact_at FROM aaa_workers ORDER BY id")
 	if err != nil {
 		return nil, err
 	}
 	for rows.Next() {
 		var id string
-		var revoked *int64
-		if err = rows.Scan(&id, &revoked); err != nil {
+		var revoked, lastContact *int64
+		if err = rows.Scan(&id, &revoked, &lastContact); err != nil {
 			rows.Close()
 			return nil, err
 		}
-		s.Pool[id] = &inference.State{WorkerID: id, Revoked: revoked != nil, Now: s.Now, Experiments: map[string]*inference.Experiment{}, Jobs: map[string]*inference.Job{}}
+		s.Pool[id] = &inference.State{WorkerID: id, Revoked: revoked != nil, Now: s.Now, LastContactAt: instant(lastContact), Experiments: map[string]*inference.Experiment{}, Jobs: map[string]*inference.Job{}}
 	}
 	err = rows.Err()
 	rows.Close()

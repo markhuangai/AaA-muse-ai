@@ -56,6 +56,107 @@ func failReason(t *testing.T, err error, reason string) *Failure {
 	return Classify(err)
 }
 
+func TestNativePullWinnerAndDueWorkUseSeekIndexes(t *testing.T) {
+	repo := newRepo(t)
+	for _, check := range []struct {
+		query, index string
+		parameters   []any
+	}{
+		{nextPullJob, "aaa_pull_queue_head", []any{"worker", 2, time.Now().UnixMicro()}},
+		{nextPullJob, "aaa_pull_queue_head", []any{"", 0, time.Now().UnixMicro()}},
+		{heldPullJob, "aaa_worker_single_held_turn", []any{"worker"}},
+		{duePullExperiments, "aaa_experiments_due", []any{time.Now().UnixMicro()}},
+		{duePullPins, "aaa_queued_pins_due", []any{time.Now().UnixMicro()}},
+	} {
+		t.Run(check.index, func(t *testing.T) {
+			rows, err := repo.db.QueryContext(t.Context(), "EXPLAIN QUERY PLAN "+check.query, check.parameters...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer rows.Close()
+			var seek bool
+			for rows.Next() {
+				var node, parent, unused int
+				var detail string
+				if err := rows.Scan(&node, &parent, &unused, &detail); err != nil {
+					t.Fatal(err)
+				}
+				if strings.HasPrefix(detail, "SEARCH ") && strings.Contains(detail, check.index) {
+					seek = check.query != nextPullJob || strings.Contains(detail, "(target=? AND capability=? AND shift=? AND bucket=?)")
+				} else if strings.HasPrefix(detail, "SCAN aaa_") || strings.HasPrefix(detail, "SCAN job") ||
+					(strings.Contains(detail, "TEMP B-TREE") && (check.query != nextPullJob || parent != 0)) {
+					t.Fatalf("native lookup used unbounded work: %s", detail)
+				}
+			}
+			if err := rows.Err(); err != nil || !seek {
+				t.Fatalf("expected indexed seek on %s: %v", check.index, err)
+			}
+		})
+	}
+}
+
+func TestNativePullWinnerSkipsExpiredQueueAndPreservesOrder(t *testing.T) {
+	repo := newRepo(t)
+	now := time.Unix(100, 0)
+	stamp := now.UnixMicro()
+	execute(t, repo, "INSERT INTO aaa_workers(id,name,credential_hash,registered_at) VALUES('worker','worker',zeroblob(32),?1)", stamp)
+	execute(t, repo, `WITH RECURSIVE rows(number) AS (VALUES(1) UNION ALL SELECT number+1 FROM rows WHERE number<4096)
+		INSERT INTO aaa_experiments(id,state,deadline_at,created_at,conversation_id,current_job_id,data)
+		SELECT 'backlog-'||number,'queued',CASE WHEN number%2=0 THEN ?1-number ELSE ?1+number END,
+		CASE WHEN number%2=0 THEN number ELSE ?1+number END,'backlog','backlog-'||number,X'7B7D' FROM rows`, stamp)
+	execute(t, repo, `INSERT INTO aaa_inference_jobs(id,worker_id,experiment_id,state,held,created_at,has_media,data,context,deadline_at,capability)
+		SELECT id,'worker',id,'queued',0,created_at,0,X'7B7D',X'7B7D',deadline_at,0 FROM aaa_experiments`)
+	for _, entry := range []struct {
+		id       string
+		target   any
+		created  int64
+		deadline int64
+		kind     int
+	}{
+		{"open-first", nil, stamp - 90, stamp + 1, 0},
+		{"target-late", "worker", stamp - 40, stamp + 1, 0},
+		{"target-first-b", "worker", stamp - 50, stamp + 2, 0},
+		{"target-first-a", "worker", stamp - 50, stamp + 3, 0},
+		{"target-needs-media", "worker", stamp - 60, stamp + 3, 1},
+	} {
+		execute(t, repo, `INSERT INTO aaa_experiments(id,worker_id,state,deadline_at,created_at,conversation_id,current_job_id,data)
+			VALUES(?1,?2,'queued',?3,?4,?1,?1,X'7B7D')`, entry.id, entry.target, entry.deadline, entry.created)
+		execute(t, repo, `INSERT INTO aaa_inference_jobs(id,worker_id,experiment_id,state,held,created_at,has_media,data,context,deadline_at,capability)
+			VALUES(?1,?2,?1,'queued',0,?3,?4!=0,X'7B7D',X'7B7D',?5,?4)`, entry.id, entry.target, entry.created, entry.kind, entry.deadline)
+	}
+	for _, check := range []struct {
+		worker string
+		kind   int
+		want   string
+	}{
+		{"worker", 0, "target-first-a"},
+		{"worker", 1, "target-needs-media"},
+		{"other-worker", 1, "open-first"},
+	} {
+		if err := repo.read(t.Context(), func(tx *sql.Tx) error {
+			winner, err := pickPullJob(t.Context(), tx, check.worker, check.kind, now)
+			if err == nil && winner.job != check.want {
+				t.Errorf("winner for %s/%d = %s, want %s", check.worker, check.kind, winner.job, check.want)
+			}
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	execute(t, repo, "UPDATE aaa_inference_jobs SET worker_id=NULL WHERE id='target-first-a'")
+	execute(t, repo, "UPDATE aaa_inference_jobs SET state='claimed',held=1 WHERE id='target-first-b'")
+	execute(t, repo, "DELETE FROM aaa_inference_jobs WHERE id='target-late'")
+	if err := repo.read(t.Context(), func(tx *sql.Tx) error {
+		winner, err := pickPullJob(t.Context(), tx, "worker", 0, now)
+		if err == nil && winner.job != "backlog-1" {
+			t.Errorf("winner after target changes = %s, want backlog-1", winner.job)
+		}
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestSQLiteBootstrapConnectionSettingsAndRestart(t *testing.T) {
 	path := privatePath(t)
 	first, second := openRepo(t, path), openRepo(t, path)
@@ -118,7 +219,7 @@ func TestSQLiteBootstrapConnectionSettingsAndRestart(t *testing.T) {
 	}
 }
 
-func TestSQLitePortalMigrationPreservesPopulatedVersionOne(t *testing.T) {
+func TestSQLiteNativeCutoverRejectsPopulatedLegacyStore(t *testing.T) {
 	path := privatePath(t)
 	original := openRepo(t, path)
 	execute(t, original, schema)
@@ -135,23 +236,27 @@ func TestSQLitePortalMigrationPreservesPopulatedVersionOne(t *testing.T) {
 	}
 	close(start)
 	for range 2 {
-		if err := <-done; err != nil {
-			t.Fatal(err, Classify(err).Detail())
-		}
+		failReason(t, <-done, "fresh_store_required")
 	}
 	for _, repo := range []*Repository{first, second} {
-		if err := repo.Ping(t.Context()); err != nil {
-			t.Fatal(err)
-		}
+		failReason(t, repo.Ping(t.Context()), "schema_version_incompatible")
 		record, err := repo.AuthenticateWorker(t.Context(), credential)
 		if err != nil || record.ID != "version-one-worker" {
-			t.Fatal("migration lost existing worker identity", err)
+			t.Fatal("refused migration modified existing worker identity", err)
 		}
 	}
-	for _, version := range []int{1, 2} {
+	var migrations int
+	if err := first.db.QueryRowContext(t.Context(), "SELECT count(*) FROM aaa_schema_migrations").Scan(&migrations); err != nil || migrations != 1 {
+		t.Fatal("refused migration modified legacy ledger", migrations, err)
+	}
+}
+
+func TestSQLiteNativeMigrationChecksums(t *testing.T) {
+	first := newRepo(t)
+	for version := 1; version <= SchemaVersion; version++ {
 		execute(t, first, "UPDATE aaa_schema_migrations SET checksum='changed' WHERE version=?1", version)
-		failReason(t, second.Ping(t.Context()), "migration_checksum_mismatch")
-		failReason(t, second.Bootstrap(t.Context()), "migration_checksum_mismatch")
+		failReason(t, first.Ping(t.Context()), "migration_checksum_mismatch")
+		failReason(t, first.Bootstrap(t.Context()), "migration_checksum_mismatch")
 		execute(t, first, "UPDATE aaa_schema_migrations SET checksum=?2 WHERE version=?1", version, migrationChecksums[version-1])
 	}
 }
@@ -200,8 +305,8 @@ func TestSQLiteUnsafeFileAndSchemaRejections(t *testing.T) {
 	})
 	t.Run("ledger", func(t *testing.T) {
 		repo := newRepo(t)
-		execute(t, repo, "UPDATE aaa_schema_migrations SET version=3 WHERE version=2")
-		if f := failReason(t, repo.Bootstrap(t.Context()), "schema_version_incompatible"); f.Observed != "3" || f.Expected != "2" {
+		execute(t, repo, "UPDATE aaa_schema_migrations SET version=4 WHERE version=3")
+		if f := failReason(t, repo.Bootstrap(t.Context()), "schema_version_incompatible"); f.Observed != "4" || f.Expected != "3" {
 			t.Fatal(f)
 		}
 		execute(t, repo, "UPDATE aaa_schema_migrations SET checksum='changed' WHERE version=1")

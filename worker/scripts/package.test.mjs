@@ -6,9 +6,9 @@ import { fixture } from '../../tools/test/helpers.mjs';
 
 function packaging(t, change = {}) {
   const f = fixture(t);
-  const source = { source_sha: 'a'.repeat(40), source_dirty: false, package_version: '0.1.0-dev.0' };
-  const metadata = { name: '@markhuangai/aaa-muse-worker', version: '0.1.0-dev.0', ...change.metadata };
-  const assets = ['install.sh', 'upgrade-enrolled.sh', 'private-directory.sh', 'hook.sh', 'SKILL.md'];
+  const source = { source_sha: 'a'.repeat(40), source_dirty: false, package_version: '1.0.0-dev.0', ...change.build };
+  const metadata = { name: '@markhuangai/aaa-muse-worker', version: '1.0.0-dev.0', ...change.metadata };
+  const assets = ['install.sh', 'private-directory.sh', 'SKILL.md'];
   for (const asset of assets) f.write('worker/setup/' + asset, 'package fixture');
   for (const [path, raw] of Object.entries({ 'worker/package.json': JSON.stringify(metadata), 'worker/dist/build.json': JSON.stringify(source), 'worker/dist/main.js': 'compiled-worker', 'worker/LICENSE': 'Apache-2.0', 'worker/README.md': 'worker' })) f.write(path, raw);
   const calls = [];
@@ -37,6 +37,7 @@ test('packaging validates metadata, archive inputs, provenance and the same arch
   const receipt = packageWorker([], f.options);
   assert.equal(receipt.outcome, 'passed'); assert.equal(receipt.version, f.source.package_version);
   assert.equal(receipt.sha256.length, 64); assert.equal(receipt.source.source_sha, f.source.source_sha);
+  assert(!receipt.files.some(path => path === 'setup/hook.sh' || path.startsWith('dist/subscriber.')));
   const published = JSON.parse(f.read('.artifacts/worker-package/latest.json'));
   assert.deepEqual(published, receipt);
   assert(f.calls.find(call => call.command === 'npm').args.includes('--ignore-scripts'));
@@ -51,6 +52,9 @@ test('packaging rejects malformed package, required files, runtime behavior and 
   for (const change of [
     { result: { name: 'wrong-package' } }, { result: { version: '1.2.3' } },
     { metadata: { dependencies: { unexpected: '1' } } },
+    { build: { package_version: '0.1.0-rc.19' } },
+    { metadata: { version: '0.1.0' } },
+    { result: { files: ['dist/main.js', 'dist/build.json', 'setup/install.sh', 'setup/private-directory.sh', 'setup/SKILL.md', 'setup/hook.sh'].map(path => ({ path })) } },
     { result: { files: [{ path: 'outside.js' }] } },
     { result: { files: [] } }, { result: { files: [{ path: 'dist/main.js' }] } },
     { result: { files: [{ path: 'dist/main.js' }, { path: 'dist/build.json' }] } },

@@ -17,7 +17,6 @@ func TestPortalHistoryManagementScopeCancellationAndCapture(t *testing.T) {
 	h.Portal = service.NewPortal(h.Authority, rand.Reader, h.Now)
 	h.Assets = fstest.MapFS{"index.html": {Data: []byte("compiled shell")}}
 	session := portalLogin(t, h)
-	connection := onlineHTTP(t, h, worker.ID)
 	input := nativeHTTPInput(worker.ID)
 	request, _ := nativeHTTP(t, h, "POST", "/api/v1/requests", "portal-session", input, 202)
 	operation := map[string]string{"X-Portal-Operation-Id": "history-portal-operation"}
@@ -42,7 +41,7 @@ func TestPortalHistoryManagementScopeCancellationAndCapture(t *testing.T) {
 	}
 	input.SubmissionID = "completed-request"
 	completed, _ := nativeHTTP(t, h, "POST", "/api/v1/requests", "another-session", input, 202)
-	nativeHTTPDecision(t, h, m, connection, key, completed)
+	nativeHTTPDecision(t, h, m, key, completed)
 	if portalHTTP(h, "POST", "/api/v1/admin/experiments/"+completed.ID+"/cancel", session.Token, `{"protocol_version":1,"submission_id":"too-late"}`, operation).Code != 409 {
 		t.Fatal("completed output was cancelled")
 	}
@@ -113,7 +112,6 @@ func TestPortalHistoryExpiredServerSessionCannotReadOrCancel(t *testing.T) {
 	h, m, worker, _ := inferenceHTTPFixture(t)
 	now := h.Now()
 	h.Portal = service.NewPortal(h.Authority, rand.Reader, func() time.Time { return now })
-	onlineHTTP(t, h, worker.ID)
 	request, _ := nativeHTTP(t, h, "POST", "/api/v1/requests", "expiry-session", nativeHTTPInput(worker.ID), 202)
 	session := portalLogin(t, h)
 	now = now.Add(service.PortalSessionLifetime + time.Second)

@@ -1,4 +1,5 @@
 """Controlled artifact delivery using the production broker, SQLite and installed packed worker."""
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import http.client
 import urllib.parse
@@ -77,6 +78,7 @@ class MediaFlow(MCPMedia, Product):
         worker = self.environment("media", mount_system_tmp=True)
         worker["slot"] = "media"
         self.install(worker, self.prompt())
+        self.checker(worker)
         self.mcp_text(worker)
         foreign = self.new_worker()
         stills, video, audios = self.inputs()
@@ -110,9 +112,8 @@ class MediaFlow(MCPMedia, Product):
                 identity = submit()
             require(submit() == identity, "exact retry created a second job")
             url = "/api/v1/media/jobs/" + identity
-            self.until(lambda: (worker["state"] / "cues" / (identity + ".json")).exists(), "media claim missing", timeout=30)
-            self.hook(worker)
-            shown = json.loads(self.cli(worker, "job-show", "--job-id", identity).stdout)
+            self.claim_work(worker, identity)
+            shown = self.start_work(worker)
             spool, progress = self.worker_media_directory(worker, identity, shown)
             output = spool / Path(shown["output_path"]).name
             expected = audios.get(case, video)
@@ -129,12 +130,11 @@ class MediaFlow(MCPMedia, Product):
             if case not in audios:
                 require(shown["prompt"] == motion, "motion text changed")
                 (spool / "native-thumbnail.webp").write_bytes(stills["image/webp"])
-            again = json.loads(self.cli(worker, "job-show", "--job-id", identity).stdout)
-            require(again["action"] == "preserve_existing_generation", "repeat wake can regenerate")
+            self.start_work(worker, want=1)
             require(self.api(url, self.other_client)[0] == self.api(url + "/artifact", self.other_client)[0] == 404, "foreign owner read media")
             require(self.api(url + "/artifact", self.client)[0] == 409, "uncommitted artifact downloadable")
             if not jobs:
-                self.adverse_upload(worker, foreign, identity, expected, output)
+                delivered_puts = self.adverse_upload(worker, foreign, identity, expected, output)
             else:
                 if case == "image/png":
                     extra = (32 << 20) - len(expected)
@@ -158,7 +158,10 @@ class MediaFlow(MCPMedia, Product):
             require(self.api(url + "/artifact", self.client)[2] == expected and self.api(url + "/artifact", self.other_client)[0] == 404, "owner download integrity or isolation failed")
             if case not in audios:
                 require((properties["width"], properties["height"], properties["fps"], properties["video_frames"]) == (64, 48, 8, 8), "wrong video measurements")
-            self.until(lambda: not progress.exists(), "worker did not reconcile the confirmed upload", timeout=35)
+            require(self.observe(worker, "completed")["outcome"] == "settled" and not progress.exists(), "worker did not reconcile the confirmed upload")
+            if not jobs:
+                require(self.proxy.media_puts["/api/v1/worker/jobs/" + identity + "/artifact"] == delivered_puts,
+                        "lost acknowledgement recovery sent a second PUT instead of probing the accepted receipt")
             require(sha(output.read_bytes()) == properties["sha256"], "worker did not leave acknowledged media to the system temp lifecycle")
             if case not in audios:
                 require((spool / "native-thumbnail.webp").read_bytes() == stills["image/webp"],
@@ -181,10 +184,9 @@ class MediaFlow(MCPMedia, Product):
         self.expire(jobs, links)
 
     def adverse_upload(self, worker, foreign, identity, expected, output):
-        current = self.checked("/api/v1/worker/jobs/" + identity, worker["credential"])[0]
+        current = worker["work"]["grant"]
         base = "/api/v1/worker/jobs/" + identity
-        fence = {"X-Muse-Connection-Id": current["connection_id"], "X-Muse-Connection-Generation": str(current["connection_generation"]),
-                 "X-Muse-Generation": str(current["generation"]), "X-Muse-Lease-Id": current["lease_id"]}
+        fence = {"X-Muse-Generation": str(current["generation"]), "X-Muse-Lease-Id": current["claim_id"]}
         self.checked("/api/v1/media/jobs/" + identity, self.client)
         require(self.api(base + "/media/image", foreign["credential"], headers=fence)[0] == 404, "foreign worker staged source")
         bad = {**fence, "X-Muse-Generation": str(current["generation"] + 1), "X-Muse-Artifact-Sha256": sha(expected), "Content-Type": "video/mp4"}
@@ -207,13 +209,39 @@ class MediaFlow(MCPMedia, Product):
         require(output.stat().st_size == (32 << 20) + 1 and self.api("/api/v1/media/jobs/" + identity + "/artifact", self.client)[0] == 409, "oversized upload was published or worker file erased")
         self.proxy.interrupt_media = True
         output.write_bytes(expected)
-        self.cli(worker, "media-finish", "--job-id", identity)
+        self.cli(worker, "media-finish", "--job-id", identity, want=1)
         require(self.proxy.media_interrupted.wait(35) and output.read_bytes() == expected, "worker lost interrupted upload")
         require(self.api("/api/v1/media/jobs/" + identity + "/artifact", self.client)[0] == 409, "partial upload published")
         self.proxy.lose_media_ack = True
         self.proxy.interrupt_media = False
+        route = base + "/artifact"
+        self.proxy.media_release.clear()
+        self.proxy.media_finished.clear()
+        self.proxy.media_pause_path = route
+        before_puts = self.proxy.media_puts.get(route, 0)
+        before_poll = self.status(worker)["last_poll_at"]
+        with ThreadPoolExecutor(max_workers=1) as worker_thread:
+            transfer = worker_thread.submit(self.cli, worker, "media-finish", "--job-id", identity, want=1)
+            try:
+                self.wait_upload_started(identity)
+                busy = self.tick(worker)
+                require(busy["outcome"] == "running" and busy["cause"] == "result_delivery_active", "checker did not return while the original uploader was active")
+                require(self.observe(worker, "completed")["outcome"] == "recovery_pending", "terminal native state ignored a surviving uploader")
+                require(not transfer.done() and self.proxy.media_puts[route] == before_puts + 1 and self.status(worker)["last_poll_at"] == before_poll,
+                        "busy check blocked, duplicated the upload, or performed a pull")
+            finally:
+                self.proxy.media_release.set()
+            transfer.result()
+        self.proxy.media_pause_path = None
         require(self.proxy.media_ack_lost.wait(35), "committed acknowledgement loss missed")
-        self.add("media.interruption_and_fencing")
+        require(self.tick(worker)["outcome"] == "recovery_pending" and self.api("/api/v1/media/jobs/" + identity + "/artifact", self.client)[2] == expected,
+                "saved upload did not reconcile the exact bytes without granting new work")
+        self.add("media.interruption_and_fencing", busy_pull_count=0, competing_upload_count=0)
+        return before_puts + 1
+
+    def wait_upload_started(self, identity):
+        self.until(lambda: bool(self.docker("exec", self.broker, "find", "/var/lib/aaa-muse-ai/media", "-maxdepth", "1", "-name", ".upload-" + identity + "-*").stdout.strip()),
+                   "transfer never passed broker preflight", timeout=35)
 
     def limits(self, stills, prompt):
         path = "/api/v1/media/jobs"
@@ -228,21 +256,26 @@ class MediaFlow(MCPMedia, Product):
 
     def cancel_during_upload(self, worker, expected, prompt):
         identity = self.checked("/api/v1/media/jobs", self.client, "POST", {"prompt": prompt, "submission_id": secrets.token_hex(16)}, want=202)[0]["job_id"]
-        self.until(lambda: (worker["state"] / "cues" / (identity + ".json")).exists(), "cancellation case lacked claim", timeout=30)
-        shown = json.loads(self.cli(worker, "job-show", "--job-id", identity).stdout)
+        self.claim_work(worker, identity)
+        shown = self.start_work(worker)
         spool, _ = self.worker_media_directory(worker, identity, shown)
         output = spool / Path(shown["output_path"]).name
         output.write_bytes(expected)
+        self.proxy.media_release.clear()
+        self.proxy.media_finished.clear()
         self.proxy.media_pause_path = "/api/v1/worker/jobs/" + identity + "/artifact"
-        self.cli(worker, "media-finish", "--job-id", identity)
-        try:
-            self.until(lambda: bool(self.docker("exec", self.broker, "find", "/var/lib/aaa-muse-ai/media", "-maxdepth", "1", "-name", ".upload-" + identity + "-*").stdout.strip()), "transfer never passed broker preflight", timeout=35)
-            self.checked("/api/v1/admin/experiments/" + identity + "/cancel", self.admin, "POST", {"protocol_version": 1, "submission_id": secrets.token_hex(16)})
-        finally:
-            self.proxy.media_release.set()
+        with ThreadPoolExecutor(max_workers=1) as worker_thread:
+            transfer = worker_thread.submit(self.cli, worker, "media-finish", "--job-id", identity, want=1)
+            try:
+                self.wait_upload_started(identity)
+                self.checked("/api/v1/admin/experiments/" + identity + "/cancel", self.admin, "POST", {"protocol_version": 1, "submission_id": secrets.token_hex(16)})
+            finally:
+                self.proxy.media_release.set()
+            transfer.result()
         require(self.proxy.media_finished.wait(25) and self.proxy.media_status == 409, "commit-time fence missed cancellation")
-        status = self.checked("/api/v1/worker/jobs/" + identity, worker["credential"])[0]
-        require(status["state"] == "cancelled" and status["held"] and output.read_bytes() == expected, "lost uncertain hold or local output")
+        status = self.checked("/api/v1/worker/status", worker["credential"])[0]
+        require(status["claim_stage"] == "recovery_pending" and status["current_claim"]["job_id"] == identity and
+                output.read_bytes() == expected, "lost uncertain hold or local output")
         require(self.api("/api/v1/media/jobs/" + identity + "/artifact", self.client)[0] == 409, "cancelled stream published")
         cancelled = self.mcp_call("download_video", {"job_id": identity})
         require(cancelled["status"] == "cancelled" and cancelled.get("reason") and
@@ -250,6 +283,8 @@ class MediaFlow(MCPMedia, Product):
                 "terminal cancellation did not end MCP polling")
         _, events = self.decode_export(self.api("/api/v1/admin/diagnostics/export?operation_id=" + identity, self.admin)[2])
         require(any(e["msg"] == "lease.fenced" and e.get("evidence", {}).get("busy_hold") is True for e in events), "missing commit-time fence diagnosis")
+        self.proxy.media_pause_path = None
+        require(self.observe(worker, "failed")["outcome"] == "settled" and output.read_bytes() == expected, "fenced upload did not settle after verified stop")
         self.add("media.cancel_during_upload")
 
     def diagnosis(self, worker, identity, prompt, original):

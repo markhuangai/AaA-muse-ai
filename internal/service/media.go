@@ -72,16 +72,8 @@ func (b *Broker) SubmitMedia(ctx context.Context, l *slog.Logger, p *media.Stage
 		ref.Principal = "media-trial:" + owner
 	}
 	return b.run(ctx, l, ref, "media_create", input, func(s *inference.State, ev *[]inferenceEvent) (any, error) {
-		workers, evidence := candidates(s, nil, inference.RequestInput{WorkerID: target}, false, "")
-		var selected *inference.State
-		for _, w := range workers {
-			if supportsMedia(w.Connection, p.Record.Profile) && available(s, w.WorkerID, "") {
-				selected = w
-				break
-			}
-		}
-		if selected == nil {
-			return nil, inference.Reject("no_ready_worker", 503, "required_capability", mediaCapability(p.Record.Profile), "candidates", evidence)
+		if err := validQueueTarget(s, target); err != nil {
+			return nil, err
 		}
 		id, err := auth.ID(b.random)
 		if err != nil {
@@ -91,13 +83,12 @@ func (b *Broker) SubmitMedia(ctx context.Context, l *slog.Logger, p *media.Stage
 		if err != nil {
 			return nil, err
 		}
-		e := &inference.Experiment{ID: id, ConversationID: id, WorkerID: selected.WorkerID, State: "queued", CurrentJobID: id, CreatedAt: s.Now, DeadlineAt: s.Now.Add(media.JobTimeout), RemoteOutcome: "not_started"}
+		e := &inference.Experiment{ID: id, ConversationID: id, WorkerID: target, State: "queued", CurrentJobID: id, CreatedAt: s.Now, DeadlineAt: s.Now.Add(media.JobTimeout), RemoteOutcome: "not_started"}
 		j := &inference.Job{ID: id, Version: 1, WorkerID: e.WorkerID, ExperimentID: id, ConversationID: id, State: "queued", CreatedAt: s.Now, DeadlineAt: e.DeadlineAt, Media: &p.Record, Context: inference.Delivery{Kind: "full", ReceiptID: id, CanonicalSHA256: hash, Messages: []inference.Item{}, Tools: []inference.Tool{}}}
 		if err = p.Install(b.Media.Dir, id); err != nil {
 			return nil, err
 		}
 		s.Experiments[id], s.Jobs[id] = e, j
-		selected.Routing.LastDispatchedAt = &s.Now
 		event(ev, slog.LevelInfo, "media.submitted", s, j, "client_id", owner, "profile", j.Media.Profile, "input_bytes", j.Media.InputSize, "input_sha256", j.Media.InputHash, "prompt_sha256", j.Media.PromptHash)
 		return mediaStatus(e, j), nil
 	})
@@ -119,6 +110,13 @@ func mediaAssignment(s *inference.State, id string, f MediaFence, allowReceipt b
 		return nil, inference.Reject("stale_assignment", 409, "expected_state", "claimed", "observed_state", j.State, "busy_hold", j.Held, "expected_generation", j.Generation, "observed_generation", f.Generation)
 	}
 	if allowReceipt && j.Media.Artifact != nil {
+		return j, nil
+	}
+	if nativeClaim(j) {
+		if j.StartedAt == nil || j.State != "claimed" || !j.Held || !s.Now.Before(j.DeadlineAt) {
+			return nil, inference.Reject("stale_assignment", 409, "expected_state", "claimed", "observed_state", j.State,
+				"busy_hold", j.Held, "claim_id", j.LeaseID, "deadline_at", j.DeadlineAt, "started_at", j.StartedAt)
+		}
 		return j, nil
 	}
 	if err := assignmentConnection(s, j, f.Connection, f.ConnectionGeneration, f.Generation); err != nil {
@@ -247,12 +245,19 @@ func (b *Broker) MediaUpload(ctx context.Context, l *slog.Logger, worker, id str
 			}
 			expires := s.Now.Add(media.Lifetime)
 			m.Artifact, m.CommittedAt, m.ExpiresAt = &u.Properties, &s.Now, &expires
-			j.State, j.Held = "accepted", false
+			j.State, j.Held = "accepted", nativeClaim(j)
 			e := s.Experiments[j.ExperimentID]
 			e.State, e.RemoteOutcome = "completed", "artifact_observed"
 			event(ev, slog.LevelInfo, "media.committed", s, j, "client_id", m.Owner, "artifact", u.Properties, "expires_at", expires)
 		}
 		receipt = ArtifactReceipt{id, hash, size, m.Artifact != nil, m.ExpiresAt}
+		if nativeClaim(j) && receipt.Accepted && j.Outcome == nil {
+			accepted, err := json.Marshal(receipt)
+			if err != nil {
+				return nil, err
+			}
+			j.Outcome = &inference.WorkOutcome{JobID: j.ID, ClaimID: j.LeaseID, State: j.State, Accepted: accepted}
+		}
 		return receipt, nil
 	})
 	if err == nil && receipt.Accepted {
