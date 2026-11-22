@@ -1,4 +1,4 @@
-name: aaa-muse-qualification
+name: muse-ai-proxy
 x-service-mounts: &service-mounts
   - type: bind
     source: ./config
@@ -6,21 +6,21 @@ x-service-mounts: &service-mounts
     bind:
       create_host_path: false
   - type: bind
-    source: ./sqlite-v1
+    source: ./sqlite
     target: /var/lib/aaa-muse-ai/state
     bind:
       create_host_path: false
   - type: bind
-    source: ./media-v1
+    source: ./media
     target: /var/lib/aaa-muse-ai/media
     bind:
       create_host_path: false
   - diagnostics:/var/lib/aaa-muse-ai/diagnostics
 services:
   prepare-mounts:
-    image: ${MUSE_SERVICE_IMAGE:?Set the verified paired-release image digest}
+    image: ghcr.io/markhuangai/aaa-muse-ai:latest
     user: '0:0'
-    command: [prepare-mounts, '${MUSE_SERVICE_USER:?Set the non-root service UID:GID}']
+    command: [prepare-mounts, '1000:1000']
     read_only: true
     network_mode: none
     cap_drop: [ALL]
@@ -28,19 +28,14 @@ services:
     security_opt: [no-new-privileges:true]
     volumes: *service-mounts
   service:
-    image: ${MUSE_SERVICE_IMAGE:?Set the verified paired-release image digest}
-    user: ${MUSE_SERVICE_USER:?Set the non-root service UID:GID}
+    image: ghcr.io/markhuangai/aaa-muse-ai:latest
+    user: '1000:1000'
     depends_on:
       prepare-mounts:
         condition: service_completed_successfully
     restart: unless-stopped
     ports:
-      - "${MUSE_BIND_ADDRESS:-127.0.0.1}:${MUSE_HTTP_PORT:-8081}:8080"
-    environment:
-      MUSE_MANAGEMENT_KEY: ${MUSE_MANAGEMENT_KEY:?Set a management key}
-      MUSE_PORTAL_PASSWORD: ${MUSE_PORTAL_PASSWORD:?Set a distinct portal password}
-      MUSE_CLIENT_KEY_A: ${MUSE_CLIENT_KEY_A:-}
-      MUSE_CLIENT_KEY_B: ${MUSE_CLIENT_KEY_B:-}
+      - '8080:8080'
     volumes: *service-mounts
     logging:
       driver: json-file
