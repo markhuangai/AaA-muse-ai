@@ -14,14 +14,24 @@ from service import SQLITE_STATE, require
 CONFIG = "/etc/aaa-muse-ai"
 MEDIA = "/var/lib/aaa-muse-ai/media"
 DIAGNOSTICS = "/var/lib/aaa-muse-ai/diagnostics"
-STATE_BIND = "sqlite-v1"
-MEDIA_BIND = "media-v1"
+STATE_BIND = "sqlite"
+MEDIA_BIND = "media"
 BASE = Path("compose.yaml").resolve()
 NAMED = Path("compose.named-volumes.yaml").resolve()
 
+TEST_OVERRIDE = """services:
+  prepare-mounts:
+    image: ${MUSE_TEST_IMAGE}
+    command: [prepare-mounts, '${MUSE_TEST_SERVICE_USER}']
+  service:
+    image: ${MUSE_TEST_IMAGE}
+    user: '${MUSE_TEST_SERVICE_USER}'
+    ports: !override ["127.0.0.1:0:8080"]
+"""
+
 LEGACY = """services:
   service:
-    image: ${MUSE_SERVICE_IMAGE}
+    image: ${MUSE_TEST_IMAGE}
     ports: ["127.0.0.1:0:8080"]
     volumes:
       - ./config:/etc/aaa-muse-ai
@@ -41,20 +51,21 @@ class ComposeProject:
         self.name = harness.owner + "-" + label
         self.dir = harness.root.resolve() / label
         self.dir.mkdir()
-        (self.dir / "config").mkdir()
+        (self.dir / "config").mkdir(mode=0o700)
         self.config = self.dir / "config" / "config.yaml"
         self.env = {
             key: value for key, value in os.environ.items()
             if not key.startswith(("COMPOSE_", "MUSE_"))
         }
-        self.env.update(MUSE_SERVICE_IMAGE=harness.args.image, MUSE_HTTP_PORT="0",
-                        MUSE_MANAGEMENT_KEY=harness.admin, MUSE_PORTAL_PASSWORD=harness.portal,
-                        MUSE_SERVICE_USER=user)
-        self.cleanup_file = BASE
+        self.env.update(MUSE_TEST_IMAGE=harness.args.image, MUSE_TEST_SERVICE_USER=user)
+        override = self.dir / "test-override.yaml"
+        override.write_text(TEST_OVERRIDE)
+        self.files = (BASE, override)
+        self.cleanup_files = self.files
 
-    def compose(self, *args, files=(BASE,), overrides=None, success=True):
+    def compose(self, *args, files=None, overrides=None, success=True):
         command = ["docker", "compose", "--env-file", "/dev/null", "--project-directory", str(self.dir), "-p", self.name]
-        for path in files:
+        for path in self.files if files is None else files:
             command.extend(("-f", str(path)))
         env = self.env | (overrides or {})
         result = subprocess.run(command + list(args), env=env, capture_output=True, text=True, timeout=75)
@@ -64,7 +75,7 @@ class ComposeProject:
             raise AssertionError("Compose result differed for " + " ".join(args))
         return result
 
-    def running_service(self, files=(BASE,)):
+    def running_service(self, files=None):
         identity = self.compose("ps", "--quiet", "service", files=files).stdout.strip()
         require(identity, "Compose service is missing")
         settings = self.h.inspect(identity)["NetworkSettings"]
@@ -101,7 +112,7 @@ def project(h, label, user):
     try:
         yield p
     finally:
-        p.compose("down", "--volumes", "--remove-orphans", files=(p.cleanup_file,))
+        p.compose("down", "--volumes", "--remove-orphans", files=p.cleanup_files)
         require(p.unused(), "fixture Compose resources remain")
         h.receipt("compose.cleanup", project=label)
 
@@ -136,11 +147,25 @@ def config_read_failures(h, config):
 
 
 def check_missing_bind_sources(p):
-    services = json.loads(p.compose("config", "--format", "json").stdout)["services"]
+    project = json.loads(p.compose("config", "--format", "json", files=(BASE,)).stdout)
+    services = project["services"]
+    helper, broker = services["prepare-mounts"], services["service"]
+    require(helper["image"] == broker["image"] == "ghcr.io/markhuangai/aaa-muse-ai:latest",
+            "Compose does not default both services to the stable image")
+    require(helper["user"] == "0:0" and helper["command"] == ["prepare-mounts", "1000:1000"]
+            and broker["user"] == "1000:1000"
+            and broker["depends_on"]["prepare-mounts"]["condition"] == "service_completed_successfully",
+            "Compose does not prepare private mounts before starting the non-root broker")
+    ports = [(port.get("host_ip"), str(port["published"]), port["target"]) for port in broker["ports"]]
+    require(ports == [(None, "8080", 8080)] and not broker.get("environment"), "unexpected default ports or environment")
+    require("diagnostics" in project["volumes"], "diagnostics volume is not declared")
+    sources = {CONFIG: "config", SQLITE_STATE: STATE_BIND, MEDIA: MEDIA_BIND}
     for name in ("prepare-mounts", "service"):
         binds = [m for m in services[name]["volumes"] if m["type"] == "bind"]
-        require({m["target"] for m in binds} == {CONFIG, SQLITE_STATE, MEDIA}
-                and all(m["bind"]["create_host_path"] is False for m in binds), "Compose allows host source creation")
+        require({m["target"]: m["source"] for m in binds} == {target: str(p.dir / source) for target, source in sources.items()}
+                and all(m["bind"]["create_host_path"] is False for m in binds), "unexpected Compose bind sources or creation policy")
+        require(any(m["type"] == "volume" and m["source"] == "diagnostics" and m["target"] == DIAGNOSTICS
+                    for m in services[name]["volumes"]), "Compose does not share the diagnostics volume")
     platform = p.h.docker("info", "--format", "{{.OperatingSystem}}").stdout.strip()
     if platform == "Docker Desktop":
         # The Desktop file-sharing layer can create sources before the engine applies the bind flags.
@@ -156,14 +181,27 @@ def fresh_install(h):
     require(os.getuid() > 0 and os.getgid() > 0, "the Compose host-edit check requires an unprivileged account")
     with project(h, "host", owner) as p:
         sample = Path("config.example.yaml").read_text()
-        p.config.write_text(sample.replace("client-keys: {}", "client-keys:\n  fixture-client: " + h.client))
-        p.compose("up", "-d", "service", overrides={"MUSE_SERVICE_USER": ""}, success=False)
+        p.config.write_text(sample.replace('key: ""', f"key: {json.dumps(h.admin)}")
+                            .replace('password: ""', f"password: {json.dumps(h.portal)}")
+                            .replace("client-keys: {}", "client-keys:\n  fixture-client: " + h.client))
         check_missing_bind_sources(p)
         for name in (STATE_BIND, MEDIA_BIND):
             (p.dir / name).mkdir(mode=0o755)
             (p.dir / name).chmod(0o755)
 
         config_read_failures(h, p.config)
+        denied_uid = 10001 if os.getuid() == 1000 else 1000
+        denied = p.dir / "non-root-helper.yaml"
+        denied.write_text(f"services:\n  prepare-mounts:\n    user: '{denied_uid}:{denied_uid}'\n")
+        p.compose("up", "-d", "service", files=(*p.files, denied), success=False)
+        event = p.logs("prepare-mounts", "permission_denied")
+        require(event["msg"] == "mounts.prepare_failed" and event["level"] == "ERROR"
+                and event["outcome"] == "stopped" and event["stage"] == "open_directory"
+                and event["target"] == CONFIG and event["observed"] is None
+                and event["expected"] == {"uid": os.getuid(), "gid": os.getgid(), "mode": "0700"},
+                "non-root helper failure does not identify inaccessible config directory and expected ownership")
+        h.receipt("compose.helper_permission_denied", stage=event["stage"], target=event["target"])
+
         wrong = p.config.with_suffix(".yml")
         p.config.rename(wrong)
         p.compose("up", "-d", "service", success=False)
@@ -190,7 +228,7 @@ def fresh_install(h):
                 "nested symlink did not stop preparation before mode changes")
         link.unlink()
         nested.rmdir()
-        p.compose("up", "-d", "service", overrides={"MUSE_SERVICE_USER": "0:10001"}, success=False)
+        p.compose("up", "-d", "service", overrides={"MUSE_TEST_SERVICE_USER": "0:10001"}, success=False)
         p.logs("prepare-mounts", "invalid_service_user")
         mount = f"type=bind,source={p.dir / STATE_BIND},target=/fixture"
         h.docker("run", "--rm", "--user", "0:0", "--mount", mount, "--entrypoint", "/bin/sh", h.args.image,
@@ -252,14 +290,19 @@ def fresh_install(h):
         require(replacement != identity, "recreate reused the old broker")
         for credential in (h.client, key, host_key):
             require(h.request(new_origin, "/v1/models", credential)[0] == 200, "configuration was lost on recreation")
+        code, _, reply = h.request(new_origin, "/api/v1/media/jobs/" + job["job_id"], h.client)
+        require(code == 200 and json.loads(reply)["job_id"] == job["job_id"]
+                and (p.dir / MEDIA_BIND / job["job_id"] / "prompt").read_text() == prompt,
+                "SQLite job or media prompt was lost on recreation")
         h.assert_private(h.logs(replacement), (session, key, host_key))
-        h.receipt("compose.host_creator", uid=os.getuid(), gid=os.getgid(), atomic_save=True, recreated=True, media_write=True)
+        h.receipt("compose.host_creator", uid=os.getuid(), gid=os.getgid(), atomic_save=True, recreated=True, database=True, media=True)
 
 
 def named_upgrade(h):
     with project(h, "named", "10001:10001") as p:
-        p.cleanup_file = p.dir / "legacy.yaml"
-        p.cleanup_file.write_text(LEGACY)
+        legacy = p.dir / "legacy.yaml"
+        legacy.write_text(LEGACY)
+        p.cleanup_files = (legacy,)
         p.config.write_text(json.dumps(h.configuration()))
         mount = f"type=bind,source={p.config.parent},target=/fixture"
 
@@ -269,8 +312,8 @@ def named_upgrade(h):
 
         try:
             config_owner("10001:10001")
-            p.compose("up", "-d", "service", files=(p.cleanup_file,))
-            old, origin = p.running_service(files=(p.cleanup_file,))
+            p.compose("up", "-d", "service", files=p.cleanup_files)
+            old, origin = p.running_service(files=p.cleanup_files)
             old_mounts = {m["Destination"]: m for m in h.inspect(old)["Mounts"]}
             p.env.update(MUSE_SQLITE_VOLUME=old_mounts[SQLITE_STATE]["Name"], MUSE_MEDIA_VOLUME=old_mounts[MEDIA]["Name"])
             code, headers, reply = json_request(h, origin, "/api/v1/admin/enrollments", h.admin)
@@ -282,9 +325,9 @@ def named_upgrade(h):
             require(code == 201, f"legacy database did not store the worker (HTTP {code})")
             worker_key = json.loads(reply)["credential"]
             h.docker("exec", old, "sh", "-ec", "umask 077\nprintf retained > /var/lib/aaa-muse-ai/media/upgrade-fixture")
-            p.compose("stop", "service", files=(p.cleanup_file,))
+            p.compose("stop", "service", files=p.cleanup_files)
 
-            files = (BASE, NAMED)
+            files = (*p.files, NAMED)
             result = p.compose("up", "-d", "service", files=files,
                                overrides={"MUSE_SQLITE_VOLUME": p.env["MUSE_SQLITE_VOLUME"] + "-missing"}, success=False)
             require("external" in result.stderr and "not found" in result.stderr, "invalid external volume did not fail closed")

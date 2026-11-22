@@ -1,6 +1,6 @@
 # AaA-muse-ai
 
-AaA-muse-ai is a self-hosted broker for using Muse from model clients. A worker's native one-minute Muse cron checks for work over outbound HTTPS and hands a claim to a finite native Muse run. Muse proposes answers and tool calls. The calling client runs its tools under its own permissions and returns the results.
+AaA-muse-ai is a self-hosted broker for using Muse from model clients. In major 1, a worker's native one-minute Muse cron checks for work over outbound HTTPS and hands a claim to a finite native Muse run. Muse proposes answers and tool calls. The calling client runs its tools under its own permissions and returns the results.
 
 - Use the OpenAI Chat Completions and Responses subsets for text and function tools, with JSON or buffered SSE. The model alias is `muse-ai`. [API and client setup](docs/history-api.md#openai-chat-completions)
 - Create client keys, enroll workers, and inspect requests in the control portal. [Portal guide](docs/portal.md)
@@ -8,24 +8,24 @@ AaA-muse-ai is a self-hosted broker for using Muse from model clients. A worker'
 
 ## Quick start
 
-Use Docker Compose on Linux with a verified major-1 paired release. The broker keeps SQLite state on one host. A major-0 installation needs a separate major-1 configuration, credentials, store and media namespace; its existing volumes must not be reused or deleted as part of this procedure. [Deployment and upgrades](docs/deployment.md) · [Paired releases](docs/releases.md)
+Use Docker Compose on Linux. The default image follows the latest stable paired release. If you already run the broker, check its installed major version, mounts, and owner before replacing its Compose file. [Deployment and upgrades](docs/deployment.md) · [Paired releases](docs/releases.md)
 
 From the directory containing `compose.yaml` and `config.example.yaml`, create the host directories and supply your configuration.
 
 ```sh
 umask 077
-mkdir -p config sqlite-v1 media-v1
+mkdir -p config sqlite media
 cp -n config.example.yaml config/config.yaml
-stat -c '%u:%g' config/config.yaml
 ```
 
-In a private `.env`, set `MUSE_SERVICE_IMAGE` to the verified image digest, `MUSE_SERVICE_USER` to the YAML creator’s numeric `UID:GID`, and distinct `MUSE_MANAGEMENT_KEY` and `MUSE_PORTAL_PASSWORD` values. Compose prepares the directory permissions before starting the broker. [Configuration and readiness](docs/deployment.md#fresh-install)
+Set distinct values for `management.key` and `control-portal.password` in `config/config.yaml`. The broker defaults to UID and GID 1000. To use a different owner, set the same numeric `UID:GID` in the helper command and the broker’s `user` field. [Configuration and readiness](docs/deployment.md#fresh-install)
 
 ```sh
 docker compose up -d service
+curl -fsS http://127.0.0.1:8080/readyz
 ```
 
-Serve the portal and API through your HTTPS reverse proxy. Sign in to the portal, open **Workers**, and paste the generated enrollment prompt into Muse as one message. Create a model-client key under **Settings → Client keys**. Point your client at the broker’s HTTPS `/v1` base URL. [Worker setup](worker/README.md) · [Portal enrollment](docs/portal.md#worker-management)
+Serve the portal and API through your HTTPS reverse proxy. Sign in to the portal, open **Workers**, and paste the generated enrollment prompt into Muse as one message. Create a model-client key under **Settings → Client keys**. Point your client at the broker’s HTTPS `/v1` base URL. [Major-1 worker setup](worker/README.md) · [Portal enrollment](docs/portal.md#worker-management)
 
 ## Qualification
 

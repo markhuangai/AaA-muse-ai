@@ -1,9 +1,9 @@
 server:
   listen: "0.0.0.0:8080"
 management:
-  key: "${MUSE_MANAGEMENT_KEY}"
+  key: ""
 control-portal:
-  password: "${MUSE_PORTAL_PASSWORD}"
+  password: ""
 client-keys: {}
 limits:
   in-flight-per-worker: 1
