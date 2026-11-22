@@ -59,6 +59,8 @@ Worker polling and freshness are independent from settings. Session generations 
 
 ## Request history and cancellation
 
+**Media job** shows the recorded owner, profile and broker-observed progress. A claim reserves the worker. A start acknowledgement appears when the worker records it with the broker. The detail shows the submission deadline and any pending worker settlement alongside the terminal status. The media timeline includes the retained assignment snapshot.
+
 Open **Requests** at `/requests`. Request pages contain up to fifty rows ordered by creation time and immutable ID. Filter by conversation ID, or open one exact request ID. Previous, next and first controls reuse the management API's opaque cursors; changing the filter starts a new page sequence. Older request pages remain anchored under polling. Explicit refresh reloads the current page without changing its filter, selection or scroll position.
 
 Detail shows the immutable request, conversation, client/session, response, worker and job identifiers; current worker names are labeled **Current name**. Names describe the registration now and never rewrite historical identity. The snapshot includes admitted messages and client tool results, tool definitions, accepted decisions/final output, request-scoped Responses instructions, assignment/connection generations, context kind/base receipt and observed timing. Expand the complete snapshot or recorded context for all retained content. JSON numbers retain their admitted values. Content is selectable text; markup and tool names are never executed.

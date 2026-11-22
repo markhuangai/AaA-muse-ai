@@ -38,6 +38,16 @@ def multipart(fields, image, kind):
 
 
 class MediaFlow(MCPMedia, Product):
+    def decode_export(self, body):
+        script = ('import {readFileSync} from "node:fs"; import {decodeExport} from "./tools/qualification-evidence.mjs"; '
+                  'process.stdout.write(JSON.stringify(decodeExport(readFileSync(0, "utf8"))));')
+        result = subprocess.run(["node", "--input-type=module", "-e", script], input=body,
+                                capture_output=True, timeout=30)
+        require(result.returncode == 0, "shared diagnostic decoder rejected media evidence")
+        self.assert_private(result.stdout.decode())
+        decoded = json.loads(result.stdout)
+        return decoded["metadata"], decoded["events"]
+
     def launch(self, *args, **kwargs):
         if not hasattr(self, "media_volume"):
             self.media_volume = self.volume("media")
@@ -75,6 +85,7 @@ class MediaFlow(MCPMedia, Product):
         self.sibling, self.sibling_origin, _ = self.launch()
         self.ready(self.sibling, self.sibling_origin)
         self.mcp_preflight()
+        self.mcp_timeout_contract()
         worker = self.environment("media", mount_system_tmp=True)
         worker["slot"] = "media"
         self.install(worker, self.prompt())
@@ -94,6 +105,7 @@ class MediaFlow(MCPMedia, Product):
                 fields = {"submission_id": fields["submission_id"], "profile": case, "owner": "fixture-client",
                           "worker_id": worker["worker"]["id"], "fixture_sha256": sha(image), "fixture_bytes": len(image)}
             elif image:
+                fields["timeout_seconds"] = 1800
                 raw, headers = multipart(fields, image, case)
             else:
                 raw, headers = None, None
@@ -151,6 +163,9 @@ class MediaFlow(MCPMedia, Product):
                 links[identity] = self.ready_link(identity, "video", expected)
                 self.add("mcp.prompt_video_delivery")
             status = self.checked(url, self.client)[0]
+            expected_timeout = 1800 if case in stills else 900
+            require(timestamp(status["deadline_at"]) - timestamp(status["created_at"]) == expected_timeout,
+                    "stored media deadline differs from submission plus timeout")
             if case in audios:
                 require("download_url" not in status, "management trial became shareable")
             properties = status["artifact"]
@@ -252,6 +267,9 @@ class MediaFlow(MCPMedia, Product):
         large = self.render("png", "-f", "lavfi", "-i", "color=c=white:s=4100x4000", "-frames:v", "1")
         raw, headers = multipart(fields, large, "image/png")
         require(self.api(path, self.client, "POST", raw=raw, headers=headers)[0] == 422, "image pixel limit missed")
+        for invalid in ("", "0", "-1", "3601", "1.5", "null", "true"):
+            raw, headers = multipart({**fields, "timeout_seconds": invalid}, stills["image/png"], "image/png")
+            require(self.api(path, self.client, "POST", raw=raw, headers=headers)[0] == 400, "multipart accepted an invalid timeout")
         self.add("media.admission_limits")
 
     def cancel_during_upload(self, worker, expected, prompt):
@@ -291,6 +309,16 @@ class MediaFlow(MCPMedia, Product):
         status, _, raw = self.api("/api/v1/admin/diagnostics/export?operation_id=" + identity, self.admin)
         meta, events = self.decode_export(raw)
         require(status == 200 and meta["complete"] and not meta["omissions"], "broker evidence incomplete")
+        boundaries = {e["msg"]: e for e in events if e["msg"] in ("media.submitted", "job.claimed", "job.work_started", "media.committed")}
+        submission = boundaries["media.submitted"]
+        require(len(boundaries) == 4 and all(e["level"] == "INFO" and e["job_id"] == identity and
+                e["deadline_at"] == submission["deadline_at"] for e in boundaries.values()) and
+                submission["timeout_seconds"] == 1800 and submission["client_id"] == "fixture-client" and
+                timestamp(submission["deadline_at"]) - timestamp(submission["created_at"]) == 1800,
+                "submission, claim, start and commit did not reconstruct the same media deadline")
+        logs = self.logs(self.broker)
+        require('"level":"DEBUG"' not in logs and all(f'"msg":"{name}"' in logs for name in boundaries),
+                "INFO output omitted media progress or exposed protected DEBUG evidence")
         committed = next(e for e in events if e["msg"] == "media.committed")
         require(committed["artifact"]["size"] > 3_000_000 and any(e["msg"] == "lease.fenced" or e.get("cause") == "stale_assignment" for e in events), "fence and commit cannot be diagnosed")
         interrupted = next(e for e in events if e["msg"] == "media.rejected" and e.get("cause") == "artifact_transfer_interrupted")

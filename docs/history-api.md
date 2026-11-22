@@ -80,7 +80,9 @@ Request detail retains `kind`, `request`, `assignment`, `delivery` and legacy hi
 
 Portal sessions can read these management projections through [Requests](portal.md#request-history-and-cancellation). The portal uses fifty-row/event pages, the existing conversation filter and exact request lookup. `POST /api/v1/admin/experiments/{id}/cancel` accepts `protocol_version: 1` and a fresh `submission_id` for assigned or unassigned work. It retains accepted receipts, tool linkage and uncertain busy holds; completed work is rejected. No new cancellation endpoint or replay authority is introduced.
 
-Existing experiments remain available through their original API and appear as `legacy` management records. Their retained item/job snapshots are read-only, have `provenance: unavailable`, and use unknown event times where original evidence does not establish them. They are never assigned to a model client or silently imported into a client session.
+Media submissions appear as `kind: "media"` in requests and conversations. The projection uses the current job and includes its recorded `owner`, `profile` and `started_at` when available. The `media_job_snapshot` timeline entry retains the job and context with `time: null`. Native text requests, including MCP `ask_muse`, continue to use the native projection. [Media jobs](media-api.md)
+
+Other retained experiments appear as `legacy` management records and remain available through their original API. Their item and job snapshots have `provenance: unavailable` and retain unknown event times.
 
 Admitted text may contain NUL. Management lists, request/conversation detail and timelines retain that content, distinguish it from a literal `\\u0000`, and preserve numeric JSON values. Indexed scalar columns carry lookup and recovery metadata. Go composes projections from the original JSON without evaluating payloads as SQLite expressions.
 

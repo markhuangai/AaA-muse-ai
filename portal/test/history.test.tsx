@@ -57,6 +57,29 @@ test('legacy and unavailable states are explicit, with terminal cancellation dis
   await act(async () => { f.api.detailWork = async () => { throw new APIError('request_failed'); }; await f.controller.refresh(); });
   expect(screen.getByText(/Retained history snapshot/)).toBeTruthy(); expect(screen.getByText(/Could not load request history/)).toBeTruthy(); f.portal.dispose();
 });
+test('media progress uses the start acknowledgement and holds a terminal assignment separately', async () => {
+  const f = await fixture();
+  const media = { kind: 'media', profile: 'prompt_wav', owner: 'fixture-client' } as const;
+  const started = '2026-11-13T00:00:01Z';
+  f.api.requestsWork = async () => ({ value: { items: [{ ...summary(), ...media, state: 'inference', started_at: null }] }, requestID: 'media-list' });
+  await f.controller.refresh();
+  render(<Requests controller={f.controller} />);
+  expect(screen.getByText('Claimed and awaiting start')).toBeTruthy();
+  expect(screen.getByText('Owner fixture-client')).toBeTruthy();
+  f.api.detailWork = async () => ({ value: { ...detail('inference'), ...media, assignment: { held: true, started_at: started } }, requestID: 'media-detail' });
+  f.api.timelineWork = async () => ({ value: { items: [{ ...entry(), kind: 'media_job_snapshot', time: null, provenance: 'unavailable' }] }, requestID: 'media-timeline' });
+  await act(async () => { await f.controller.select(requestID); });
+  expect(screen.getByText('Start acknowledged')).toBeTruthy();
+  expect(screen.getByText('Held')).toBeTruthy();
+  expect(screen.getByText('Media job snapshot')).toBeTruthy();
+  expect(screen.queryByText(/Legacy request|Legacy provenance/)).toBeNull();
+  f.api.detailWork = async () => ({ value: { ...detail('interrupted'), ...media, assignment: { held: true, started_at: started }, execution: { ...execution('interrupted'), reason: 'deadline_exceeded' } }, requestID: 'media-expiry' });
+  await act(async () => { await f.controller.refresh(); });
+  expect(screen.getByText('Interrupted')).toBeTruthy();
+  expect(screen.getByText('deadline_exceeded')).toBeTruthy();
+  expect(screen.getByText('Awaiting worker settlement')).toBeTruthy();
+  f.portal.dispose();
+});
 test('empty/loading/error list and detail frames expose bounded pagination controls', async () => {
   const f = await fixture(); f.api.requestsWork = async () => ({ value: { items: [] }, requestID: 'empty' }); await f.controller.refresh(); render(<Requests controller={f.controller} />);
   expect(screen.getByText(/No recorded requests match/)).toBeTruthy();

@@ -246,7 +246,7 @@ func TestRejectedInputsAndOrphans(t *testing.T) {
 	if _, err = os.Stat(p.Path); err != nil {
 		t.Fatal("deleted in-flight stage")
 	}
-	if err = s.Cleanup(ctx, l, now.Add(2*JobTimeout), get); err != nil {
+	if err = s.Cleanup(ctx, l, now.Add(2*OrphanGrace), get); err != nil {
 		t.Fatal(err)
 	}
 	if _, err = os.Stat(p.Path); !errors.Is(err, os.ErrNotExist) {

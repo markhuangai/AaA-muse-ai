@@ -51,6 +51,25 @@ test('real adapter uses bounded management reads and existing cancellation with 
     expect(call.options.credentials).toBe('same-origin'); expect(call.options.cache).toBe('no-store'); expect(call.path).not.toContain(token);
   }
 });
+
+test('media projections require the recorded owner, profile and start evidence', async () => {
+  const media = { kind: 'media', owner: 'fixture-client', profile: 'prompt_wav' } as const;
+  const row = { ...summary(), ...media, started_at: null };
+  const record = { ...detail(), ...media, assignment: { held: true, started_at: '2026-11-13T00:00:01Z' } };
+  expect(isSummary(row)).toBe(true);
+  expect(isSummary({ ...row, started_at: record.assignment.started_at })).toBe(true);
+  expect(isSummary({ ...row, started_at: 'bad' })).toBe(false);
+  expect(isSummary({ ...row, owner: null })).toBe(false);
+  expect(isSummary({ ...row, owner: '' })).toBe(false);
+  expect(isSummary({ ...row, profile: null })).toBe(false);
+  expect(isSummary({ ...row, profile: '' })).toBe(false);
+  expect(isDetail(record)).toBe(true);
+  expect(isDetail({ ...record, assignment: { held: false } })).toBe(true);
+  expect(isDetail({ ...record, assignment: null })).toBe(false);
+  expect(isDetail({ ...record, assignment: { held: 'true' } })).toBe(false);
+  expect(isDetail({ ...record, assignment: { held: false, started_at: 'unknown' } })).toBe(false);
+  expect((await adapter(record).api.requestDetail(requestID, 'op-media', signal())).value).toEqual(record);
+});
 test('real adapter rejects mismatched, duplicated, oversized and malformed history instead of silently dropping it', async () => {
   for (const value of [{ items: [summary(), summary()] }, { items: [summary()], next_cursor: 'bad cursor' }, { items: [{ ...summary(), conversation_id: 'wrong' }] }]) await expect(adapter(value).api.requests(conversationID, '', 'op', signal())).rejects.toMatchObject({ causeCode: 'invalid_response', requestID: 'history-http' });
   for (const value of [null, { ...detail(), request: { ...detail().request, id: 'different' }, execution: { ...execution(), id: 'different' } }]) await expect(adapter(value).api.requestDetail(requestID, 'op', signal())).rejects.toMatchObject({ causeCode: 'invalid_response' });

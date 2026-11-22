@@ -11,14 +11,34 @@ import (
 	"github.com/markhuangai/AaA-muse-ai/internal/inference"
 )
 
-const conversationRecords = `SELECT c.id,c.created_at,'native' AS kind,c.data,e.state
- FROM aaa_conversations c LEFT JOIN aaa_experiments e ON e.id=c.current_request_id
- UNION ALL SELECT e.conversation_id,e.created_at,'legacy',e.data,e.state FROM aaa_experiments e
- WHERE NOT EXISTS(SELECT 1 FROM aaa_model_requests m WHERE m.id=e.id)`
+const currentMedia = ` LEFT JOIN aaa_inference_jobs j ON j.id=e.current_job_id AND j.has_media=1`
 
-const requestRecords = `SELECT e.id,e.created_at,e.conversation_id,e.worker_id,e.state,e.data,m.client_id,m.response_id,c.session_id
+const conversationRecords = `SELECT c.id,c.created_at,'native' AS kind,c.data,e.state,NULL AS media
+ FROM aaa_conversations c LEFT JOIN aaa_experiments e ON e.id=c.current_request_id
+ UNION ALL SELECT e.conversation_id,e.created_at,CASE WHEN j.id IS NOT NULL THEN 'media' ELSE 'legacy' END,e.data,e.state,j.data
+ FROM aaa_experiments e` + currentMedia + ` WHERE NOT EXISTS(SELECT 1 FROM aaa_model_requests m WHERE m.id=e.id)`
+
+const requestRecords = `SELECT e.id,e.created_at,e.conversation_id,e.worker_id,e.state,e.data,m.client_id,m.response_id,c.session_id,
+ CASE WHEN m.id IS NOT NULL THEN 'native' WHEN j.id IS NOT NULL THEN 'media' ELSE 'legacy' END AS kind,
+ CASE WHEN m.id IS NULL THEN j.data END AS media_job
  FROM aaa_experiments e LEFT JOIN aaa_model_requests m ON m.id=e.id
- LEFT JOIN aaa_conversations c ON c.id=m.conversation_id`
+ LEFT JOIN aaa_conversations c ON c.id=m.conversation_id` + currentMedia
+
+func projectMedia(result map[string]any, raw []byte) error {
+	var job struct {
+		Media     *inference.Media `json:"media"`
+		StartedAt *time.Time       `json:"started_at"`
+	}
+	if err := json.Unmarshal(raw, &job); err != nil {
+		return err
+	}
+	if job.Media == nil || job.Media.Owner == "" || job.Media.Profile == "" {
+		return &Failure{Reason: "history_projection_invalid", cause: errors.New("media owner or profile missing")}
+	}
+	result["owner"], result["profile"], result["provenance"] = job.Media.Owner, job.Media.Profile, "recorded"
+	result["client_id"], result["started_at"] = job.Media.Owner, job.StartedAt
+	return nil
+}
 
 type executionMetadata struct {
 	ID             string    `json:"id"`
@@ -58,8 +78,8 @@ func scanConversation(row scanner) (string, int64, json.RawMessage, error) {
 	var id, kind string
 	var created int64
 	var state *string
-	var raw []byte
-	if err := row.Scan(&id, &created, &kind, &raw, &state); err != nil {
+	var raw, media []byte
+	if err := row.Scan(&id, &created, &kind, &raw, &state, &media); err != nil {
 		return "", 0, nil, err
 	}
 	result := map[string]any{"kind": kind, "id": id, "created_at": time.UnixMicro(created).UTC(), "current_request_state": state}
@@ -79,39 +99,50 @@ func scanConversation(row scanner) (string, int64, json.RawMessage, error) {
 		}
 		result["client_id"], result["session_id"], result["worker_id"] = nil, nil, e.WorkerID
 		result["created_at"], result["current_request_id"], result["provenance"] = e.CreatedAt, e.ID, "unavailable"
+		if kind == "media" {
+			if err := projectMedia(result, media); err != nil {
+				return "", 0, nil, err
+			}
+		}
 	}
 	data, err := json.Marshal(result)
 	return id, created, data, err
 }
 
 func scanRequest(row scanner) (string, int64, json.RawMessage, error) {
-	var id, conversation, state string
+	var id, conversation, state, kind string
 	var worker, client, response, session *string
 	var created int64
-	var raw []byte
-	if err := row.Scan(&id, &created, &conversation, &worker, &state, &raw, &client, &response, &session); err != nil {
+	var raw, media []byte
+	if err := row.Scan(&id, &created, &conversation, &worker, &state, &raw, &client, &response, &session, &kind, &media); err != nil {
 		return "", 0, nil, err
 	}
 	var e executionMetadata
 	if err := json.Unmarshal(raw, &e); err != nil {
 		return "", 0, nil, err
 	}
-	kind, provenance := "legacy", "unavailable"
-	if client != nil {
-		kind, provenance = "native", "recorded"
-	}
-	data, err := json.Marshal(map[string]any{"kind": kind, "id": id, "conversation_id": conversation, "client_id": client,
+	result := map[string]any{"kind": kind, "id": id, "conversation_id": conversation, "client_id": client,
 		"session_id": session, "response_id": response, "worker_id": worker, "state": state, "reason": e.Reason,
-		"created_at": e.CreatedAt, "provenance": provenance})
+		"created_at": e.CreatedAt, "provenance": "unavailable"}
+	switch kind {
+	case "native":
+		result["provenance"] = "recorded"
+	case "media":
+		if err := projectMedia(result, media); err != nil {
+			return "", 0, nil, err
+		}
+	}
+	data, err := json.Marshal(result)
 	return id, created, data, err
 }
 
 func historyRequest(ctx context.Context, tx *sql.Tx, id string) (json.RawMessage, error) {
 	var legacy, native, job, delivery []byte
 	var worker *string
-	if err := tx.QueryRowContext(ctx, `SELECT e.data,m.data,j.data,j.context,e.worker_id FROM aaa_experiments e
+	var media bool
+	if err := tx.QueryRowContext(ctx, `SELECT e.data,m.data,j.data,j.context,e.worker_id,COALESCE(j.has_media,0) FROM aaa_experiments e
 		LEFT JOIN aaa_model_requests m ON m.id=e.id LEFT JOIN aaa_inference_jobs j ON j.id=e.current_job_id WHERE e.id=?1`,
-		id).Scan(&legacy, &native, &job, &delivery, &worker); err != nil {
+		id).Scan(&legacy, &native, &job, &delivery, &worker, &media); err != nil {
 		return nil, err
 	}
 	var execution executionMetadata
@@ -123,6 +154,12 @@ func historyRequest(ctx context.Context, tx *sql.Tx, id string) (json.RawMessage
 			"remote_outcome": execution.RemoteOutcome, "created_at": execution.CreatedAt, "deadline_at": execution.DeadlineAt, "current_job_id": execution.CurrentJobID}}
 	if native == nil {
 		result["kind"], result["request"], result["provenance"] = "legacy", json.RawMessage(legacy), "unavailable"
+		if media {
+			result["kind"] = "media"
+			if err := projectMedia(result, job); err != nil {
+				return nil, err
+			}
+		}
 		rows, err := tx.QueryContext(ctx, "SELECT data FROM aaa_inference_history WHERE experiment_id=?1 ORDER BY sequence", id)
 		if err != nil {
 			return nil, err
@@ -172,7 +209,7 @@ func timelineRows(ctx context.Context, tx *sql.Tx, q inference.HistoryQuery) (*s
 	return tx.QueryContext(ctx, `SELECT kind,sequence,request_id,data,delivery FROM (
 		SELECT 'legacy_item' AS kind,h.sequence,h.experiment_id AS request_id,h.data,NULL AS delivery
 		FROM aaa_inference_history h JOIN aaa_experiments e ON e.id=h.experiment_id WHERE e.conversation_id=?1
-		UNION ALL SELECT 'legacy_job_snapshot',
+		UNION ALL SELECT CASE WHEN j.has_media=1 THEN 'media_job_snapshot' ELSE 'legacy_job_snapshot' END,
 			(SELECT count(*) FROM aaa_inference_history h WHERE h.experiment_id=j.experiment_id)+
 			row_number() OVER(ORDER BY j.created_at,j.id)-1,j.experiment_id,j.data,j.context
 		FROM aaa_inference_jobs j JOIN aaa_experiments e ON e.id=j.experiment_id WHERE e.conversation_id=?1
