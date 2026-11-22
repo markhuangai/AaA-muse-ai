@@ -22,9 +22,9 @@ test('real failing candidate path emits sufficient INFO/WARN/ERROR evidence with
   const failed = events.find(event => event.level === 'ERROR' && event.event === 'worker.release.failed');
   assert.equal(failed.operation, 'manifest_publication'); assert.equal(failed.destination, 'product-release.json');
   assert.equal(failed.http_status, 503); assert.equal(failed.outcome, 'incomplete');
-  assert(failed.completed_destinations.includes('github_packages')); assert(failed.completed_destinations.includes('candidate-0.1.0'));
-  assert(!failed.missing_destinations.includes('candidate-0.1.0'));
-  assert(!failed.missing_destinations.includes('sha-' + 'a'.repeat(40) + '-0.1.0'));
+  assert(failed.completed_destinations.includes('github_packages')); assert(failed.completed_destinations.includes('candidate-1.0.0'));
+  assert(!failed.missing_destinations.includes('candidate-1.0.0'));
+  assert(!failed.missing_destinations.includes('sha-' + 'a'.repeat(40) + '-1.0.0'));
   assert(failed.completed_destinations.every(destination => !failed.missing_destinations.includes(destination)));
   assert.equal(failed.uncertain_destination, 'product-release.json');
   assert(!failed.missing_destinations.includes(failed.uncertain_destination));
@@ -47,13 +47,13 @@ test('source and reservation rejection logs identify the exact safe mismatch and
     const core = { error: line => process.stderr.write(line + '\\n'), setFailed() {} };
     f.state.source = 'f'.repeat(40);
     try { await prepareStableRelease(f); } catch (error) { reportReleaseFailure(core, error); }
-    f.state.refs.set('tags/v0.1.0', { object: { type: 'commit', sha: 'f'.repeat(40) } });
+    f.state.refs.set('tags/v1.0.0', { object: { type: 'commit', sha: 'f'.repeat(40) } });
     try { await candidateRecovery(f); } catch (error) { reportReleaseFailure(core, error); }
     f.state.source = f.source; f.seed();
-    f.state.refs.get('tags/v0.1.0').object.sha = 'f'.repeat(40);
-    try { await verifyPublished({ ...f, tag: 'v0.1.0', sourceSHA: f.source, manifestSHA256: hash(jsonBytes(f.manifest)) }); } catch (error) { reportReleaseFailure(core, error); }
-    f.state.refs.get('tags/v0.1.0').object.sha = f.source; f.state.tree = 'd'.repeat(40);
-    try { await verifyPublished({ ...f, tag: 'v0.1.0', sourceSHA: f.source, manifestSHA256: hash(jsonBytes(f.manifest)) }); } catch (error) { reportReleaseFailure(core, error); }
+    f.state.refs.get('tags/v1.0.0').object.sha = 'f'.repeat(40);
+    try { await verifyPublished({ ...f, tag: 'v1.0.0', sourceSHA: f.source, manifestSHA256: hash(jsonBytes(f.manifest)) }); } catch (error) { reportReleaseFailure(core, error); }
+    f.state.refs.get('tags/v1.0.0').object.sha = f.source; f.state.tree = 'd'.repeat(40);
+    try { await verifyPublished({ ...f, tag: 'v1.0.0', sourceSHA: f.source, manifestSHA256: hash(jsonBytes(f.manifest)) }); } catch (error) { reportReleaseFailure(core, error); }
     for (const fn of cleanup) await fn();
   `;
   const child = spawnSync(process.execPath, ['--input-type=module', '-e', script], { encoding: 'utf8', timeout: 30000 });
@@ -64,7 +64,7 @@ test('source and reservation rejection logs identify the exact safe mismatch and
   assert.equal(source.operation_id, 'release-100-1'); assert.equal(source.destination, 'source_repository');
   for (const cause of ['product_release_version_reserved_for_other_source', 'product_release_tag_conflict', 'product_release_source_tree_conflict']) {
     const rejected = events.find(event => event.cause === cause); assert(rejected, cause);
-    assert.equal(rejected.expected_source, 'a'.repeat(40)); assert(rejected.operation_id); assert(rejected.destination); assert.equal(rejected.version, '0.1.0');
+    assert.equal(rejected.expected_source, 'a'.repeat(40)); assert(rejected.operation_id); assert(rejected.destination); assert.equal(rejected.version, '1.0.0');
     if (cause.endsWith('tree_conflict')) { assert.equal(rejected.expected_tree, 'e'.repeat(40)); assert.equal(rejected.observed_tree, 'd'.repeat(40)); }
     else assert.equal(rejected.observed_source, 'f'.repeat(40));
   }
@@ -109,7 +109,7 @@ test('npm process failures after image promotion retain an accurate ledger and p
   assert.deepEqual(artifact.completed_destinations, []);
   const failed = events.find(event => event.level === 'ERROR' && event.operation === 'npm_distribution_promotion');
   assert.equal(failed.process_status, 1); assert.equal(failed.http_status, null); assert.equal(failed.uncertain_destination, 'npm_latest');
-  assert(failed.completed_destinations.includes('0.1.0')); assert(failed.completed_destinations.includes('latest'));
+  assert(failed.completed_destinations.includes('1.0.0')); assert(failed.completed_destinations.includes('latest'));
   assert(failed.missing_destinations.includes('github_release')); assert(failed.missing_destinations.includes('promotion.json'));
   assert(!failed.missing_destinations.includes('npm_latest'));
   assert(failed.completed_destinations.every(destination => !failed.missing_destinations.includes(destination)));
@@ -130,7 +130,7 @@ test('stable dispatch failures identify the requested pair and the corrective ac
     };
     await run({ ...f, version: f.token });
     await run({ ...f, version: '1.0.1' });
-    const newer = f.addRC('0.1.0-rc.14', { rcSource: 'b'.repeat(40) });
+    const newer = f.addRC('1.0.0-rc.14', { rcSource: 'b'.repeat(40) });
     await run(f);
     f.state.images.set(f.version, f.state.imageBytes);
     await run({ ...f, prereleaseTag: newer.release.tag_name });
@@ -146,12 +146,12 @@ test('stable dispatch failures identify the requested pair and the corrective ac
   assert.equal(invalid.cause, 'product_release_dispatch_inputs_invalid');
   assert.equal(invalid.version, 'invalid');
   assert.equal(step.cause, 'product_release_stable_version_step_invalid');
-  assert.equal(step.active_series, '0.1.0');
+  assert.equal(step.active_series, '1.0.0');
   assert.equal(step.observed_version, '1.0.1');
   assert.equal(stale.cause, 'product_release_stale_rc');
   assert.equal(stale.operation, 'latest_rc_selection');
-  assert.equal(stale.expected_rc, 'v0.1.0-rc.13');
-  assert.equal(stale.observed_rc, 'v0.1.0-rc.14');
+  assert.equal(stale.expected_rc, 'v1.0.0-rc.13');
+  assert.equal(stale.observed_rc, 'v1.0.0-rc.14');
   assert.equal(stale.observed_digest.length, 64);
   assert.equal(stale.observed_source, 'b'.repeat(40));
   assert.equal(occupied.cause, 'product_release_version_destination_conflict');
@@ -165,7 +165,7 @@ test('stable dispatch failures identify the requested pair and the corrective ac
     assert.equal(event.run_id, 100);
     assert.equal(event.attempt, 1);
     assert.equal(event.outcome, 'blocked');
-    assert.match(event.prerelease_tag, /^v0\.1\.0-rc\./);
+    assert.match(event.prerelease_tag, /^v1\.0\.0-rc\./);
     assert(event.duration_ms >= 0);
     assert.deepEqual(event.completed_destinations, []);
   }

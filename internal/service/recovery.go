@@ -39,7 +39,11 @@ func assignmentConnection(s *inference.State, j *inference.Job, id string, conne
 }
 
 func uncertain(events *[]inferenceEvent, s *inference.State, j *inference.Job, boundary, reason string) {
-	event(events, slog.LevelWarn, "recovery.uncertain", s, j, "last_boundary", boundary, "reason", reason, "busy_hold", j.Held, "remote_outcome", "unknown", "automatic_replay", false, "corrective_action", "preserve the assignment; accept only a current unexpired matching decision, otherwise await the exact idle acknowledgement without retrying inference")
+	corrective := "preserve the assignment; accept only a current unexpired matching decision, otherwise await the exact idle acknowledgement without retrying inference"
+	if nativeClaim(j) {
+		corrective = "preserve the claim; reconcile the exact native execution and all producers before settling; do not retry work"
+	}
+	event(events, slog.LevelWarn, "recovery.uncertain", s, j, "claim_id", j.LeaseID, "last_boundary", boundary, "reason", reason, "busy_hold", j.Held, "remote_outcome", "unknown", "automatic_replay", false, "corrective_action", corrective)
 }
 
 func (b *Broker) Recover(ctx context.Context, logger *slog.Logger) error {
@@ -96,6 +100,9 @@ func recoverDelivery(events *[]inferenceEvent, s *inference.State, j *inference.
 			action = "verify worker health and readiness, then retrieve the same unclaimed job; do not create replacement work or assume a decision exists"
 			if j.Held || j.ClaimedAt != nil {
 				action = "preserve the claimed assignment and await its correlated outcome or exact idle acknowledgement after fencing; do not retry inference"
+			}
+			if nativeClaim(j) {
+				action = "preserve the claim and reconcile the exact native execution and all producers; do not authorize a second execution"
 			}
 		}
 		event(events, slog.LevelWarn, "recovery.uncertain", s, j, "last_boundary", boundary.name, "reason", "delivery_completion_receipt_missing", "decision_available", r.Output != nil, "busy_hold", j.Held, "remote_outcome", e.RemoteOutcome, "automatic_replay", false, "corrective_action", action)

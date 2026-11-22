@@ -6,9 +6,12 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -25,6 +28,39 @@ type httpInferenceStore struct {
 	fail     error
 	output   *bytes.Buffer
 	capture  *diagnostics.Store
+	sequence int64
+}
+
+func (m *httpInferenceStore) WithinPull(ctx context.Context, digest [32]byte, _ inference.Pull, _ string, capability int, claim func(*inference.State) (*inference.Grant, error)) (inference.PullResult, string, bool, inference.PullTiming, error) {
+	identity, err := m.workers.AuthenticateWorker(ctx, digest)
+	if err != nil {
+		return inference.PullResult{}, "", false, inference.PullTiming{}, err
+	}
+	var result inference.PullResult
+	err = m.withinRouting(inference.Ref{WorkerID: identity.ID}, func(pool *inference.State) error {
+		worker := pool.Pool[identity.ID]
+		worker.LastPollAt, worker.LastContactAt = &pool.Now, &pool.Now
+		var candidate *inference.Job
+		for _, job := range pool.Jobs {
+			if job.WorkerID == identity.ID && job.Held {
+				return nil
+			}
+			if job.State != "queued" || (job.WorkerID != "" && job.WorkerID != identity.ID) || (job.Media != nil && capability == 0) {
+				continue
+			}
+			if candidate == nil || job.CreatedAt.Before(candidate.CreatedAt) {
+				candidate = job
+			}
+		}
+		if candidate == nil {
+			return nil
+		}
+		selected := *pool
+		selected.Jobs = map[string]*inference.Job{candidate.ID: candidate}
+		result.Job, err = claim(&selected)
+		return err
+	})
+	return result, identity.ID, false, inference.PullTiming{}, err
 }
 
 func (m *httpInferenceStore) InferenceWorkers(context.Context) ([]string, error) { return nil, m.fail }
@@ -40,14 +76,18 @@ func (m *httpInferenceStore) WithinInference(_ context.Context, ref inference.Re
 	}
 	wid := ref.WorkerID
 	if ref.ExperimentID != "" || ref.JobID != "" {
-		wid = ""
+		found := false
 		for id, s := range m.states {
 			if s.Experiments[ref.ExperimentID] != nil || s.Jobs[ref.JobID] != nil {
-				wid = id
+				wid, found = id, true
+				break
 			}
 		}
+		if !found {
+			return inference.Reject("inference_not_found", 404)
+		}
 	}
-	if _, ok := m.workers.records[wid]; !ok {
+	if _, ok := m.workers.records[wid]; !ok && (wid != "" || m.states[wid] == nil) {
 		return inference.Reject("inference_not_found", 404)
 	}
 	if ref.WorkerAuth != "" && ref.WorkerAuth != wid {
@@ -133,24 +173,39 @@ func inferenceHTTPFixture(t *testing.T) (*Handler, *httpInferenceStore, workerVi
 	h, workers, output, capture := workerHTTPFixture(t)
 	w, key := enrollHTTP(t, h, issueHTTP(t, h))
 	m := &httpInferenceStore{workers: workers, states: map[string]*inference.State{}, receipts: map[string]*inference.Receipt{}, output: output, capture: capture}
+	m.states[w.ID] = &inference.State{WorkerID: w.ID}
 	h.Broker = service.NewBroker(m, rand.Reader, time.Now, func(context.Context, time.Duration) error { return context.Canceled })
 	return h, m, w, key
 }
 
-func onlineHTTP(t *testing.T, h *Handler, wid string) inference.Connection {
+func pullAndStartHTTP(t *testing.T, h *Handler, m *httpInferenceStore, key string, media bool) inference.Job {
 	t.Helper()
-	data, err := h.Broker.Open(context.Background(), h.Logger, wid, nil)
-	if err != nil {
-		t.Fatal(err)
+	m.sequence++
+	stamp := time.Now().UTC()
+	var pulled inference.PullResult
+	poll := inference.Pull{Version: 1, Sequence: m.sequence, Checker: "checker", Occurrence: fmt.Sprintf("tick-%d", m.sequence), ScheduledAt: stamp, EnteredAt: stamp, MediaJobs: media}
+	nativeResponse(t, nativePost(h, "/api/v1/worker/pull", key, poll), 200, &pulled)
+	if pulled.Job == nil {
+		t.Fatal("no queued fixture job")
 	}
-	var c inference.Connection
-	if err = json.Unmarshal(data, &c); err != nil {
-		t.Fatal(err)
-	}
-	if _, err = h.Broker.Heartbeat(context.Background(), h.Logger, wid, inference.Heartbeat{Version: 1, ConnectionID: c.ID, Generation: c.Generation, ChallengeID: c.Challenges[0].ID}); err != nil {
-		t.Fatal(err)
-	}
-	return c
+	var started inference.Job
+	nativeResponse(t, nativePost(h, "/api/v1/worker/jobs/"+pulled.Job.JobID+"/start", key, inference.WorkStart{
+		Version: 1, ClaimID: pulled.Job.ClaimID, Generation: pulled.Job.Generation, LaunchID: "launch", NativeJob: "once",
+	}), 200, &started)
+	return started
+}
+
+func submitAndSettleHTTP(t *testing.T, h *Handler, key string, job inference.Job, decision inference.Item) {
+	t.Helper()
+	path := "/api/v1/worker/jobs/" + job.ID
+	apiJSON(t, h, "POST", path+"/decisions", key, inference.Submit{
+		Claim: inference.Claim{Version: 1, SubmissionID: "decision-" + job.ID}, ConversationID: job.ConversationID,
+		Generation: job.Generation, LeaseID: job.LeaseID, ContextReceiptID: job.Context.ReceiptID, Decision: decision,
+	}, 200)
+	apiJSON(t, h, "POST", path+"/interrupt", key, inference.Interruption{
+		Version: 1, SubmissionID: "settlement-" + job.ID, ClaimID: job.LeaseID, Generation: job.Generation,
+		LaunchID: "launch", NativeJob: "once", NativeRun: "execution", Reason: "execution_confirmed_stopped",
+	}, 200)
 }
 
 func apiJSON(t *testing.T, h *Handler, method, path, key string, input any, want int) map[string]any {
@@ -175,16 +230,26 @@ func apiJSON(t *testing.T, h *Handler, method, path, key string, input any, want
 }
 
 func TestInferenceHTTPProductionLogicAndCapture(t *testing.T) {
-	h, _, w, key := inferenceHTTPFixture(t)
-	c := onlineHTTP(t, h, w.ID)
-	input := map[string]any{"protocol_version": 1, "submission_id": "create", "worker_id": w.ID, "messages": []any{map[string]any{"type": "message", "role": "user", "text": "private client fixture"}}, "tools": []any{map[string]any{"name": "read_file", "parameters": map[string]any{"type": "object"}}}}
+	root := t.TempDir()
+	if err := os.Chmod(root, 0700); err != nil {
+		t.Fatal(err)
+	}
+	h := pullHTTP(t, filepath.Join(root, "broker.sqlite3"))
+	key := enrollNative(t, h)
+	workerID := apiJSON(t, h, "GET", "/api/v1/worker/status", key, nil, 200)["id"].(string)
+	input := map[string]any{"protocol_version": 1, "submission_id": "create", "worker_id": workerID, "messages": []any{map[string]any{"type": "message", "role": "user", "text": "private client fixture"}}, "tools": []any{map[string]any{"name": "read_file", "parameters": map[string]any{"type": "object"}}}}
 	e := apiJSON(t, h, "POST", "/api/v1/admin/experiments", "admin-private-sentinel", input, 201)
 	id, job := e["id"].(string), e["current_job_id"].(string)
 	apiJSON(t, h, "GET", "/api/v1/admin/experiments/"+id, "admin-private-sentinel", nil, 200)
-	apiJSON(t, h, "GET", "/api/v1/worker/jobs/"+job, key, nil, 200)
-	claim := map[string]any{"protocol_version": 1, "submission_id": "claim", "connection_id": c.ID, "connection_generation": c.Generation}
-	j := apiJSON(t, h, "POST", "/api/v1/worker/jobs/"+job+"/claim", key, claim, 200)
-	decision := map[string]any{"protocol_version": 1, "submission_id": "decision", "connection_id": c.ID, "connection_generation": c.Generation, "conversation_id": j["conversation_id"], "generation": j["generation"], "lease_id": j["lease_id"], "context_receipt_id": j["context"].(map[string]any)["receipt_id"], "decision": map[string]any{"type": "tool_call", "call_id": "client-call", "name": "read_file", "arguments": map[string]any{}}}
+	stamp := time.Now().UTC()
+	var pulled inference.PullResult
+	nativeResponse(t, nativePost(h, "/api/v1/worker/pull", key, inference.Pull{Version: 1, Sequence: 1, Checker: "checker", Occurrence: "tick", ScheduledAt: stamp, EnteredAt: stamp}), 200, &pulled)
+	if pulled.Job == nil || pulled.Job.JobID != job {
+		t.Fatal("targeted experiment was not pulled")
+	}
+	var started inference.Job
+	nativeResponse(t, nativePost(h, "/api/v1/worker/jobs/"+job+"/start", key, inference.WorkStart{Version: 1, ClaimID: pulled.Job.ClaimID, Generation: pulled.Job.Generation, LaunchID: "launch", NativeJob: "once"}), 200, &started)
+	decision := inference.Submit{Claim: inference.Claim{Version: 1, SubmissionID: "decision"}, ConversationID: started.ConversationID, Generation: started.Generation, LeaseID: started.LeaseID, ContextReceiptID: started.Context.ReceiptID, Decision: inference.Item{Type: "tool_call", CallID: "client-call", Name: "read_file", Arguments: map[string]any{"path": "client-only"}}}
 	got := apiJSON(t, h, "POST", "/api/v1/worker/jobs/"+job+"/decisions", key, decision, 200)
 	if got["state"] != "waiting_for_tool" {
 		t.Fatal("tool call not exposed")
@@ -194,14 +259,13 @@ func TestInferenceHTTPProductionLogicAndCapture(t *testing.T) {
 	if got["state"] != "cancelled" {
 		t.Fatal("cancellation delayed")
 	}
-	apiJSON(t, h, "POST", "/api/v1/worker/heartbeat", key, map[string]any{"protocol_version": 1, "connection_id": c.ID, "connection_generation": c.Generation, "challenge_id": c.Challenges[0].ID}, 200)
 	status := apiJSON(t, h, "GET", "/api/v1/worker/status", key, nil, 200)
-	if status["connection_status"] != "online" || status["inference_readiness"] != "unverified" {
+	if status["connection_status"] != "recent" || status["inference_readiness"] != "unverified" {
 		t.Fatal("connection/readiness conflated")
 	}
 	apiJSON(t, h, "GET", "/api/v1/admin/workers", "admin-private-sentinel", nil, 200)
-	apiJSON(t, h, "PATCH", "/api/v1/admin/workers/"+w.ID, "admin-private-sentinel", map[string]any{"name": "live renamed"}, 200)
-	apiJSON(t, h, "POST", "/api/v1/admin/workers/"+w.ID+"/revoke", "admin-private-sentinel", nil, 200)
+	apiJSON(t, h, "PATCH", "/api/v1/admin/workers/"+workerID, "admin-private-sentinel", map[string]any{"name": "live renamed"}, 200)
+	apiJSON(t, h, "POST", "/api/v1/admin/workers/"+workerID+"/revoke", "admin-private-sentinel", nil, 200)
 	export := call(h, "GET", "/api/v1/admin/diagnostics/export?operation_id="+id, "Bearer admin-private-sentinel", nil)
 	if export.Code != 200 || !strings.Contains(export.Body.String(), "event") {
 		t.Fatal("correlated protected capture unavailable")
@@ -217,10 +281,8 @@ func TestInferenceHTTPBoundaries(t *testing.T) {
 			apiJSON(t, h, route.method, route.path, k, nil, 401)
 		}
 	}
-	for _, route := range []string{"/api/v1/worker/events", "/api/v1/worker/jobs/" + w.ID} {
-		apiJSON(t, h, "GET", route, "admin-private-sentinel", nil, 401)
-	}
-	for _, route := range []string{"/api/v1/worker/heartbeat", "/api/v1/worker/jobs/" + w.ID + "/claim", "/api/v1/worker/jobs/" + w.ID + "/decisions"} {
+	apiJSON(t, h, "GET", "/api/v1/worker/status", "admin-private-sentinel", nil, 401)
+	for _, route := range []string{"/api/v1/worker/pull", "/api/v1/worker/jobs/" + w.ID + "/start", "/api/v1/worker/jobs/" + w.ID + "/interrupt", "/api/v1/worker/jobs/" + w.ID + "/decisions"} {
 		apiJSON(t, h, "POST", route, "admin-private-sentinel", nil, 401)
 	}
 	for _, body := range []string{`{}`, `null`, `{"protocol_version":1,"submission_id":"x","worker_id":"x","messages":[],"tools":[],"extra":true}`, `{"protocol_version":1,"protocol_version":1}`, `{} {}`, `{"protocol_version":null}`, `{"messages":[{"type":"media"}]}`} {
@@ -229,6 +291,10 @@ func TestInferenceHTTPBoundaries(t *testing.T) {
 		}
 	}
 	base := map[string]any{"protocol_version": 1, "submission_id": "alias", "worker_id": w.ID, "messages": []any{map[string]any{"type": "message", "role": "user", "text": "x"}}, "tools": []any{}}
+	statesBefore, err := json.Marshal(m.states)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, extra := range []map[string]any{
 		{"TIMEOUT_SECONDS": 1},
 		{"timeout_seconds": 300, "TIMEOUT_SECONDS": 1},
@@ -243,7 +309,8 @@ func TestInferenceHTTPBoundaries(t *testing.T) {
 			input[k] = v
 		}
 		apiJSON(t, h, "POST", "/api/v1/admin/experiments", "admin-private-sentinel", input, 400)
-		if len(m.states) != 0 || len(m.receipts) != 0 {
+		statesAfter, err := json.Marshal(m.states)
+		if err != nil || !bytes.Equal(statesBefore, statesAfter) || len(m.receipts) != 0 {
 			t.Fatal("rejected structural alias reached business mutation")
 		}
 	}
@@ -268,34 +335,12 @@ func TestInferenceHTTPBoundaries(t *testing.T) {
 	}
 }
 
-func TestSSEUsesRealWritesAndBoundedCapture(t *testing.T) {
+func TestRetiredWorkerRoutesDoNotProvideAuthority(t *testing.T) {
 	h, _, w, key := inferenceHTTPFixture(t)
-	server := httptest.NewServer(h)
-	defer server.Close()
-	r, err := http.NewRequest("GET", server.URL+"/api/v1/worker/events", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	r.Header.Set("Authorization", "Bearer "+key)
-	client := &http.Client{Timeout: 3 * time.Second}
-	response, err := client.Do(r)
-	if err != nil {
-		t.Fatal(err)
-	}
-	body, err := io.ReadAll(response.Body)
-	response.Body.Close()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if response.StatusCode != 200 || !bytes.Contains(body, []byte("event: health.challenge")) || !bytes.Contains(body, []byte("event: connection.opened")) {
-		t.Fatal("SSE events unavailable")
-	}
-	p, err := h.Broker.Projection(context.Background(), h.Logger, w.ID, true)
-	if err != nil || p.ConnectionStatus != "offline" {
-		t.Fatal("closed stream remained online")
-	}
-	if call(h, "GET", "/api/v1/worker/events", "Bearer "+key, nil).Code != 503 {
-		t.Fatal("unsupported stream writer accepted")
+	apiJSON(t, h, "GET", "/api/v1/worker/events", key, nil, 404)
+	apiJSON(t, h, "GET", "/api/v1/worker/jobs/"+w.ID, key, nil, 404)
+	for _, path := range []string{"/api/v1/worker/heartbeat", "/api/v1/worker/jobs/" + w.ID + "/claim", "/api/v1/worker/upgrade-reservation"} {
+		apiJSON(t, h, "POST", path, key, nil, 404)
 	}
 	wrapped := &responseWriterProbe{header: http.Header{}}
 	h.ServeHTTP(wrapped, httptest.NewRequest("GET", "/healthz", nil))

@@ -33,7 +33,7 @@ func TestResponsesCanonicalChainingInstructionsAndReplay(t *testing.T) {
 	if j.Context.Messages[0].Text != "first only" || j.Context.Messages[1].Text != "question" {
 		t.Fatal(j.Context)
 	}
-	conversation := m.states[first.WorkerID].Conversations[first.ConversationID]
+	conversation := m.states[j.WorkerID].Conversations[first.ConversationID]
 	if conversation.ItemCount != 2 || conversation.Items[0].Item.Text != "question" {
 		t.Fatal("instructions entered message history", conversation)
 	}
@@ -63,7 +63,7 @@ func TestResponsesCanonicalChainingInstructionsAndReplay(t *testing.T) {
 	if j.Context.Messages[0].Text != "changed only" || len(j.Context.Messages) != 6 {
 		t.Fatal(j.Context)
 	}
-	data, _ := json.Marshal(m.states[third.WorkerID].Requests[first.ID])
+	data, _ := json.Marshal(m.states[j.WorkerID].Requests[first.ID])
 	if !strings.Contains(string(data), "first only") {
 		t.Fatal("immutable instruction snapshot lost")
 	}
@@ -106,7 +106,7 @@ func TestResponsesFunctionReplayIDsAndConflictingResults(t *testing.T) {
 			if len(job.Context.Messages) != 3 || job.Context.Messages[1].CallID != call.CallID || job.Context.Messages[2].Output != result.Output {
 				t.Fatal(job.Context)
 			}
-			conversation := m.states[second.WorkerID].Conversations[second.ConversationID]
+			conversation := m.states[job.WorkerID].Conversations[second.ConversationID]
 			if conversation.ItemCount != 4 {
 				t.Fatal("duplicate history", conversation.ItemCount)
 			}
@@ -122,7 +122,7 @@ func TestResponsesItemValidationAndAtomicFailure(t *testing.T) {
 	b, m, logger, _ := inferenceFixture()
 	c := connectInference(t, b, m, logger, "worker-a")
 	first := submitResponse(t, b, "items", responseInput("items-first", "question"))
-	nativeDecide(t, b, m, c, first, inference.Item{Type: "final", Text: "answer"})
+	job := nativeDecide(t, b, m, c, first, inference.Item{Type: "final", Text: "answer"})
 	for _, kind := range []string{"unknown", "changed", "duplicate", "length", "size", "busy"} {
 		t.Run(kind, func(t *testing.T) {
 			input := responseInput("item-"+kind, "next")
@@ -157,7 +157,7 @@ func TestResponsesItemValidationAndAtomicFailure(t *testing.T) {
 			if err == nil {
 				t.Fatal("invalid item admitted")
 			}
-			if m.states[first.WorkerID].Conversations[first.ConversationID].ItemCount != 2 {
+			if m.states[job.WorkerID].Conversations[first.ConversationID].ItemCount != 2 {
 				t.Fatal("failed admission appended history")
 			}
 		})

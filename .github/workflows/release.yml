@@ -31,6 +31,8 @@ jobs:
       version: ${{ steps.resolve.outputs.version }}
       prepared: ${{ steps.resolve.outputs.prepared }}
       resume_run_id: ${{ steps.resolve.outputs.resume_run_id }}
+      resume_artifact_id: ${{ steps.resolve.outputs.resume_artifact_id }}
+      recovery_only: ${{ steps.resolve.outputs.recovery_only }}
       candidate_ready: ${{ steps.resolve.outputs.candidate_ready }}
     steps:
       - uses: actions/checkout@v7
@@ -54,6 +56,8 @@ jobs:
               core.setOutput('version', prepared.version);
               core.setOutput('prepared', JSON.stringify(prepared));
               core.setOutput('resume_run_id', prepared.resume_run_id ?? '');
+              core.setOutput('resume_artifact_id', prepared.resume_artifact_id ?? '');
+              core.setOutput('recovery_only', String(prepared.recovery_only === true));
               core.setOutput('candidate_ready', String(prepared.candidate_ready));
             } catch (error) { reportReleaseFailure(core, error); }
 
@@ -144,7 +148,8 @@ jobs:
           registry-url: https://npm.pkg.github.com
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: release-bundle-${{ needs.resolve.outputs.version }}-${{ needs.resolve.outputs.source_sha }}
+          name: ${{ needs.resolve.outputs.resume_artifact_id == '' && format('release-bundle-{0}-{1}', needs.resolve.outputs.version, needs.resolve.outputs.source_sha) || '' }}
+          artifact-ids: ${{ needs.resolve.outputs.resume_artifact_id }}
           path: ${{ runner.temp }}/release-bundle
           run-id: ${{ needs.resolve.outputs.resume_run_id || github.run_id }}
           github-token: ${{ github.token }}
@@ -191,7 +196,7 @@ jobs:
 
   promote:
     needs: [resolve, publish]
-    if: ${{ !cancelled() && needs.resolve.result == 'success' && (needs.publish.result == 'success' || (needs.publish.result == 'skipped' && needs.resolve.outputs.candidate_ready == 'true')) }}
+    if: ${{ !cancelled() && needs.resolve.result == 'success' && needs.resolve.outputs.recovery_only != 'true' && (needs.publish.result == 'success' || (needs.publish.result == 'skipped' && needs.resolve.outputs.candidate_ready == 'true')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:

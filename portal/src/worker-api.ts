@@ -16,6 +16,11 @@ export interface Worker {
   current_job: { job_id: string; generation: number } | null;
   waiting_for_client_tool: number;
   last_heartbeat_at: string | null;
+  last_poll_at?: string | null;
+  current_claim?: { job_id: string; claim_id: string; claimed_at: string; deadline_at: string } | null;
+  claim_age_ms?: number;
+  claim_stage?: string;
+  claim_started_at?: string;
   model_report?: ModelReport;
 }
 
@@ -48,6 +53,11 @@ export function isWorker(value: unknown): value is Worker {
     typeof value.work_status === 'string' &&
     (value.current_job === null || (object(value.current_job) && typeof value.current_job.job_id === 'string' && integer(value.current_job.generation))) &&
     integer(value.waiting_for_client_tool) && optionalDate(value.last_heartbeat_at) &&
+    (value.last_poll_at === undefined || optionalDate(value.last_poll_at)) &&
+    (value.current_claim === undefined || value.current_claim === null || (object(value.current_claim) && typeof value.current_claim.job_id === 'string' &&
+      typeof value.current_claim.claim_id === 'string' && date(value.current_claim.claimed_at) && date(value.current_claim.deadline_at))) &&
+    (value.claim_age_ms === undefined || integer(value.claim_age_ms)) && (value.claim_stage === undefined || typeof value.claim_stage === 'string') &&
+    (value.claim_started_at === undefined || date(value.claim_started_at)) &&
     (value.model_report === undefined || modelReport(value.model_report));
 }
 

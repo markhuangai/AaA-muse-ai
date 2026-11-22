@@ -6,7 +6,7 @@ import (
 	"strings"
 )
 
-const DevelopmentVersion = "0.1.0-dev.0"
+const DevelopmentVersion = "1.0.0-dev.0"
 const WorkerVersionHeader = "X-Muse-Worker-Version"
 const ServiceVersionHeader = "X-Muse-Service-Version"
 

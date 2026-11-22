@@ -30,7 +30,7 @@ test('enrollment preserves identity, rejects origin changes, and never silently 
   await assert.rejects(lost.worker.enroll(CODE), /enrollment_uncertain/);
   assert.equal(lost.broker.calls.filter(c => c.path.endsWith('/enroll')).length, 1);
   const rejected = await fixture(t); await rejected.worker.configure('https://broker.example.test');
-  rejected.broker.override = async call => call.path.endsWith('/enroll') ? new Response('{"error":"enrollment_expired"}', { status: 410 }) : undefined;
+  rejected.broker.override = async call => call.path.endsWith('/enroll') ? new Response('{"error":"enrollment_expired"}', { status: 410, headers: { 'X-Muse-Service-Version': call.options.headers['X-Muse-Worker-Version'] } }) : undefined;
   await assert.rejects(rejected.worker.enroll(CODE), /broker_rejected/);
   assert.equal(object(parse(await rejected.state.read('enrollment.json'))).state, 'rejected');
   rejected.broker.override = undefined; await rejected.worker.enroll(CODE);

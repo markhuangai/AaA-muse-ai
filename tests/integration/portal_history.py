@@ -18,7 +18,7 @@ from service import require
 class PortalHistory(Portal, Routing):
     def native_timeline(self):
         worker = self.new_worker()
-        peer = self.peer(worker)
+        peer = self.pull_peer(worker)
         original_name = "Archive agent before rename"
         self.checked("/api/v1/admin/workers/" + worker["worker"]["id"], self.admin, "PATCH", {"name": original_name})
         payload = '<img src=x onerror="window.__unsafe=1"> Exact request text\r\n' + "admitted-history-" * 600
@@ -46,7 +46,7 @@ class PortalHistory(Portal, Routing):
         events = self.timeline(first["conversation_id"], 50)
         require(len(events) > 50, "timeline fixture does not cross the actual page bound")
         self.checked("/api/v1/admin/workers/" + worker["worker"]["id"], self.admin, "PATCH", {"name": "Renamed archive agent"})
-        bot = DecisionPeer(self, worker, peer).start()
+        bot = DecisionPeer(self, self.new_worker()).start()
         try:
             response, _ = self.checked("/v1/responses", self.client, "POST", {"model": "muse-pool-text", "input": "aaa-chat:text:Request-scoped answer", "instructions": "Instructions only for this Responses request"})
             require(response["status"] == "completed" and len(bot.jobs) == 1, "controlled Responses request did not complete")
@@ -95,49 +95,47 @@ class PortalHistory(Portal, Routing):
 
     def routing_fixtures(self):
         result = {}
-        for boundary in ("safe", "context", "claimed", "tool-wait"):
+        for boundary in ("safe", "granted", "started", "tool-wait"):
             pair = self.new_pair()
-            by_id = {worker["worker"]["id"]: (worker, peer) for worker, peer in pair}
+            (worker, peer), (replacement, replacement_peer) = pair
             initial = self.request_input("Initial " + boundary, tools=boundary == "tool-wait", timeout=1800)
             request, _ = self.submit(initial, "portal-boundary-" + boundary)
-            worker, peer = by_id[request["worker_id"]]
             decision = {"type": "tool_call", "call_id": "retained-boundary-call", "name": "read_file", "arguments": {"path": "client-only.txt"}} if boundary == "tool-wait" else {"type": "final", "text": "Prior final answer"}
             self.deliver(worker, peer, request, decision)
             self.read_native(request)
             canonical = initial["messages"] + [decision if boundary == "tool-wait" else {"type": "message", "role": "assistant", "text": decision["text"]}]
             suffix = {"type": "tool_result", "call_id": decision["call_id"], "output": "Accepted client result"} if boundary == "tool-wait" else {"type": "message", "role": "user", "text": "Next turn"}
+            if boundary == "safe":
+                self.silence(worker, 605)
             pending, _ = self.submit({**self.request_input(timeout=1800), "messages": canonical + [suffix]}, request["session_id"])
             old = self.experiment(pending["id"])
-            if boundary == "context":
-                self.checked("/api/v1/worker/jobs/" + old["current_job_id"], worker["credential"])
-            if boundary == "claimed":
+            if boundary == "granted":
+                require(peer.poll()["job_id"] == old["current_job_id"], "grant did not preserve the pin")
+            if boundary == "started":
                 self.claim(worker, peer, old)
             if boundary == "safe":
-                peer.reply = False
-                self.until(lambda: self.status(worker)["connection_status"] == "offline", "worker health did not expire", timeout=40)
-                self.until(lambda: self.read_native(pending)[0]["worker_id"] != worker["worker"]["id"], "safe reassignment did not occur", timeout=15)
-                moved, _ = self.read_native(pending)
-                replacement, replacement_peer = by_id[moved["worker_id"]]
+                require(self.worker_projection(worker)[0]["connection_status"] == "offline", "silent pin did not go offline")
+                self.until(lambda: self.experiment(pending["id"])["current_job_id"] != old["current_job_id"], "safe pin was not released", timeout=15)
                 self.checked("/api/v1/admin/workers/" + worker["worker"]["id"], self.admin, "PATCH", {"name": "Previous worker renamed now"})
                 self.checked("/api/v1/admin/workers/" + replacement["worker"]["id"], self.admin, "PATCH", {"name": "Replacement worker renamed now"})
-                self.deliver(replacement, replacement_peer, moved, {"type": "final", "text": "Full-history replacement"})
-                self.read_native(moved)
-                require(self.detail(moved)["delivery"]["messages"] == canonical + [suffix], "safe replacement did not retain full context")
+                self.deliver(replacement, replacement_peer, pending, {"type": "final", "text": "Full-history replacement"})
+                require(self.read_native(pending)[0]["worker_id"] == replacement["worker"]["id"], "safe replacement did not acquire the pin")
+                require(self.detail(pending)["delivery"]["messages"] == canonical + [suffix], "safe replacement did not retain full context")
             else:
-                peer.stop()
+                self.silence(worker, 605)
+                require(replacement_peer.poll() is None, "other worker acquired a held or tool-owned pin")
                 current, _ = self.read_native(pending)
-                require(current["worker_id"] == worker["worker"]["id"], "exposed request was replaced")
+                require(current["worker_id"] == worker["worker"]["id"], "protected request was replaced")
+                if boundary in ("granted", "started"):
+                    self.cancel(pending["id"])
             result[boundary] = pending["id"]
         self.receipt("portal.history_recorded_replacement_boundaries", full_history_replayed=True, claim_context_tool_fences=True, inference_retry_added=False)
         return result
 
     def cancellation_fixtures(self):
         self.new_pair()
-        for peer in self.peers:
-            if peer.thread.is_alive():
-                peer.stop()
         worker = self.new_worker()
-        peer = self.peer(worker)
+        peer = self.pull_peer(worker)
         held, _ = self.submit(self.input(worker, tools=[], timeout=1800), "portal-held")
         held_job = self.deliver_claim(worker, peer, held)
         queued, _ = self.submit(self.input(worker, tools=[], timeout=1800), "portal-unassigned-proof")
@@ -150,17 +148,18 @@ class PortalHistory(Portal, Routing):
             require(diagnosis["transaction_outcome"] == "committed", "cancellation lacks committed evidence")
         self.decision(worker, peer, held_job, {"type": "final", "text": "Rejected late decision"}, want=409)
         require(self.status(worker)["work_status"] == "busy", "cancel discarded uncertain busy hold")
-        peer.acknowledge_idle(held_job)
-        require(self.detail(held)["execution"]["remote_outcome"] == "unknown", "idle acknowledgement invented remote outcome")
+        require(self.detail(held)["execution"]["remote_outcome"] == "unknown", "cancellation invented a native stop")
+        peer.settle(held_job, "cancelled")
         blocker, _ = self.submit(self.input(worker, tools=[], timeout=1800), "portal-browser-blocker")
         self.deliver_claim(worker, peer, blocker)
         cancellable = [self.submit(self.input(worker, tools=[], timeout=1800), "portal-browser-queued-" + str(i))[0] for i in range(6)]
         race_worker = self.new_worker()
-        race_peer = self.peer(race_worker)
+        race_peer = self.pull_peer(race_worker)
         race, _ = self.submit(self.input(race_worker, tools=[], timeout=1800), "portal-race")
         job = self.experiment(race["id"])["current_job_id"]
-        self.receipt("portal.history_cancellation_authority", unassigned=True, held_uncertainty=True, late_decision_rejected=True, exact_idle_ack=True)
-        return {"queued": cancellable, "held": blocker, "race": race, "race_control": {"credential": race_worker["credential"], "job_id": job, **race_peer.opened}}
+        self.receipt("portal.history_cancellation_authority", unassigned=True, held_uncertainty=True, late_decision_rejected=True, exact_settlement=True)
+        return {"queued": cancellable, "held": blocker, "race": race, "race_control": {"credential": race_worker["credential"], "job_id": job,
+                "version": self.worker_version, "poll": race_peer.poll_input()}}
 
     def deliver_claim(self, worker, peer, request):
         return self.claim(worker, peer, self.experiment(request["id"]))[0]
@@ -183,12 +182,15 @@ class PortalHistory(Portal, Routing):
             native = self.retained_export("operation_id", event["operation_id"])
             require(event["operation_id"] == event.get("request_record_id", event.get("experiment_id")), "cancel lacks native request correlation")
             require(any(item["msg"] == "inference.exchange" and item.get("experiment_id") == event["operation_id"] for item in native), "native cancellation exchange missing")
-            assignments = [item for item in native if item["msg"] == "job.queued"]
+            assignments = [item for item in native if item["msg"] in ("dispatch.queued", "job.queued", "job.claimed")]
             decisions = [item for item in native if item["msg"] == "decision.accepted"]
             remote, busy = event["remote_outcome"], event["busy_hold"]
             require(remote in ("not_started", "unknown", "decision_observed") and isinstance(busy, bool), "cancel remote outcome or busy hold missing")
             if event.get("job_id"):
                 require(assignments and any(item.get("job_id") == event["job_id"] for item in assignments), "cancel assignment cannot be reconstructed")
+                if busy:
+                    require(any(item["msg"] == "job.claimed" and item.get("job_id") == event["job_id"] and item.get("claim_id")
+                                for item in assignments), "held cancellation lost its native claim identity")
             require(event["requested_state"] == "cancelled" and event["portal_session_id"], "cancel result lacks authenticated state evidence")
             if status == 200:
                 require(event["transaction_outcome"] == "committed" and event["observed_state"] in ("cancelled", "interrupted"), "successful HTTP cancel lacks actual commit/state")

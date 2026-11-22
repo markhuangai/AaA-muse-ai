@@ -28,9 +28,12 @@ test('two required inputs carry the named RC and frozen final pair through a sin
   assert(publish.needs.includes('build'));
   assert.match(publish.if, /needs\.build\.result == 'skipped' && needs\.resolve\.outputs\.resume_run_id != ''/);
   assert(publish.steps.some(step => step.uses?.startsWith('actions/download-artifact@') && step.with['run-id']));
+  assert.equal(publish.steps.find(step => step.uses?.startsWith('actions/download-artifact@')).with['artifact-ids'],
+    '${{ needs.resolve.outputs.resume_artifact_id }}');
   assert.equal(publish.steps.find(step => step.uses?.startsWith('actions/download-artifact@')).with.path, upload.with.path);
   const promote = workflow.jobs.promote;
   assert.deepEqual(promote.needs, ['resolve', 'publish']);
+  assert.match(promote.if, /needs\.resolve\.outputs\.recovery_only != 'true'/);
   assert.match(promote.if, /needs\.publish\.result == 'skipped' && needs\.resolve\.outputs\.candidate_ready == 'true'/);
   const step = promote.steps.find(step => step.uses === 'actions/github-script@v9');
   assert.match(step.with.script, /promoteStable/);

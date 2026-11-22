@@ -8,7 +8,7 @@ import (
 )
 
 func (h *Handler) workerCompatibility(w *response, r *http.Request, logger *slog.Logger, route string) bool {
-	if route != "/api/v1/worker/enroll" && route != "/api/v1/worker/events" && route != "/api/v1/worker/jobs/{id}/claim" {
+	if route != "/api/v1/worker/enroll" && route != "/api/v1/worker/pull" && route != "/api/v1/worker/jobs/{id}/start" {
 		return true
 	}
 	build := h.Service.Build()
@@ -25,6 +25,10 @@ func (h *Handler) workerCompatibility(w *response, r *http.Request, logger *slog
 		writeJSON(w, http.StatusUpgradeRequired, map[string]any{"error": "update_required", "service_version": build.Version, "worker_version": version, "worker_package": build.WorkerPackage, "automatic_update": false})
 		return false
 	}
-	logger.Info("worker.compatibility_accepted", "service_version", build.Version, "worker_version", version, "legacy_handshake", len(values) == 0)
+	level := slog.LevelInfo
+	if route == "/api/v1/worker/pull" {
+		level = slog.LevelDebug
+	}
+	logger.Log(r.Context(), level, "worker.compatibility_accepted", "service_version", build.Version, "worker_version", version, "legacy_handshake", len(values) == 0)
 	return true
 }

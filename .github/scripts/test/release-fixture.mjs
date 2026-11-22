@@ -38,8 +38,8 @@ function populate(record) {
   release.body = completionMarker(manifest);
 }
 
-export async function releaseFixture(t, { source = 'a'.repeat(40), tree = 'e'.repeat(40), version = '0.1.0',
-  rcVersion = '0.1.0-rc.13', previous } = {}) {
+export async function releaseFixture(t, { source = 'a'.repeat(40), tree = 'e'.repeat(40), version = '1.0.0',
+  rcVersion = '1.0.0-rc.13', previous } = {}) {
   const directory = mkdtempSync(join(tmpdir(), 'aaa-release-test-'));
   const state = { refs: new Map(previous?.state.refs), assets: new Map(), images: new Map(previous?.state.images),
     npm: null, tags: { ...previous?.state.tags }, requests: [], commands: [], uploads: 0, permission: 'admin',

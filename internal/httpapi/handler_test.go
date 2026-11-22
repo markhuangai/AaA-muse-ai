@@ -48,6 +48,9 @@ func fixture(t *testing.T) (*Handler, *testDB, *bytes.Buffer, *diagnostics.Store
 func call(h *Handler, method, path, authorization string, body io.Reader) *httptest.ResponseRecorder {
 	r := httptest.NewRequest(method, path, body)
 	r.Header.Set("Authorization", authorization)
+	if path == "/api/v1/worker/enroll" {
+		r.Header.Set(service.WorkerVersionHeader, service.DevelopmentVersion)
+	}
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, r)
 	return w

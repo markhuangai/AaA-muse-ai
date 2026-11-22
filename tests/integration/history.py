@@ -132,7 +132,7 @@ class History(Inference):
         a, headers = self.submit(initial, "session-A")
         require(headers["X-Muse-Session-Id"] == "session-A" and "output" not in a, "admission exposed output or lost session")
         tool = {"type": "tool_call", "call_id": "call-" + secrets.token_hex(10), "name": "read_file", "arguments": {"path": str(fixture), "number": 9007199254740993}}
-        original_job = self.deliver(worker, peer, a, tool)
+        self.deliver(worker, peer, a, tool)
         observed, _ = self.read_native(a)
         require(observed["state"] == "completed" and observed["output"] == tool, "tool decision or integer changed")
         require(self.status(worker)["work_status"] == "idle" and self.status(worker)["waiting_for_client_tool"] == 1, "native tool wait confused with busy inference")
@@ -158,7 +158,6 @@ class History(Inference):
         require(b_messages[0]["text"] not in json.dumps(job["context"]), "B history crossed into A continuation")
         final, _ = self.read_native(continued)
         require(final["output"]["text"] == fixture_value, "exact result bytes changed")
-        self.checked("/api/v1/worker/jobs/" + original_job["id"], worker["credential"])
         original = self.detail(a)
         require(original["delivery"]["messages"] == initial["messages"] and original["delivery"]["tools"] == initial["tools"], "old delivery snapshot rewritten")
         canonical = continued_input["messages"] + [{"type": "message", "role": "assistant", "text": fixture_value}]
@@ -274,7 +273,7 @@ class History(Inference):
 
     def nul_histories(self):
         worker = self.new_worker()
-        peer = self.peer(worker)
+        peer = self.pull_peer(worker)
         text = 'nul-history-value\x00 literal\\u0000 SOH\x01 quote" slash\\ unicode雪\r\n'
         messages = [{"type": "message", "role": "system", "text": text}, {"type": "message", "role": "user", "text": text}]
         tools = [{"name": "read_file", "description": text, "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "marker": {"type": "string", "description": text}, "number": {"type": "integer"}}, "required": ["path", "marker"]}}]
@@ -353,7 +352,6 @@ class History(Inference):
             self.sql("UPDATE aaa_conversation_events SET data=x'" + original.encode().hex() + "' WHERE conversation_id='" + first["conversation_id"] + "' AND sequence=0;")
         require(self.sql(retained) == before, "projection fault fixture did not restore original history")
         require('nul-history-value' not in self.logs(self.main_service), "NUL payload escaped INFO filtering")
-        peer.stop()
         self.receipt("history.nul_original_payloads", native=True, legacy=True, client_result=True, accepted_output=True, tools_and_arguments=True, details=True, literal_escape_distinct=True, management_read_only=True, paginated=True, diagnostic_reconstruction=True)
         self.receipt("history.nul_projection_failure_diagnosis", cause="history_projection_invalid", transaction_outcome="rolled_back", corrective_action="Correct the timeline projection or unsupported metadata and retry reading; preserve original records.", business_table_queries=False)
         return {"native": continued["id"], "legacy": legacy["id"], "call_id": call["call_id"]}
@@ -404,14 +402,13 @@ class History(Inference):
         self.until(interrupted, "native request deadline did not terminate", timeout=6)
         _, events = self.diagnose_history(deadline_headers[0]["X-Request-Id"], "job.deadline_exceeded", "deadline_exceeded")
         require(any(e["msg"] == "job.deadline_exceeded" and e["generation"] == job["generation"] and e["client_id"] == "fixture-client" for e in events), "deadline cause/assignment/owner unavailable")
-        peer.acknowledge_idle(job)
-        peer.stop()
-        self.until(lambda: self.status(worker)["connection_status"] == "offline", "subscriber did not close")
+        require(self.status(worker)["work_status"] == "busy", "deadline released an uncertain claim")
+        peer.settle(job)
+        require(self.status(worker)["work_status"] == "idle", "matching terminal receipt did not release the claim")
         self.docker("stop", "--time", "5", self.main_service)
         self.docker("start", self.main_service)
         self.origin_url = self.origin(self.main_service)
         self.ready(self.main_service, self.origin_url)
-        peer = self.peer(worker)
         replay, _ = self.submit({**initial, "submission_id": secrets.token_hex(12)}, "session-A")
         require(replay["id"] == first["id"], "broker restart lost replay ownership")
         followup = self.input(worker, canonical + [{"type": "message", "role": "user", "text": "After restart"}], tools=[])
@@ -440,7 +437,7 @@ def main():
         secondary, second_origin, _ = h.launch(config)
         h.ready(secondary, second_origin)
         worker = h.new_worker()
-        peer = h.peer(worker)
+        peer = h.pull_peer(worker)
         first, initial, canonical = h.tool_history(worker, peer)
         h.owners_and_invalid_inputs(worker, peer, first, initial)
         h.competing_turns(worker, second_origin)
@@ -452,15 +449,7 @@ def main():
         h.deadline_and_restart(worker, peer, first, initial, canonical)
         h.private("results.json", json.dumps({"suite": "history", "source_sha": args.source_sha, "synthetic_peer": True, "receipts": h.receipts}))
     finally:
-        failures = []
-        for peer in h.peers:
-            if peer.thread.is_alive():
-                try:
-                    peer.stop()
-                except Exception as error:
-                    failures.append(str(error))
         h.cleanup()
-        require(not failures, "history peer cleanup failed")
 
 
 if __name__ == "__main__":

@@ -17,6 +17,34 @@ import (
 	"github.com/markhuangai/AaA-muse-ai/internal/inference"
 )
 
+func TestNativeContactStatusUsesBrokerBoundariesWithoutReleasingClaim(t *testing.T) {
+	contact := time.Date(2026, 11, 21, 17, 0, 0, 0, time.UTC)
+	deadline := contact.Add(15 * time.Minute)
+	job := &inference.Job{ID: "job", WorkerID: "worker", State: "claimed", ClaimedAt: &contact, DeadlineAt: deadline, Held: true, LeaseID: "claim", Generation: 1}
+	for _, sample := range []struct {
+		elapsed time.Duration
+		status  string
+	}{
+		{0, "recent"},
+		{time.Minute - time.Microsecond, "recent"},
+		{time.Minute, "quiet"},
+		{10*time.Minute - time.Microsecond, "quiet"},
+		{10 * time.Minute, "offline"},
+		{12 * time.Minute, "offline"},
+	} {
+		t.Run(sample.elapsed.String(), func(t *testing.T) {
+			s := &inference.State{WorkerID: "worker", Now: contact.Add(sample.elapsed), LastContactAt: &contact, LastPollAt: &contact, Jobs: map[string]*inference.Job{job.ID: job}}
+			projection := project(s)
+			applyPullProjection(&projection, s)
+			if projection.ConnectionStatus != sample.status || projection.WorkStatus != "busy" || projection.Claim == nil ||
+				projection.Claim.ClaimID != job.LeaseID || !projection.Claim.DeadlineAt.Equal(deadline) ||
+				projection.ClaimAgeMS == nil || *projection.ClaimAgeMS != sample.elapsed.Milliseconds() || !job.Held {
+				t.Fatalf("incorrect claim/contact projection: %+v", projection)
+			}
+		})
+	}
+}
+
 func memoryHistoryScope(states map[string]*inference.State, ref *inference.Ref) error {
 	if ref.ClientID == "" {
 		return nil
@@ -82,15 +110,61 @@ func testHistoryLogger() *slog.Logger { return slog.New(slog.NewJSONHandler(io.D
 
 func nativeJob(t *testing.T, b *Broker, m *inferenceMemory, c inference.Connection, v inference.RequestView) inference.Job {
 	t.Helper()
-	e := m.states[v.WorkerID].Experiments[v.ID]
-	return claimInference(t, b, testHistoryLogger(), c, *e, "claim-"+v.ID)
+	for worker, state := range m.states {
+		if worker != "" && state.Connection.ID == c.ID {
+			return startFixtureJob(t, b, m, worker, v.ID)
+		}
+	}
+	t.Fatal("controlled worker not found")
+	return inference.Job{}
+}
+
+func startFixtureJob(t *testing.T, b *Broker, m *inferenceMemory, worker, operation string) inference.Job {
+	t.Helper()
+	ctx, logger := context.Background(), testHistoryLogger()
+	var grant *inference.Grant
+	err := m.WithinInference(ctx, inference.Ref{WorkerID: worker, Routing: true}, func(pool *inference.State) error {
+		experiment := pool.Experiments[operation]
+		job := pool.Jobs[experiment.CurrentJobID]
+		if job.WorkerID != "" && job.WorkerID != worker {
+			return fmt.Errorf("fixture work targets %s, not %s", job.WorkerID, worker)
+		}
+		for _, active := range pool.Jobs {
+			if active.Held && active.WorkerID == worker {
+				return fmt.Errorf("fixture worker %s still holds %s", worker, active.ID)
+			}
+		}
+		pool.Pool[worker].LastPollAt, pool.Pool[worker].LastContactAt = &pool.Now, &pool.Now
+		candidate := *pool
+		candidate.Jobs = map[string]*inference.Job{job.ID: job}
+		var err error
+		grant, err = b.claimPulledJob(&candidate)
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := b.StartWork(ctx, logger, worker, grant.JobID, inference.WorkStart{Version: 1, ClaimID: grant.ClaimID,
+		Generation: grant.Generation, LaunchID: "launch-" + grant.JobID, NativeJob: "once-" + grant.JobID})
+	return decodeResult[inference.Job](t, data, err)
+}
+
+func settleFixtureJob(t *testing.T, b *Broker, j inference.Job) inference.WorkOutcome {
+	t.Helper()
+	data, err := b.InterruptWork(context.Background(), testHistoryLogger(), j.WorkerID, j.ID, inference.Interruption{Version: 1,
+		SubmissionID: "settle-" + j.ID, ClaimID: j.LeaseID, Generation: j.Generation, LaunchID: j.LaunchID,
+		NativeJob: j.NativeJob, NativeRun: "execution-" + j.ID, Reason: "execution_confirmed_stopped"})
+	return decodeResult[inference.WorkOutcome](t, data, err)
 }
 
 func nativeDecide(t *testing.T, b *Broker, m *inferenceMemory, c inference.Connection, v inference.RequestView, item inference.Item) inference.Job {
 	t.Helper()
 	j := nativeJob(t, b, m, c, v)
-	if _, err := b.Decide(context.Background(), testHistoryLogger(), v.WorkerID, j.ID, submission(j, c, "decision-"+j.ID, item)); err != nil {
+	if _, err := b.Decide(context.Background(), testHistoryLogger(), j.WorkerID, j.ID, submission(j, inference.Connection{}, "decision-"+j.ID, item)); err != nil {
 		t.Fatal(err)
+	}
+	if receipt := settleFixtureJob(t, b, j); receipt.State != "accepted" {
+		t.Fatal("result not accepted", receipt.State)
 	}
 	return j
 }
@@ -365,14 +439,14 @@ func TestNativeValidationAndDependencyErrors(t *testing.T) {
 			t.Fatal("accepted", kind)
 		}
 	}
-	_, err := b.SubmitRequest(ctx, logger, "alice", "offline", requestInput("offline"))
-	requireInferenceReason(t, err, "no_ready_worker")
-	requireCandidateReason(t, err, "worker-a", "worker_offline")
+	offline, err := b.SubmitRequest(ctx, logger, "alice", "offline", requestInput("offline"))
+	if err != nil || offline.State != "queued" || offline.WorkerID != "" {
+		t.Fatal("an offline targeted worker must not prevent queue admission", err)
+	}
 	connectInference(t, b, m, logger, "worker-a")
 	m.states["worker-a"].Revoked = true
 	_, err = b.SubmitRequest(ctx, logger, "alice", "revoked", requestInput("revoked"))
-	requireInferenceReason(t, err, "no_ready_worker")
-	requireCandidateReason(t, err, "worker-a", "worker_revoked")
+	requireInferenceReason(t, err, "worker_revoked")
 	m.states["worker-a"].Revoked = false
 	for n := 0; n < 6; n++ {
 		b.random = bytes.NewReader(make([]byte, n*16))
@@ -405,7 +479,7 @@ func TestNativeDecisionIdentifierFailureRemainsRetryable(t *testing.T) {
 	c := connectInference(t, b, m, logger, "worker-a")
 	v := admitted(t, b, "alice", "session", requestInput("first"))
 	job := nativeJob(t, b, m, c, v)
-	body := submission(job, c, "decision", inference.Item{Type: "final", Text: "result"})
+	body := submission(job, inference.Connection{}, "decision", inference.Item{Type: "final", Text: "result"})
 	b.random = bytes.NewReader(nil)
 	if _, err := b.Decide(context.Background(), logger, "worker-a", job.ID, body); err == nil {
 		t.Fatal("failed item identity accepted")

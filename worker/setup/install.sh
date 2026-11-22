@@ -55,8 +55,8 @@ if ! directory_helper=$(tar -xOzf "$archive" package/setup/private-directory.sh)
   event ERROR setup.package_mismatch
   exit 1
 fi
-root="${XDG_DATA_HOME:-$HOME/.local/share}/aaa-muse-worker"
-state="${XDG_STATE_HOME:-$HOME/.local/state}/aaa-muse-worker"
+root="${XDG_DATA_HOME:-$HOME/.local/share}/aaa-muse-worker-v1"
+state="${XDG_STATE_HOME:-$HOME/.local/state}/aaa-muse-worker-v1"
 [[ "$root" == /* && "$state" == /* ]]
 private_dir "$root" install_directory
 private_dir "$root/releases" bundle_directory

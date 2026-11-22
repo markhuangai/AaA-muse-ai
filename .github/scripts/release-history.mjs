@@ -1,6 +1,6 @@
 import { download } from './release-io.mjs';
 import { digest, hash, jsonBytes, need, repository, sameDigest, validateManifest } from './release-manifest.mjs';
-import { baseVersion, compareVersions, initialVersion, isFinalVersion, releaseVersion } from './release-versions.mjs';
+import { baseVersion, compareVersions, isFinalVersion, releaseVersion } from './release-versions.mjs';
 
 export function releaseAsset(release, name) {
   const matches = release.assets?.filter(asset => asset.name === name) ?? [];
@@ -66,8 +66,9 @@ export async function latestStableRelease(releases, fetcher) {
 }
 
 export function nextRCBase(prior) {
-  if (!prior) return initialVersion;
+  if (!prior) return '1.0.0';
   const version = releaseVersion(prior.version);
+  if (version.major === 0) return '1.0.0';
   version.patch++;
   need(Number.isSafeInteger(version.patch), 'product_release_version_overflow');
   return baseVersion(version);

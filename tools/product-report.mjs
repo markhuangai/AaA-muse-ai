@@ -37,7 +37,7 @@ function partialOutput(item, report, events) {
       interrupted.written_bytes === terminal.written_bytes && interrupted.attempted_bytes === terminal.attempted_bytes));
 }
 
-function inspectCycle(item, report, broker, workers) {
+export function inspectCycle(item, report, broker, workers, workerContext = (event, turn, context) => event.msg === 'worker.context' && event.worker_id === turn.worker_id && event.job_id === turn.job_id && same(event.context, context)) {
   const issues = [], miss = code => issues.push(`${item.id}:${code}`);
   const worker = report.workers.find(value => value.slot === item.slot);
   if (!worker || !identifier(item.session_id) || item.fixture?.owner !== 'client_driver' || !item.fixture.contents || !item.fixture.path || !instant(item.fixture.created_at)) miss('client_fixture_or_identity');
@@ -59,7 +59,7 @@ function inspectCycle(item, report, broker, workers) {
     const encoded = broker.find(event => event.msg === item.protocol + '.accepted_decision' && event.request_id === turn.request_id);
     const admission = broker.find(event => event.msg === item.protocol + '.request_admitted' && event.request_id === turn.request_id);
     if (!boundary || !same(boundary.input, turn.body) || !expected || !same(encoded?.decision, expected.decision) || admission?.operation_id !== turn.operation_id || admission?.session_id !== item.session_id || admission?.conversation_id !== turn.conversation_id) miss('authenticated_protocol_boundary');
-    if (!workers.some(event => event.msg === 'worker.context' && event.worker_id === turn.worker_id && event.job_id === turn.job_id && same(event.context, context?.context))) miss('authenticated_worker_context');
+    if (!workers.some(event => workerContext(event, turn, context?.context))) miss('authenticated_worker_context');
     if (report.evidence_kind === 'live') {
       const observedCaseID = index < (item.measured_from_turn ?? 0) ? item.replay_source_case_id : item.id;
       const observation = report.observations.find(entry => entry.kind === 'model_turn' && entry.case_id === observedCaseID && entry.worker_id === turn.worker_id && entry.job_id === turn.job_id && provenance(entry) && nativeTurnObserved(entry, workers, decision?.decision) && typeof entry.account_memory_observation === 'string' && entry.account_memory_observation && Array.isArray(entry.effective_instructions));

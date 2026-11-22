@@ -6,12 +6,12 @@ x-service-mounts: &service-mounts
     bind:
       create_host_path: false
   - type: bind
-    source: ./sqlite
+    source: ./sqlite-v1
     target: /var/lib/aaa-muse-ai/state
     bind:
       create_host_path: false
   - type: bind
-    source: ./media
+    source: ./media-v1
     target: /var/lib/aaa-muse-ai/media
     bind:
       create_host_path: false

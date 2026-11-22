@@ -8,7 +8,7 @@ From your Compose directory, create the host directories and supply `config/conf
 
 ```sh
 umask 077
-mkdir -p config sqlite media
+mkdir -p config sqlite-v1 media-v1
 cp -n config.example.yaml config/config.yaml
 stat -c '%u:%g' config/config.yaml
 ```
@@ -34,6 +34,8 @@ The setup service prepares the directory modes (`0700`) and the regular YAML (`0
 
 ## Upgrade existing storage
 
+The following same-store procedure applies only within a compatible major. For a major-0 to major-1 cutover, record the exact old container, Compose project, mount sources and owner IDs with the inspection command below. Leave those files and registrations intact. Use a separate Compose directory/project, new private YAML and management, portal and model-client keys, an empty `sqlite-v1` store, a separate empty `media-v1` directory and new worker enrollment. Test readiness and verify the new mounts before separately arranging a production switch. `db.fresh_store_required` identifies a legacy SQLite file; `media.namespace_rejected` can identify a populated, unmarked media directory. Correct the configured mounts rather than clearing either directory. Do not copy the namespace marker between stores. Prior job history and download references stay with the old installation and do not transfer. Any retirement, volume removal or production change requires separate owner authorization.
+
 Before replacing an existing Compose file, inspect the old service container even if it is stopped. Match the actual mounts to their container targets and record the original project name. The following command prints mount metadata.
 
 ```sh
@@ -57,7 +59,9 @@ Check readiness and confirm the new container mounts the same state, media and d
 
 Keep `broker.sqlite3`, its WAL and its shared-memory sidecar together on a local filesystem. SQLite requires the directory to be `0700` and the database and sidecars to be regular files with mode `0600`. Same-host sibling brokers use the same SQLite version and storage. For a backup, stop all brokers writing to the database and copy the complete private state directory. Back up configuration and protected diagnostics separately. Media has its own expiry lifecycle.
 
-For the one-time fresh start from a PostgreSQL deployment, stop submissions, let media drain and keep the old worker journal. Confirm the legacy project and the mount at `/var/lib/postgresql` before decommissioning PostgreSQL. Remove the `database` block from the protected YAML and remove `POSTGRES_PASSWORD` from the Compose environment. Start with new SQLite state and retain diagnostics. Old worker registrations, approvals, history and pending jobs belonged to PostgreSQL. For each returning worker, stop the old subscriber, retire its old hook, keep its journal and enroll using a fresh private absolute `XDG_STATE_HOME`. [Worker state and recovery](../worker/README.md#registration-reconnect-and-removal)
+The queue maintains FIFO index entries for fixed, aligned ranges of job deadlines. A pull seeks only the head of each eligible range in priority order; neither expired nor live backlog expands the number of candidates inspected. Queue state and index membership change in the same SQLite transaction. Use the protected pull timing to separate scheduler entry delay, SQLite writer acquisition, and queue lookup.
+
+For the earlier PostgreSQL-to-SQLite migration, consult the [historical major-0 procedure](https://github.com/markhuangai/AaA-muse-ai/blob/7b772e5dc1771d3e8d4de178ffe61dc99d4c6939/docs/deployment.md#upgrade-existing-storage). It is not a major-1 migration procedure or authorization to retire an existing deployment.
 
 ## Startup troubleshooting
 

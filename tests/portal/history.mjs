@@ -17,10 +17,11 @@ const remember = value => { secrets.push(value); save(`history-browser-secrets-$
 const pause = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
 let browser;
 
-async function control(path, { key, method = 'GET', body, cookie } = {}) {
+async function control(path, { key, method = 'GET', body, cookie, workerVersion } = {}) {
   const headers = { 'Content-Type': 'application/json' };
   if (cookie) Object.assign(headers, browserSessionHeaders(cookie, fixture.origin));
   if (key) headers.Authorization = `Bearer ${key}`;
+  if (workerVersion) headers['X-Muse-Worker-Version'] = workerVersion;
   const response = await fetch(fixture.origin + path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(10_000) });
   const value = response.status === 204 ? null : await response.json();
   return { response, value };
@@ -152,9 +153,9 @@ async function viewports() {
 }
 async function boundaries() {
   const context = await browser.newContext({ serviceWorkers: 'block' }); const page = await context.newPage(); await login(page);
-  await open(page, fixture.fixtures.boundaries.safe); const moved = await timelineText(page); expect(moved).toContain('dispatch.reassigned'); expect(moved).toContain('offline_before_claim_and_context'); expect(moved).toContain('prior_job_id'); expect(moved).toContain('Current name: Previous worker renamed now'); expect(moved).toContain('Current name: Replacement worker renamed now'); expect(moved).toContain('Full-history replacement');
-  await open(page, fixture.fixtures.boundaries.context); await expect(page.getByText(/Context exposure or claimed inference/)).toBeVisible();
-  await open(page, fixture.fixtures.boundaries.claimed); await expect(page.getByText('Retained; remote execution may continue', { exact: true })).toBeVisible();
+  await open(page, fixture.fixtures.boundaries.safe); const moved = await timelineText(page); expect(moved).toContain('dispatch.pin_released'); expect(moved).toContain('dispatch.reassigned'); expect(moved).toContain('offline_before_claim_and_context'); expect(moved).toContain('prior_job_id'); expect(moved).toContain('Current name: Previous worker renamed now'); expect(moved).toContain('Current name: Replacement worker renamed now'); expect(moved).toContain('Full-history replacement');
+  await open(page, fixture.fixtures.boundaries.granted); await expect(page.getByText('Retained; remote execution may continue', { exact: true })).toBeVisible();
+  await open(page, fixture.fixtures.boundaries.started); await expect(page.getByText('Retained; remote execution may continue', { exact: true })).toBeVisible();
   await open(page, fixture.fixtures.boundaries['tool-wait']); const tools = await timelineText(page); expect(tools).toContain('retained-boundary-call'); expect(tools).toContain('Accepted client result'); expect(tools).not.toContain('dispatch.reassigned');
   passed('portal.history_reassignment_and_interrupted_boundaries', { full_history: true, job_generations_preserved: true, accepted_call_ids_preserved: true, uncertainty_explicit: true }); await context.close();
 }
@@ -230,9 +231,15 @@ async function cancellationOutcomes() {
   const race = fixture.fixtures.cancellation.race, authority = fixture.fixtures.cancellation.race_control; remember(authority.credential);
   await open(page, race.id);
   await page.route(`**/api/v1/admin/experiments/${race.id}/cancel`, async route => {
-    const claimed = await control(`/api/v1/worker/jobs/${authority.job_id}/claim`, { key: authority.credential, method: 'POST', body: { protocol_version: 1, submission_id: 'browser-race-claim', connection_id: authority.connection_id, connection_generation: authority.connection_generation } }); expect(claimed.response.status).toBe(200);
-    const job = claimed.value;
-    const decided = await control(`/api/v1/worker/jobs/${job.id}/decisions`, { key: authority.credential, method: 'POST', body: { protocol_version: 1, submission_id: 'browser-race-decision', connection_id: authority.connection_id, connection_generation: authority.connection_generation, generation: job.generation, lease_id: job.lease_id, conversation_id: job.conversation_id, context_receipt_id: job.context.receipt_id, decision: { type: 'final', text: 'Completion won the cancellation race' } } }); expect(decided.response.status).toBe(200);
+    const auth = { key: authority.credential, workerVersion: authority.version, method: 'POST' };
+    const claimed = await control('/api/v1/worker/pull', { ...auth, body: authority.poll }); expect(claimed.response.status).toBe(200);
+    const grant = claimed.value.job; expect(grant.job_id).toBe(authority.job_id);
+    const start = { protocol_version: 1, claim_id: grant.claim_id, generation: grant.generation, launch_id: 'browser-launch', native_job_id: 'browser-native-work' };
+    const started = await control(`/api/v1/worker/jobs/${grant.job_id}/start`, { ...auth, body: start }); expect(started.response.status).toBe(200);
+    const job = started.value;
+    const decided = await control(`/api/v1/worker/jobs/${job.id}/decisions`, { ...auth, body: { protocol_version: 1, submission_id: 'browser-race-decision', connection_id: '', connection_generation: 0, generation: job.generation, lease_id: job.lease_id, conversation_id: job.conversation_id, context_receipt_id: job.context.receipt_id, decision: { type: 'final', text: 'Completion won the cancellation race' } } }); expect(decided.response.status).toBe(200);
+    const settled = await control(`/api/v1/worker/jobs/${job.id}/interrupt`, { ...auth, body: { ...start, submission_id: 'browser-race-settlement', native_run_id: 'browser-native-execution', reason: 'execution_confirmed_stopped' } });
+    expect(settled.response.status).toBe(200); expect(settled.value.state).toBe('accepted');
     await route.continue();
   });
   await page.getByRole('button', { name: 'Cancel request', exact: true }).click(); expect((await cancellation(page, race.id)).status()).toBe(409);

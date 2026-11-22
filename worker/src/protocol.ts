@@ -18,8 +18,15 @@ export function job(value: ObjectValue, workerId: string, jobId: string): Object
   requireValue(/^[a-f0-9]{64}$/.test(text(context.canonical_sha256)), 'invalid_context_hash');
   if (context.kind === 'delta') { identifier(context.base_receipt_id); requireValue(/^[a-f0-9]{64}$/.test(text(context.base_sha256)), 'invalid_context_base'); }
   if (value.state === 'claimed') {
-    identifier(value.lease_id); identifier(value.connection_id);
-    requireValue(integer(value.generation) > 0 && integer(value.connection_generation) > 0 && value.held === true, 'invalid_assignment');
+    identifier(value.lease_id);
+    if (value.connection_id === '') {
+      identifier(value.native_job_id); identifier(value.launch_id);
+      requireValue(Number.isFinite(Date.parse(text(value.started_at))) && integer(value.connection_generation) === 0, 'invalid_native_start');
+    } else {
+      identifier(value.connection_id);
+      requireValue(integer(value.connection_generation) > 0, 'invalid_assignment');
+    }
+    requireValue(integer(value.generation) > 0 && value.held === true, 'invalid_assignment');
   }
   return value;
 }

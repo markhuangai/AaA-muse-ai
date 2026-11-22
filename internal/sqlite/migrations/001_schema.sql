@@ -53,7 +53,7 @@ CREATE TABLE aaa_inference_history (
 ) STRICT;
 CREATE TABLE aaa_inference_jobs (
     id TEXT PRIMARY KEY,
-    worker_id TEXT NOT NULL REFERENCES aaa_workers(id),
+    worker_id TEXT REFERENCES aaa_workers(id),
     experiment_id TEXT NOT NULL REFERENCES aaa_experiments(id),
     state TEXT NOT NULL,
     held INTEGER NOT NULL CHECK (held IN (0, 1)),
@@ -61,7 +61,11 @@ CREATE TABLE aaa_inference_jobs (
     has_media INTEGER NOT NULL CHECK (has_media IN (0, 1)),
     media_expires_at INTEGER,
     data BLOB NOT NULL,
-    context BLOB NOT NULL
+    context BLOB NOT NULL,
+    deadline_at INTEGER NOT NULL,
+    capability INTEGER NOT NULL CHECK (capability BETWEEN 0 AND 2),
+    pin_check_at INTEGER,
+    CHECK (NOT held OR worker_id IS NOT NULL)
 ) STRICT;
 CREATE UNIQUE INDEX aaa_worker_single_held_turn ON aaa_inference_jobs(worker_id) WHERE held;
 CREATE UNIQUE INDEX aaa_experiment_single_pending_turn ON aaa_inference_jobs(experiment_id)

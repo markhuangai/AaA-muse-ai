@@ -43,6 +43,48 @@ func New(dir string) *Store {
 	return s
 }
 
+const namespaceMarker = ".aaa-muse-media-v1"
+
+var ErrFreshNamespace = errors.New("fresh_media_namespace_required")
+
+func (s *Store) PrepareNamespace() error {
+	return s.prepareNamespace(true)
+}
+
+func (s *Store) prepareNamespace(create bool) error {
+	entries, err := s.files.readDir(s.Dir)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if entry.Name() != namespaceMarker {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if info.Mode() != 0600 || info.Size() != 0 {
+			return ErrFreshNamespace
+		}
+		return nil
+	}
+	if len(entries) != 0 || !create {
+		return ErrFreshNamespace
+	}
+	marker, err := s.files.openFile(filepath.Join(s.Dir, namespaceMarker), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if errors.Is(err, os.ErrExist) {
+		return s.prepareNamespace(false)
+	}
+	if err != nil {
+		return err
+	}
+	if err = errors.Join(marker.Sync(), marker.Close()); err != nil {
+		return err
+	}
+	return s.files.syncDir(s.Dir)
+}
+
 type Stage struct {
 	Path   string
 	Record inference.Media

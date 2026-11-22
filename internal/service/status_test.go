@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/markhuangai/AaA-muse-ai/internal/config"
+	"github.com/markhuangai/AaA-muse-ai/internal/sqlite"
 )
 
 type database struct {
@@ -28,7 +29,7 @@ func TestReadinessTransitions(t *testing.T) {
 	svc := New(db, config.Defaults(), Build{Revision: "revision"}, "instance", clock, logger)
 	now = now.Add(time.Second)
 	first := svc.Status(context.Background(), logger)
-	if !first.Ready || first.SchemaVersion != 2 || first.UptimeSeconds != 1 || !db.deadline {
+	if !first.Ready || first.SchemaVersion != sqlite.SchemaVersion || first.UptimeSeconds != 1 || !db.deadline {
 		t.Fatal("wrong initial status")
 	}
 	db.err = errors.New("unavailable")

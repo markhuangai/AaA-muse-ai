@@ -142,6 +142,25 @@ func (m *inferenceMemory) WithinInference(_ context.Context, ref inference.Ref, 
 			delete(s.Conversations, id)
 		}
 	}
+	if ref.PollProjection && ref.JobID != "" && wid != "" {
+		unassigned := m.states[""]
+		for id, experiment := range s.Experiments {
+			if experiment.WorkerID == "" {
+				unassigned.Experiments[id] = experiment
+				delete(s.Experiments, id)
+				if request := s.Requests[id]; request != nil {
+					unassigned.Requests[id] = request
+					delete(s.Requests, id)
+				}
+			}
+		}
+		for id, job := range s.Jobs {
+			if job.WorkerID == "" {
+				unassigned.Jobs[id] = job
+				delete(s.Jobs, id)
+			}
+		}
+	}
 	m.states[wid] = &s
 	return nil
 }

@@ -20,6 +20,7 @@ class TLSFixture:
         self.media_interrupted = threading.Event()
         self.slow_media = False
         self.media_pause_path = None
+        self.media_puts = {}
         self.media_release = threading.Event()
         self.media_finished = threading.Event()
         self.media_status = None
@@ -35,6 +36,7 @@ class TLSFixture:
         self.allow_statuses = 0
         self.fail_statuses = 0
         self.worker_route_failures = {}
+        self.lose_worker_replies = {}
         self.enrollment_accepted = None
         self.pause_decision = False
         self.decision_captured = threading.Event()
@@ -139,8 +141,11 @@ class TLSFixture:
                                "Forwarded", "X-Forwarded-Host",
                                "X-Request-Id", "X-Portal-Operation-Id",
                                "X-Muse-Worker-Version", "X-Muse-Worker-Model-Report", "X-Muse-Media-Jobs", "X-Muse-Prompt-Wav",
-                               "X-Muse-Artifact-Sha256", "X-Muse-Connection-Id", "X-Muse-Connection-Generation",
+                               "X-Muse-Artifact-Sha256", "X-Muse-Artifact-Size", "X-Muse-Connection-Id", "X-Muse-Connection-Generation",
                                "X-Muse-Generation", "X-Muse-Lease-Id") if key in self.headers}
+                    if self.command == "PUT" and path.endswith("/artifact"):
+                        with fixture.lock:
+                            fixture.media_puts[path] = fixture.media_puts.get(path, 0) + 1
                     if self.command == "PUT" and fixture.interrupt_media:
                         headers["Content-Length"] = str(len(body))
                         connection.request("PUT", self.path, body=body[:len(body) // 2], headers=headers)
@@ -170,6 +175,18 @@ class TLSFixture:
                     streaming = self.path == "/api/v1/worker/events" and response.status == 200
                     if not streaming:
                         payload = response.read()
+                        if self.command == "POST" and path.startswith("/api/v1/worker/") and response.status == 200:
+                            with fixture.lock:
+                                remaining = fixture.lose_worker_replies.get(path, 0)
+                                drop_worker_reply = remaining > 0
+                                if drop_worker_reply:
+                                    fixture.lose_worker_replies[path] = remaining - 1
+                                    fixture.events.append({"event": "fixture.worker_reply_lost", "route": path,
+                                                           "request_id": response.getheader("X-Request-Id"), "status": response.status})
+                            if drop_worker_reply:
+                                self.connection.shutdown(socket.SHUT_RDWR)
+                                self.close_connection = True
+                                return
                         if route == "/mcp" and fixture.lose_mcp_reply and response.status == 200:
                             params = json.loads(body).get("params", {})
                             if params.get("name") == "ask_muse":

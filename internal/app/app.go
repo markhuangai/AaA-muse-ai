@@ -160,6 +160,11 @@ func Run(ctx context.Context, args []string, build service.Build, d Dependencies
 	broker := service.NewBroker(repo, d.Random, d.Now, d.Wait)
 	if d.MediaDir != "" {
 		broker.Media = media.New(d.MediaDir)
+		if err = broker.Media.PrepareNamespace(); err != nil {
+			startup.Error("media.namespace_rejected", "configured_media_directory", d.MediaDir, "cause", err.Error(),
+				"corrective_action", "mount a separate private major-1 media directory; do not clear the old installation")
+			return 1
+		}
 	}
 	if err = broker.Recover(ctx, startup); err != nil {
 		return 1
@@ -263,7 +268,11 @@ func connect(ctx context.Context, d Dependencies, logger *slog.Logger) (Reposito
 		retry := failure.Reason == "database_busy" || failure.Reason == "database_unavailable" || failure.Reason == "database_operation_failed"
 		if !retry || attempt == 3 || ctx.Err() != nil {
 			event := "db.connect_failed"
-			if failure.Reason == "schema_version_incompatible" || failure.Reason == "migration_checksum_mismatch" || failure.Reason == "database_schema_unrecognized" {
+			if failure.Reason == "fresh_store_required" {
+				logger.Error("db.fresh_store_required", "configured_database", d.DatabasePath, "observed", failure.Observed,
+					"corrective_action", "Keep this legacy installation and its files unchanged. Use a separate major-1 configuration, database directory, and media mount.")
+			}
+			if failure.Reason == "schema_version_incompatible" || failure.Reason == "migration_checksum_mismatch" || failure.Reason == "database_schema_unrecognized" || failure.Reason == "fresh_store_required" {
 				event = "db.migration_failed"
 			}
 			logger.Error(event, "cause", failure.Reason, "attempt", attempt, "sqlite_code", failure.Code, "phase", failure.Phase, "transaction_outcome", failure.Outcome, "expected", failure.Expected, "observed", failure.Observed, "duration_ms", d.Now().Sub(started).Milliseconds(), "outcome", "startup_stopped")

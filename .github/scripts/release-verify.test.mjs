@@ -20,9 +20,10 @@ test('published verification reads real tar bytes and every destination; public 
 });
 
 test('historical receipts remain readable and explicitly fail exact final-candidate requirements', async t => {
-  const f = await releaseFixture(t);
+  const f = await releaseFixture(t, { version: '0.1.0', rcVersion: '0.1.0-rc.13' });
   const legacy = structuredClone(f.manifest); delete legacy.schema_version; delete legacy.tree_sha; delete legacy.protocol_version; delete legacy.installer;
   assert.equal(validateManifest(legacy, { historical: true }).missing_identity_fields.length, 3);
+  assert.equal(verifyBundle(f.directory, f.prepared, f).worker.sha256, f.worker.sha256);
   assert.throws(() => validateManifest(legacy), /identity_incomplete/);
   assert.throws(() => validateManifest(null), /manifest_invalid/);
   for (const change of [m => { m.worker.sha256 = 'x'; }, m => { m.worker.archive = 'other.tgz'; }, m => { m.image = 'foreign'; },

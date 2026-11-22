@@ -12,6 +12,7 @@ import (
 	neturl "net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -23,9 +24,6 @@ import (
 
 func TestMediaHTTP(t *testing.T) {
 	h, db, w, key := inferenceHTTPFixture(t)
-	c := onlineHTTP(t, h, w.ID)
-	db.states[w.ID].Connection.MediaJobs = true
-	db.states[w.ID].Routing.Qualifications = []inference.Qualification{{Capabilities: []string{"text"}, Input: inference.QualificationInput{Action: "approve"}}}
 	h.Broker.Media = media.New(t.TempDir())
 	h.Broker.Media.Inspect = func(_ context.Context, path, kind string) (inference.MediaProperties, error) {
 		_, err := os.Stat(path)
@@ -81,8 +79,11 @@ func TestMediaHTTP(t *testing.T) {
 	req("GET", url, client, "", nil, nil, 200)
 	req("GET", url+"/artifact", client, "", nil, nil, 409)
 	workerRoute := "/api/v1/worker/jobs/" + row.ID
-	claim := apiJSON(t, h, "POST", workerRoute+"/claim", key, map[string]any{"protocol_version": 1, "submission_id": "claim-media", "connection_id": c.ID, "connection_generation": c.Generation}, 200)
-	headers := map[string]string{"X-Muse-Connection-Id": c.ID, "X-Muse-Connection-Generation": "1", "X-Muse-Generation": "1", "X-Muse-Lease-Id": claim["lease_id"].(string)}
+	job := pullAndStartHTTP(t, h, db, key, true)
+	if job.ID != row.ID {
+		t.Fatal("wrong media assignment")
+	}
+	headers := map[string]string{"X-Muse-Generation": strconv.FormatInt(job.Generation, 10), "X-Muse-Lease-Id": job.LeaseID}
 	if actual := req("GET", workerRoute+"/media/prompt", key, "", nil, headers, 200); actual.Body.String() != "private-media-user-text" {
 		t.Fatal("wrong prompt")
 	}
@@ -125,13 +126,13 @@ func TestMediaHTTP(t *testing.T) {
 			t.Fatal("public denial leaked its internal reason")
 		}
 	}
-	job := db.states[w.ID].Jobs[row.ID]
+	saved := db.states[w.ID].Jobs[row.ID]
 	past := time.Now().Add(-time.Second)
-	job.Media.ExpiresAt = &past
+	saved.Media.ExpiresAt = &past
 	req("GET", url+"/artifact", client, "", nil, nil, 410)
 	req("GET", publicLink.Path, "", "", nil, nil, 404)
 	future := time.Now().Add(time.Minute)
-	job.Media.ExpiresAt = &future
+	saved.Media.ExpiresAt = &future
 	if err = os.Remove(filepath.Join(h.Broker.Media.Dir, row.ID, "artifact")); err != nil {
 		t.Fatal(err)
 	}

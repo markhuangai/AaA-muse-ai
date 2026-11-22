@@ -1,142 +1,37 @@
 # Muse worker CLI
 
-The worker receives broker assignments and carries structured decisions. It answers transport-health challenges; it never invents a model answer, answers an inference-readiness challenge automatically, or executes client tools. Issue #6 supplies installation and candidate hook/recovery assets; live Muse qualification belongs to issue #7.
+The major-1 worker is a finite TypeScript helper for an enrolled Muse goal. One visible native `agent` cron at `every: "1m"` checks for work. The checker pulls only when idle and hands each claim to a separate native `runonce` agent job. There is no managed hook, service process, or persistent broker connection. Muse proposes answers and tool calls; only the calling client executes client tools.
 
-Build with Node 24.22.2 and TypeScript 7.0.2. Compiled JavaScript targets Node 22.12.0 or newer on a POSIX filesystem. The actual Muse runtime remains unverified. The package is `@markhuangai/aaa-muse-worker`, version `0.1.0-dev.0`; development builds keep this version. Post-merge issue #6 publication stamps matching package/CLI versions as `0.1.0-rc.N`; no worker publication is qualified before its live workflow receipt.
+## Install and verify
 
-From the repository root:
+1. Use the control portal on the broker’s HTTPS origin to generate an enrollment prompt for the verified paired major-1 worker archive. Paste it into the owning Muse goal. Review the actual site, shell, and scheduler permissions before enrolling. Build targets Node.js 22.12.0 or newer on a POSIX filesystem. See [deployment](../docs/deployment.md) and [paired releases](../docs/releases.md).
+2. Verify the installer receipt and read back the same goal ID, checker job ID, enabled state, one-minute interval, and exact action. If registration was uncertain, inspect the goal’s active and disabled native jobs. Adopt a single exact match; do not create another checker because a reply or listing is missing.
+3. Keep the same worker ID and private state across restarts. The default path is `$XDG_STATE_HOME/aaa-muse-worker-v1`, falling back to `$HOME/.local/state/aaa-muse-worker-v1`. The state directory is `0700` and `credential.key` is `0600`. Enrollment codes are private, single-use, and valid for fifteen minutes; the long-lived worker credential never goes in a prompt, URL, or argument. Do not reuse a major-0 installation, store, schedule, or key for this cutover.
 
-```sh
-npm ci --ignore-scripts --no-audit --no-fund
-npm run build --workspace worker
-npm run check --workspace worker
-npm test --workspace worker
-make worker-package
-make test-worker-transport
-make test-worker-setup
-make test-worker-recovery
-```
+The installed launcher passes the correct state directory. Source builds can use `node worker/dist/main.js` with `--state-dir /absolute/path`.
 
-The last check requires Docker, Python 3, and OpenSSL. It runs the packed CLI in pinned Node containers through a private trusted TLS fixture to the real Go/SQLite broker. Decisions are supplied by the test driver. Its client fixture is absent from worker containers. These are software checks, not Muse inference evidence.
-
-## Commands
-
-Invoke `node worker/dist/main.js` from a source build, or `aaa-muse-worker` from an installed package. Every command accepts `--state-dir /absolute/path`, `--help`, and `--version`. The default is `$XDG_STATE_HOME/aaa-muse-worker`, or `$HOME/.local/state/aaa-muse-worker` when XDG state is unset.
-
-| Command | Behavior |
+| Command | Use |
 | --- | --- |
-| `setup --origin HTTPS_ORIGIN --code-stdin --install-dir ABSOLUTE_PATH --setup-id ID` | Verified installer entry: preserve enrollment, install scoped assets and start one subscriber |
-| `hook-check` | Internal managed-hook check and guarded recovery; never a model answer |
-| `configure --origin https://muse.example.com` | Save an HTTPS origin, with no credentials, path, query, or fragment |
-| `enroll --code-stdin` | Read the single-use code from stdin; save the returned worker key without printing it |
-| `run` | Hold one authenticated SSE subscription, answer health challenges, claim jobs, and publish cues |
-| `status` / `doctor` | Read authenticated status; doctor also reports verified local permissions and explicit unverified Muse capabilities |
-| `health` | Read local poll, subscriber, heartbeat, path, terminal-stop and actionable-job evidence as JSON |
-| `watchdog-check` | Check the installed worker independently of the managed hook and emit JSON for new observations that need the owner |
-| `job-show --job-id ID` | Fetch that worker's immutable context and identity/receipt metadata |
-| `decision-submit --job-id ID --input FILE` | Submit one strict JSON decision; `--input -` reads stdin |
-| `decision-submit --job-id ID --ack-idle` | Explicitly confirm that this cancelled/interrupted assignment finished or stopped |
-| `diagnostics-export` | Export protected logs with completeness metadata and verified chunks; `--decode` reconstructs events |
+| `cron-describe --goal-id ID` | Read the expected checker definition before registration. |
+| `cron-authorize-registration --input FILE` / `cron-confirm --input FILE` | Save the initial registration intent and then confirm the exact read-back. Use `-` for standard input. |
+| `cron-check --input FILE` / `cron-prepare --input FILE` | Process an actual occurrence; persist launch intent before registering a finite work job. |
+| `cron-start --launch-id ID --native-job-id ID` | Verify authority before showing the work brief. Do not do work on a rejected or uncertain start. |
+| `cron-producer-intent --launch-id ID` | Reserve a durable producer ID **before** starting any finite process that could survive the work agent. |
+| `cron-producer --launch-id ID --producer-id ID --pid PID` | Bind the exact process to its intent. An unobservable producer keeps the slot held. |
+| `decision-submit --job-id ID --input FILE` / `media-finish --job-id ID` | Submit a validated decision or the original media bytes. Preserve the saved operation and file after a lost reply. |
+| `cron-observe --input FILE` | Reconcile the exact native job and execution after a real checker occurrence. |
+| `status` / `doctor` / `diagnostics-export` | Inspect broker observations or export protected evidence. |
 
-Pass bootstrap authority through stdin from an approved private input source. Do not put credentials in command arguments, URLs, prompts, hook bodies, or logs. Configuration rejects a changed origin once enrolled; use a separate state directory for a different origin. Repeating enrollment preserves a healthy identity. Revocation never triggers automatic re-enrollment.
+## Recovery and diagnosis
 
-An enrollment response can be lost after its single-use code is consumed. A pending enrollment record without a saved key is an explicit uncertain outcome. Use management records/request IDs to find and revoke any orphaned identity before starting a new enrollment with a fresh code and separate state directory. The CLI does not recover plaintext credentials or silently redeem again.
+A checker can finish while a one-time job is still queued or active. Use native run identity and observable producer identity, not a green checker run, an absent listing, elapsed time, or PID alone. Unknown status retains the claim. A cancelled or expired job cannot start or accept a new result. A previously accepted receipt can still reconcile; the broker releases an accepted claim only after the worker confirms the old work stopped. Revoking the worker blocks the credential and does not prove native work stopped.
 
-## Registration, reconnect and removal
+A check never retries a file upload while the original result helper is active. The helper records its process identity alongside the exact saved result. Once native work and its producers have stopped, recovery checks for an accepted media receipt before sending file bytes again. Unknown delivery identity keeps the hold.
 
-An enrollment code expires after fifteen minutes and can be used once. Successful enrollment returns a separate 256-bit worker credential with no automatic expiry or renewal schedule. Keep `credential.key` in the protected state directory (`0700`, with a `0600` key file). Network reconnects and worker, service, or database restarts reuse that credential and the same worker ID. Preserve the complete state, including operation journals and receipts, when replacing a package.
+Use `diagnostics-export --state-dir /absolute/path --since RFC3339 --until RFC3339 --decode`. Join worker, checker occurrence, work job and execution, poll sequence, job/claim, producer, and receipt by their distinct identifiers. Join HTTP request IDs and operation IDs to the management-authenticated `/api/v1/admin/diagnostics/export` filters from every participating broker. Decode with `tools/qualification-evidence.mjs` and check omissions before interpreting the chronology. Keep raw exports and journal files private.
 
-To revoke a registration, management uses `POST /api/v1/admin/workers/{id}/revoke`. The broker rejects the credential and every copy of it while retaining registration, revocation, and history records. Revocation does not prove that an already-running remote Muse inference stopped. The subscriber stops on authorization denial; managed recovery and repeated setup cannot restore revoked authority or silently enroll another identity.
+In the [portal](../docs/portal.md#worker-management), Never seen means there is no authenticated poll. Quiet begins at one minute without authenticated contact, and Offline at ten minutes. A busy worker normally sends no pulls; neither badge shortens a claim deadline or proves work stopped.
 
-Before removing a local installation, suspend its exact native watchdog and hook, then stop the identified subscriber. Preserve needed journals and receipts before removing local state. Verify the two owned registrations are removed when retiring the installation. Revoke the server registration to invalidate the credential and any saved copies.
+## Evidence limits
 
-The server stores a credential hash and cannot return a lost key. Loss of local credential state requires explicit replacement enrollment with a fresh single-use code; retain and inspect uncertain enrollment records, and revoke any orphaned registration first. A VM wipe cannot recover the original identity from the broker. Registration, transport health, and controlled software checks do not establish live Muse inference or wipe/refresh recovery.
-
-## Context and decisions
-
-`pending.json` contains protocol version, worker/conversation/job identity, assignment generation, context receipt/kind/base, deadline, and progress for work needing attention. It contains no key, lease, or context text. Per-job cues remain in `cues/`; accepted tool decisions leave the inference slot free while the client supplies its tool result. Distinct conversations are never combined in an implicit global context.
-
-Read the context with `job-show`, then submit exactly one of:
-
-```json
-{"type":"final","text":"answer"}
-```
-
-```json
-{"type":"tool_call","call_id":"client-call-1","name":"read_file","arguments":{"path":"client-only.txt"}}
-```
-
-Duplicate keys, trailing input, unknown fields, invalid IDs, unsupported decisions and unknown tools fail explicitly. The broker validates tool arguments against its authoritative schema. JSON number text is retained, including integers larger than JavaScript's exact Number range. The worker never derives commands from prose or calls `read_file` itself.
-
-Full context is the normal baseline. Delta context is carried only when the broker supplies a qualification probe with its explicit base receipt. A stale delta after reconnect is rejected; cancel that experiment and create a full-context replacement explicitly. The CLI does not invent a new context base or automatically retry inference.
-
-Requests are bounded to 10 seconds and three attempts, with a 1 MiB request ceiling and a 3 MiB response ceiling that includes duplicated final text and broker metadata. Immutable journal bodies and submission IDs are saved before mutations and reused across retries, including after restart. A received receipt describes an accepted operation, not a fresh assignment. Claimed work is checked against current broker state before exposure as actionable work. Cancellation or expiry during that check retains its exact stopped assignment for explicit acknowledgement while health continues.
-
-The subscriber retries transient startup authentication, reconciliation and stream failures with delays capped at 30 seconds. Each HTTP operation retains its three attempts and ten-second timeout; accepted health resets subscriber backoff. Revocation, invalid protocol, unsafe state and credential/TLS failures stop it explicitly. Only one daemon may own a state directory. Live or ambiguous owners are rejected; stale owners may be recovered only when their process is provably dead. An abandoned recovery guard fails closed and requires operator inspection.
-
-The service routes work to an authenticated online worker when its slot is free. Reconnects reuse the saved credential. Revocation blocks subsequent access. Current connection and assignment fences protect accepted decisions and uncertain busy holds. Independent wake and model trials record observed behavior for release evidence.
-
-Cancellation, a deadline, or disconnect fences late results but does not prove that Muse stopped. The broker retains the busy hold. Send `--ack-idle` only after that exact assignment has finished/stopped. The CLI queues its job/generation/lease tuple for a fresh health challenge; output distinguishes `queued` from `confirmed`. Ordinary heartbeats and restarts never supply this acknowledgement automatically.
-
-The acknowledgment record confirms broker acceptance before the local cue and `pending.json` refresh finishes. `worker.idle_confirmed` is emitted after that publication; callers observing files must wait for both confirmation and the reconciled pending state.
-
-Startup and each reconnect reconcile the broker's current assignment, persisted actionable cues and their saved operation evidence, including when the broker is idle. This repairs interrupted cue publication after an accepted decision. A delayed context read cannot revive an exact assignment with an accepted decision or confirmed explicit idle acknowledgement; other assignments and uncertain stopped work retain their cues. A broker-accepted job may have a pending local journal after a lost response; reconciliation reports both facts and does not manufacture a receipt or resubmit a decision. An explicit retry uses the original submission ID and body.
-
-## Protected state and diagnostics
-
-The state directory must be owned by the current user with mode `0700`; files must be owned regular files with mode `0600`. Symlinked entries and multiply linked files are rejected. Updates use exclusive temporary files, file synchronization, atomic rename, and directory synchronization. Keep the complete protected state when replacing a package: the key is in `credential.key`, and operation journals retain request bodies and accepted/uncertain outcomes. Do not delete a journal to retry an uncertain operation.
-
-INFO, WARN, and ERROR JSON events go to stderr. DEBUG detail is always captured in `diagnostics/` after redaction. Retention is seven days or 128 MiB. Exports use the service's NDJSON metadata/chunk format, with records at most 6 KiB, Base64 payload chunks, and SHA-256 integrity. Missing, corrupt, expired, or capacity-pruned evidence is explicit. Large context/decision exchanges are reconstructed rather than truncated. Authentication fields and known/token-shaped secrets are masked, including overlapping secrets and object keys. Payload numbers retain their text.
-
-Capacity pruning persists one conservative watermark for the entire deletion batch before removing captures. This avoids a metadata sync for every removed file while holding the shared capture lock. A failed watermark write removes no captures; an interrupted deletion may conservatively report omissions for planned captures that still exist. Required logging failures still stop work and preserve a terminal marker; this change never clears that marker or releases uncertain broker work.
-
-Collect an experiment timeline without business-table queries or process inspection:
-
-```sh
-aaa-muse-worker diagnostics-export \
-  --state-dir "$STATE_DIR" --operation-id "$EXPERIMENT_ID" --decode
-```
-
-Also available: `--request-id`, `--since`, and `--until` with RFC3339 times. Check the first metadata record's `complete` and `omissions`, then inspect events. `worker.decision_rejected` and `worker.http_exchange` identify rejected input, broker cause, request ID, and outcome; use that request ID in the broker's authenticated diagnostics export. `worker.stream_retrying` records connection, last event, causal code, attempts and delay. Progress events identify the last context/decision boundary, deadline and elapsed time without inventing an internal Muse cause.
-
-`worker.state_unsafe` reports expected/observed permissions, ownership/type, and the stopped operation. Repair the identified private state before restarting. If the directory cannot safely open, stderr records that protected capture is unavailable. A required capture-write failure emits `worker.capture_failed` and stops the operation; repair its storage cause before restarting. Exports record their outcome without recapturing their own response.
-
-Unit coverage receipts under `.artifacts/unit/worker` list every production module and raw covered/total statements; the ratio must be strictly above 90%. Broker/image integration receipts stay separate. Packed archives and source/runtime/digest receipts are under `.artifacts/worker-package`; isolated integration resources and cleanup receipts use the existing unique test-owner labels. None of these private artifacts belongs in Git or a public handoff.
-
-## Installation, detector and recovery
-
-Use the broker's management-authenticated setup-prompt endpoint using the paired release metadata embedded in the service image. Paste its complete result into Muse and approve only the actual permissions it requests. The bootstrap verifies the archive before executing package code; Node fallback verifies the pinned Linux x64 archive before executing that runtime. An unavailable platform, tool or permission stops setup explicitly. No npm registry credentials enter the VM.
-
-The setup prompt asks Muse for the model name and total context window it can observe during setup. The installer accepts an optional JSON line after the enrollment code with `model_name` and `context_window_tokens`. Omit unavailable fields. The worker saves a valid report and its timestamp in its protected installation record. The first authenticated connection and subsequent reconnects send that snapshot. A rejected report produces a warning and leaves model information unavailable. Dispatch uses the current authenticated heartbeat and broker capacity.
-
-The installer checks private writes for install, state, diagnostics, launcher, hook and skill before exchanging the enrollment code. It probes the shared hook and skill parents and leaves their modes alone. The broker assigns a fresh worker ID during the exchange. Setup checks the final ID-specific paths once it has that ID. Private directories use `0700`. The installer clears inherited setgid on an owned, real, empty `2700` worker directory and verifies its identity and final mode. An existing owned `0700` directory can contain the previous installation.
-
-For a `v0.2.1-rc.1` refusal at `install_directory` with `execution_started: false`, inspect only the `aaa-muse-worker` directories under the original XDG data and state homes. Their defaults are `$HOME/.local/share` and `$HOME/.local/state`. As the setup user, create any missing worker directory privately. On an owned, real, empty `2700` worker directory, clear setgid from inside the verified directory with `chmod g-s -- .`. Verify both named directories are exactly `0700` and use a separate fresh portal prompt for each instance.
-
-After enrollment, a hook or skill refusal requires the same saved credential, worker ID, origin and state directory on retry. Inspect the setup ID with `diagnostics-export --operation-id SETUP_ID --decode`. Correct only the reported worker-specific directory beneath `$HOME/hooks/scripts` or `$HOME/workspace/skills`. An uncertain identity requires operator inspection. Register the hook after a successful receipt confirms that worker ID and returns its exact paths.
-
-The installer receipt identifies the launcher, state, hook and skill paths and the exact watchdog command. Setup requires an enabled no-argument five-second hook and one native `aaa-muse-worker-watchdog` owned by the worker's installation goal. The watchdog runs every five minutes with a 300-second timeout. List enabled and disabled entries, reuse exact matches and verify each saved definition by reading it back. Setup is incomplete when native checks, permissions or registrations cannot be confirmed. With the owner's approval, use the same goal-owned job for an in-place upgrade from the legacy `hook-check` action.
-
-The scheduled task checks the registered hook ID, path and interval, then calls `watchdog-check` independently of the hook runtime. The watchdog can relaunch an absent, authenticated subscriber and observe up to 30 seconds for a current-generation heartbeat after each launch. It allows up to two guarded attempts after transient failure and proven absence. Broker heartbeat evidence expires at 30 seconds. A genuine poll or heartbeat more than 120 seconds old triggers a recheck. A live subscriber keeps its process and reconnect loop.
-
-The hook records its own attempt and completion times and retains the latest gap bounds and a gap count. `health` shows these alongside the current owner, connection generation, and the age and provenance of the last heartbeat. A successful hook poll and a current heartbeat prove different steps. The watchdog leaves job wakes to the hook. Use the structured notice to summarize new incidents, confirmed recovery and changed actionable-job counts in the owning chat. Verify first execution, native chat delivery and any VM replacement survival through live observations. Both schedules can pause during a shared runtime outage.
-
-Previous bundles and private credentials/journals remain intact. One daemon owns the state directory. Managed checks may restart only a provably absent subscriber, preserving the worker's identity. A terminal `run-stop.json`, ambiguous ownership, revoked key, unsafe state, or uncertain enrollment blocks recovery and needs operator diagnosis. Do not delete journals or silently re-enroll. Automatic upgrades are forbidden. A different product major logs `worker.update_required` with the service/worker versions and manual corrective action. See [manual upgrade](../docs/releases.md#manual-worker-upgrade); preserve credentials and journals. Full wipes, account resets and live refresh persistence remain outside the software receipt.
-
-Only the owning background daemon records a new terminal stop while it holds the daemon lock. A rejected duplicate invocation cannot create or replace that marker or the owner's launch record. Transient network, broker and routing failures, including unstructured 404s on the authenticated status, stream and heartbeat endpoints, stay in the reconnect loop. Genuine terminal markers block background startup. No automatic process restart acknowledges stopped model work or releases a broker busy hold.
-
-Use the verified paired upgrade prompt to update an existing installation and recover a proven older outage latch. If program files are damaged, diagnose the failure and follow the manual upgrade procedure. Suspend the watchdog and hook before stopping the subscriber and using the verified installer. Retain protected state, prior bundles, credentials, journals and receipts. Missing credentials or uncertain enrollment require the explicit lifecycle steps above.
-
-Unchanged actionable cues emit one wake per assignment/state change. Native emission failure leaves the cue eligible; successful emission does not prove inference started. Inspect the deadline, last emitted cue, subsequent job progress and broker outcome when work stalls. No model retry or stopped-assignment acknowledgement is invented by the detector. Managed dry runs stop before worker state access, network, filesystem writes or subscriber launch.
-
-Before verified Node is available, bootstrap records contain only bounded nonsecret metadata in a private `0700` temporary directory and `0600` receipt. Preserve that directory on failure. Successful setup imports the receipt into the existing protected capture. Installer failures include stage, expected/observed artifact digest or capability, setup correlation and execution status. Required evidence-write failure stops installation. Background stderr is a private bounded 64 KiB emergency sink; the existing diagnostic capture retains complete redacted events and explicitly reports retention omissions.
-
-Collect a setup timeline with `diagnostics-export --decode`, check the first export record's completeness/omissions, and filter events by `setup_id`. Use worker/operation/request IDs to join recovered processes and broker exports. `setup.digest_mismatch`, `setup.runtime_unsupported`, `setup.recovery_blocked`, `setup.cue_observed` and `setup.wake_emitted` distinguish artifact refusal, capability refusal, ownership/authorization stops and emitted but unconfirmed work. Setup and transport health always retain `inference_readiness: unverified` until independent live qualification.
-
-For a watchdog incident, run `diagnostics-export --state-dir STATE --since FROM --until TO --decode` with UTC times. Check completeness and omissions, filter by worker and watchdog notice ID (`instance_id`), then join the accepted heartbeat by connection and request IDs to the broker diagnostics. WARN records `watchdog.hook_gap_observed`, `watchdog.hook_stalled` and `watchdog.subscriber_stalled`. INFO records genuine hook recovery and broker-acknowledged subscriber recovery. ERROR `watchdog.recovery_failed` records the missing prerequisite or the outcome of bounded recovery. Protected DEBUG records initial and final observations and launch attempts. Use the private bootstrap receipt for early setup errors and the scheduler's bounded error for a missing launcher or state.
-
-For a startup outage or crash, export its UTC interval with `--since` and `--until`, then filter by worker, command and instance IDs. `worker.stream_retrying` WARN identifies authentication, reconciliation or subscription phase, cause, request ID, attempt, delay and duration. `worker.supervision_started` INFO identifies the exclusive daemon owner. `worker.recovery_reconciled` INFO/WARN compares local receipt state with broker state and records the disposition, assignment linkage and corrective action; protected `worker.recovery_detail` DEBUG retains complete redacted exchanges and snapshots. `worker.local_state_invalid` ERROR names a malformed local entry without dumping its contents; existing permission and authorization events remain available. Join request IDs to the management-authenticated `/api/v1/admin/diagnostics/export?request_id=ID` and decode with the existing qualification evidence decoder. Complete captures explain the cause and corrective action without business-table queries or process attachment.
-
-`make test-worker-recovery` runs the shipped installer, managed-hook script and worker against real HTTP/TLS/SQLite with controlled task decisions. It covers exhausted startup requests, abrupt process death, duplicate invocation, lost decision response and exact receipt replay, broker restart with an unresolved hold, invalid state and revocation. It verifies capture completeness, INFO filtering, credential protection and owned-resource cleanup separately from unit coverage. This is software evidence; it does not qualify live Muse inference or a VM refresh.
-
-Paired publication after authorized human merge uses immutable `vVERSION` tags. Legacy `worker-v0.1.0-rc.N` tags remain unchanged. Service and worker share one version and source SHA, even for service-only changes. It packs one archive, tests it on the build and minimum runtimes, and compares registry and anonymous public Release bytes. `worker-release.json` provides source/version/digest pins. Existing-byte conflicts fail; publication does not overwrite tags or assets. Its first live receipt, actual Muse permissions, native wake and supported-refresh recovery must be observed separately before issue #7 passes.
+The November 21, 2026 trials measured one account with local synthetic work. Native cron rejected a ten-second recurrence; a long foreground checker coalesced a scheduled occurrence. Separate one-time work and a recurring checker ran concurrently. See [trial evidence and limits](../docs/project-history.md#native-muse-cron). These trials do not qualify the installed paired worker, public HTTPS pickup, live inference, or VM-loss recovery.

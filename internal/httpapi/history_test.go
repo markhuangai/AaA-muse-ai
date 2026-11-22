@@ -122,25 +122,23 @@ func nativeHTTPInput(worker string) inference.RequestInput {
 	return inference.RequestInput{Version: 1, SubmissionID: "native-first", WorkerID: worker, Messages: []inference.Item{{Type: "message", Role: "system", Text: "Exact text\n"}, {Type: "message", Role: "user", Text: "hello"}}, Tools: []inference.Tool{}}
 }
 
-func nativeHTTPDecision(t *testing.T, h *Handler, m *httpInferenceStore, c inference.Connection, key string, v inference.RequestView) inference.Job {
+func nativeHTTPDecision(t *testing.T, h *Handler, m *httpInferenceStore, key string, v inference.RequestView) {
 	t.Helper()
-	e := m.states[v.WorkerID].Experiments[v.ID]
-	claim := map[string]any{"protocol_version": 1, "submission_id": "claim-" + v.ID, "connection_id": c.ID, "connection_generation": c.Generation}
-	j := apiJSON(t, h, "POST", "/api/v1/worker/jobs/"+e.CurrentJobID+"/claim", key, claim, 200)
-	decision := map[string]any{"protocol_version": 1, "submission_id": "decision-" + v.ID, "connection_id": c.ID, "connection_generation": c.Generation, "conversation_id": v.ConversationID, "generation": j["generation"], "lease_id": j["lease_id"], "context_receipt_id": j["context"].(map[string]any)["receipt_id"], "decision": map[string]any{"type": "final", "text": "exact answer\n"}}
-	apiJSON(t, h, "POST", "/api/v1/worker/jobs/"+e.CurrentJobID+"/decisions", key, decision, 200)
-	return *m.states[v.WorkerID].Jobs[e.CurrentJobID]
+	job := pullAndStartHTTP(t, h, m, key, false)
+	if job.ExperimentID != v.ID {
+		t.Fatal("start authorized a different request")
+	}
+	submitAndSettleHTTP(t, h, key, job, inference.Item{Type: "final", Text: "exact answer\n"})
 }
 
 func TestNativeHTTPProductionFlowAndDisclosure(t *testing.T) {
 	h, m, w, key := inferenceHTTPFixture(t)
-	c := onlineHTTP(t, h, w.ID)
 	input := nativeHTTPInput(w.ID)
 	v, response := nativeHTTP(t, h, "POST", "/api/v1/requests", "session-http", input, 202)
 	if response.Header().Get("X-Muse-Session-Id") != "session-http" || v.Output != nil {
 		t.Fatal("admission disclosure/correlation wrong")
 	}
-	job := nativeHTTPDecision(t, h, m, c, key, v)
+	nativeHTTPDecision(t, h, m, key, v)
 	if m.states[w.ID].Requests[v.ID].ContextDeliveryWritten == nil {
 		t.Fatal("context write boundary missing")
 	}
@@ -169,16 +167,14 @@ func TestNativeHTTPProductionFlowAndDisclosure(t *testing.T) {
 	if cancelled.State != "cancelled" {
 		t.Fatal("owned cancellation failed")
 	}
-	apiJSON(t, h, "GET", "/api/v1/worker/jobs/"+job.ID, key, nil, 200)
 }
 
 func TestHistoryConflictContentStaysInProtectedCapture(t *testing.T) {
 	h, m, w, key := inferenceHTTPFixture(t)
-	c := onlineHTTP(t, h, w.ID)
 	input := nativeHTTPInput(w.ID)
 	input.Messages[0].Text = "distinctive-private-history-marker\n"
 	v, _ := nativeHTTP(t, h, "POST", "/api/v1/requests", "protected-session", input, 202)
-	nativeHTTPDecision(t, h, m, c, key, v)
+	nativeHTTPDecision(t, h, m, key, v)
 	conflict := input
 	conflict.SubmissionID = "conflict"
 	conflict.Messages = append(append([]inference.Item{}, input.Messages...), inference.Item{Type: "message", Role: "assistant", Text: "exact answer\n"}, inference.Item{Type: "message", Role: "user", Text: "next"})
@@ -229,9 +225,8 @@ func TestNativeOutputPartialWriteAndBoundaryFailure(t *testing.T) {
 	for _, storageFailure := range []bool{false, true} {
 		t.Run(fmt.Sprint(storageFailure), func(t *testing.T) {
 			h, m, w, key := inferenceHTTPFixture(t)
-			c := onlineHTTP(t, h, w.ID)
 			v, _ := nativeHTTP(t, h, "POST", "/api/v1/requests", "session", nativeHTTPInput(w.ID), 202)
-			nativeHTTPDecision(t, h, m, c, key, v)
+			nativeHTTPDecision(t, h, m, key, v)
 			r := httptest.NewRequest("GET", "/api/v1/requests/"+v.ID, nil)
 			r.Header.Set("Authorization", "Bearer client-private-sentinel")
 			out := &nativeWriteFailure{}
@@ -249,7 +244,6 @@ func TestNativeOutputPartialWriteAndBoundaryFailure(t *testing.T) {
 
 func TestNativeHTTPStrictBoundariesAndHistoryQueries(t *testing.T) {
 	h, m, w, key := inferenceHTTPFixture(t)
-	onlineHTTP(t, h, w.ID)
 	for _, path := range []string{"/api/v1/requests", "/api/v1/requests/abc", "/api/v1/requests/abc/cancel"} {
 		method := "GET"
 		if path == "/api/v1/requests" || strings.HasSuffix(path, "cancel") {

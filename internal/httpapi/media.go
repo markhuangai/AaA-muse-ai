@@ -63,7 +63,7 @@ func mediaRoute(path string) (string, string) {
 			switch action {
 			case "artifact":
 				return workerMediaArtifact, id
-			case "media/prompt", "media/image":
+			case "media/prompt", "media/image", "media/receipt":
 				return workerMedia + strings.TrimPrefix(action, "media/"), id
 			}
 		}
@@ -223,7 +223,7 @@ func (h *Handler) serveMedia(w *response, r *http.Request, l *slog.Logger, route
 		}
 	case sharedMedia:
 		err = h.serveSharedMedia(ctx, l, w, r, id)
-	case workerMediaArtifact, workerMedia + "image", workerMedia + "prompt":
+	case workerMediaArtifact, workerMedia + "image", workerMedia + "prompt", workerMedia + "receipt":
 		var f service.MediaFence
 		f.Connection = r.Header.Get("X-Muse-Connection-Id")
 		f.Lease = r.Header.Get("X-Muse-Lease-Id")
@@ -231,6 +231,17 @@ func (h *Handler) serveMedia(w *response, r *http.Request, l *slog.Logger, route
 		f.ConnectionGeneration, _ = strconv.ParseInt(r.Header.Get("X-Muse-Connection-Generation"), 10, 64)
 		if route == workerMediaArtifact {
 			err = h.uploadMedia(w, r, ctx, l, worker, id, f)
+		} else if route == workerMedia+"receipt" {
+			size, _ := strconv.ParseInt(r.Header.Get("X-Muse-Artifact-Size"), 10, 64)
+			var hash string
+			hash, err = artifactIdentity(r, size)
+			if err == nil {
+				var receipt service.ArtifactReceipt
+				_, receipt, err = h.Broker.MediaUpload(ctx, l, worker, id, f, hash, size, nil)
+				if err == nil {
+					writeJSON(w, 200, receipt)
+				}
+			}
 		} else {
 			var file fs.File
 			var kind string
@@ -313,18 +324,26 @@ func (h *Handler) submitMedia(w *response, r *http.Request, ctx context.Context,
 	return err
 }
 
-func (h *Handler) uploadMedia(w *response, r *http.Request, ctx context.Context, l *slog.Logger, worker, id string, f service.MediaFence) error {
+func artifactIdentity(r *http.Request, size int64) (string, error) {
 	hash := r.Header.Get("X-Muse-Artifact-Sha256")
 	value, err := hex.DecodeString(hash)
 	if err != nil || len(value) != 32 || strings.ToLower(hash) != hash {
-		return inference.Reject("invalid_artifact_digest", 400)
+		return "", inference.Reject("invalid_artifact_digest", 400)
 	}
-	size := r.ContentLength
 	if size <= 0 {
-		return inference.Reject("content_length_required", 411)
+		return "", inference.Reject("content_length_required", 411)
 	}
 	if size > media.ArtifactLimit {
-		return inference.Reject("media_too_large", 413)
+		return "", inference.Reject("media_too_large", 413)
+	}
+	return hash, nil
+}
+
+func (h *Handler) uploadMedia(w *response, r *http.Request, ctx context.Context, l *slog.Logger, worker, id string, f service.MediaFence) error {
+	size := r.ContentLength
+	hash, err := artifactIdentity(r, size)
+	if err != nil {
+		return err
 	}
 	profile, receipt, err := h.Broker.MediaUpload(ctx, l, worker, id, f, hash, size, nil)
 	if err != nil {

@@ -43,7 +43,7 @@ export class Transport {
     const retryable = response.status === 429 || response.status >= 500 || (route.endsWith('/events') && response.status === 409) ||
       controlRouteUnavailable(response.status, route, data, this.credential);
     if (declared === null && retryable && data.error !== 'update_required') return;
-    const checked = route.endsWith('/enroll') || (route.endsWith('/status') && !this.credential) || route.endsWith('/events') || route.endsWith('/claim');
+    const checked = route.endsWith('/enroll') || (route.endsWith('/status') && !this.credential) || route.endsWith('/pull') || route.endsWith('/start') || route.endsWith('/events') || route.endsWith('/claim');
     if (data.error === 'update_required' || (checked && major(this.productVersion) !== (declared === null ? '0' : major(declared)))) {
       const recommended = data.worker_package ?? (declared === null ? null : { version: declared, release_url: 'https://github.com/markhuangai/AaA-muse-ai/releases/tag/v' + declared });
       throw new Failure('update_required', { worker_version: this.productVersion, service_version: declared ?? 'legacy-major-zero', recommended_worker: recommended, automatic_update: false, corrective_action: 'Install the service-paired worker manually, or align the service major; preserve worker identity and journals.', http_status: response.status, request_id: response.headers.get('x-request-id') ?? '' });
@@ -97,7 +97,7 @@ export class Transport {
         if (!response.ok) throw new Failure(response.status === 401 ? 'worker_unauthorized' : 'broker_rejected', { ...correlation, ...validation, request_id: requestId, route, method, http_status: response.status, reason: typeof data.error === 'string' ? data.error : 'invalid_error_response' }, response.status === 429 || response.status >= 500 || controlRouteUnavailable(response.status, route, data, this.credential));
         return { data, requestId, status: response.status };
       } catch (error) {
-        const failure = error instanceof Failure ? error : new Failure('broker_unreachable', { cause: cause(error), request_id: requestId }, !/CERT|TLS|SSL/.test(cause(error)));
+        const failure = error instanceof Failure ? error : new Failure('broker_unreachable', { ...correlation, cause: cause(error), request_id: requestId, route, method, attempt, duration_ms: this.sys.now() - started }, !/CERT|TLS|SSL/.test(cause(error)));
         // An unstructured control-route 404 must return the subscriber to reconciliation.
         if (!failure.retryable || failure.fields.http_status === 404 || attempt >= attempts) throw failure;
         await this.logger.log('WARN', 'worker.http_retrying', { ...correlation, ...failure.fields, endpoint: this.endpoint, route, method, attempt, delay_ms: attempt * 1000, cause: failure.code, duration_ms: this.sys.now() - started });

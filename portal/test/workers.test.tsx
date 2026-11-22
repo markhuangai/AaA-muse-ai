@@ -24,20 +24,27 @@ async function fixture() {
 
 test('actual worker components show facts separately, text-safe names and the server-accepted rename', async () => {
   const { portal, api, controller } = await fixture();
-  api.workersWork = async () => ({ value: [{ ...worker(), name: '<img src=x onerror=alert(1)>', work_status: 'busy', current_job: { job_id: 'job-observed', generation: 2 }, waiting_for_client_tool: 1,
+  api.workersWork = async () => ({ value: [{ ...worker(), name: '<img src=x onerror=alert(1)>', work_status: 'busy', connection_status: 'quiet',
+    current_job: { job_id: 'job-observed', generation: 2 }, waiting_for_client_tool: 1,
+    current_claim: { job_id: 'job-observed', claim_id: 'observed-claim', claimed_at: '2026-11-18T00:00:00Z', deadline_at: '2026-11-18T00:05:00Z' },
+    last_poll_at: '2026-11-18T00:00:00Z', claim_stage: 'pending_native_start',
     model_report: { model_name: '<img src=x onerror=alert(2)>', context_window_tokens: 350000, reported_at: '2026-11-18T00:00:00Z' } },
-  { ...worker('b'.repeat(32), 'Reserved worker'), work_status: 'upgrading' }], requestID: 'facts-request' });
+  { ...worker('b'.repeat(32), 'New worker'), connection_status: 'not_observed', last_contact_at: null, last_poll_at: null, work_status: 'unknown' }], requestID: 'facts-request' });
   await controller.refresh(); render(<Workers controller={controller} />);
   expect(screen.queryByRole('columnheader', { name: 'Qualification' })).toBeNull();
-  expect(within(screen.getByRole('button', { name: 'Reserved worker' }).closest('tr')!).getByText('Upgrading')).toBeTruthy();
+  expect(within(screen.getByRole('button', { name: 'New worker' }).closest('tr')!).getByText('Never seen')).toBeTruthy();
   await act(async () => { fireEvent.click(screen.getByRole('button', { name: '<img src=x onerror=alert(1)>' })); });
   expect(document.querySelector('img')).toBeNull();
   expect(screen.getByRole('heading', { name: 'Reported by Muse during setup' })).toBeTruthy();
   expect(screen.getByText('<img src=x onerror=alert(2)>')).toBeTruthy();
   expect(screen.getByText('350,000 tokens')).toBeTruthy();
-  expect(screen.getByText('2026-11-18 00:00:00 UTC')).toBeTruthy();
+  expect(screen.getByText('Reported at').nextElementSibling?.textContent).toBe('2026-11-18 00:00:00 UTC');
+  expect(screen.getByText('Last work poll').nextElementSibling?.textContent).toBe('2026-11-18 00:00:00 UTC');
   expect(screen.getByText('Installed version').parentElement?.textContent).toContain('Not reported'); expect(screen.getByText('Not independently observed')).toBeTruthy();
   expect(screen.getByText('job-observed')).toBeTruthy();
+  expect(screen.getByText('observed-claim')).toBeTruthy();
+  expect(screen.getByText('Pending native start')).toBeTruthy();
+  expect(screen.getByText('2026-11-18 00:05:00 UTC')).toBeTruthy();
   expect(screen.queryByRole('heading', { name: 'Inference qualification' })).toBeNull();
   expect(screen.getByText('Valid until revoked')).toBeTruthy();
   fireEvent.change(screen.getByLabelText('Display name'), { target: { value: '  Accepted name  ' } });
@@ -108,7 +115,7 @@ test('closing a worker drawer during rename returns focus to the row before and 
 test('offline values age from each accepted row and freeze at the broker sample when stale', async () => {
   const { portal, controller, api, system } = await fixture();
   const first = { ...worker(), connection_status: 'offline', offline_for_ms: 0 };
-  const second = { ...worker('b'.repeat(32), 'Second worker'), connection_status: 'connecting', offline_for_ms: 90_123_000 };
+  const second = { ...worker('b'.repeat(32), 'Second worker'), connection_status: 'offline', offline_for_ms: 90_123_000 };
   const legacy = { ...worker('c'.repeat(32), 'Older worker'), connection_status: 'offline' };
   api.workersWork = async () => ({ value: [first, second, legacy], requestID: 'offline-snapshot' });
   await controller.refresh();
@@ -147,7 +154,7 @@ test('offline values age from each accepted row and freeze at the broker sample 
   expect(value(renamed.name)).toBe('1h 2m 3s');
   expect(value(second.name)).toBe('25h 2m 3s');
 
-  api.workersWork = async () => ({ value: [{ ...renamed, connection_status: 'online', offline_for_ms: undefined }, second, legacy], requestID: 'reconnected' });
+  api.workersWork = async () => ({ value: [{ ...renamed, connection_status: 'recent', offline_for_ms: undefined }, second, legacy], requestID: 'reconnected' });
   await act(async () => { await controller.refresh(); await system.advance(1000); });
   expect(value(renamed.name)).toBe('-');
   expect(value(second.name)).toBe('25h 2m 4s');

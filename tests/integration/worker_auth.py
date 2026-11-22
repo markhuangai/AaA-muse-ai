@@ -14,13 +14,22 @@ class WorkerAuth(Harness):
         super().__init__(args)
         self.secrets = []
         self.origin_url = None
+        self.worker_version = None
 
     def assert_private(self, value, extra=()):
         super().assert_private(value, (*self.secrets, *extra))
 
     def api(self, path, key=None, method="GET", data=None, origin=None, raw=None, headers=None):
+        origin = origin or self.origin_url
+        headers = {"Content-Type": "application/json", **(headers or {})}
+        if path.startswith("/api/v1/worker/") and "X-Muse-Worker-Version" not in headers:
+            if self.worker_version is None:
+                status, observed, _ = self.request(origin, "/healthz")
+                require(status == 200 and observed.get("X-Muse-Service-Version"), "controlled peer did not observe a paired build version")
+                self.worker_version = observed["X-Muse-Service-Version"]
+            headers["X-Muse-Worker-Version"] = self.worker_version
         body = raw if raw is not None else None if data is None else json.dumps(data, ensure_ascii=False).encode()
-        return self.request(origin or self.origin_url, path, key, method, body, {"Content-Type": "application/json", **(headers or {})})
+        return self.request(origin, path, key, method, body, headers)
 
     def issue(self):
         code, headers, body = self.api("/api/v1/admin/enrollments", self.admin, "POST")

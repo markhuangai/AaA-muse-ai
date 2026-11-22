@@ -103,9 +103,18 @@ func (b *Broker) submitRequest(ctx context.Context, logger *slog.Logger, client,
 			}
 		}
 		movable := movableConversation(s, c)
-		allowed, evidence := candidates(s, c, input, movable, "")
-		if len(allowed) == 0 {
-			return nil, inference.Reject("no_ready_worker", 503, "candidates", evidence, "required_capabilities", inference.RequiredCapabilities(input.Messages, input.Tools))
+		target := input.WorkerID
+		if c != nil && c.WorkerID != "" {
+			target = c.WorkerID
+		}
+		routedFrom := ""
+		if movable && input.WorkerID == "" {
+			if pin := poolWorker(s, target); pin != nil && pin.Revoked && pin.LastContactAt != nil && !s.Now.Before(pin.LastContactAt.Add(nativeOfflineAfter)) {
+				routedFrom, target = target, ""
+			}
+		}
+		if err := validQueueTarget(s, target); err != nil {
+			return nil, err
 		}
 
 		id, err := auth.ID(b.random)
@@ -137,6 +146,9 @@ func (b *Broker) submitRequest(ctx context.Context, logger *slog.Logger, client,
 			s.Requests = map[string]*inference.Request{}
 		}
 		r := &inference.Request{ID: id, ConversationID: c.ID, ClientID: client, SessionID: c.SessionID, WorkerID: c.WorkerID, ResponseID: "resp_" + responseID, CreatedAt: s.Now, State: "queued", ReassignAllowed: movable, ReplayHash: replay, Input: input, RequestedSession: ref.SessionID, InputCount: len(input.Messages), CanonicalEnd: len(input.Messages), Response: response}
+		if routedFrom != "" {
+			r.WorkerID = ""
+		}
 		s.Requests[id] = r
 		for _, item := range input.Messages[matched:] {
 			if err = b.appendHistory(s, c, r.ID, "client_provided", item); err != nil {
@@ -144,7 +156,7 @@ func (b *Broker) submitRequest(ctx context.Context, logger *slog.Logger, client,
 			}
 		}
 		c.CurrentRequestID, c.PendingCallID = id, ""
-		e := &inference.Experiment{ID: id, ConversationID: c.ID, WorkerID: c.WorkerID, State: "queued", CreatedAt: s.Now, DeadlineAt: s.Now.Add(time.Duration(input.TimeoutSeconds) * time.Second), Messages: inference.RequestMessages(c, r), Tools: input.Tools, RemoteOutcome: "not_started"}
+		e := &inference.Experiment{ID: id, ConversationID: c.ID, WorkerID: target, State: "queued", CreatedAt: s.Now, DeadlineAt: s.Now.Add(time.Duration(input.TimeoutSeconds) * time.Second), Messages: inference.RequestMessages(c, r), Tools: input.Tools, RemoteOutcome: "not_started"}
 		if err = inference.CheckContext(e.Messages, e.Tools); err != nil {
 			return nil, err
 		}
@@ -154,10 +166,18 @@ func (b *Broker) submitRequest(ctx context.Context, logger *slog.Logger, client,
 			return nil, err
 		}
 		event(events, slog.LevelInfo, "history.reconciled", s, &inference.Job{ExperimentID: id, ConversationID: c.ID}, "client_id", client, "session_id", c.SessionID, "request_record_id", id, "matched_from", 0, "matched_to", matched, "appended_from", matched, "appended_to", c.ItemCount, "reason", "new_suffix", "tool_count", len(input.Tools))
-		event(events, slog.LevelInfo, "dispatch.queued", s, &inference.Job{ExperimentID: id, ConversationID: c.ID, DeadlineAt: e.DeadlineAt}, "candidates", evidence, "timeout_seconds", input.TimeoutSeconds, "worker_selection_constraint", input.WorkerID, "reassign_allowed", movable, "prior_decision_type", priorDecision, "required_capabilities", inference.RequiredCapabilities(input.Messages, input.Tools))
-		if err = b.dispatch(s, events); err != nil {
+		job, err := b.newJob(s, e, nil)
+		if err != nil {
 			return nil, err
 		}
+		job.ReroutedFrom = routedFrom
+		if movable && input.WorkerID == "" {
+			if peer := poolWorker(s, target); peer != nil && peer.LastContactAt != nil {
+				due := peer.LastContactAt.Add(nativeOfflineAfter)
+				job.PinCheckAt = &due
+			}
+		}
+		event(events, slog.LevelInfo, "dispatch.queued", s, job, "timeout_seconds", input.TimeoutSeconds, "worker_selection_constraint", input.WorkerID, "reassign_allowed", movable, "prior_decision_type", priorDecision, "required_capabilities", inference.RequiredCapabilities(input.Messages, input.Tools))
 
 		return r.View(false), nil
 	})

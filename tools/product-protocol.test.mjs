@@ -84,6 +84,29 @@ test('production correlation requires captured admission, an assignment and one 
   await assert.rejects(sameOwner.rejectOtherClient(responseItem), /product_cross_client_admitted/);
 });
 
+test('native correlation binds every client turn to a claim, one-shot job and valid start time', async t => {
+  const h = await productServer(t), item = make();
+  const driver = new ProductProtocol({ origin: h.origin, keys, readFixture: async () => item.fixture.contents });
+  await driver.start(item); await driver.finish(item);
+  const management = (overrides = {}) => async path => {
+    const value = await h.management(path);
+    if (!path.includes('/diagnostics/export')) Object.assign(value.assignment, {
+      lease_id: 'claim-' + value.execution.current_job_id, launch_id: 'launch-' + value.execution.current_job_id,
+      native_job_id: 'native-' + value.execution.current_job_id, started_at: item.turns[0].started_at, ...overrides,
+    });
+    return value;
+  };
+  assert.equal((await driver.correlate(item, management())).outcome, 'passed');
+  for (const turn of item.turns) {
+    assert.equal(turn.claim_id, 'claim-' + turn.job_id);
+    assert.equal(turn.launch_id, 'launch-' + turn.job_id);
+    assert.equal(turn.native_job_id, 'native-' + turn.job_id);
+  }
+  for (const invalid of [{ lease_id: undefined }, { native_job_id: 'unsafe id' }, { started_at: null }]) {
+    await assert.rejects(driver.correlate(item, management(invalid)), /product_assignment_missing/);
+  }
+});
+
 test('correlation survives unrelated pruned history but rejects missing current evidence and invalid service times', async t => {
   for (const protocol of ['chat', 'responses']) {
     const h = await productServer(t), item = make(protocol);

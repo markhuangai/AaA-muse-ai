@@ -3,6 +3,7 @@ import { join, resolve } from 'node:path';
 import { State, system } from '../dist/state.js';
 import { Logger, Capture } from '../dist/diagnostics.js';
 import { Worker } from '../dist/worker.js';
+import { VERSION } from '../dist/version.js';
 import { encode, parse, object } from '../dist/json.js';
 
 export const KEY = 'muse_worker_' + Buffer.alloc(32, 17).toString('base64url');
@@ -25,8 +26,14 @@ export class Broker {
     const input = options.body ? object(parse(options.body)) : undefined;
     const call = { path, options, input };
     this.calls.push(call);
-    if (this.override) { const value = await this.override(call); if (value) return value; }
-    const response = (value, status = 200) => new Response(encode(value), { status, headers: { 'content-type': 'application/json', 'x-request-id': 'unit-request-' + this.calls.length } });
+    if (this.override) {
+      const value = await this.override(call);
+      if (value) {
+        if (!value.headers.has('X-Muse-Service-Version')) value.headers.set('X-Muse-Service-Version', VERSION);
+        return value;
+      }
+    }
+    const response = (value, status = 200) => new Response(encode(value), { status, headers: { 'content-type': 'application/json', 'x-request-id': 'unit-request-' + this.calls.length, 'X-Muse-Service-Version': VERSION } });
     if (this.denied) return response({ error: 'unauthorized' }, 401);
     if (path.endsWith('/enroll')) return response({ worker: { id: ID }, credential: KEY }, 201);
     if (path.endsWith('/status')) {
@@ -69,7 +76,7 @@ export async function fixture(t, { broker = new Broker(), maxBytes, retentionMs 
   const sys = { ...system, now: () => Date.now() + offset, wait: async ms => { waits.push(ms); await new Promise(done => setTimeout(done, Math.min(ms, 5))); } };
   const state = new State(root, fs, sys);
   await state.ensure();
-  const logger = new Logger(state, new Capture(await state.child('diagnostics'), maxBytes, retentionMs), line => output.push(line), { package_version: '0.1.0-dev.0', node_version: process.version });
+  const logger = new Logger(state, new Capture(await state.child('diagnostics'), maxBytes, retentionMs), line => output.push(line), { package_version: VERSION, node_version: process.version });
   logger.redactor.add(KEY); logger.redactor.add(CODE);
   const net = { fetch: broker.fetch.bind(broker), setTimer: setTimeout, clearTimer: clearTimeout };
   const worker = new Worker(state, logger, net);

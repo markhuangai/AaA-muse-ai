@@ -7,7 +7,7 @@ import { prepareRelease, publishRelease } from './worker-release.mjs';
 import { publishCandidate } from './release-candidate.mjs';
 import { promoteStable } from './release-promote.mjs';
 import { hash, jsonBytes } from './release-manifest.mjs';
-import { prepareStableRelease } from './release-control.mjs';
+import { bundleName, prepareStableRelease } from './release-control.mjs';
 import { latestStableRelease, readProductRelease } from './release-history.mjs';
 import { candidateNpmTag } from './release-versions.mjs';
 import { verifyPublished } from './release-verify.mjs';
@@ -15,15 +15,55 @@ import { verifyPublished } from './release-verify.mjs';
 const publish = f => publishCandidate({ ...f, publishWorker: options => publishRelease({ ...options, publishNpm: f.publishNpm }) });
 const promote = (f, options) => promoteStable({ ...f, ...options });
 
+test('major-zero frozen recovery verifies original identity without rebuilding or promoting', async t => {
+  const f = await releaseFixture(t, { version: '0.1.0', rcVersion: '0.1.0-rc.13' });
+  const active = f.addRC('1.0.0-rc.0', { rcSource: 'b'.repeat(40) });
+  const next = await prepareStableRelease({ ...f, prereleaseTag: active.release.tag_name, version: '1.0.0' });
+  assert.equal(next.source_sha, active.source);
+  assert.equal(next.resume_run_id, null);
+  await assert.rejects(prepareStableRelease(f), /original_bundle_unavailable/);
+  f.state.runs = [{ id: 72 }];
+  const artifact = { id: 54, name: bundleName(f.prepared), run_id: 72, expired: true };
+  f.state.artifacts = [artifact];
+  const original = { workflow_id: 7, event: 'workflow_dispatch', head_branch: 'main',
+    repository: { full_name: 'markhuangai/AaA-muse-ai' }, head_repository: { full_name: 'markhuangai/AaA-muse-ai' } };
+  f.state.originalRuns.set(72, original);
+  await assert.rejects(prepareStableRelease(f), /original_bundle_unavailable/);
+  artifact.expired = false; original.head_branch = 'other';
+  await assert.rejects(prepareStableRelease(f), /resume_run_untrusted/);
+  original.head_branch = 'main';
+  const prepared = await prepareStableRelease(f);
+  assert.equal(prepared.recovery_only, true);
+  assert.equal(prepared.resume_run_id, 72);
+  assert.equal(prepared.resume_artifact_id, 54);
+  await assert.rejects(publish({ ...f, prepared: { ...prepared, resume_artifact_id: 55 } }), /original_bundle_unavailable/);
+  writeFileSync(join(f.directory, 'bundle.json'), jsonBytes({ ...f.bundle, source_rc: { ...f.bundle.source_rc, manifest_sha256: 'f'.repeat(64) } }));
+  await assert.rejects(publish({ ...f, prepared }), /bundle_identity_mismatch/);
+  assert.equal(f.state.commands.length, 0);
+  assert.equal(f.state.uploads, 0);
+  writeFileSync(join(f.directory, 'bundle.json'), jsonBytes(f.bundle));
+  const receipt = await publish({ ...f, prepared });
+  assert.equal(receipt.publication, 'complete');
+  assert.equal(f.state.tags[candidateNpmTag(f.version)], f.version);
+  assert.equal(f.state.tags.candidate, undefined);
+  assert.equal(f.state.tags.latest, undefined);
+  assert(!f.state.images.has(f.version) && !f.state.images.has('latest'));
+  assert(!f.state.commands.some(command => command[0] === 'docker' &&
+    (command[1] === 'build' || command[1] === 'buildx' && command[2] === 'build')));
+  await assert.rejects(promote(f, { prepared, manifestSHA256: receipt.manifest_sha256 }), /historical_candidate_only/);
+  assert.equal((await prepareStableRelease(f)).candidate_ready, true);
+  assert(!f.state.assets.has('promotion-intent.json'));
+});
+
 test('candidate publication uses frozen final-version bytes, then retries without building or republishing', async t => {
   const f = await releaseFixture(t);
   const rcImage = f.state.images.get('sha-' + f.source);
   const first = await publish(f);
-  assert.equal(first.publication, 'complete'); assert.equal(first.version, '0.1.0');
-  assert.equal(f.state.npm.version, '0.1.0'); assert.equal(f.state.tags.latest, undefined);
+  assert.equal(first.publication, 'complete'); assert.equal(first.version, '1.0.0');
+  assert.equal(f.state.npm.version, '1.0.0'); assert.equal(f.state.tags.latest, undefined);
   assert.equal(f.state.tags[candidateNpmTag(f.version)], f.version);
   assert(f.release.prerelease); assert.match(f.release.body, /aaa-muse-product:verified/);
-  assert(f.state.images.has('candidate-0.1.0'));
+  assert(f.state.images.has('candidate-' + f.version));
   assert.deepEqual(f.state.images.get('sha-' + f.source), rcImage);
   assert(f.state.commands.some(([command, operation, source]) =>
     command === 'docker' && operation === 'tag' && source === 'aaa-muse-stable:prepared'));
@@ -53,7 +93,7 @@ test('a mismatched restored image blocks candidate writes', async t => {
   assert.equal(f.state.npm, null);
   assert.equal(f.state.uploads, 0);
   assert(!f.state.refs.has('tags/' + f.prepared.tag));
-  assert(!f.state.images.has('candidate-0.1.0'));
+  assert(!f.state.images.has('candidate-' + f.version));
 });
 
 test('partial publication retains its destination ledger and resumes only the missing identical bytes', async t => {
@@ -66,13 +106,14 @@ test('partial publication retains its destination ledger and resumes only the mi
   const commands = f.state.commands.length; f.state.failAsset = null;
   assert.equal((await publish(f)).publication, 'complete');
   assert.deepEqual(f.state.commands.slice(commands).map(args => args.slice(0, 5)),
-    [['npm', 'dist-tag', 'add', '@markhuangai/aaa-muse-worker@0.1.0', 'candidate']]);
+    [['npm', 'dist-tag', 'add', '@markhuangai/aaa-muse-worker@' + f.version, 'candidate']]);
 });
 
 test('a failed completion marker keeps the candidate alias usable for a newer stable dispatch', async t => {
-  const earlier = await releaseFixture(t, { version: '0.1.0', rcVersion: '0.1.0-rc.12', source: 'c'.repeat(40) });
+  const earlier = await releaseFixture(t, { source: 'c'.repeat(40) });
   earlier.seed();
-  const interrupted = await releaseFixture(t, { version: '0.1.1', previous: earlier });
+  await promote(earlier);
+  const interrupted = await releaseFixture(t, { version: '1.0.1', rcVersion: '1.0.1-rc.0', previous: earlier });
   const updateRelease = interrupted.github.rest.repos.updateRelease;
   interrupted.github.rest.repos.updateRelease = async options => {
     if (options.body?.includes('<!-- aaa-muse-product:verified:')) throw { status: 503 };
@@ -82,13 +123,13 @@ test('a failed completion marker keeps the candidate alias usable for a newer st
   await assert.rejects(publish({ ...interrupted, prepared: original }), error =>
     error.fields.operation === 'completion_marker_publication' && error.fields.http_status === 503);
   assert.equal(interrupted.state.tags.candidate, earlier.version);
-  assert.equal(interrupted.state.tags.latest, undefined);
+  assert.equal(interrupted.state.tags.latest, earlier.version);
   assert(!interrupted.release.body.includes('<!-- aaa-muse-product:verified:'));
 
-  const source = 'b'.repeat(40), rcVersion = '0.1.0-rc.14';
+  const source = 'b'.repeat(40), rcVersion = '1.0.1-rc.1';
   interrupted.addRC(rcVersion, { rcSource: source });
   await assert.rejects(prepareStableRelease(interrupted), /product_release_stale_rc/);
-  const newer = await releaseFixture(t, { version: '0.2.0', rcVersion, source, previous: interrupted });
+  const newer = await releaseFixture(t, { version: '1.1.0', rcVersion, source, previous: interrupted });
   const prepared = await prepareStableRelease(newer);
   const published = await publish({ ...newer, prepared });
   await promote(newer, { prepared, manifestSHA256: published.manifest_sha256 });
@@ -99,16 +140,16 @@ test('a failed completion marker keeps the candidate alias usable for a newer st
 test('candidate refusal preserves conflicting image destinations and altered frozen artifacts', async t => {
   const f = await releaseFixture(t);
   const other = jsonBytes({ config: { digest: 'sha256:' + hash('{}') } });
-  f.state.images.set('candidate-0.1.0', other); f.state.configBytes = Buffer.from('{}');
+  f.state.images.set('candidate-' + f.version, other); f.state.configBytes = Buffer.from('{}');
   await assert.rejects(publish(f), /artifact_conflict/);
-  assert.deepEqual(f.state.images.get('candidate-0.1.0'), other); assert.equal(f.state.npm, null);
-  f.state.images.clear(); writeFileSync(join(f.directory, 'image.tar'), 'changed');
+  assert.deepEqual(f.state.images.get('candidate-' + f.version), other); assert.equal(f.state.npm, null);
+  f.state.images.delete('candidate-' + f.version); writeFileSync(join(f.directory, 'image.tar'), 'changed');
   await assert.rejects(publish(f), /artifact_conflict/); assert.equal(f.state.uploads, 0);
 });
 
 test('candidate reconciliation copies a verified existing manifest for a missing tag without pushing new bytes', async t => {
   const f = await releaseFixture(t); f.seed();
-  f.state.images.delete(`sha-${f.source}-0.1.0`);
+  f.state.images.delete(`sha-${f.source}-${f.version}`);
   const result = await publish(f); assert.equal(result.publication, 'complete');
   assert(f.state.commands.some(command => command.includes('imagetools')));
   assert(!f.state.commands.some(command => command.includes('push')));
@@ -118,7 +159,7 @@ test('matching npm bytes recover an absent candidate tag and preserve a conflict
   const f = await releaseFixture(t); f.seed(); delete f.state.tags.candidate;
   await publish(f);
   assert.equal(f.state.tags.candidate, f.version);
-  assert.deepEqual(f.state.commands.filter(command => command[0] === 'npm').map(command => command.slice(1, 4)), [['dist-tag', 'add', '@markhuangai/aaa-muse-worker@0.1.0']]);
+  assert.deepEqual(f.state.commands.filter(command => command[0] === 'npm').map(command => command.slice(1, 4)), [['dist-tag', 'add', '@markhuangai/aaa-muse-worker@' + f.version]]);
   assert(!f.state.commands.some(command => command.includes('publish')));
   f.state.tags.candidate = '0.2.0'; const before = f.state.commands.length;
   await assert.rejects(publish(f), /distribution_conflict/);
@@ -145,8 +186,8 @@ test('stable publication verifies the pinned pair and records no implicit live p
   assert.deepEqual(result.source_rc, f.prepared.source_rc);
   assert.deepEqual(JSON.parse(f.state.assets.get('promotion.json')), result);
   assert(!f.release.assets.some(asset => asset.name.startsWith('qualification-')));
-  assert.equal(f.state.tags.latest, '0.1.0'); assert(!f.release.prerelease);
-  assert(f.state.images.has('0.1.0')); assert(f.state.images.has('latest'));
+  assert.equal(f.state.tags.latest, f.version); assert(!f.release.prerelease);
+  assert(f.state.images.has(f.version)); assert(f.state.images.has('latest'));
   for (const [name, bytes] of before) assert.deepEqual(f.state.assets.get(name), bytes);
   assert(!f.state.commands.some(command => command.includes('build') || command.includes('pack') || command.includes('publish') || command.includes('push')));
   const count = f.state.commands.length;
@@ -156,11 +197,11 @@ test('stable publication verifies the pinned pair and records no implicit live p
 
 test('a newer complete RC blocks a fresh promotion before any stable write', async t => {
   const f = await releaseFixture(t); f.seed();
-  f.addRC('0.1.0-rc.14', { rcSource: 'b'.repeat(40) });
+  f.addRC('1.0.0-rc.14', { rcSource: 'b'.repeat(40) });
   await assert.rejects(promote(f), error => {
     assert.equal(error.message, 'product_release_stale_rc');
-    assert.equal(error.fields.expected_rc, 'v0.1.0-rc.13');
-    assert.equal(error.fields.observed_rc, 'v0.1.0-rc.14');
+    assert.equal(error.fields.expected_rc, 'v1.0.0-rc.13');
+    assert.equal(error.fields.observed_rc, 'v1.0.0-rc.14');
     return true;
   });
   assert.equal(f.state.uploads, 0);
@@ -169,7 +210,11 @@ test('a newer complete RC blocks a fresh promotion before any stable write', asy
 });
 
 test('two successive candidates advance the verified aliases and keep the old exact release verifiable', async t => {
-  const first = await releaseFixture(t, { version: '1.0.0' });
+  const first = await releaseFixture(t, { version: '1.0.0', rcVersion: '1.0.0-rc.0' });
+  await assert.rejects(prepareStableRelease({ ...first, version: '0.1.1' }), /source_target_major_mismatch/);
+  await assert.rejects(prepareStableRelease({ ...first, prereleaseTag: 'v0.1.0-rc.15' }), /source_target_major_mismatch/);
+  assert.equal(first.state.commands.length, 0);
+  assert.equal(first.state.uploads, 0);
   const firstPrepared = await prepareStableRelease(first);
   assert.equal(firstPrepared.candidate_ready, false);
   const firstPublished = await publish({ ...first, prepared: firstPrepared });
@@ -260,10 +305,10 @@ test('promotion stops on distribution conflicts, retains partial progress, and r
   assert(f.release.prerelease);
   assert(f.state.assets.has('promotion-intent.json'));
   assert(!f.state.assets.has('promotion.json'));
-  f.addRC('0.1.0-rc.14', { rcSource: 'b'.repeat(40) });
-  const newer = await releaseFixture(t, { version: '0.1.1', rcVersion: '0.1.0-rc.14', source: 'b'.repeat(40), previous: f });
+  f.addRC('1.0.0-rc.14', { rcSource: 'b'.repeat(40) });
+  const newer = await releaseFixture(t, { version: '1.0.1', rcVersion: '1.0.0-rc.14', source: 'b'.repeat(40), previous: f });
   newer.seed();
-  await assert.rejects(promote(newer), /other_promotion_incomplete/);
+  await assert.rejects(promote(newer), /stable_version_step_invalid/);
   f.execute = execute;
   const prepared = await prepareStableRelease(f);
   assert.equal(prepared.candidate_ready, true);
@@ -283,7 +328,7 @@ test('a saved intent without an actual stable write does not permit stale promot
   await assert.rejects(promote(f), /required_operation_failed/);
   assert(f.state.assets.has('promotion-intent.json'));
   assert(!f.state.images.has(f.version));
-  f.addRC('0.1.0-rc.14', { rcSource: 'b'.repeat(40) });
+  f.addRC('1.0.0-rc.14', { rcSource: 'b'.repeat(40) });
   f.execute = execute;
   const before = { commands: f.state.commands.length, uploads: f.state.uploads };
   await assert.rejects(promote(f), /stale_rc/);

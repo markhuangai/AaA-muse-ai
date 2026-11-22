@@ -13,13 +13,13 @@ function fixture() {
     git: { listMatchingRefs: refsRoute },
     repos: {
       getBranch: async () => ({ data: { commit: { sha: state.main } } }), listPullRequestsAssociatedWithCommit: pullsRoute, listReleases: releasesRoute,
-      getReleaseByTag: async () => ({ data: { id: 1, draft: false, prerelease: true, tag_name: 'v0.1.0-rc.7', body: state.body, assets: [...state.assets.keys()].map(name => ({ name })) } }),
+      getReleaseByTag: async () => ({ data: { id: 1, draft: false, prerelease: true, tag_name: 'v1.0.0-rc.7', body: state.body, assets: [...state.assets.keys()].map(name => ({ name })) } }),
       uploadReleaseAsset: async ({ name, data }) => { state.uploads++; state.assets.set(name, data); },
       updateRelease: async ({ body }) => { state.updates++; state.body = body; },
     },
-  }, paginate: async route => route === refsRoute ? [{ ref: 'refs/tags/worker-v0.1.0-rc.6', object: { type: 'commit', sha: 'e'.repeat(40) } }] : route === releasesRoute ? [] : [{ merged_at: '2026-11-14', merge_commit_sha: source, base: { ref: 'main', repo: repository } }] };
+  }, paginate: async route => route === refsRoute ? [{ ref: 'refs/tags/v1.0.0-rc.6', object: { type: 'commit', sha: 'e'.repeat(40) } }] : route === releasesRoute ? [] : [{ merged_at: '2026-11-14', merge_commit_sha: source, base: { ref: 'main', repo: repository } }] };
   const context = { eventName: 'workflow_run', repo: { owner: 'markhuangai', repo: 'AaA-muse-ai' }, payload: { workflow_run: { id: 3, workflow_id: 7, event: 'push', conclusion: 'success', head_branch: 'main', head_sha: source, repository, head_repository: repository } } };
-  const prepared = { source_sha: source, version: '0.1.0-rc.7', tag: 'v0.1.0-rc.7', paired: true };
+  const prepared = { source_sha: source, version: '1.0.0-rc.7', tag: 'v1.0.0-rc.7', paired: true };
   const worker = { source: { source_sha: source, source_dirty: false, package_version: prepared.version }, version: prepared.version, sha256: digest, installer_sha256: 'f'.repeat(64), package: '@markhuangai/aaa-muse-worker' };
   const image = { source_sha: source, tree_sha: 'e'.repeat(40), version: prepared.version, image_config_digest: imageConfig, worker_sha256: digest };
   const fetcher = async (url, options) => {
@@ -33,11 +33,11 @@ function fixture() {
 
 test('paired selection includes service-only changes and reserves one shared version across retries', async () => {
   const f = fixture(); const prepared = await prepareRelease({ ...f, paired: true });
-  assert.equal(prepared.should_publish, true); assert.equal(prepared.version, '0.1.0-rc.7'); assert.equal(prepared.tag, 'v0.1.0-rc.7');
-  const ref = { ref: 'refs/tags/v0.1.0-rc.7', object: { type: 'commit', sha: f.prepared.source_sha } };
-  assert.equal(chooseVersion([ref], f.prepared.source_sha, true), '0.1.0-rc.7');
-  assert.equal(chooseVersion([ref], 'e'.repeat(40), true), '0.1.0-rc.8');
-  assert.throws(() => chooseVersion([ref, { ...ref, ref: 'refs/tags/v0.1.0-rc.8' }], f.prepared.source_sha, true), /ambiguous/);
+  assert.equal(prepared.should_publish, true); assert.equal(prepared.version, '1.0.0-rc.7'); assert.equal(prepared.tag, 'v1.0.0-rc.7');
+  const ref = { ref: 'refs/tags/v1.0.0-rc.7', object: { type: 'commit', sha: f.prepared.source_sha } };
+  assert.equal(chooseVersion([ref], f.prepared.source_sha, true, '1.0.0'), '1.0.0-rc.7');
+  assert.equal(chooseVersion([ref], 'e'.repeat(40), true, '1.0.0'), '1.0.0-rc.8');
+  assert.throws(() => chooseVersion([ref, { ...ref, ref: 'refs/tags/v1.0.0-rc.8' }], f.prepared.source_sha, true, '1.0.0'), /ambiguous/);
 });
 
 test('paired completion verifies registry identities and anonymous receipt bytes, then publishes once', async () => {

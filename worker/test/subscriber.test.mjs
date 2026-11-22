@@ -4,7 +4,6 @@ import * as fs from 'node:fs/promises';
 import { State } from '../dist/state.js';
 import { Subscriber } from '../dist/subscriber.js';
 import { Worker } from '../dist/worker.js';
-import { execute } from '../dist/cli.js';
 import { encode, parse, integer } from '../dist/json.js';
 import { fixture, enrolled, until, ID, JOB, CONN, KEY, claimed } from './helpers.mjs';
 
@@ -42,7 +41,7 @@ test('confirmed idle precedes pending publication and is not its completion sign
   assert(!exported.includes(KEY));
 });
 
-test('publication failure after confirmed idle fails the real run command and remains diagnosable', { timeout: 10_000 }, async t => {
+test('the retired subscriber preserved broker-accepted idle when local publication failed', { timeout: 10_000 }, async t => {
   for (const boundary of ['cue', 'index']) {
     const f = await fixture(t); await enrolled(f);
     f.broker.jobs.set(JOB, claimed({ state: 'cancelled' }));
@@ -60,22 +59,21 @@ test('publication failure after confirmed idle fails the real run command and re
         return new Response(new ReadableStream({ start(c) { c.enqueue(Buffer.from(frames.map(([type, data], i) => `id: failure-${i}\nevent: ${type}\ndata: ${encode(data)}\n\n`).join(''))); } }), { headers: { 'content-type': 'text/event-stream' } });
       }
     };
-    const io = { files, system: f.state.sys, network: f.net, env: {}, home: () => f.state.root, nodeVersion: process.version, input: async () => '', stdout() {}, stderr: line => f.output.push(line), signal: new AbortController().signal, metadata: async () => ({ source_sha: 'unit', source_dirty: true }) };
-    assert.equal(await execute(['run', '--state-dir', f.state.root], io), 1);
+    const archived = new Worker(new State(f.state.root, files, f.state.sys), f.logger, f.net);
+    await assert.rejects(new Subscriber(archived).run(new AbortController().signal), { code: 'ENOSPC' });
     assert.equal(parse(await (await f.state.child('acks')).read(JOB + '.json')).state, 'confirmed');
     assert.equal(parse(await f.state.read('pending.json')).jobs.length, 1);
     assert.equal(f.broker.jobs.get(JOB).held, false);
     const exported = await f.logger.capture.export({}, true);
     const events = exported.trimEnd().split('\n').map(JSON.parse);
     assert.equal(events[0].complete, true);
-    assert(events.some(event => event.msg === 'worker.command_failed' && event.cause === 'ENOSPC' && event.stopped_operation === 'run' && event.command_id && event.instance_id));
     assert(events.some(event => event.msg === 'worker.http_exchange' && event.route.endsWith('/heartbeat') && event.http_status === 200 && event.input.idle_ack.job_id === JOB));
     assert(!events.some(event => event.msg === 'worker.idle_confirmed'));
     assert(!f.output.some(line => JSON.parse(line).level === 'DEBUG')); assert(!exported.includes(KEY));
     fail = false;
     const stopped = new AbortController();
     f.broker.override = async call => { if (call.path.endsWith('/status')) stopped.abort(); };
-    assert.equal(await execute(['run', '--state-dir', f.state.root], { ...io, signal: stopped.signal }), 0);
+    await new Subscriber(archived).run(stopped.signal);
     assert.equal(parse(await f.state.read('pending.json')).jobs.length, 0);
     assert.equal(f.broker.calls.filter(call => call.input?.idle_ack).length, 1);
   }

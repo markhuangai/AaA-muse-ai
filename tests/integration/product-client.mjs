@@ -57,10 +57,9 @@ try {
   } else if (fixture.phase === 'resume-restart') {
     const item = fixture.cycle; output.cycles.push(item);
     await driver.finish(item); output.cases.push({ ...await capture(item), id: 'recovery.broker-tool-wait' });
-  } else if (fixture.phase === 'worker-recovery' || fixture.phase === 'watchdog-recovery') {
-    const watchdog = fixture.phase === 'watchdog-recovery';
-    const item = make(watchdog ? 'watchdog-probe' : 'worker-probe', 'b'); await startOnWorker(item); await driver.finish(item);
-    output.cases.push({ ...await capture(item), id: watchdog ? 'recovery.watchdog' : 'recovery.worker' });
+  } else if (fixture.phase === 'worker-recovery') {
+    const item = make('worker-probe', 'b'); await startOnWorker(item); await driver.finish(item);
+    output.cases.push({ ...await capture(item), id: 'recovery.worker' });
   } else if (fixture.phase === 'replacement') {
     const item = fixture.cycle; item.replay_source_case_id = item.id; item.measured_from_turn = item.turns.length; item.id = 'replacement'; item.started_at = new Date().toISOString(); item.followup = undefined; output.cycles.push(item);
     await driver.followup(item, 'replacement-full-history');
