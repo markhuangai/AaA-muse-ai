@@ -126,6 +126,8 @@ class MediaFlow(MCPMedia, Product):
             url = "/api/v1/media/jobs/" + identity
             self.claim_work(worker, identity)
             shown = self.start_work(worker)
+            if case == "prompt_video":
+                require(self.observe(worker, "running")["outcome"] == "running", "foreground video run was not bound")
             spool, progress = self.worker_media_directory(worker, identity, shown)
             output = spool / Path(shown["output_path"]).name
             expected = audios.get(case, video)
@@ -145,8 +147,9 @@ class MediaFlow(MCPMedia, Product):
             self.start_work(worker, want=1)
             require(self.api(url, self.other_client)[0] == self.api(url + "/artifact", self.other_client)[0] == 404, "foreign owner read media")
             require(self.api(url + "/artifact", self.client)[0] == 409, "uncommitted artifact downloadable")
+            settled = None
             if not jobs:
-                delivered_puts = self.adverse_upload(worker, foreign, identity, expected, output)
+                delivered_puts, settled = self.adverse_upload(worker, foreign, identity, expected, output)
             else:
                 if case == "image/png":
                     extra = (32 << 20) - len(expected)
@@ -173,7 +176,16 @@ class MediaFlow(MCPMedia, Product):
             require(self.api(url + "/artifact", self.client)[2] == expected and self.api(url + "/artifact", self.other_client)[0] == 404, "owner download integrity or isolation failed")
             if case not in audios:
                 require((properties["width"], properties["height"], properties["fps"], properties["video_frames"]) == (64, 48, 8, 8), "wrong video measurements")
-            require(self.observe(worker, "completed")["outcome"] == "settled" and not progress.exists(), "worker did not reconcile the confirmed upload")
+            if case == "prompt_video":
+                execution = {"native_job_id": worker["work"]["definition"]["native_job_id"],
+                             "native_run_id": "controlled-execution-" + identity, "status": "succeeded"}
+                settled = self.observe(worker, "completed", matches=[], execution=execution)
+                require(self.proxy.media_puts["/api/v1/worker/jobs/" + identity + "/artifact"] == 1,
+                        "foreground media was uploaded again during recovery from run history")
+                self.add("media.foreground_video_settled_from_bound_run_history", uploads=1)
+            elif settled is None:
+                settled = self.observe(worker, "completed")
+            require(settled["outcome"] == "settled" and not progress.exists(), "worker did not reconcile the confirmed upload")
             if not jobs:
                 require(self.proxy.media_puts["/api/v1/worker/jobs/" + identity + "/artifact"] == delivered_puts,
                         "lost acknowledgement recovery sent a second PUT instead of probing the accepted receipt")
@@ -249,10 +261,11 @@ class MediaFlow(MCPMedia, Product):
             transfer.result()
         self.proxy.media_pause_path = None
         require(self.proxy.media_ack_lost.wait(35), "committed acknowledgement loss missed")
-        require(self.tick(worker)["outcome"] == "recovery_pending" and self.api("/api/v1/media/jobs/" + identity + "/artifact", self.client)[2] == expected,
+        recovered = self.tick(worker)
+        require(recovered["outcome"] == "settled" and self.api("/api/v1/media/jobs/" + identity + "/artifact", self.client)[2] == expected,
                 "saved upload did not reconcile the exact bytes without granting new work")
         self.add("media.interruption_and_fencing", busy_pull_count=0, competing_upload_count=0)
-        return before_puts + 1
+        return before_puts + 1, recovered
 
     def wait_upload_started(self, identity):
         self.until(lambda: bool(self.docker("exec", self.broker, "find", "/var/lib/aaa-muse-ai/media", "-maxdepth", "1", "-name", ".upload-" + identity + "-*").stdout.strip()),

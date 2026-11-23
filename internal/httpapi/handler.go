@@ -162,7 +162,7 @@ func (h *Handler) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 		}
 		logger.Debug("request.exchange", "method", r.Method, "role", role, "status", w.code, "response", w.body.String(), "response_capture", captureKind, "outcome", outcome, "write_error", detail, "attempted_bytes", w.attempted, "written_bytes", w.written)
 		level := slog.LevelInfo
-		if route == "/api/v1/worker/pull" && w.code == http.StatusOK && outcome == "completed" {
+		if (route == "/api/v1/worker/pull" || route == workerPresenceRoute) && w.code == http.StatusOK && outcome == "completed" {
 			level = slog.LevelDebug
 		}
 		logger.Log(r.Context(), level, "request.completed", "method", r.Method, "role", role, "status", w.code, "outcome", outcome, "duration_ms", h.Now().Sub(started).Milliseconds())
@@ -266,7 +266,7 @@ func (h *Handler) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 			logger = logger.With("portal_session_id", identity.ID)
 		}
 		if route != mcpRoute && role == "unauthenticated" && strings.HasPrefix(authorization, "Bearer ") && strings.HasPrefix(credential, auth.WorkerPrefix) && h.Workers != nil {
-			if route == "/api/v1/worker/pull" {
+			if route == "/api/v1/worker/pull" || route == workerPresenceRoute {
 				role = "worker"
 			} else {
 				record, err := h.Workers.Authenticate(r.Context(), logger, credential)

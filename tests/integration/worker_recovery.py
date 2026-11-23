@@ -77,24 +77,31 @@ class WorkerRecovery(WorkerSetup):
         old_definition = worker["work"]["definition"]
         launch_id, job_id = grant["launch_id"], brief["job_id"]
         intent = json.loads(self.native_cli(worker, "cron-producer-intent", "--launch-id", launch_id))
-        producer_args = ("cron-producer", "--launch-id", launch_id, "--producer-id", intent["producer_id"], "--pid")
-        self.native_cli(worker, *producer_args, "2147483647", want=1)
+        unused = json.loads(self.native_cli(worker, "cron-producer-intent", "--launch-id", launch_id))
+        producer = intent["producer_command"]
+        marker = "/home/worker/producer-started"
+        pid = self.command(worker, ["bash", "-c", 'set -eu; "$@" </dev/null >/dev/null 2>&1 & printf "%s\n" "$!"',
+                                    "run-guarded", *producer, "sh", "-c", 'printf "%s" "$$" > "$1"; exec sleep 120',
+                                    "guarded-producer", marker]).stdout.strip()
         require(self.observe(worker, "unobservable")["outcome"] == "recovery_pending", "inaccessible native execution was treated as stopped")
-        require(self.observe(worker, "failed")["outcome"] == "recovery_pending", "untracked producer intent was treated as stopped")
-        pid = self.command(worker, ["bash", "-c", "sleep 120 </dev/null >/dev/null 2>&1 & printf '%s\n' \"$!\""]).stdout.strip()
         try:
-            self.native_cli(worker, *producer_args, pid)
-            before = self.status(worker)["last_poll_at"]
-            require(self.tick(worker)["outcome"] == "recovery_pending" and self.observe(worker, "failed")["outcome"] == "recovery_pending",
-                    "stopped native agent released a live finite process")
+            marker_file = worker["home"] / "producer-started"
+            self.until(lambda: marker_file.exists() and marker_file.read_text() == pid, "packed wrapper did not bind the producer before executing it")
+            before = self.worker_projection(worker)[0]["last_poll_at"]
+            require(self.observe(worker, "failed")["cause"] == "producer_still_active_or_unobservable", "stopped native agent released a live finite process")
+            self.command(worker, [*unused["producer_command"], "touch", "/home/worker/late-launch"], want=1)
+            require(not (worker["home"] / "late-launch").exists(), "a delayed wrapper started after terminal proof")
+            held = self.tick(worker)
+            require(held["lookup"] is None and held["cause"] == "producer_still_active_or_unobservable", "new checker did not reuse the stopped run proof")
             self.cancel(experiment["id"])
-            require(self.status(worker)["work_status"] == "busy" and self.observe(worker, "failed")["outcome"] == "recovery_pending" and self.status(worker)["last_poll_at"] == before,
+            projected = self.worker_projection(worker)[0]
+            require(projected["work_status"] == "busy" and projected["busy_reason"] == held["cause"] and projected["last_poll_at"] == before,
                     "cancellation released the surviving producer or caused a work pull")
         finally:
             self.command(worker, ["bash", "-c", 'kill -TERM "$1"', "controlled-producer-stop", pid])
         self.until(lambda: self.docker("exec", worker["container"], "bash", "-c", '! kill -0 "$1" 2>/dev/null', "controlled-producer-exit", pid, success=False).returncode == 0,
                    "owned producer did not terminate")
-        require(self.observe(worker, "failed")["outcome"] == "settled", "confirmed stop did not reconcile to the prior cancellation")
+        require(self.tick(worker)["outcome"] == "settled", "saved stop did not reconcile to the prior cancellation after producer exit")
         require(self.experiment(experiment["id"])["state"] == "cancelled" and self.status(worker)["work_status"] == "idle", "settlement lost cancellation or left the slot held")
         followup = self.create(worker, "only settled work allows the next pull", tools=False)
         self.claim_work(worker, followup["current_job_id"])
@@ -109,6 +116,8 @@ class WorkerRecovery(WorkerSetup):
         require(self.observe(worker, "failed")["outcome"] == "settled" and self.experiment(followup["id"])["state"] == "interrupted",
                 "confirmed failure without a result did not record an interruption")
         records = self.events(worker, operation=experiment["id"])
+        require(any(value["msg"] == "cron.unused_producers_retired" and value["producer_ids"] == [unused["producer_id"]] for value in records),
+                "protected logs did not identify the fenced unused reservation")
         require(any(value["msg"] == "cron.native_observation" and value.get("native_status") == "failed" and
                     value.get("outcome") == "confirmed_stopped" and value.get("native_run_id") == "controlled-execution-" + job_id and
                     value.get("claim_id") == grant["claim_id"] for value in records), "exports omitted the verified native failure")

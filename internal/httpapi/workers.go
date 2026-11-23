@@ -63,7 +63,7 @@ func routeMethod(route string) string {
 		return http.MethodPost
 	case "/api/v1/admin/workers/{id}":
 		return http.MethodPatch
-	case "/api/v1/requests", "/api/v1/requests/{id}/cancel", "/api/v1/admin/experiments", "/api/v1/admin/experiments/{id}/cancel", "/api/v1/admin/experiments/{id}/tool-results", "/api/v1/worker/jobs/{id}/decisions", "/api/v1/worker/pull", "/api/v1/worker/jobs/{id}/start", "/api/v1/worker/jobs/{id}/interrupt":
+	case "/api/v1/requests", "/api/v1/requests/{id}/cancel", "/api/v1/admin/experiments", "/api/v1/admin/experiments/{id}/cancel", "/api/v1/admin/experiments/{id}/tool-results", "/api/v1/worker/jobs/{id}/decisions", "/api/v1/worker/pull", "/api/v1/worker/jobs/{id}/start", "/api/v1/worker/jobs/{id}/interrupt", workerPresenceRoute:
 		return http.MethodPost
 	default:
 		return http.MethodGet
@@ -115,6 +115,9 @@ func (h *Handler) projectedWorker(r *http.Request, logger *slog.Logger, record w
 	}
 	p, err := h.Broker.Projection(r.Context(), logger, record.ID, own)
 	v.Projection = p
+	if p.NativeContactAt != nil {
+		v.LastContactAt = p.NativeContactAt
+	}
 	return v, err
 }
 

@@ -11,6 +11,7 @@ export interface Network {
   clearTimer(timer: ReturnType<typeof setTimeout>): void;
 }
 export const network: Network = { fetch, setTimer: setTimeout, clearTimer: clearTimeout };
+export const presenceTimeoutMs = 2500;
 export interface Reply { data: ObjectValue; requestId: string; status: number }
 export interface Event { id: string; type: string; data: ObjectValue }
 function decoded(decoder: TextDecoder, bytes?: Uint8Array, streaming = false): string {
@@ -71,13 +72,13 @@ export class Transport {
       return decoded(new TextDecoder('utf8', { fatal: true, ignoreBOM: preserveBOM }), Buffer.concat(buffers));
     } finally { await reader.cancel(); reader.releaseLock(); }
   }
-  async request(route: string, method = 'GET', input?: string, correlation: Record<string, Value> = {}, attempts = 3): Promise<Reply> {
+  async request(route: string, method = 'GET', input?: string, correlation: Record<string, Value> = {}, attempts = 3, timeoutMs = 10_000): Promise<Reply> {
     requireValue(/^\/api\/v1\/worker\/[a-z0-9/_-]+$/.test(route), 'invalid_worker_route');
     validateBody(input);
     for (let attempt = 1; ; attempt++) {
       const started = this.sys.now();
       const controller = new AbortController();
-      const timer = this.net.setTimer(() => controller.abort(), 10_000);
+      const timer = this.net.setTimer(() => controller.abort(), timeoutMs);
       let requestId = this.sys.uuid();
       try {
         const response = await this.net.fetch(this.endpoint + route, { method, body: input, redirect: 'manual', signal: controller.signal, headers: { ...(this.credential ? { Authorization: 'Bearer ' + this.credential } : {}), Accept: 'application/json', ...(input === undefined ? {} : { 'Content-Type': 'application/json' }), 'X-Request-Id': requestId, 'X-Muse-Worker-Version': this.productVersion } });

@@ -77,6 +77,28 @@ type PullTiming struct {
 	PreviousPin string
 }
 
+type BusyCheck struct {
+	Version     int       `json:"protocol_version"`
+	ClaimID     string    `json:"claim_id"`
+	Generation  int64     `json:"generation"`
+	Checker     string    `json:"checker_job_id"`
+	Occurrence  string    `json:"checker_run_id"`
+	ScheduledAt time.Time `json:"scheduled_at"`
+	Reason      string    `json:"hold_reason,omitempty"`
+}
+
+type BusyPresence struct {
+	Occurrence  string    `json:"checker_run_id"`
+	ScheduledAt time.Time `json:"scheduled_at"`
+	ReceivedAt  time.Time `json:"received_at"`
+	Reason      string    `json:"hold_reason,omitempty"`
+}
+
+type PresenceReceipt struct {
+	Recorded   bool      `json:"recorded"`
+	ReceivedAt time.Time `json:"received_at"`
+}
+
 type WorkStart struct {
 	Version    int    `json:"protocol_version"`
 	ClaimID    string `json:"claim_id"`
@@ -216,6 +238,7 @@ type Job struct {
 	StartedAt            *time.Time     `json:"started_at,omitempty"`
 	LaunchID             string         `json:"launch_id,omitempty"`
 	NativeJob            string         `json:"native_job_id,omitempty"`
+	BusyPresence         *BusyPresence  `json:"busy_presence,omitempty"`
 	PinCheckAt           *time.Time     `json:"pin_check_at,omitempty"`
 	ReroutedFrom         string         `json:"rerouted_from,omitempty"`
 	Outcome              *WorkOutcome   `json:"work_outcome,omitempty"`
@@ -288,6 +311,8 @@ type Projection struct {
 	QualificationHistory []Qualification `json:"qualification_history"`
 	ModelReport          *ModelReport    `json:"model_report,omitempty"`
 	LastPollAt           *time.Time      `json:"last_poll_at"`
+	NativeContactAt      *time.Time      `json:"-"`
+	BusyReason           string          `json:"busy_reason,omitempty"`
 	Claim                *Grant          `json:"current_claim"`
 	ClaimAgeMS           *int64          `json:"claim_age_ms,omitempty"`
 	ClaimStage           string          `json:"claim_stage,omitempty"`

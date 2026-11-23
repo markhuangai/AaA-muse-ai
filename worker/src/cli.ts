@@ -7,7 +7,7 @@ import { Capture, Logger } from './diagnostics.js';
 import { Worker } from './worker.js';
 import { Failure, cause, requireValue } from './errors.js';
 import { encode, object, parse, identifier, type ObjectValue } from './json.js';
-import type { Network } from './transport.js';
+import { presenceTimeoutMs, type Network } from './transport.js';
 import { captureBootstrap, installationIO, type InstallationIO } from './install-io.js';
 import { Cron } from './cron.js';
 import { CronSetup } from './cron-setup.js';
@@ -23,6 +23,7 @@ export interface Adapters {
   env: Record<string, string | undefined>;
   home(): string;
   nodeVersion: string;
+  parentPid?: number;
   input(file: string): Promise<string>;
   stdout(line: string): void;
   stderr(line: string): void;
@@ -38,6 +39,7 @@ export function argumentsFor(args: string[]): { command: string; flags: Record<s
     'decision-submit': ['job-id', 'input'], 'diagnostics-export': ['operation-id', 'request-id', 'since', 'until', 'decode'],
     'cron-describe': ['goal-id'], 'cron-authorize-registration': ['input'], 'cron-confirm': ['input'], 'cron-check': ['input'], 'cron-observe': ['input'], 'cron-prepare': ['input'],
     'cron-start': ['launch-id', 'native-job-id'], 'cron-producer-intent': ['launch-id'], 'cron-producer': ['launch-id', 'producer-id', 'pid'],
+    'cron-producer-bind': ['launch-id', 'producer-id'],
   };
   requireValue(Object.hasOwn(allowed, command) || ['--help', '--version'].includes(command), 'unknown_command');
   for (let i = 1; i < args.length; i++) {
@@ -70,7 +72,7 @@ export async function execute(args: string[], io: Adapters): Promise<number> {
     await state.ensure();
     const metadata = await io.metadata();
     const logs = await state.child('diagnostics');
-    logger = new Logger(state, new Capture(logs), io.stderr, { package_version: VERSION, node_version: io.nodeVersion, protocol_version: 1, command, command_id: io.system.uuid(), ...metadata, setup_id: flags['setup-id'] as string, operation_id: flags['setup-id'] as string, effective_settings: { request_timeout_ms: 10_000, request_attempts: 3, capture_level: 'DEBUG', runtime_level: 'INFO', retention_days: 7, capture_max_bytes: 128 * 1024 * 1024, max_body_bytes: 1024 * 1024 } });
+    logger = new Logger(state, new Capture(logs), io.stderr, { package_version: VERSION, node_version: io.nodeVersion, protocol_version: 1, command, command_id: io.system.uuid(), ...metadata, setup_id: flags['setup-id'] as string, operation_id: flags['setup-id'] as string, effective_settings: { request_timeout_ms: 10_000, request_attempts: 3, presence_timeout_ms: presenceTimeoutMs, presence_attempts: 1, capture_level: 'DEBUG', runtime_level: 'INFO', retention_days: 7, capture_max_bytes: 128 * 1024 * 1024, max_body_bytes: 1024 * 1024 } });
     if (command === 'setup' && typeof flags.bootstrap === 'string') {
       requireValue(typeof flags['setup-id'] === 'string', 'setup_id_required');
       await captureBootstrap(logger, flags['setup-id'], await io.input(flags.bootstrap));
@@ -116,6 +118,9 @@ export async function execute(args: string[], io: Adapters): Promise<number> {
         break;
       case 'cron-producer':
         result = await cron.producer(identifier(flags['launch-id'] as string), identifier(flags['producer-id'] as string), Number(flags.pid));
+        break;
+      case 'cron-producer-bind':
+        result = await cron.producer(identifier(flags['launch-id'] as string), identifier(flags['producer-id'] as string), io.parentPid ?? 0, true);
         break;
       case 'configure':
         requireValue(typeof flags.origin === 'string', 'origin_required');
@@ -168,7 +173,7 @@ export async function main(args = process.argv.slice(2)): Promise<number> {
   process.once('SIGINT', stop); process.once('SIGTERM', stop);
   try {
     return await execute(args, {
-      files: fs, system, env: process.env, home: homedir, nodeVersion: process.version, signal: controller.signal,
+      files: fs, system, env: process.env, home: homedir, nodeVersion: process.version, parentPid: process.ppid, signal: controller.signal,
       stdout: line => { process.stdout.write(line); }, stderr: line => { process.stderr.write(line); },
       async metadata() { return object(parse(await fs.readFile(fileURLToPath(new URL('./build.json', import.meta.url)), 'utf8'))); },
       async input(file) {

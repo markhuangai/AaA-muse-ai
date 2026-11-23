@@ -391,6 +391,95 @@ func enrollNative(t *testing.T, handler *Handler) string {
 	return enrolled.Credential
 }
 
+func TestNativeBusyCheckProjectsContactWithoutChangingPollOrClaim(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	clock := func() time.Time { return now }
+	root := t.TempDir()
+	if err := os.Chmod(root, 0700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, "broker.sqlite3")
+	first, second := pullHTTPClock(t, path, clock), pullHTTPClock(t, path, clock)
+	key, foreign := enrollNative(t, first), enrollNative(t, first)
+	var enrolled workerView
+	nativeResponse(t, call(first, http.MethodGet, "/api/v1/worker/status", "Bearer "+key, nil), 200, &enrolled)
+	_, err := first.Broker.SubmitRequest(t.Context(), first.Logger, "client-a", "busy", inference.RequestInput{
+		Version: 1, SubmissionID: "busy-request", WorkerID: enrolled.ID, TimeoutSeconds: 1800,
+		Messages: []inference.Item{{Type: "message", Role: "user", Text: "long running fixture"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pulled inference.PullResult
+	pollAt := now
+	nativeResponse(t, nativePost(first, "/api/v1/worker/pull", key, inference.Pull{Version: 1, Sequence: 1, Checker: "checker",
+		Occurrence: "poll", ScheduledAt: now, EnteredAt: now}), 200, &pulled)
+	if pulled.Job == nil {
+		t.Fatal("fixture claim not acquired")
+	}
+	grant := *pulled.Job
+	route := "/api/v1/worker/jobs/" + grant.JobID + "/presence"
+	read := func(connection string, expectedContact time.Time, reason string) {
+		t.Helper()
+		var list struct{ Workers []workerView }
+		nativeResponse(t, call(second, http.MethodGet, "/api/v1/admin/workers", "Bearer "+testManagementKey, nil), 200, &list)
+		for _, view := range list.Workers {
+			if view.ID != enrolled.ID {
+				continue
+			}
+			if view.ConnectionStatus != connection || view.WorkStatus != "busy" || view.Claim == nil || view.Claim.ClaimID != grant.ClaimID ||
+				!view.Claim.DeadlineAt.Equal(grant.DeadlineAt) || view.LastPollAt == nil || !view.LastPollAt.Equal(pollAt) ||
+				view.LastContactAt == nil || !view.LastContactAt.Equal(expectedContact) || view.BusyReason != reason {
+				t.Fatalf("incorrect busy projection: %+v", view)
+			}
+			return
+		}
+		t.Fatal("worker omitted from projection")
+	}
+	now = pollAt.Add(10 * time.Minute)
+	read("offline", pollAt, "")
+	check := inference.BusyCheck{Version: 1, ClaimID: grant.ClaimID, Generation: grant.Generation, Checker: "checker",
+		Occurrence: "busy-one", ScheduledAt: now, Reason: "producer_launch_unobservable"}
+	var receipt inference.PresenceReceipt
+	nativeResponse(t, nativePostVersion(first, route, key, "1.0.0-rc.1", check), 200, &receipt)
+	checkedAt := now
+	if !receipt.Recorded || !receipt.ReceivedAt.Equal(checkedAt) {
+		t.Fatal("busy check was not recorded")
+	}
+	read("recent", checkedAt, check.Reason)
+	now = now.Add(time.Minute)
+	nativeResponse(t, nativePost(second, route, key, check), 200, &receipt)
+	if receipt.Recorded || !receipt.ReceivedAt.Equal(checkedAt) {
+		t.Fatal("duplicate busy check moved contact")
+	}
+	old := check
+	old.Occurrence, old.ScheduledAt = "older", checkedAt.Add(-time.Minute)
+	nativeResponse(t, nativePost(second, route, key, old), 200, &receipt)
+	if receipt.Recorded || !receipt.ReceivedAt.Equal(checkedAt) {
+		t.Fatal("older busy check moved contact")
+	}
+	next := check
+	next.Occurrence, next.ScheduledAt, next.Generation = "busy-two", now, grant.Generation+1
+	nativeResponse(t, nativePost(first, route, key, next), 409, nil)
+	next.Generation = grant.Generation
+	nativeResponse(t, nativePost(first, route, foreign, next), 409, nil)
+	nativeResponse(t, nativePost(first, route, testManagementKey, next), 401, nil)
+	nativeResponse(t, nativePost(first, route, "muse_worker_"+strings.Repeat("A", 43), next), 401, nil)
+	next.Reason = "unbounded worker text"
+	nativeResponse(t, nativePost(first, route, key, next), 400, nil)
+	read("quiet", checkedAt, check.Reason)
+	next.Reason = ""
+	nativeResponse(t, nativePost(second, route, key, next), 200, &receipt)
+	checkedAt = now
+	read("recent", checkedAt, "")
+	now = checkedAt.Add(10 * time.Minute)
+	read("offline", checkedAt, "")
+	if _, err := first.Workers.Revoke(t.Context(), first.Logger, enrolled.ID); err != nil {
+		t.Fatal(err)
+	}
+	nativeResponse(t, nativePost(second, route, key, next), 401, nil)
+}
+
 func TestNativePullAcrossSameHostBrokers(t *testing.T) {
 	root := t.TempDir()
 	if err := os.Chmod(root, 0700); err != nil {
@@ -656,6 +745,20 @@ func TestNativeSweepExpiresQueueAndReleasesUntouchedPinAcrossBrokers(t *testing.
 		ClaimID: claimed.ClaimID, Generation: claimed.Generation, LaunchID: start.LaunchID, NativeJob: start.NativeJob, NativeRun: "execution-old",
 		Reason: "execution_confirmed_stopped"}), 200, nil)
 
+	active, err := first.Broker.SubmitRequest(t.Context(), first.Logger, client, "unrelated", inference.RequestInput{
+		Version: 1, SubmissionID: "unrelated-turn", Messages: []inference.Item{firstMessage}, TimeoutSeconds: 1800,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tick.Sequence, tick.Occurrence = 2, "unrelated-pull"
+	now = now.Add(time.Second)
+	tick.ScheduledAt, tick.EnteredAt = now, now
+	nativeResponse(t, nativePost(first, "/api/v1/worker/pull", pinnedKey, tick), 200, &pull)
+	if pull.Job == nil || pull.Job.OperationID != active.ID {
+		t.Fatal("worker did not retain a separate, long-running claim")
+	}
+	busy := *pull.Job
 	now = now.Add(9 * time.Minute)
 	queued, err := first.Broker.SubmitRequest(t.Context(), first.Logger, client, "pin", inference.RequestInput{
 		Version: 1, SubmissionID: "next-turn", Messages: []inference.Item{firstMessage, {Type: "message", Role: "assistant", Text: previousAnswer.Text},
@@ -670,6 +773,9 @@ func TestNativeSweepExpiresQueueAndReleasesUntouchedPinAcrossBrokers(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
+	nativeResponse(t, nativePost(first, "/api/v1/worker/jobs/"+busy.JobID+"/presence", pinnedKey, inference.BusyCheck{
+		Version: 1, ClaimID: busy.ClaimID, Generation: busy.Generation, Checker: tick.Checker, Occurrence: "fresh-busy-check", ScheduledAt: now,
+	}), 200, nil)
 	now = now.Add(time.Minute)
 	var evidence bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&evidence, nil))
@@ -680,7 +786,7 @@ func TestNativeSweepExpiresQueueAndReleasesUntouchedPinAcrossBrokers(t *testing.
 		!bytes.Contains(evidence.Bytes(), []byte(`"msg":"dispatch.pin_released"`)) || !bytes.Contains(evidence.Bytes(), []byte(queued.ID)) {
 		t.Fatal("sweep did not commit expiry and untouched pin release without a pull")
 	}
-	tick.Checker, tick.Occurrence, tick.ScheduledAt, tick.EnteredAt = "checker-b", "tick-b", now, now
+	tick.Sequence, tick.Checker, tick.Occurrence, tick.ScheduledAt, tick.EnteredAt = 1, "checker-b", "tick-b", now, now
 	nativeResponse(t, nativePost(second, "/api/v1/worker/pull", nextKey, tick), 200, &pull)
 	if pull.Job == nil || pull.Job.OperationID != queued.ID {
 		t.Fatal("another worker could not claim the released continuation")

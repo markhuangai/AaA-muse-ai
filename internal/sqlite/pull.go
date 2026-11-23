@@ -75,21 +75,61 @@ func loadPullCandidate(ctx context.Context, tx *sql.Tx, candidate pollCandidate,
 	return loadHistory(ctx, tx, inference.Ref{}, state)
 }
 
+func nativeWorker(ctx context.Context, tx *sql.Tx, credential [32]byte) (id string, err error) {
+	var revoked *int64
+	err = tx.QueryRowContext(ctx, "SELECT id,revoked_at FROM aaa_workers WHERE credential_hash=?1", credential[:]).Scan(&id, &revoked)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", inference.Reject("invalid_worker_credential", 401)
+	}
+	if err == nil && revoked != nil {
+		err = inference.Reject("worker_revoked", 401)
+	}
+	return
+}
+
+func (r *Repository) RecordBusyPresence(ctx context.Context, credential [32]byte, jobID string, record func(*inference.Job, time.Time) (inference.PresenceReceipt, error)) (receipt inference.PresenceReceipt, workerID, operationID string, err error) {
+	err = r.write(ctx, func(tx *sql.Tx) error {
+		var err error
+		workerID, err = nativeWorker(ctx, tx, credential)
+		if err != nil {
+			return err
+		}
+		var raw []byte
+		err = tx.QueryRowContext(ctx, "SELECT data FROM aaa_inference_jobs WHERE id=?1 AND worker_id=?2 AND held", jobID, workerID).Scan(&raw)
+		if errors.Is(err, sql.ErrNoRows) {
+			return inference.Reject("stale_assignment", 409)
+		}
+		if err != nil {
+			return err
+		}
+		var job inference.Job
+		if err = decodeInference(raw, &job); err != nil {
+			return err
+		}
+		operationID = job.ExperimentID
+		receipt, err = record(&job, r.databaseTime())
+		if err != nil || !receipt.Recorded {
+			return err
+		}
+		raw, err = json.Marshal(&job)
+		if err != nil {
+			return err
+		}
+		_, err = tx.ExecContext(ctx, "UPDATE aaa_inference_jobs SET data=?2 WHERE id=?1", jobID, raw)
+		return err
+	})
+	return
+}
+
 func (r *Repository) WithinPull(ctx context.Context, credential [32]byte, input inference.Pull, hash string, capability int, claim func(*inference.State) (*inference.Grant, error)) (result inference.PullResult, workerID string, replayed bool, timing inference.PullTiming, err error) {
 	started, acquired := time.Now(), false
 	err = r.write(ctx, func(tx *sql.Tx) error {
 		timing.Acquire, acquired = time.Since(started), true
 		now := r.databaseTime()
-		var revoked *int64
-		err := tx.QueryRowContext(ctx, "SELECT id,revoked_at FROM aaa_workers WHERE credential_hash=?1", credential[:]).Scan(&workerID, &revoked)
-		if errors.Is(err, sql.ErrNoRows) {
-			return inference.Reject("invalid_worker_credential", 401)
-		}
+		var err error
+		workerID, err = nativeWorker(ctx, tx, credential)
 		if err != nil {
 			return err
-		}
-		if revoked != nil {
-			return inference.Reject("worker_revoked", 401)
 		}
 		var sequence, scheduled int64
 		var priorHash string

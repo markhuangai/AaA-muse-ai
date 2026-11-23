@@ -8,6 +8,7 @@ import shutil
 import subprocess
 
 from history import History
+from native_cron import utc_stamp
 from portal import Portal, source_identity
 from service import require
 from worker_tls import TLSFixture
@@ -38,6 +39,16 @@ class PortalWorkers(Portal, History):
         experiment = self.create(busy, "Controlled held assignment", tools=False, timeout=1800)
         job, _, _ = self.claim(busy, busy_peer, experiment)
         self.silence(busy, 605)
+        busy_view, _ = self.worker_projection(busy)
+        require(busy_view["connection_status"] == "offline" and busy_view["work_status"] == "busy", "controlled silent claim was not offline")
+        self.checked("/api/v1/worker/jobs/" + job["id"] + "/presence", busy["credential"], "POST", {
+            "protocol_version": 1, "claim_id": job["lease_id"], "generation": job["generation"],
+            "checker_job_id": "portal-checker", "checker_run_id": "portal-busy-check", "scheduled_at": utc_stamp(),
+            "hold_reason": "producer_launch_unobservable",
+        })
+        present, _ = self.worker_projection(busy)
+        require(present["connection_status"] == "recent" and present["last_poll_at"] == busy_view["last_poll_at"] and present["work_status"] == "busy",
+                "busy contact did not preserve the separate assignment and last poll")
         waiting = self.named_worker("Client-tool native cron")
         waiting_peer = self.pull_peer(waiting)
         request, _ = self.submit(self.input(waiting, timeout=1800), "portal-controlled-tool-wait")

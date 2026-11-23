@@ -8,7 +8,7 @@ import (
 )
 
 func (h *Handler) workerCompatibility(w *response, r *http.Request, logger *slog.Logger, route string) bool {
-	if route != "/api/v1/worker/enroll" && route != "/api/v1/worker/pull" && route != "/api/v1/worker/jobs/{id}/start" {
+	if route != "/api/v1/worker/enroll" && route != "/api/v1/worker/pull" && route != "/api/v1/worker/jobs/{id}/start" && route != workerPresenceRoute {
 		return true
 	}
 	build := h.Service.Build()
@@ -26,7 +26,7 @@ func (h *Handler) workerCompatibility(w *response, r *http.Request, logger *slog
 		return false
 	}
 	level := slog.LevelInfo
-	if route == "/api/v1/worker/pull" {
+	if route == "/api/v1/worker/pull" || route == workerPresenceRoute {
 		level = slog.LevelDebug
 	}
 	logger.Log(r.Context(), level, "worker.compatibility_accepted", "service_version", build.Version, "worker_version", version, "legacy_handshake", len(values) == 0)
