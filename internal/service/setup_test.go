@@ -42,14 +42,30 @@ func TestSetupPromptRequiresVerifiedNativeCheckerAndFiniteWork(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	before, after, ok := strings.Cut(result.Prompt, "```bash")
-	if !ok || !strings.Contains(before, "visible one-minute native agent cron and finite native agent runonce jobs owned by this goal") {
+	before, bootstrap, ok := strings.Cut(result.Prompt, "```bash\n")
+	if !ok {
+		t.Fatal("missing setup bootstrap")
+	}
+	if !strings.HasPrefix(before, "I authorize you to run the verified AaA worker launcher and finish setup in this goal during this turn.") {
+		t.Fatal("setup must start with the owner's same-turn authorization")
+	}
+	if !strings.Contains(before, "register or reuse one visible one-minute checker and verify the saved job") ||
+		!strings.Contains(before, "If Muse requires another approval, show me the specific request.") {
+		t.Fatal("missing scoped checker authorization and Muse approval instructions")
+	}
+	if !strings.Contains(before, "visible one-minute native agent cron and finite native agent runonce jobs owned by this goal") {
 		t.Fatal("missing pre-enrollment scheduler and permission check")
 	}
+	_, after, ok := strings.Cut(bootstrap, "```\n")
+	if !ok {
+		t.Fatal("missing post-bootstrap instructions")
+	}
 	for _, phrase := range []string{
+		"cron_registration: pending", "Continue with the enrolled worker in this turn",
 		`Reuse one exact enabled match by goal, name, every: "1m", execution.kind=agent and exact prompt`,
 		"cron-authorize-registration", "After a write or uncertain reply, reread the native jobs", "cron-confirm",
-		"Setup is incomplete until this read-back succeeds", "Do not process model work in this turn", "one finite native agent runonce",
+		"Setup is incomplete until this read-back succeeds", "When cron-confirm returns registered, report the checker job ID",
+		"Leave the first work check to the scheduler", "Do not process model work in this turn", "one finite native agent runonce",
 		"earliest supported absolute UTC due time inside the existing deadline", "VM-loss recovery without exact live observations",
 	} {
 		if !strings.Contains(after, phrase) {

@@ -164,11 +164,20 @@ class MCPMedia:
                     return view["status"] == "interrupted" and view.get("reason") == "deadline_exceeded"
 
                 self.until(expired, "queued media did not expire under its one-second deadline", timeout=10)
-                events = self.mcp_diagnostic("operation_id", identity, self.origin_url)
-                expiry = next((event for event in events if event["msg"] == "job.deadline_exceeded"), None)
-                require(expiry is not None and expiry["level"] == "ERROR" and expiry["reason"] == "deadline_exceeded" and
-                        expiry["deadline_at"] == deadline and expiry["busy_hold"] is False,
-                        "the protected export could not explain the queued deadline failure")
+
+                def expiry_captured():
+                    events = self.mcp_diagnostic("operation_id", identity, self.origin_url)
+                    events.extend(self.mcp_diagnostic("operation_id", identity, self.sibling_origin, allow_absent=True))
+                    expiry = next((event for event in events if event["msg"] == "job.deadline_exceeded"), None)
+                    if expiry is None:
+                        return False
+                    require(expiry["level"] == "ERROR" and expiry["reason"] == "deadline_exceeded" and
+                            expiry["deadline_at"] == deadline and expiry["busy_hold"] is False,
+                            "the protected expiry record did not explain the queued deadline failure")
+                    return True
+
+                # The committing broker records the event after the shared state becomes visible.
+                self.until(expiry_captured, "neither broker exported the queued media expiry", timeout=10)
             else:
                 self.cancel(identity)
         self.add("media.timeout_bounds_cross_transport_and_diagnostics")
@@ -248,10 +257,21 @@ class MCPMedia:
         finally:
             connection.close()
 
-    def mcp_diagnostic(self, selector, identity, origin):
+    def mcp_diagnostic(self, selector, identity, origin, *, allow_absent=False):
         status, _, body = self.api("/api/v1/admin/diagnostics/export?" + selector + "=" + identity, self.admin, origin=origin)
+        require(status == 200, "MCP diagnostic export unavailable")
+        if allow_absent:
+            records = body.splitlines()
+            if len(records) == 1:
+                metadata = json.loads(records[0])
+                captures = metadata.get("captures")
+                if (metadata.get("type") == "export" and metadata.get("complete") is False and
+                        type(captures) is int and captures == 0 and
+                        metadata.get("omissions") == ["requested_identity_not_captured_in_interval"]):
+                    self.assert_private(body.decode())
+                    return []
         metadata, events = self.decode_export(body)
-        require(status == 200 and metadata["complete"] and not metadata["omissions"], "incomplete MCP diagnostic capture")
+        require(metadata["complete"] and not metadata["omissions"], "incomplete MCP diagnostic capture")
         return events
 
     def mcp_rejection(self, request_id, name, cause, operation=None, owner=None):
