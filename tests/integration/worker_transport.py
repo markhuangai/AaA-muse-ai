@@ -33,12 +33,16 @@ class WorkerTransport(NativeCronFixture, Inference):
     def native_cli(self, worker, *command, input_text=None, want=0):
         state = worker["state"]
         state.mkdir(mode=0o700, exist_ok=True)
+        usage_mount = []
+        if "subscription_path" in worker:
+            usage_mount = ["--mount", "type=bind,source=" + str(worker["subscription_path"]) + ",target=/opt/subscription,readonly",
+                           "-e", "PATH=/opt/subscription:/usr/local/bin:/usr/bin:/bin"]
         identity = self.docker("create", "-i", "--label", LABEL + "=" + self.owner, "--network", "host", "--read-only",
                                "--user", str(os.getuid()) + ":" + str(os.getgid()), "-e", "HOME=/state",
                                "--mount", "type=bind,source=" + str(worker.get("package", self.package).resolve()) + ",target=/opt/worker,readonly",
                                "--mount", "type=bind,source=" + str(state.resolve()) + ",target=/state",
                                "--mount", "type=bind,source=" + str(self.proxy.cert) + ",target=/opt/ca.pem,readonly",
-                               "-e", "NODE_EXTRA_CA_CERTS=/opt/ca.pem", NODE_IMAGE,
+                               "-e", "NODE_EXTRA_CA_CERTS=/opt/ca.pem", *usage_mount, NODE_IMAGE,
                                "node", "/opt/worker/dist/main.js", command[0], "--state-dir", "/state", *command[1:]).stdout.strip()
         self.remember("containers", identity)
         result = self.docker("start", "-ai", identity, input_text=input_text, success=False, timeout=60)
@@ -88,6 +92,90 @@ class WorkerTransport(NativeCronFixture, Inference):
         require(not (legacy["state"] / "credential.key").exists(), "mixed major gained a worker credential")
         self.receipt("worker.archived_major_zero_rejected", archive_sha256=expected, new_authority=False)
         return enrollment
+
+    def weekly_usage_check(self, sibling):
+        worker = self.cli_worker("weekly-usage")
+        checker = (worker["state"] / "cron-installation.json").read_bytes()
+        directory = self.root.resolve() / "subscription-status-fixture"
+        directory.mkdir(mode=0o700)
+        worker["subscription_path"] = directory
+        command = directory / "subscription-status"
+
+        def status_script(lines):
+            command.write_text("#!/bin/sh\n" + lines)
+            command.chmod(0o700)
+
+        status_script("test \"$#\" = 1 && test \"$1\" = status || exit 1\nprintf '%s\\n' 'Usage: 33.25% of free weekly limit.' 'Additional tokens: 89% used (provider-private)'\n")
+        require(self.tick(worker)["outcome"] == "idle", "weekly allowance changed an idle check outcome")
+        before = self.worker_projection(worker)[0]
+        require(before["weekly_usage"]["used_percent"] == 33.25 and not before["weekly_usage"]["stale"], "broker did not receive the packed helper's reading")
+
+        job = self.create(worker, "Held native work during weekly check", tools=False)
+        grant = self.tick(worker)
+        require(grant["outcome"] == "prepare" and grant["job_id"] == job["current_job_id"], "work pickup with weekly usage failed")
+        claimed = self.worker_projection(worker)[0]
+        target = self.proxy.target
+        self.proxy.target = urlsplit(sibling)
+        try:
+            status_script("printf '%s\\n' 'Usage: 100% of free weekly limit.'\n")
+            busy = self.tick(worker)
+            after = self.worker_projection(worker, origin=sibling)[0]
+            require(busy["outcome"] == "prepare" and after["weekly_usage"]["used_percent"] == 100 and
+                    after["last_poll_at"] == claimed["last_poll_at"] and after["current_claim"] == claimed["current_claim"],
+                    "busy check failed to report usage separately from the work poll and claim")
+
+            status_script("trap '' TERM\nexec /bin/sleep 20\n")
+            start = datetime.now(timezone.utc)
+            degraded = self.tick(worker)
+            require(degraded["outcome"] == "prepare" and (datetime.now(timezone.utc) - start).total_seconds() < 12,
+                    "hanging status command blocked an existing busy check")
+            require(self.worker_projection(worker)[0]["weekly_usage"] == after["weekly_usage"], "failed status command refreshed a reading")
+        finally:
+            self.proxy.target = target
+        decoded = self.native_cli(worker, "diagnostics-export", "--decode")
+        envelope, *records = [json.loads(raw) for raw in decoded.splitlines()]
+        require(envelope["complete"] and not envelope["omissions"], "weekly usage worker export was incomplete")
+        reading = next(record for record in records if record.get("msg") == "cron.weekly_usage_read" and
+                       record["checker_run_id"] == busy["checker_run_id"])
+        warning = next(record for record in records if record.get("msg") == "cron.weekly_usage_unavailable" and
+                       record["reason"] == "subscription_status_timeout")
+        log = next(record for record in records if record.get("msg") == "worker.http_exchange" and
+                   record.get("checker_run_id") == warning["checker_run_id"] and record["route"].endswith("/presence"))
+        require(reading["weekly_usage"]["used_percent"] == 100 and reading["level"] == "DEBUG" and
+                warning["job_id"] == log["job_id"] == claimed["current_claim"]["job_id"] and warning["level"] == "WARN" and
+                log["http_status"] == 200 and warning["timeout_ms"] == 2000 and warning["worker_id"] == worker["worker"]["id"] and
+                "provider-private" not in decoded and (worker["state"] / "cron-installation.json").read_bytes() == checker,
+                "protected worker evidence did not explain the timed-out reading and successful check-in")
+        worker_id = worker["worker"]["id"]
+        identities = set()
+        for tick, origin, other in ((grant, self.origin_url, sibling), (busy, sibling, self.origin_url), (degraded, sibling, self.origin_url)):
+            occurrence = tick["checker_run_id"]
+            exchange, = [event for event in records if event["msg"] == "worker.http_exchange" and event.get("checker_run_id") == occurrence]
+            self.broker_evidence(other, "request_id", exchange["request_id"], absent=True)
+            broker = self.broker_evidence(origin, "request_id", exchange["request_id"])
+            outcome_name = "job.claimed" if tick is grant else "worker.presence_observed"
+            outcome, = [event for event in broker if event["msg"] == outcome_name]
+            identities.add(outcome["instance_id"])
+            require(exchange["http_status"] == 200 and outcome["checker_run_id"] == occurrence and
+                    outcome["worker_id"] == worker_id == exchange["worker_id"] and
+                    outcome["job_id"] == grant["job_id"] and outcome["operation_id"] == job["id"],
+                    "protected broker records did not join the packed checker to the same job")
+            reports = [event for event in broker if event["msg"] == "worker.weekly_usage_observed"]
+            if tick is degraded:
+                require(not reports and outcome["recorded"] and warning["checker_run_id"] == occurrence,
+                        "failed collection did not reach the same broker check-in without a report")
+                continue
+            report, = reports
+            sample = exchange["weekly_usage"]
+            require(report["weekly_usage"]["used_percent"] == sample["used_percent"] and report["reason"] == "recorded" and
+                    datetime.fromisoformat(report["weekly_usage"]["observed_at"]) == datetime.fromisoformat(sample["observed_at"]) and
+                    report["level"] == "DEBUG", "broker observation did not match the packed checker's normalized sample")
+            if tick is grant:
+                routing, = [event for event in broker if event["msg"] == "dispatch.weekly_usage_decision"]
+                require(routing["job_id"] == grant["job_id"] and routing["reason"] == "targeted_job" and
+                        routing["effective_usage"]["used_percent"] == sample["used_percent"], "broker did not log the claim's quota decision")
+        require(len(identities) == 2, "the usage and presence traces did not cover two brokers")
+        self.receipt("worker.weekly_usage", original_checker=True, busy_report=True, command_timeout=True, linked_private_diagnostics=True, brokers=2)
 
     def legacy_native_hold(self):
         version = "1.0.0-rc.1"
@@ -457,6 +545,7 @@ def main():
         harness.ambiguous_start(worker, committed=True)
         harness.cancel_before_start(worker)
         harness.expire_before_start(worker)
+        harness.weekly_usage_check(sibling_origin)
         harness.private("results.json", json.dumps({"suite": "worker-transport", "native_scheduler": "controlled", "transport": "loopback_https", "source_sha": args.source_sha, "package_sha256": harness.package_receipt["sha256"], "receipts": harness.receipts}))
     finally:
         if proxy:

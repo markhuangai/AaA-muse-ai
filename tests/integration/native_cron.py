@@ -1,3 +1,4 @@
+from base64 import urlsafe_b64encode
 from datetime import datetime, timedelta, timezone
 import json
 import time
@@ -7,6 +8,11 @@ from service import require
 
 def utc_stamp(value=None):
     return (value or datetime.now(timezone.utc)).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def usage_header(used_percent, observed_at):
+    reading = json.dumps({"used_percent": used_percent, "observed_at": observed_at, "reset_label": "Nov 29 at 7:49 AM EST"})
+    return {"X-Muse-Worker-Weekly-Usage": urlsafe_b64encode(reading.encode()).decode().rstrip("=")}
 
 
 class NativeCronFixture:

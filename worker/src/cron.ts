@@ -7,6 +7,7 @@ import { job as validateJob } from './protocol.js';
 import { Worker } from './worker.js';
 import type { CronUpdate } from './cron-update.js';
 import { presenceTimeoutMs } from './transport.js';
+import { readWeeklyUsage, weeklyUsageHeaders, weeklyUsageMaxBytes, weeklyUsageTimeoutMs } from './weekly-usage.js';
 
 const interval = 60_000;
 const pullAttemptWindow = 15_000;
@@ -77,7 +78,8 @@ export async function processIdentity(pid: number): Promise<ProcessIdentity | un
 }
 
 export class Cron {
-  constructor(readonly worker: Worker, readonly inspectProcess = processIdentity, readonly updater?: CronUpdate) {}
+  constructor(readonly worker: Worker, readonly inspectProcess = processIdentity, readonly updater?: CronUpdate,
+    readonly readUsage = readWeeklyUsage) {}
 
   get state() { return this.worker.state; }
   private async read(name: string): Promise<ObjectValue | undefined> { return this.worker.readRecord(this.state, name); }
@@ -86,6 +88,21 @@ export class Cron {
     const saved = await this.read('cron-installation.json');
     requireValue(saved, 'checker_registration_unverified');
     return saved;
+  }
+
+  private async weeklyUsage(details: ObjectValue): Promise<ObjectValue | undefined> {
+    const started = this.state.sys.now();
+    const report = await this.readUsage();
+    const observed = this.state.sys.now();
+    const context = { ...details, attempt: 1, duration_ms: observed - started, timeout_ms: weeklyUsageTimeoutMs,
+      output_limit_bytes: weeklyUsageMaxBytes };
+    if ('reason' in report) {
+      await this.worker.logger.log('WARN', 'cron.weekly_usage_unavailable', { ...context, reason: report.reason });
+      return;
+    }
+    const reading = { ...report.reading, observed_at: iso(observed) };
+    await this.worker.logger.log('DEBUG', 'cron.weekly_usage_read', { ...context, weekly_usage: reading });
+    return reading;
   }
 
   private correlation(claim: ObjectValue): ObjectValue {
@@ -202,13 +219,15 @@ export class Cron {
           return { outcome: 'coalesced', cause: 'pull_attempt_in_flight' } as const;
         }
         await this.save(tickFile, { ...prior, attempt, attempt_started_at: tick.entered_at });
-        return { outcome: 'pull', pending } as const;
+        return { outcome: 'pull', pending, usage: prior.weekly_usage ? object(prior.weekly_usage) : undefined } as const;
       }
       const sequence = (prior ? integer(prior.sequence) : 0) + 1;
       const pending: ObjectValue = { protocol_version: 1, sequence, checker_job_id: input.checker_job_id, checker_run_id: occurrence,
         scheduled_at: iso(scheduled), entered_at: iso(entered), media_jobs: true, prompt_wav: true };
-      await this.save(tickFile, { sequence, scheduled_at: pending.scheduled_at, attempt, attempt_started_at: tick.entered_at, pending });
-      return { outcome: 'pull', pending } as const;
+      const usage = await this.weeklyUsage({ ...tick, sequence });
+      await this.save(tickFile, { sequence, scheduled_at: pending.scheduled_at, attempt, attempt_started_at: tick.entered_at, pending,
+        ...(usage ? { weekly_usage: usage } : {}) });
+      return { outcome: 'pull', pending, usage } as const;
     });
     if (planned.outcome === 'update') return { ...tick, ...planned.recovered };
     if (planned.outcome === 'settle') return { ...tick, ...await this.settle(planned.active, object(planned.active.failure), occurrence) };
@@ -236,7 +255,9 @@ export class Cron {
       const transport = await this.worker.load();
       const { pending } = planned;
       const pull = { ...tick, sequence: pending.sequence, pull_run_id: pending.checker_run_id, pull_scheduled_at: pending.scheduled_at, pull_entered_at: pending.entered_at };
-      const reply = await transport.request('/api/v1/worker/pull', 'POST', encode(pending), pull, 1, undefined, await this.updater?.contactHeaders());
+      const reply = await transport.request('/api/v1/worker/pull', 'POST', encode(pending),
+        { ...pull, ...(planned.usage ? { weekly_usage: planned.usage } : {}) }, 1, undefined,
+        { ...await this.updater?.contactHeaders(), ...weeklyUsageHeaders(planned.usage) });
       return await this.state.withLock('cron', async () => {
         const stored = await this.read(tickFile);
         requireValue(stored?.attempt === attempt, 'poll_owner_changed');
@@ -261,7 +282,7 @@ export class Cron {
       await this.state.withLock('cron', async () => {
         const stored = await this.read(tickFile);
         if (stored?.attempt !== attempt) return;
-        await this.save(tickFile, { sequence: stored.sequence, scheduled_at: stored.scheduled_at, pending: object(stored.pending) });
+        await this.save(tickFile, { sequence: stored.sequence, scheduled_at: stored.scheduled_at, pending: object(stored.pending), weekly_usage: stored.weekly_usage });
       });
       throw error;
     }
@@ -274,7 +295,9 @@ export class Cron {
     const route = `/api/v1/worker/jobs/${identifier(claim.job_id)}/presence`;
     try {
       const transport = await this.worker.load();
-      const reply = await transport.request(route, 'POST', encode(input), details, 1, presenceTimeoutMs, await this.updater?.contactHeaders());
+      const usage = await this.weeklyUsage(details);
+      const reply = await transport.request(route, 'POST', encode(input), { ...details, ...(usage ? { weekly_usage: usage } : {}) }, 1, presenceTimeoutMs,
+        { ...await this.updater?.contactHeaders(), ...weeklyUsageHeaders(usage) });
       requireValue(typeof reply.data.recorded === 'boolean', 'invalid_presence_reply', { request_id: reply.requestId });
       time(reply.data.received_at);
       await this.worker.logger.log('DEBUG', 'cron.presence_observed', { ...details, request_id: reply.requestId, recorded: reply.data.recorded, received_at: reply.data.received_at });

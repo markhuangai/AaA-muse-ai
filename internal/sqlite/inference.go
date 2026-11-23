@@ -131,6 +131,12 @@ func (r *Repository) WithinInference(ctx context.Context, ref inference.Ref, app
 			if update.ObservedAt != nil || update.State != "" {
 				s.WorkerUpdate = &update
 			}
+			if ref.Principal == "management" {
+				s.WeeklyUsage, err = readWeeklyUsage(ctx, tx, s.WorkerID)
+				if err != nil {
+					return err
+				}
+			}
 		}
 		if err = loadInference(ctx, tx, ref, s); err != nil {
 			return err

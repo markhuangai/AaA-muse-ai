@@ -57,6 +57,8 @@ Keep `broker.sqlite3`, its WAL and its shared-memory sidecar together on a local
 
 Take this backup and stop every older broker before starting the first broker with automatic worker updates. That release applies migration 004. [Automatic worker updates](releases.md#automatic-worker-updates)
 
+The weekly allowance feature applies migration 005. Back up the state directory while all brokers are stopped, then upgrade every broker that shares it to the current release. Previous broker binaries require their original SQLite schema. Keep the backup for recovery.
+
 The queue maintains FIFO index entries for fixed, aligned ranges of job deadlines. A pull seeks only the head of each eligible range in priority order; neither expired nor live backlog expands the number of candidates inspected. Queue state and index membership change in the same SQLite transaction. Use the protected pull timing to separate scheduler entry delay, SQLite writer acquisition, and queue lookup.
 
 For the earlier PostgreSQL-to-SQLite migration, consult the [historical major-0 procedure](https://github.com/markhuangai/AaA-muse-ai/blob/7b772e5dc1771d3e8d4de178ffe61dc99d4c6939/docs/deployment.md#upgrade-existing-storage). It is not a major-1 migration procedure or authorization to retire an existing deployment.

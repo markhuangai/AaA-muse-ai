@@ -5,6 +5,12 @@ import type { WorkersController, WorkersView } from './worker-controller';
 export const timestamp = (value: string | null) => value ? new Date(value).toISOString().replace('T', ' ').replace(/\.\d+Z$/, ' UTC') : 'Not observed';
 const states: Record<string, string> = { recent: 'Recent contact', quiet: 'Quiet', offline: 'Offline', not_observed: 'Never seen', idle: 'Idle', busy: 'Busy', unknown: 'Unknown', pending_native_start: 'Pending native start', started: 'Execution started', terminal_receipt: 'Result accepted; awaiting settlement', recovery_pending: 'Recovery pending' };
 const stateName = (value: string) => states[value] ?? value;
+const percentage = (value: number) => value.toLocaleString('en-US', { maximumFractionDigits: 9 }) + '%';
+const weeklyAllowance = (worker: Worker, stale: boolean) => {
+  const usage = worker.weekly_usage;
+  if (!usage) return 'Unknown';
+  return usage.stale || stale ? 'Stale' : percentage(100 - usage.used_percent);
+};
 const busyReasons = new Map([
   ['native_observation_pending', 'Waiting for native run evidence'],
   ['result_delivery_active', 'Result delivery in progress'],
@@ -108,6 +114,15 @@ function WorkerDetail({ worker, controller, view }: { worker: Worker; controller
         <label htmlFor="worker-update-prompt">Paste into this worker’s Muse goal</label>
         <textarea id="worker-update-prompt" readOnly spellCheck={false} value={view.updatePrompt} rows={8} />
       </div>}
+      <h4>Weekly account usage</h4>
+      <dl className="identity-list">
+        <div><dt>Allowance remaining</dt><dd className="num">{weeklyAllowance(worker, view.stale)}</dd></div>
+        {worker.weekly_usage && <>
+          <div><dt>Used at last sample</dt><dd className="num">{percentage(worker.weekly_usage.used_percent)}</dd></div>
+          <div><dt>Sample time</dt><dd>{timestamp(worker.weekly_usage.observed_at)}</dd></div>
+          {worker.weekly_usage.reset_label && <div><dt>Muse reports reset</dt><dd>{worker.weekly_usage.reset_label}</dd></div>}
+        </>}
+      </dl>
       <h4>Reported by Muse during setup</h4>
       <dl className="identity-list">
         <div><dt>Model</dt><dd>{worker.model_report?.model_name ?? 'Not reported'}</dd></div>
@@ -193,7 +208,7 @@ export function Workers({ controller }: { controller: WorkersController }) {
     <section className="worker-list" aria-label="Registered workers" aria-busy={view.loading}>
       <p className="scope-note">Workers pull queued jobs on scheduled checks when their slots are free.</p>
       {view.workers === null ? <p className="empty-state">{view.loading ? 'Loading registered workers…' : 'Worker information is unavailable. Use Refresh workers to retry.'}</p> : view.workers.length === 0 ? <p className="empty-state">No workers have access. Use enrollment to add a worker.</p> :
-        <table className="workers-table"><thead><tr><th scope="col">Worker identity</th><th scope="col">Broker contact</th><th scope="col">Offline for</th><th scope="col">Broker activity</th></tr></thead><tbody>{view.workers.map(worker => <tr key={worker.id}>
+        <table className="workers-table"><thead><tr><th scope="col">Worker identity</th><th scope="col">Broker contact</th><th scope="col">Offline for</th><th scope="col" className="weekly-allowance">Weekly allowance remaining</th><th scope="col">Broker activity</th></tr></thead><tbody>{view.workers.map(worker => <tr key={worker.id}>
           <td><button className="worker-name" aria-haspopup="dialog" aria-disabled={!!view.pending} onClick={event => {
             if (view.pending) return;
             opener.current = event.currentTarget; controller.select(worker.id);
@@ -203,6 +218,10 @@ export function Workers({ controller }: { controller: WorkersController }) {
             <span className="offline-label" aria-hidden="true">Offline for</span>
             <span className="num">{worker.connection_status !== 'offline' || worker.offline_for_ms === undefined ? '-' :
               formatOfflineDuration(worker.offline_for_ms + (view.stale ? 0 : Math.max(0, view.offlineClock - worker.receivedAt)))}</span>
+          </td>
+          <td className="weekly-allowance">
+            <span className="allowance-label" aria-hidden="true">Weekly allowance remaining</span>
+            <span className="num">{weeklyAllowance(worker, view.stale)}</span>
           </td>
           <td>{stateName(worker.work_status)}
             {updateLabel(worker) && <span className="row-note">{updateLabel(worker)}</span>}

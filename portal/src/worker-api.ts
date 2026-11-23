@@ -4,6 +4,13 @@ interface ModelReport {
   reported_at: string;
 }
 
+interface WeeklyUsage {
+  used_percent: number;
+  observed_at: string;
+  reset_label?: string;
+  stale: boolean;
+}
+
 export interface WorkerUpdate {
   version?: string;
   contract?: string;
@@ -34,6 +41,7 @@ export interface Worker {
   claim_started_at?: string;
   model_report?: ModelReport;
   worker_update?: WorkerUpdate;
+  weekly_usage?: WeeklyUsage;
 }
 
 export interface Enrollment {
@@ -64,6 +72,12 @@ function isWorkerUpdate(value: unknown): value is WorkerUpdate {
     (value.target === undefined || (object(value.target) && typeof value.target.version === 'string'));
 }
 
+function isWeeklyUsage(value: unknown): value is WeeklyUsage {
+  return object(value) && typeof value.used_percent === 'number' && value.used_percent >= 0 && value.used_percent <= 100 &&
+    date(value.observed_at) && typeof value.stale === 'boolean' &&
+    (value.reset_label === undefined || typeof value.reset_label === 'string' && value.reset_label.length <= 48);
+}
+
 export function isWorker(value: unknown): value is Worker {
   return object(value) && typeof value.id === 'string' && /^[a-f0-9]{32}$/.test(value.id) && typeof value.name === 'string' &&
     date(value.registered_at) && optionalDate(value.revoked_at) && optionalDate(value.last_contact_at) &&
@@ -78,7 +92,8 @@ export function isWorker(value: unknown): value is Worker {
     (value.busy_reason === undefined || typeof value.busy_reason === 'string') &&
     (value.claim_started_at === undefined || date(value.claim_started_at)) &&
     (value.model_report === undefined || modelReport(value.model_report)) &&
-    (value.worker_update === undefined || isWorkerUpdate(value.worker_update));
+    (value.worker_update === undefined || isWorkerUpdate(value.worker_update)) &&
+    (value.weekly_usage === undefined || isWeeklyUsage(value.weekly_usage));
 }
 
 export function isEnrollment(value: unknown, kind: EnrollmentKind): value is Enrollment {

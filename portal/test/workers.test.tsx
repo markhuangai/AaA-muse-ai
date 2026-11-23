@@ -28,9 +28,11 @@ test('actual worker components show facts separately, text-safe names and the se
     current_job: { job_id: 'job-observed', generation: 2 }, waiting_for_client_tool: 1,
     current_claim: { job_id: 'job-observed', claim_id: 'observed-claim', claimed_at: '2026-11-18T00:00:00Z', deadline_at: '2026-11-18T00:05:00Z' },
     last_poll_at: '2026-11-18T00:00:00Z', claim_stage: 'pending_native_start',
+    weekly_usage: { used_percent: 33.25, observed_at: '2026-11-18T00:00:00Z', reset_label: 'Nov 29 at 7:49 AM EST', stale: false },
     model_report: { model_name: '<img src=x onerror=alert(2)>', context_window_tokens: 350000, reported_at: '2026-11-18T00:00:00Z' } },
   { ...worker('b'.repeat(32), 'New worker'), connection_status: 'not_observed', last_contact_at: null, last_poll_at: null, work_status: 'unknown' }], requestID: 'facts-request' });
   await controller.refresh(); render(<Workers controller={controller} />);
+  expect(screen.getByText('66.75%', { exact: true })).toBeTruthy();
   expect(screen.queryByRole('columnheader', { name: 'Qualification' })).toBeNull();
   expect(within(screen.getByRole('button', { name: 'New worker' }).closest('tr')!).getByText('Never seen')).toBeTruthy();
   await act(async () => { fireEvent.click(screen.getByRole('button', { name: '<img src=x onerror=alert(1)>' })); });

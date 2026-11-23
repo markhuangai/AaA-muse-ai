@@ -174,6 +174,10 @@ async function viewports() {
     await expect(row(fixture.workers.busy_id)).toContainText('Background process launch unverified');
     await expect(row(fixture.workers.waiting_id)).toContainText('1 client-tool waits');
     await expect(row(fixture.workers.transport_id)).toContainText('Idle');
+    await expect(row(fixture.workers.transport_id).locator('.weekly-allowance .num')).toHaveText('67%');
+    await expect(row(fixture.workers.offline_id).locator('.weekly-allowance .num')).toHaveText('Stale');
+    await expect(row(fixture.workers.never_id).locator('.weekly-allowance .num')).toHaveText('Unknown');
+    if (width === 390) await expect(row(fixture.workers.transport_id).locator('.allowance-label')).toBeVisible();
     await screenshot(page, 'list', width);
     await page.evaluate(() => scrollTo(0, 100));
     await row(fixture.workers.transport_id).getByRole('button').scrollIntoViewIfNeeded();
@@ -181,6 +185,9 @@ async function viewports() {
     expect(listScroll).toBeGreaterThan(0);
     await openWorker(page, fixture.workers.transport_id);
     await expect(page.getByRole('heading', { name: 'Reported by Muse during setup' })).toBeVisible();
+    await expect(page.getByText('Used at last sample', { exact: true }).locator('..')).toContainText('33%');
+    await expect(page.getByText('Sample time', { exact: true }).locator('..')).toContainText('UTC');
+    await expect(page.getByText('Muse reports reset', { exact: true }).locator('..')).toContainText('Nov 29 at 7:49 AM EST');
     await expect(page.getByText('Last work poll', { exact: true }).locator('..')).not.toContainText('Not reported');
     await page.keyboard.press('Escape');
     await expect(row(fixture.workers.transport_id).getByRole('button')).toBeFocused();

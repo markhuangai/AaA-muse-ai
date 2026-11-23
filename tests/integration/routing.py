@@ -264,6 +264,34 @@ class Routing(History):
                     peer.settle(claimed, "cancelled")
             self.receipt("routing.offline_" + boundary, full_history=True, controlled_peer=True)
 
+    def weekly_usage(self):
+        (_, peer_a), (_, peer_b) = self.new_pair()
+        for percent_a, percent_b, highest in ((80, 33, peer_b), (25, 91, peer_a)):
+            require(peer_a.poll_usage(percent_a, self.origins[0]) is None, "idle sample took a stray job")
+            require(peer_b.poll_usage(percent_b, self.origins[1]) is None, "idle sample took a stray job")
+            submitted, _ = self.submit(self.request_input(), "quota-" + str(percent_a))
+            first = peer_a if highest is peer_b else peer_b
+            first_index = int(first is peer_b)
+            highest_index = 1 - first_index
+            percentages = [percent_a, percent_b]
+            require(first.poll_usage(percentages[first_index], self.origins[first_index]) is None,
+                    "the first, lower-allowance poll claimed instead of waiting")
+            denied_id = first.pulls[-1]["request_id"]
+            grant = highest.poll_usage(percentages[highest_index], self.origins[highest_index])
+            require(grant is not None and grant["operation_id"] == submitted["id"], "the highest remaining allowance did not win")
+            selected = highest.worker
+            job, _, _ = highest.begin(grant, origin=self.origins[highest_index])
+            self.decision(selected, highest, job, {"type": "final", "text": "allowed worker finished"})
+            events = self.filtered_events("operation_id", submitted["id"])
+            deferred, = [event for event in events if event["msg"] == "dispatch.weekly_usage_deferred"]
+            claimed, = [event for event in events if event["msg"] == "job.claimed"]
+            require(deferred["request_id"] == denied_id and deferred["worker_id"] == first.worker["worker"]["id"] and
+                    deferred["preferred_worker_id"] == claimed["worker_id"] == selected["worker"]["id"] and
+                    deferred["job_id"] == claimed["job_id"] and deferred["instance_id"] != claimed["instance_id"] and
+                    deferred["preferred_used_percent"] == percentages[highest_index] and deferred["level"] == "DEBUG",
+                    "protected logs did not explain the cross-broker quota choice")
+        self.receipt("routing.weekly_allowance_two_brokers", lower_reporter_first=True, ranking_reversed=True, linked_protected_logs=True)
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -290,6 +318,7 @@ def main():
         h.session_races()
         h.adverse_diagnostics()
         h.offline_boundaries()
+        h.weekly_usage()
         h.private("results.json", json.dumps({"suite": "routing", "source": json.loads(source), "receipts": h.receipts, "synthetic_peer": True, "live_qualification": "not_established"}))
     finally:
         failures = []

@@ -34,11 +34,13 @@ test('management calls use the real adapter, immutable IDs and accepted backend 
 
 test('worker boundary validation rejects malformed facts, duplicate identities and mismatched action targets', async () => {
   const model_report = { model_name: 'Reported fixture', context_window_tokens: 350000, reported_at: '2026-11-18T00:00:00Z' };
+  const weekly_usage = { used_percent: 33.25, observed_at: model_report.reported_at, reset_label: 'Nov 29 at 7:49 AM EST', stale: false };
   const valid = { ...worker(), connection_status: 'offline', offline_for_ms: 0,
-    work_status: 'upgrading', current_job: null, qualification_history: [{ archived: true }], model_report };
+    work_status: 'upgrading', current_job: null, qualification_history: [{ archived: true }], model_report, weekly_usage };
   const good = new BrowserAPI((async () => json({ workers: [valid] })) as typeof fetch);
   expect((await good.workers('operation', signal())).value[0].work_status).toBe('upgrading');
   expect((await good.workers('operation', signal())).value[0].model_report).toEqual(model_report);
+  expect((await good.workers('operation', signal())).value[0].weekly_usage).toEqual(weekly_usage);
   expect((await good.workers('operation', signal())).value[0].offline_for_ms).toBe(0);
   for (const data of [null, {}, { workers: null }, { workers: [worker(), worker()] }, ...[
     { id: 'wrong' }, { name: 1 }, { registered_at: 'wrong' }, { revoked_at: 'wrong' }, { last_contact_at: undefined },
@@ -47,6 +49,9 @@ test('worker boundary validation rejects malformed facts, duplicate identities a
     { model_report: null }, { model_report: { ...model_report, reported_at: 'invalid' } },
     { model_report: { ...model_report, model_name: 1 } }, { model_report: { ...model_report, context_window_tokens: 0 } },
     { model_report: { reported_at: model_report.reported_at } },
+    { weekly_usage: null }, { weekly_usage: { ...weekly_usage, used_percent: -1 } }, { weekly_usage: { ...weekly_usage, used_percent: 101 } },
+    { weekly_usage: { ...weekly_usage, observed_at: 'invalid' } }, { weekly_usage: { ...weekly_usage, stale: 'yes' } },
+    { weekly_usage: { ...weekly_usage, reset_label: 'X'.repeat(49) } },
   ].map(patch => ({ workers: [{ ...worker(), ...patch }] }))]) {
     const api = new BrowserAPI((async () => json(data)) as typeof fetch);
     await expect(api.workers('operation', signal())).rejects.toMatchObject({ causeCode: 'invalid_response', requestID: 'worker-api-request' });

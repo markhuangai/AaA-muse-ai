@@ -65,6 +65,9 @@ func (b *Broker) BusyCheck(ctx context.Context, logger *slog.Logger, credential,
 		}
 	} else {
 		logger.Debug("worker.presence_observed", "received_at", receipt.ReceivedAt, "recorded", receipt.Recorded, "transaction_outcome", "committed")
+		if input.WeeklyUsage != nil {
+			logWeeklyUsage(logger, input.WeeklyUsage, receipt.ReceivedAt, receipt.UsageResult)
+		}
 	}
 	return receipt, workerID, err
 }
@@ -124,12 +127,26 @@ func (b *Broker) PullWork(ctx context.Context, logger *slog.Logger, credential s
 	if !replayed {
 		logUpdateDecision(ctx, logger, timing.Update, b.now().Sub(started))
 	}
+	if input.WeeklyUsage != nil {
+		logWeeklyUsage(logger, input.WeeklyUsage, b.now(), timing.UsageResult)
+	}
+	for _, deferment := range timing.UsageDeferrals {
+		logger.Debug("dispatch.weekly_usage_deferred", "operation_id", deferment.OperationID, "job_id", deferment.JobID,
+			"preferred_worker_id", deferment.PreferredWorker, "preferred_used_percent", deferment.PercentUsed,
+			"preferred_observed_at", deferment.ObservedAt, "preference_until", deferment.Until, "effective_usage", timing.EffectiveUsage)
+	}
 	if grant := result.Job; grant != nil {
 		logger = logger.With("operation_id", grant.OperationID, "job_id", grant.JobID, "claim_id", grant.ClaimID, "generation", grant.Generation)
+	}
+	if !replayed {
+		logger.Debug("dispatch.weekly_usage_decision", "reason", timing.UsageDecision, "effective_usage", timing.EffectiveUsage,
+			"freshness_ms", worker.WeeklyUsageFreshness.Milliseconds(), "preference_ms", time.Minute.Milliseconds(), "transaction_outcome", "committed")
+	}
+	if grant := result.Job; grant != nil {
 		logger.Info("job.claimed", "claimed_at", grant.ClaimedAt, "deadline_at", grant.DeadlineAt, "replayed", replayed)
 		if timing.PreviousPin != "" && timing.PreviousPin != workerID {
 			logger.Info("dispatch.reassigned", "expected_worker_id", timing.PreviousPin, "observed_worker_id", workerID,
-				"reason", "offline_before_claim_and_context", "context_delivery_started", false, "replayed", replayed)
+				"reason", timing.PreviousPinReason, "context_delivery_started", false, "replayed", replayed)
 		}
 	} else {
 		logger.Debug("worker.pull_empty", "replayed", replayed)
@@ -137,11 +154,32 @@ func (b *Broker) PullWork(ctx context.Context, logger *slog.Logger, credential s
 	return result, workerID, nil
 }
 
+func logWeeklyUsage(logger *slog.Logger, sample *worker.WeeklyUsage, received time.Time, result string) {
+	switch result {
+	case "": // An identical busy check resolves to its original receipt.
+		result = "presence_replayed"
+	case "observation_in_future", "observation_before_occurrence":
+		logger.Warn("worker.weekly_usage_rejected", "reason", result, "observed_at", sample.ObservedAt, "received_at", received)
+	}
+	logger.Debug("worker.weekly_usage_observed", "weekly_usage", sample, "age_ms", received.Sub(sample.ObservedAt).Milliseconds(),
+		"reason", result, "received_at", received, "freshness_ms", worker.WeeklyUsageFreshness.Milliseconds())
+}
+
 func (b *Broker) claimPulledJob(s *inference.State) (*inference.Grant, error) {
 	for _, job := range s.Jobs {
 		experiment := s.Experiments[job.ExperimentID]
-		if experiment == nil || experiment.State != "queued" || experiment.CurrentJobID != job.ID {
+		if experiment == nil || experiment.State != "queued" || experiment.CurrentJobID != job.ID ||
+			job.State != "queued" || job.ClaimedAt != nil || job.StartedAt != nil || job.Held {
 			return nil, errors.New("inconsistent_queued_job")
+		}
+		request := s.Requests[experiment.ID]
+		previousPinReason := inference.OfflinePinReason
+		if from := s.QuotaTransferFrom; from != "" {
+			if request == nil || request.State != "queued" || request.ContextDeliveryStarted != nil || job.WorkerID != from || experiment.WorkerID != from {
+				return nil, errors.New("inconsistent_quota_transfer")
+			}
+			job.ReroutedFrom = from
+			previousPinReason = inference.ExhaustedPinReason
 		}
 		claim, err := auth.ID(b.random)
 		if err != nil {
@@ -151,10 +189,10 @@ func (b *Broker) claimPulledJob(s *inference.State) (*inference.Grant, error) {
 		job.Generation++
 		job.LeaseID, job.ClaimedAt, job.PinCheckAt = claim, &s.Now, nil
 		experiment.WorkerID, experiment.State = s.WorkerID, "inference"
-		if request := s.Requests[experiment.ID]; request != nil {
+		if request != nil {
 			conversation := s.Conversations[request.ConversationID]
 			if conversation == nil || (conversation.WorkerID != "" && conversation.WorkerID != s.WorkerID &&
-				(conversation.WorkerID != job.ReroutedFrom || !request.ReassignAllowed || request.Input.WorkerID != "" || request.ContextDeliveryStarted != nil)) {
+				(conversation.WorkerID != job.ReroutedFrom || !movablePulledPin(s, request, conversation))) {
 				return nil, errors.New("inconsistent_queued_pin")
 			}
 			conversation.WorkerID, request.WorkerID, request.State = s.WorkerID, s.WorkerID, experiment.State
@@ -163,7 +201,7 @@ func (b *Broker) claimPulledJob(s *inference.State) (*inference.Grant, error) {
 				return nil, err
 			}
 			if job.ReroutedFrom != "" && job.ReroutedFrom != s.WorkerID {
-				details["expected_worker_id"], details["observed_worker_id"], details["reason"] = job.ReroutedFrom, s.WorkerID, "offline_before_claim_and_context"
+				details["expected_worker_id"], details["observed_worker_id"], details["reason"] = job.ReroutedFrom, s.WorkerID, previousPinReason
 				if err := addTimeline(conversation, s.Now, request.ID, "dispatch.reassigned", "INFO", details); err != nil {
 					return nil, err
 				}
@@ -172,6 +210,13 @@ func (b *Broker) claimPulledJob(s *inference.State) (*inference.Grant, error) {
 		return &inference.Grant{JobID: job.ID, OperationID: experiment.ID, ClaimID: claim, Generation: job.Generation, ClaimedAt: s.Now, DeadlineAt: job.DeadlineAt}, nil
 	}
 	return nil, errors.New("missing_pull_candidate")
+}
+
+func movablePulledPin(s *inference.State, request *inference.Request, conversation *inference.Conversation) bool {
+	if s.QuotaTransferFrom != "" {
+		return conversation.PendingCallID == ""
+	}
+	return request.ReassignAllowed && request.Input.WorkerID == "" && request.ContextDeliveryStarted == nil
 }
 
 func nativeClaim(job *inference.Job) bool {
@@ -210,7 +255,7 @@ func (b *Broker) checkQueuedPin(ctx context.Context, logger *slog.Logger, id str
 		}
 		replacement.ReroutedFrom = old.WorkerID
 		event(events, slog.LevelInfo, "dispatch.pin_released", s, replacement, "previous_worker_id", old.WorkerID,
-			"prior_job_id", id, "reason", "offline_before_claim_and_context", "last_contact_at", s.LastContactAt)
+			"prior_job_id", id, "reason", inference.OfflinePinReason, "last_contact_at", s.LastContactAt)
 		return nil, nil
 	})
 	return err
@@ -218,6 +263,9 @@ func (b *Broker) checkQueuedPin(ctx context.Context, logger *slog.Logger, id str
 
 func applyPullProjection(projection *inference.Projection, state *inference.State) {
 	projection.LastPollAt = state.LastPollAt
+	if state.WeeklyUsage != nil {
+		projection.WeeklyUsage = &worker.WeeklyUsageView{WeeklyUsage: *state.WeeklyUsage, Stale: !state.WeeklyUsage.Fresh(state.Now)}
+	}
 	job := heldJob(state)
 	contact := state.LastContactAt
 	if nativeClaim(job) && job.BusyPresence != nil && !state.Revoked {

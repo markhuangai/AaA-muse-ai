@@ -49,6 +49,8 @@ Before the first authenticated work poll, the drawer shows **Never seen**. After
 
 Archived model reports describe the original setup turn, not current worker availability or readiness. The broker applies its configured request limits.
 
+**Weekly allowance remaining** shows the last fresh percentage received from the worker. Its drawer shows the percentage used, UTC observation time and the reset label Muse supplied. Each percentage refers to that account’s plan. The broker marks readings stale after two minutes and shows Unknown if it has received none.
+
 Last service contact, last authenticated work poll, claim age, claim deadline and native start are separate observations. A busy checker reports contact for its existing claim, so **Recent contact** can appear alongside **Busy** and a last reported hold. The Workers page retains the last work poll while the slot is held. Busy check-ins use their own broker timestamp. Claim authorization, deadlines and pre-claim routing use the existing broker rules.
 
 `POST /api/v1/admin/setup-prompts` takes `{"origin":"https://host:8443"}` and creates a fifteen-minute single-use enrollment with pinned installation and native cron read-back instructions. The browser supplies its current HTTPS origin. Use `POST /api/v1/admin/enrollments` for code-only enrollment. Expiry, session end, and leaving Workers clear the current text and copy control. Clipboard denial leaves selectable text, and the broker enforces single use and expiry.

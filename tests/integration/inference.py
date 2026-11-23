@@ -12,6 +12,7 @@ import threading
 import time
 import urllib.parse
 
+from native_cron import usage_header
 from service import require
 from worker_auth import WorkerAuth
 
@@ -127,12 +128,12 @@ class PullPeer:
                 "checker_run_id": f"tick-{sequence}", "scheduled_at": stamp, "entered_at": stamp,
                 "media_jobs": media_jobs, "prompt_wav": prompt_wav}
 
-    def poll(self, origin=None, *, media_jobs=False, prompt_wav=False, payload=None):
+    def poll(self, origin=None, *, media_jobs=False, prompt_wav=False, payload=None, headers=None):
         require(self.active is None, "controlled peer attempted a work pull while busy")
         payload = payload or self.poll_input(media_jobs=media_jobs, prompt_wav=prompt_wav)
         sequence = payload["sequence"]
         started = time.monotonic()
-        value, headers = self.h.checked("/api/v1/worker/pull", self.worker["credential"], "POST", payload, origin=origin)
+        value, headers = self.h.checked("/api/v1/worker/pull", self.worker["credential"], "POST", payload, origin=origin, headers=headers)
         grant = value["job"]
         with self.condition:
             observed = time.monotonic()
@@ -143,6 +144,10 @@ class PullPeer:
                 self.active = grant["job_id"]
             self.condition.notify_all()
         return grant
+
+    def poll_usage(self, used_percent, origin=None):
+        payload = self.poll_input()
+        return self.poll(origin, payload=payload, headers=usage_header(used_percent, payload["scheduled_at"]))
 
     def begin(self, grant, origin=None):
         require(self.active == grant["job_id"], "controlled peer tried to start an unowned grant")
@@ -192,8 +197,8 @@ class Inference(WorkerAuth):
             time.sleep(0.1)
         raise AssertionError(message)
 
-    def checked(self, path, key=None, method="GET", data=None, want=200, origin=None):
-        status, headers, body = self.api(path, key, method, data, origin=origin)
+    def checked(self, path, key=None, method="GET", data=None, want=200, origin=None, headers=None):
+        status, headers, body = self.api(path, key, method, data, origin=origin, headers=headers)
         require(status == want, "unexpected HTTP status for " + method + " " + path + ": " + str(status))
         return json.loads(body), headers
 

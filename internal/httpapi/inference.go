@@ -93,6 +93,7 @@ func (h *Handler) inferenceRequest(w *response, r *http.Request, logger *slog.Lo
 				break
 			}
 			contact.Incompatible = !h.Service.Build().Compatible(contact.Version)
+			input.WeeklyUsage = readWeeklyUsage(r.Header, logger)
 			pulled, w.workerID, err = h.Broker.PullWork(r.Context(), logger, strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "), input, contact)
 			if err == nil {
 				writeJSON(w, code, pulled)
@@ -115,6 +116,7 @@ func (h *Handler) inferenceRequest(w *response, r *http.Request, logger *slog.Lo
 				err = contactErr
 				break
 			}
+			input.WeeklyUsage = readWeeklyUsage(r.Header, logger)
 			receipt, w.workerID, err = h.Broker.BusyCheck(r.Context(), logger, strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "), id, input, contact)
 			if err == nil {
 				writeJSON(w, code, receipt)
