@@ -167,7 +167,7 @@ class MCPMedia:
 
                 def expiry_captured():
                     events = self.mcp_diagnostic("operation_id", identity, self.origin_url)
-                    events.extend(self.mcp_diagnostic("operation_id", identity, self.sibling_origin))
+                    events.extend(self.mcp_diagnostic("operation_id", identity, self.sibling_origin, allow_absent=True))
                     expiry = next((event for event in events if event["msg"] == "job.deadline_exceeded"), None)
                     if expiry is None:
                         return False
@@ -257,10 +257,21 @@ class MCPMedia:
         finally:
             connection.close()
 
-    def mcp_diagnostic(self, selector, identity, origin):
+    def mcp_diagnostic(self, selector, identity, origin, *, allow_absent=False):
         status, _, body = self.api("/api/v1/admin/diagnostics/export?" + selector + "=" + identity, self.admin, origin=origin)
+        require(status == 200, "MCP diagnostic export unavailable")
+        if allow_absent:
+            records = body.splitlines()
+            if len(records) == 1:
+                metadata = json.loads(records[0])
+                captures = metadata.get("captures")
+                if (metadata.get("type") == "export" and metadata.get("complete") is False and
+                        type(captures) is int and captures == 0 and
+                        metadata.get("omissions") == ["requested_identity_not_captured_in_interval"]):
+                    self.assert_private(body.decode())
+                    return []
         metadata, events = self.decode_export(body)
-        require(status == 200 and metadata["complete"] and not metadata["omissions"], "incomplete MCP diagnostic capture")
+        require(metadata["complete"] and not metadata["omissions"], "incomplete MCP diagnostic capture")
         return events
 
     def mcp_rejection(self, request_id, name, cause, operation=None, owner=None):
