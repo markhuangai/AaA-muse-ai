@@ -19,7 +19,7 @@ const reply = data => new Response(JSON.stringify(data), { headers: { 'X-Muse-Se
 
 async function installed(t) {
   const f = await fixture(t);
-  await f.state.write('installation.json', encode({ command: "'/fixture/launcher'", worker_id: ID }));
+  await f.state.write('installation.json', encode({ command: "'/fixture/launcher'", launcher: '/fixture/launcher', worker_id: ID }));
   await f.state.write('config.json', encode({ protocol_version: 1, origin: 'https://broker.example.test', worker_id: ID }));
   await f.state.write('credential.key', KEY);
   const setup = new CronSetup(f.worker, {}, VERSION);
@@ -109,7 +109,7 @@ test('affirmative registration rejection rotates only the launch and an unstarte
   assert.equal(f.broker.calls.length, 2);
 });
 
-test('native lookup ambiguity and a surviving real producer hold a claim until exact interruption replay', async t => {
+test('a legacy producer holds the claim until its exact process stops and settlement replays', async t => {
   const f = await installed(t);
   let pulled = false;
   let loseInterrupt = true;
@@ -127,12 +127,18 @@ test('native lookup ambiguity and a surviving real producer hold a claim until e
       return reply(claimed({ connection_id: '', connection_generation: 0, native_job_id: workJob, launch_id: input.launch_id,
         lease_id: claimID, started_at: iso(f.state.sys.now()), deadline_at: grant.deadline_at }));
     }
+    if (path.endsWith('/presence')) {
+      return new Response('{"error":"not_found"}', { status: 404, headers: { 'X-Muse-Service-Version': '1.0.0-rc.1' } });
+    }
     assert.ok(path.endsWith('/interrupt'));
     if (loseInterrupt) { loseInterrupt = false; throw disconnect(); }
     return reply({ job_id: JOB, claim_id: claimID, state: 'interrupted' });
   };
   const initial = await f.cron.check(f.tick(1));
   assert.equal(initial.outcome, 'prepare');
+  const legacy = JSON.parse(await f.state.read('cron-claim.json'));
+  delete legacy.producer_mode;
+  await f.state.write('cron-claim.json', encode(legacy));
   const request = { claim_id: claimID, launch_id: initial.launch_id, due_at: iso(stamp + 5_000) };
   const registered = await f.cron.prepare(request);
   assert.equal(registered.outcome, 'register');
@@ -160,8 +166,9 @@ test('native lookup ambiguity and a surviving real producer hold a claim until e
   const stopped = once(child, 'exit');
   t.after(() => { if (child.exitCode === null && child.signalCode === null) child.kill(); });
   await once(child, 'spawn');
+  assert.equal((await f.observe(observed([status('failed')]))).cause, 'producer_launch_unobservable');
   f.advance(60_000);
-  assert.equal((await f.cron.check(f.tick(2))).outcome, 'running');
+  assert.equal((await f.cron.check(f.tick(2))).cause, 'producer_launch_unobservable');
   assert.equal((await f.cron.check(f.tick(2))).outcome, 'coalesced');
   assert.equal((await f.observe(observed([status('failed')]))).outcome, 'recovery_pending');
   await f.cron.producer(initial.launch_id, producer.producer_id, child.pid);
@@ -174,15 +181,57 @@ test('native lookup ambiguity and a surviving real producer hold a claim until e
   });
   assert.equal((await replaced.observe({ checker_job_id: occurrence.checker_job_id, checker_run_id: occurrence.checker_run_id,
     ...observed([status('failed')]) })).outcome, 'recovery_pending');
-  assert.equal(f.broker.calls.length, 2);
+  const presences = f.broker.calls.filter(call => call.path.endsWith('/presence'));
+  assert.equal(presences.length, 1);
+  assert.equal(presences[0].input.hold_reason, 'producer_launch_unobservable');
   child.kill();
   await stopped;
-  await assert.rejects(f.observe(observed([status('failed')])), /broker_unreachable/);
   f.advance(60_000);
-  assert.equal((await f.cron.check(f.tick(3))).outcome, 'settled');
+  await assert.rejects(f.cron.check(f.tick(3)), /broker_unreachable/);
+  f.advance(60_000);
+  assert.equal((await f.cron.check(f.tick(4))).outcome, 'settled');
   const attempts = f.broker.calls.filter(call => call.path.endsWith('/interrupt'));
   assert.equal(attempts.length, 2);
   assert.equal(attempts[0].options.body, attempts[1].options.body);
   f.advance(60_000);
-  assert.equal((await f.cron.check(f.tick(4))).outcome, 'idle');
+  assert.equal((await f.cron.check(f.tick(5))).outcome, 'idle');
+});
+
+test('settles only normalized execution evidence bound to the same native job and run', async t => {
+  const f = await installed(t);
+  const stamp = f.state.sys.now();
+  const grant = { job_id: JOB, operation_id: EXP, claim_id: claimID, generation: 1, claimed_at: iso(stamp), deadline_at: iso(stamp + 300_000) };
+  f.broker.override = ({ path, input }) => {
+    if (path.endsWith('/pull')) return reply({ job: grant });
+    if (path.endsWith('/presence')) return reply({ recorded: true, received_at: iso(f.state.sys.now()) });
+    if (path.endsWith('/start')) return reply(claimed({ native_job_id: workJob, launch_id: input.launch_id,
+      lease_id: claimID, started_at: iso(stamp), deadline_at: grant.deadline_at }));
+    assert.ok(path.endsWith('/interrupt'));
+    assert.equal(input.native_job_id, workJob);
+    assert.equal(input.native_run_id, run);
+    return reply({ job_id: JOB, claim_id: claimID, state: 'interrupted' });
+  };
+  const check = await f.cron.check(f.tick(1));
+  const scope = { claim_id: claimID, launch_id: check.launch_id };
+  const definition = (await f.cron.prepare({ ...scope, due_at: iso(stamp + 5000) })).work;
+  const match = { ...definition, native_job_id: workJob };
+  const record = (status, parent = workJob, id = run) => ({ native_job_id: parent, native_run_id: id, status });
+  const observe = (matches, execution) => f.observe({ ...scope, observed_at: iso(f.state.sys.now()), matches, execution });
+  assert.equal((await observe([], record('succeeded'))).cause, 'native_registration_unobservable');
+  assert.equal((await f.cron.start(check.launch_id, workJob)).outcome, 'authorized');
+  assert.equal((await observe([], record('succeeded'))).cause, 'native_registration_unobservable');
+  const reserved = await f.cron.producerIntent(check.launch_id);
+  assert.equal(reserved.mode, 'guarded');
+  await assert.rejects(f.cron.producer(check.launch_id, reserved.producer_id, process.pid), /producer_guard_required/);
+  assert.equal((await observe([{ ...match, status: 'running' }], record('running'))).outcome, 'running');
+  assert.equal((await observe([{ ...match, status: 'completed', execution: record('failed') }], record('succeeded'))).cause,
+    'native_execution_record_mismatch');
+  assert.equal((await observe([], record('succeeded', 'foreign-job'))).cause, 'native_registration_unobservable');
+  assert.equal((await observe([], record('succeeded', workJob, 'foreign-run'))).cause, 'native_registration_unobservable');
+  f.advance(60_000);
+  const later = await f.cron.check(f.tick(2));
+  assert.equal(later.history_lookup.native_run_id, run);
+  assert.equal((await observe([], record('succeeded'))).outcome, 'settled');
+  await assert.rejects(f.cron.producer(check.launch_id, reserved.producer_id, process.pid, true), /stale_native_launch/);
+  assert.equal(f.broker.calls.filter(call => call.path.endsWith('/interrupt')).length, 1);
 });

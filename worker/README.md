@@ -16,8 +16,8 @@ The installed launcher passes the correct state directory. Source builds can use
 | `cron-authorize-registration --input FILE` / `cron-confirm --input FILE` | Save the initial registration intent and then confirm the exact read-back. Use `-` for standard input. |
 | `cron-check --input FILE` / `cron-prepare --input FILE` | Process an actual occurrence; persist launch intent before registering a finite work job. |
 | `cron-start --launch-id ID --native-job-id ID` | Verify authority before showing the work brief. Do not do work on a rejected or uncertain start. |
-| `cron-producer-intent --launch-id ID` | Reserve a durable producer ID **before** starting any finite process that could survive the work agent. |
-| `cron-producer --launch-id ID --producer-id ID --pid PID` | Bind the exact process to its intent. An unobservable producer keeps the slot held. |
+| `cron-producer-intent --launch-id ID` | Reserve a producer only for a finite VM-local process that must outlive the work agent. Run the returned `producer_command` with the executable and its arguments. |
+| `cron-producer --launch-id ID --producer-id ID --pid PID` | Bind an exact PID using a work definition issued before the guarded wrapper. An unobservable legacy reservation keeps the slot held. |
 | `decision-submit --job-id ID --input FILE` / `media-finish --job-id ID` | Submit a validated decision or the original media bytes. Preserve the saved operation and file after a lost reply. |
 | `cron-observe --input FILE` | Reconcile the exact native job and execution after a real checker occurrence. |
 | `status` / `doctor` / `diagnostics-export` | Inspect broker observations or export protected evidence. |
@@ -28,9 +28,13 @@ A checker can finish while a one-time job is still queued or active. Use native 
 
 A check never retries a file upload while the original result helper is active. The helper records its process identity alongside the exact saved result. Once native work and its producers have stopped, recovery checks for an accepted media receipt before sending file bytes again. Unknown delivery identity keeps the hold.
 
+When Muse removes a one-shot definition, look up history scoped to the job identified by `history_lookup`. Pass `matches: []` and the exact `execution` containing `native_job_id`, `native_run_id` and `status`. The helper accepts terminal history for a previously matched job and run, including Muse’s `succeeded` status. A verified stop is durable across checker invocations. An accepted result stays held until the helper can account for its delivery process and producers.
+
+Foreground work has no producer reservation. For work that outlives the agent, the packaged wrapper records its own PID, boot ID and start time before replacing itself with the executable. An unused reservation from that guard expires when the helper verifies terminal execution. Older unbound intents keep the slot held. A native summary that says work ran in the foreground does not provide a process record.
+
 Use `diagnostics-export --state-dir /absolute/path --since RFC3339 --until RFC3339 --decode`. Join worker, checker occurrence, work job and execution, poll sequence, job/claim, producer, and receipt by their distinct identifiers. Join HTTP request IDs and operation IDs to the management-authenticated `/api/v1/admin/diagnostics/export` filters from every participating broker. Decode with `tools/qualification-evidence.mjs` and check omissions before interpreting the chronology. Keep raw exports and journal files private.
 
-In the [portal](../docs/portal.md#worker-management), Never seen means there is no authenticated poll. Quiet begins at one minute without authenticated contact, and Offline at ten minutes. A busy worker normally sends no pulls; neither badge shortens a claim deadline or proves work stopped.
+In the [portal](../docs/portal.md#worker-management), Never seen means there is no authenticated poll. Quiet begins at one minute without authenticated contact, and Offline at ten minutes. The busy checker reports contact for its held claim without pulling another job. Join `cron.presence_observed` or `cron.presence_unavailable` with the broker request ID. `cron.recovery_pending` gives the hold reason and producer ID when applicable. Use a time-window export to include early input refusals that lack an operation ID.
 
 ## Evidence limits
 

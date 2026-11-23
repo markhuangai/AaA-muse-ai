@@ -12,6 +12,8 @@ import (
 	"github.com/markhuangai/AaA-muse-ai/internal/inference"
 )
 
+const workerPresenceRoute = "/api/v1/worker/jobs/{id}/presence"
+
 func inferenceRoute(path string) (string, string) {
 	switch path {
 	case "/api/v1/admin/experiments", "/api/v1/worker/pull":
@@ -29,7 +31,7 @@ func inferenceRoute(path string) (string, string) {
 		if len(parts) == 1 && strings.Contains(prefix, "admin") {
 			return base, parts[0]
 		}
-		if len(parts) == 2 && ((strings.Contains(prefix, "admin") && (parts[1] == "cancel" || parts[1] == "tool-results")) || (strings.Contains(prefix, "worker") && (parts[1] == "decisions" || parts[1] == "start" || parts[1] == "interrupt"))) {
+		if len(parts) == 2 && ((strings.Contains(prefix, "admin") && (parts[1] == "cancel" || parts[1] == "tool-results")) || (strings.Contains(prefix, "worker") && (parts[1] == "decisions" || parts[1] == "start" || parts[1] == "interrupt" || parts[1] == "presence"))) {
 			return base + "/" + parts[1], parts[0]
 		}
 	}
@@ -95,6 +97,17 @@ func (h *Handler) inferenceRequest(w *response, r *http.Request, logger *slog.Lo
 		err = decodeInferenceInput(body, &input, "protocol_version", "claim_id", "generation", "launch_id", "native_job_id")
 		if err == nil {
 			result, err = h.Broker.StartWork(r.Context(), logger, identity.ID, id, input)
+		}
+	case workerPresenceRoute:
+		var input inference.BusyCheck
+		err = decodeInferenceInput(body, &input, "protocol_version", "claim_id", "generation", "checker_job_id", "checker_run_id", "scheduled_at")
+		if err == nil {
+			var receipt inference.PresenceReceipt
+			receipt, w.workerID, err = h.Broker.BusyCheck(r.Context(), logger, strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "), id, input)
+			if err == nil {
+				writeJSON(w, code, receipt)
+				return
+			}
 		}
 	case "/api/v1/worker/jobs/{id}/interrupt":
 		var input inference.Interruption

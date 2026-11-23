@@ -16,7 +16,67 @@ type pullRepository interface {
 	WithinPull(context.Context, [32]byte, inference.Pull, string, int, func(*inference.State) (*inference.Grant, error)) (inference.PullResult, string, bool, inference.PullTiming, error)
 }
 
+type presenceRepository interface {
+	RecordBusyPresence(context.Context, [32]byte, string, func(*inference.Job, time.Time) (inference.PresenceReceipt, error)) (inference.PresenceReceipt, string, string, error)
+}
+
 const nativeOfflineAfter = 10 * time.Minute
+
+func (b *Broker) BusyCheck(ctx context.Context, logger *slog.Logger, credential, jobID string, input inference.BusyCheck) (inference.PresenceReceipt, string, error) {
+	logger = logger.With("job_id", jobID, "claim_id", input.ClaimID, "generation", input.Generation, "checker_job_id", input.Checker,
+		"checker_run_id", input.Occurrence, "scheduled_at", input.ScheduledAt)
+	if !auth.ValidToken(credential, auth.WorkerPrefix) {
+		logger.Warn("worker.presence_rejected", "reason", "invalid_worker_credential")
+		return inference.PresenceReceipt{}, "", inference.Reject("invalid_worker_credential", 401)
+	}
+	if input.Version != inference.Version || input.Generation < 1 || !inference.Identifier.MatchString(input.ClaimID) ||
+		!inference.Identifier.MatchString(input.Checker) || !inference.Identifier.MatchString(input.Occurrence) || input.ScheduledAt.IsZero() || !validBusyReason(input.Reason) {
+		logger.Warn("worker.presence_rejected", "reason", "invalid_busy_check")
+		return inference.PresenceReceipt{}, "", inference.Reject("invalid_busy_check", 400)
+	}
+	repo, ok := b.repo.(presenceRepository)
+	if !ok {
+		logger.Error("worker.presence_failed", "reason", "presence_repository_unavailable")
+		return inference.PresenceReceipt{}, "", errors.New("presence_repository_unavailable")
+	}
+	started := b.now()
+	bounded, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	receipt, workerID, operationID, err := repo.RecordBusyPresence(bounded, auth.Digest(credential), jobID,
+		func(job *inference.Job, now time.Time) (inference.PresenceReceipt, error) {
+			if !claimMatches(job, input.ClaimID, input.Generation) || !job.Held {
+				return inference.PresenceReceipt{}, inference.Reject("stale_assignment", 409)
+			}
+			if previous := job.BusyPresence; previous != nil && (input.Occurrence == previous.Occurrence || !input.ScheduledAt.After(previous.ScheduledAt)) {
+				return inference.PresenceReceipt{ReceivedAt: previous.ReceivedAt}, nil
+			}
+			job.BusyPresence = &inference.BusyPresence{Occurrence: input.Occurrence, ScheduledAt: input.ScheduledAt, ReceivedAt: now, Reason: input.Reason}
+			return inference.PresenceReceipt{Recorded: true, ReceivedAt: now}, nil
+		})
+	logger = logger.With("worker_id", workerID, "operation_id", operationID, "hold_reason", input.Reason, "attempt", 1, "duration_ms", b.now().Sub(started).Milliseconds())
+	if err != nil {
+		var rejected *inference.Rejection
+		if errors.As(err, &rejected) {
+			logger.Warn("worker.presence_rejected", "reason", rejected.Reason)
+		} else {
+			failure := sqlite.Classify(err)
+			logger.Error("worker.presence_failed", "reason", failure.Reason, "phase", failure.Phase, "sqlite_code", failure.Code, "transaction_outcome", failure.Outcome)
+		}
+	} else {
+		logger.Debug("worker.presence_observed", "received_at", receipt.ReceivedAt, "recorded", receipt.Recorded, "transaction_outcome", "committed")
+	}
+	return receipt, workerID, err
+}
+
+func validBusyReason(reason string) bool {
+	switch reason {
+	case "", "native_observation_pending", "result_delivery_active", "result_delivery_unobservable",
+		"producer_launch_unobservable", "producer_still_active_or_unobservable":
+		return true
+	default:
+		return false
+	}
+}
 
 func (b *Broker) PullWork(ctx context.Context, logger *slog.Logger, credential string, input inference.Pull) (inference.PullResult, string, error) {
 	if !auth.ValidToken(credential, auth.WorkerPrefix) {
@@ -154,8 +214,18 @@ func (b *Broker) checkQueuedPin(ctx context.Context, logger *slog.Logger, id str
 
 func applyPullProjection(projection *inference.Projection, state *inference.State) {
 	projection.LastPollAt = state.LastPollAt
-	if state.LastPollAt != nil && state.LastContactAt != nil && !state.Revoked {
-		elapsed := state.Now.Sub(*state.LastContactAt)
+	job := heldJob(state)
+	contact := state.LastContactAt
+	if nativeClaim(job) && job.BusyPresence != nil && !state.Revoked {
+		if contact == nil || job.BusyPresence.ReceivedAt.After(*contact) {
+			contact = &job.BusyPresence.ReceivedAt
+		}
+		projection.BusyReason = job.BusyPresence.Reason
+	}
+	if state.LastPollAt != nil && contact != nil && !state.Revoked {
+		projection.NativeContactAt = contact
+		projection.OfflineForMS = nil
+		elapsed := state.Now.Sub(*contact)
 		switch {
 		case elapsed >= nativeOfflineAfter:
 			projection.ConnectionStatus = "offline"
@@ -168,7 +238,7 @@ func applyPullProjection(projection *inference.Projection, state *inference.Stat
 		}
 		projection.WorkStatus = "idle"
 	}
-	if job := heldJob(state); nativeClaim(job) {
+	if nativeClaim(job) {
 		projection.WorkStatus = "busy"
 		projection.Claim = &inference.Grant{JobID: job.ID, OperationID: job.ExperimentID, ClaimID: job.LeaseID, Generation: job.Generation, ClaimedAt: *job.ClaimedAt, DeadlineAt: job.DeadlineAt}
 		age := max(0, state.Now.Sub(*job.ClaimedAt).Milliseconds())

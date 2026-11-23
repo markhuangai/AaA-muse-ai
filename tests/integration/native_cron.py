@@ -51,7 +51,7 @@ class NativeCronFixture:
         worker["work"] = {"definition": work, "due": due, "grant": grant}
         return work
 
-    def observe(self, worker, status, *, want=0, matches=None, run=True, never_started=False):
+    def observe(self, worker, status, *, want=0, matches=None, run=True, never_started=False, execution=None):
         work = worker["work"]
         grant = work["grant"]
         match = {**work["definition"], "status": status}
@@ -61,9 +61,10 @@ class NativeCronFixture:
         if never_started:
             match["execution_never_started"] = True
         tick = worker["last_tick"]
+        evidence = {"execution": execution} if execution is not None else {}
         return self.cron_json(worker, "cron-observe", {"claim_id": grant["claim_id"], "launch_id": grant["launch_id"],
             "checker_job_id": tick["checker_job_id"], "checker_run_id": tick["checker_run_id"],
-            "observed_at": utc_stamp(), "matches": [match] if matches is None else matches}, want)
+            "observed_at": utc_stamp(), "matches": [match] if matches is None else matches, **evidence}, want)
 
     def start_work(self, worker, *, want=0):
         work = worker["work"]

@@ -169,6 +169,8 @@ async function viewports() {
     await expect(row(fixture.workers.quiet_id)).toContainText('Quiet');
     await expect(page.getByRole('columnheader', { name: 'Qualification' })).toHaveCount(0);
     await expect(row(fixture.workers.busy_id)).toContainText('Busy');
+    await expect(row(fixture.workers.busy_id).getByText(/^(Recent contact|Quiet)$/)).toBeVisible();
+    await expect(row(fixture.workers.busy_id)).toContainText('Background process launch unverified');
     await expect(row(fixture.workers.waiting_id)).toContainText('1 client-tool waits');
     await expect(row(fixture.workers.transport_id)).toContainText('Idle');
     await screenshot(page, 'list', width);
@@ -186,6 +188,7 @@ async function viewports() {
     await verifyDrawerDismissal(page, row(fixture.workers.transport_id).getByRole('button'), width, listScroll);
     await openWorker(page, fixture.workers.busy_id);
     await expect(page.getByText(fixture.workers.busy_job_id, { exact: true })).toBeVisible();
+    await expect(page.getByText('Last reported hold', { exact: true })).toBeVisible();
     await expect(page.getByText('Execution started', { exact: true })).toBeVisible();
     await expect(page.getByText('Deadline', { exact: true })).toBeVisible();
     await expect(page.getByRole('heading', { name: 'Inference qualification' })).toHaveCount(0);

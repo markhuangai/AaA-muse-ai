@@ -8,7 +8,7 @@ function packaging(t, change = {}) {
   const f = fixture(t);
   const source = { source_sha: 'a'.repeat(40), source_dirty: false, package_version: '1.0.0-dev.0', ...change.build };
   const metadata = { name: '@markhuangai/aaa-muse-worker', version: '1.0.0-dev.0', ...change.metadata };
-  const assets = ['install.sh', 'private-directory.sh', 'SKILL.md'];
+  const assets = ['install.sh', 'private-directory.sh', 'producer.sh', 'SKILL.md'];
   for (const asset of assets) f.write('worker/setup/' + asset, 'package fixture');
   for (const [path, raw] of Object.entries({ 'worker/package.json': JSON.stringify(metadata), 'worker/dist/build.json': JSON.stringify(source), 'worker/dist/main.js': 'compiled-worker', 'worker/LICENSE': 'Apache-2.0', 'worker/README.md': 'worker' })) f.write(path, raw);
   const calls = [];
@@ -54,7 +54,7 @@ test('packaging rejects malformed package, required files, runtime behavior and 
     { metadata: { dependencies: { unexpected: '1' } } },
     { build: { package_version: '0.1.0-rc.19' } },
     { metadata: { version: '0.1.0' } },
-    { result: { files: ['dist/main.js', 'dist/build.json', 'setup/install.sh', 'setup/private-directory.sh', 'setup/SKILL.md', 'setup/hook.sh'].map(path => ({ path })) } },
+    { result: { files: ['dist/main.js', 'dist/build.json', 'setup/install.sh', 'setup/private-directory.sh', 'setup/producer.sh', 'setup/SKILL.md', 'setup/hook.sh'].map(path => ({ path })) } },
     { result: { files: [{ path: 'outside.js' }] } },
     { result: { files: [] } }, { result: { files: [{ path: 'dist/main.js' }] } },
     { result: { files: [{ path: 'dist/main.js' }, { path: 'dist/build.json' }] } },

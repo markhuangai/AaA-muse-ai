@@ -48,8 +48,10 @@ class WorkerTransport(NativeCronFixture, Inference):
         require(self.inspect(identity)["State"]["ExitCode"] == want, "worker command failed: " + command[0] + "; see private receipts")
         return result.stdout
 
-    def cli_worker(self, suffix, registration=None):
+    def cli_worker(self, suffix, registration=None, package=None):
         worker = {"state": self.root.resolve() / ("worker-" + suffix)}
+        if package:
+            worker["package"] = package
         enrollment = registration or self.issue()
         args = ("setup", "--origin", self.proxy.origin, "--code-stdin", "--install-dir", "/state/install",
                 "--setup-id", enrollment["enrollment_id"])
@@ -86,6 +88,70 @@ class WorkerTransport(NativeCronFixture, Inference):
         require(not (legacy["state"] / "credential.key").exists(), "mixed major gained a worker credential")
         self.receipt("worker.archived_major_zero_rejected", archive_sha256=expected, new_authority=False)
         return enrollment
+
+    def legacy_native_hold(self):
+        version = "1.0.0-rc.1"
+        archive_name = "markhuangai-aaa-muse-worker-" + version + ".tgz"
+        url = "https://github.com/markhuangai/AaA-muse-ai/releases/download/v" + version + "/" + archive_name
+        with urllib.request.urlopen(url, timeout=120) as response:
+            archive = response.read(1024 * 1024)
+        digest = "2f2d1051d541dcc32c0a882727b8e8844125fdc5249f88e1bdd912905dd3595b"
+        require(hashlib.sha256(archive).hexdigest() == digest, "reported-release fixture differs from the published archive")
+        source = "d0956a0dbea074e848790fc9ae007802c9e1746a"
+        directory = self.root.resolve() / "legacy-native-release"
+        directory.mkdir(mode=0o700)
+        with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as package:
+            require(all(item.name.startswith("package/") and (item.isfile() or item.isdir()) and ".." not in Path(item.name).parts
+                        for item in package.getmembers()), "legacy native archive paths unsafe")
+            package.extractall(directory, filter="data")
+        build = json.loads((directory / "package/dist/build.json").read_text())
+        require(build["source_sha"] == source and build["package_version"] == version and not build["source_dirty"], "legacy native artifact provenance differs")
+        worker = self.cli_worker("legacy-native", package=directory / "package")
+        checker = (worker["state"] / "cron-installation.json").read_bytes()
+        experiment = self.create(worker, "accepted reply with an unused legacy reservation", tools=False)
+        job_id = experiment["current_job_id"]
+        grant = self.claim_work(worker, job_id)
+        self.start_work(worker)
+        launch = grant["launch_id"]
+        intent = json.loads(self.native_cli(worker, "cron-producer-intent", "--launch-id", launch))
+        native = worker["work"]["definition"]
+        parent, execution = native["native_job_id"], "controlled-execution-" + job_id
+        require(self.observe(worker, "running")["outcome"] == "running", "legacy helper did not bind the real execution fixture")
+        require(self.submit_cli(worker, job_id, {"type": "final", "text": "already accepted"})["outcome"] == "accepted", "legacy worker could not deliver to newer 1.x broker")
+        claimed = self.worker_projection(worker)[0]
+        require(self.tick(worker)["outcome"] == "running" and self.worker_projection(worker)[0]["last_contact_at"] == claimed["last_contact_at"],
+                "legacy checker unexpectedly contacted the newer broker while busy")
+        before = utc_stamp()
+        worker.pop("package")
+        active = self.tick(worker)
+        require(active["history_lookup"]["native_job_id"] == parent and active["history_lookup"]["native_run_id"] == execution and
+                active["lookup"] == {key: value for key, value in native.items() if key != "native_job_id"} and
+                (worker["state"] / "cron-installation.json").read_bytes() == checker, "new helper changed the archived checker or work definition")
+        evidence = {"native_job_id": parent, "native_run_id": execution, "status": "succeeded"}
+        completed = {**native, "status": "completed"}
+        require(self.observe(worker, "completed", matches=[completed], execution=evidence)["cause"] == "producer_launch_unobservable",
+                "rc.1 execution shape did not reach the separate legacy producer guard")
+        held = self.tick(worker)
+        require(held["cause"] == "producer_launch_unobservable" and held["producer_id"] == intent["producer_id"] and held["lookup"] is None,
+                "restart did not preserve the terminal proof and unresolved legacy intent")
+        view = self.worker_projection(worker)[0]
+        require(view["last_poll_at"] == claimed["last_poll_at"] and view["last_contact_at"] > claimed["last_contact_at"] and
+                view["work_status"] == "busy" and view["claim_stage"] == "terminal_receipt" and view["busy_reason"] == held["cause"],
+                "busy contact and accepted receipt were not independently visible")
+        after = utc_stamp()
+        observed = [event for event in self.decoded(worker, since=before, until=after) if event.get("operation_id") == experiment["id"]]
+        pending = next(event for event in observed if event["msg"] == "cron.recovery_pending")
+        terminal = next(event for event in observed if event["msg"] == "cron.native_observation" and event["outcome"] == "confirmed_stopped")
+        require(pending["level"] == "WARN" and pending["producer_id"] == intent["producer_id"] and terminal["level"] == "INFO" and
+                terminal["native_run_id"] == execution and terminal["evidence_source"] == "definition_and_execution", "worker logs cannot identify the hold")
+        contact = [event for event in observed if event["msg"] == "cron.presence_observed" and event["hold_reason"] == held["cause"]]
+        require(len(contact) == 1 and contact[0]["level"] == "DEBUG", "worker did not make exactly one busy check-in for the retained hold")
+        broker = self.broker_evidence(self.origin_url, "request_id", contact[0]["request_id"])
+        accepted = next(event for event in broker if event["msg"] == "worker.presence_observed")
+        require(accepted["checker_run_id"] == held["checker_run_id"] and accepted["worker_id"] == worker["worker"]["id"] and
+                accepted["claim_id"] == grant["claim_id"] and accepted["hold_reason"] == held["cause"] and accepted["recorded"],
+                "broker evidence cannot reconstruct the held claim check-in")
+        self.receipt("worker.legacy_native_hold_with_busy_presence", archived_sha256=digest, accepted=True, held=True, protected_evidence=True)
 
     def decoded(self, worker, operation=None, since=None, until=None):
         args = ["diagnostics-export"]
@@ -346,11 +412,11 @@ class WorkerTransport(NativeCronFixture, Inference):
         self.receipt("worker.late_start_after_cancellation", exposed_brief=False, slot_released_after_native_stop=True)
 
     def expire_before_start(self, worker):
-        experiment = self.create(worker, "deadline passes before native work begins", tools=False, timeout=7)
+        experiment = self.create(worker, "deadline passes before native work begins", tools=False, timeout=20)
         job_id = experiment["current_job_id"]
         grant = self.claim_work(worker, job_id)
         expires = datetime.fromisoformat(grant["deadline_at"].replace("Z", "+00:00"))
-        self.until(lambda: datetime.now(timezone.utc) >= expires, "original deadline was not reached", timeout=12)
+        self.until(lambda: datetime.now(timezone.utc) >= expires, "original deadline was not reached", timeout=25)
         self.start_work(worker, want=1)
         require(self.status(worker)["work_status"] == "busy" and self.observe(worker, "failed")["outcome"] == "settled",
                 "expired start released the slot without confirming the native stop")
@@ -384,6 +450,7 @@ def main():
         harness.exact_pull(worker)
         harness.joined_pull_diagnosis(sibling_origin)
         harness.finite_tool_loop(worker)
+        harness.legacy_native_hold()
         harness.start_before_registration_reply(worker)
         harness.invalid_saved_result(worker)
         harness.ambiguous_start(worker, committed=False)

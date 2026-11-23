@@ -1,9 +1,11 @@
 import { readFile } from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
 import { Failure, cause, requireValue } from './errors.js';
 import { decision, encode, identifier, integer, object, text, type ObjectValue, type Value } from './json.js';
 import { prepareMedia, finishMedia } from './media.js';
 import { job as validateJob } from './protocol.js';
 import { Worker } from './worker.js';
+import { presenceTimeoutMs } from './transport.js';
 
 const interval = 60_000;
 const pullAttemptWindow = 15_000;
@@ -12,6 +14,9 @@ const tickFile = 'cron-tick.json';
 const occurrenceFile = 'cron-occurrence.json';
 const claimFile = 'cron-claim.json';
 const terminalNativeStates = ['completed', 'failed', 'cancelled'];
+const nativeStates = ['queued', 'running', 'unobservable', ...terminalNativeStates];
+const guardedProducerMode = 'guarded';
+const producerWrapper = fileURLToPath(new URL('../setup/producer.sh', import.meta.url));
 
 function time(value: Value | undefined): number {
   const date = text(value);
@@ -22,6 +27,18 @@ function time(value: Value | undefined): number {
 function iso(value: number): string { return new Date(value).toISOString(); }
 
 function shell(value: string): string { return "'" + value.replaceAll("'", "'\\''") + "'"; }
+
+function nativeStatus(value: Value | undefined): string {
+  const status = text(value);
+  if (status === 'succeeded') return 'completed';
+  requireValue(nativeStates.includes(status), 'invalid_native_status');
+  return status;
+}
+
+function nativeExecution(value: Value): { job: string; run: string; status: string } {
+  const record = object(value);
+  return { job: identifier(record.native_job_id), run: identifier(record.native_run_id), status: nativeStatus(record.status) };
+}
 
 function fencedResult(error: unknown): boolean {
   return error instanceof Failure &&
@@ -90,11 +107,47 @@ export class Cron {
     if (!('missing' in identity) && identity.running) return 'result_delivery_active';
   }
 
+  private verifiedStop(claim: ObjectValue): boolean {
+    if (!terminalNativeStates.includes(String(claim.native_status)) || !claim.observed_at || !claim.observing_checker_run_id || !claim.native_job_id) return false;
+    const checkerIDs = this.checkerIDs(claim);
+    if (checkerIDs.includes(claim.native_job_id)) return false;
+    if (!claim.native_run_id) return claim.native_status === 'cancelled' && claim.native_never_started === true && !claim.start_requested_at;
+    return claim.native_run_id !== claim.native_job_id && !checkerIDs.includes(claim.native_run_id);
+  }
+
+  private async stoppedBlock(claim: ObjectValue): Promise<ObjectValue | undefined> {
+    const delivery = await this.deliveryBlock(claim);
+    if (delivery) return { cause: delivery };
+    for (const value of Array.isArray(claim.producers) ? claim.producers : []) {
+      const producer = object(value);
+      if (!producer.pid) {
+        if (claim.producer_mode === guardedProducerMode && producer.mode === guardedProducerMode) continue;
+        return { cause: 'producer_launch_unobservable', producer_id: producer.producer_id };
+      }
+      const identity = await this.inspectProcess(integer(producer.pid));
+      if (!identity || identity.boot !== producer.boot || (!('missing' in identity) && (identity.start !== producer.start || identity.running))) {
+        return { cause: 'producer_still_active_or_unobservable', producer_id: producer.producer_id };
+      }
+    }
+  }
+
   private definition(claim: ObjectValue, installation: ObjectValue): ObjectValue {
     const command = text(installation.command);
     const launch = identifier(claim.launch_id);
-    const prompt = `This finite work run must not pull another broker job or change any schedule. Obtain your own native one-time job ID. Run ${command} cron-start --launch-id ${shell(launch)} --native-job-id followed by that exact ID. If the start is not authorized, finish without doing work. Use only the returned brief for this claim. For text and tools use decision-submit with strict JSON; only the calling client executes any proposed client tool. For media use the private supplied destination and media-finish after verifying the file. Prefer foreground work. Before launching any finite process that could outlive this agent, obtain a durable producer ID using ${command} cron-producer-intent --launch-id ${shell(launch)}. After launch record that producer ID and the exact PID with cron-producer. Do not detach work if this guard is unavailable. Return only a short outcome without the request, credentials, file paths or output. Do not redo a rejected or uncertain start.`;
+    const intent = `${command} cron-producer-intent --launch-id ${shell(launch)}`;
+    const producer = claim.producer_mode === guardedProducerMode
+      ? `Keep foreground work in this run and wait for it to finish. Foreground work requires no producer intent. If a finite VM-local producer must outlive this run, reserve it using ${intent}. Use only the returned producer_command argument array followed by the producer executable and its arguments. The executable must stay alive until all of its work is finished. If the wrapper refuses authorization, do not run the producer.`
+      : `Prefer foreground work. Before launching any finite process that could outlive this agent, obtain a durable producer ID using ${intent}. After launch record that producer ID and the exact PID with cron-producer. Do not detach work if this guard is unavailable.`;
+    const prompt = `This finite work run must not pull another broker job or change any schedule. Obtain your own native one-time job ID. Run ${command} cron-start --launch-id ${shell(launch)} --native-job-id followed by that exact ID. If the start is not authorized, finish without doing work. Use only the returned brief for this claim. For text and tools use decision-submit with strict JSON; only the calling client executes any proposed client tool. For media use the private supplied destination and media-finish after verifying the file. ${producer} Return only a short outcome without the request, credentials, file paths or output. Do not redo a rejected or uncertain start.`;
     return { goal_id: installation.goal_id, reference: launch, due_at: claim.due_at, kind: 'agent', prompt };
+  }
+
+  private lookup(claim: ObjectValue, installation: ObjectValue): ObjectValue {
+    const history = claim.native_status && claim.native_job_id && claim.native_run_id ? {
+      native_job_id: claim.native_job_id, native_run_id: claim.native_run_id,
+      instruction: 'If the schedule is gone, scope native run history to this job ID. Report only the exact terminal execution as top-level execution with matches: [].',
+    } : undefined;
+    return { lookup: claim.due_at ? this.definition(claim, installation) : null, ...(history ? { history_lookup: history } : {}) };
   }
 
   async prepare(input: ObjectValue): Promise<ObjectValue> {
@@ -157,12 +210,19 @@ export class Cron {
     if (planned.outcome === 'settle') return { ...tick, ...await this.settle(planned.active, object(planned.active.failure), occurrence) };
     if (planned.outcome === 'active') {
       const { active } = planned;
+      if (this.verifiedStop(active)) {
+        const recovery = await this.finishStopped(active, occurrence);
+        if (recovery.outcome === 'recovery_pending') await this.reportPresence(active, tick, recovery.cause);
+        return { ...tick, ...recovery, lookup: null };
+      }
       const delivery = await this.deliveryBlock(active);
       const outcome = delivery === 'result_delivery_active' ? 'running' : delivery ? 'recovery_pending' :
-        !active.due_at ? 'prepare' : active.native_status === 'running' ? 'running' : active.native_status === 'queued' ? 'queued' : 'recovery_pending';
+        !active.due_at ? 'prepare' : active.native_lookup_pending ? 'recovery_pending' :
+          active.native_status === 'running' ? 'running' : active.native_status === 'queued' ? 'queued' : 'recovery_pending';
       const result = { ...tick, ...this.correlation(active), outcome, cause: delivery ?? null };
       await this.worker.logger.log(delivery === 'result_delivery_unobservable' ? 'WARN' : 'DEBUG', 'cron.check', result);
-      return { ...result, lookup: active.due_at ? this.definition(active, installation) : null };
+      await this.reportPresence(active, tick, delivery ?? (outcome === 'recovery_pending' ? 'native_observation_pending' : undefined));
+      return { ...result, ...this.lookup(active, installation) };
     }
     if (planned.outcome !== 'pull') {
       await this.worker.logger.log('DEBUG', 'cron.check', { ...tick, outcome: planned.outcome, cause: planned.cause });
@@ -182,7 +242,7 @@ export class Cron {
           identifier(grant.job_id); identifier(grant.claim_id); identifier(grant.operation_id);
           requireValue(integer(grant.generation) > 0 && time(grant.deadline_at) >= time(grant.claimed_at), 'invalid_work_grant');
           const current = await this.read(claimFile);
-          const claim: ObjectValue = current ?? { ...grant, launch_id: this.state.sys.uuid(), ...pull };
+          const claim: ObjectValue = current ?? { ...grant, launch_id: this.state.sys.uuid(), producer_mode: guardedProducerMode, ...pull };
           requireValue(claim.claim_id === grant.claim_id, 'pull_grant_conflict');
           if (!current) await this.save(claimFile, claim);
           result = { ...pull, ...this.correlation(claim), outcome: claim.due_at ? 'recovery_pending' : 'prepare', lookup: claim.due_at ? this.definition(claim, installation) : null };
@@ -198,6 +258,26 @@ export class Cron {
         await this.save(tickFile, { sequence: stored.sequence, scheduled_at: stored.scheduled_at, pending: object(stored.pending) });
       });
       throw error;
+    }
+  }
+
+  private async reportPresence(claim: ObjectValue, tick: ObjectValue, reason?: Value): Promise<void> {
+    const details = { ...this.correlation(claim), ...tick, hold_reason: reason ?? null };
+    const input = { protocol_version: 1, claim_id: claim.claim_id, generation: claim.generation, checker_job_id: tick.checker_job_id,
+      checker_run_id: tick.checker_run_id, scheduled_at: tick.scheduled_at, hold_reason: reason };
+    const route = `/api/v1/worker/jobs/${identifier(claim.job_id)}/presence`;
+    try {
+      const transport = await this.worker.load();
+      const reply = await transport.request(route, 'POST', encode(input), details, 1, presenceTimeoutMs);
+      requireValue(typeof reply.data.recorded === 'boolean', 'invalid_presence_reply', { request_id: reply.requestId });
+      time(reply.data.received_at);
+      await this.worker.logger.log('DEBUG', 'cron.presence_observed', { ...details, request_id: reply.requestId, recorded: reply.data.recorded, received_at: reply.data.received_at });
+    } catch (error) {
+      const fields = error instanceof Failure ? error.fields : {};
+      const unsupported = fields.http_status === 404 && fields.reason === 'not_found';
+      await this.worker.logger.log(unsupported ? 'DEBUG' : 'WARN', 'cron.presence_unavailable', {
+        ...details, ...fields, route, cause: cause(error), outcome: unsupported ? 'unsupported_by_broker' : 'contact_unconfirmed',
+      });
     }
   }
 
@@ -220,7 +300,7 @@ export class Cron {
     requireValue(brief.lease_id === claim.claim_id && integer(brief.generation) === integer(claim.generation) && brief.native_job_id === nativeJob && brief.launch_id === launch, 'work_start_response_mismatch');
     await this.state.withLock('cron', async () => {
       const saved = await this.read(claimFile);
-      requireValue(saved?.claim_id === claim.claim_id && !saved.failure && !saved.receipt, 'stale_native_launch');
+      requireValue(saved?.claim_id === claim.claim_id && !saved.failure && !saved.receipt && !this.verifiedStop(saved), 'stale_native_launch');
       saved.brief = brief;
       await this.save(claimFile, saved);
     });
@@ -232,18 +312,22 @@ export class Cron {
   async producerIntent(launch: string): Promise<ObjectValue> {
     return this.state.withLock('cron', async () => {
       const claim = await this.read(claimFile);
-      requireValue(claim?.launch_id === identifier(launch) && claim.brief && !claim.receipt && !claim.failure && !claim.pending_result, 'stale_native_launch');
+      requireValue(claim?.launch_id === identifier(launch) && claim.brief && !claim.receipt && !claim.failure && !claim.pending_result &&
+        !this.verifiedStop(claim), 'stale_native_launch');
       const producers = Array.isArray(claim.producers) ? claim.producers : [];
       requireValue(producers.length < 16, 'producer_limit_reached');
-      const intent = { producer_id: this.state.sys.uuid(), intended_at: iso(this.state.sys.now()) };
+      const guarded = claim.producer_mode === guardedProducerMode;
+      const intent = { producer_id: this.state.sys.uuid(), intended_at: iso(this.state.sys.now()), ...(guarded ? { mode: guardedProducerMode } : {}) };
+      const installation = guarded ? await this.read('installation.json') : undefined;
+      const producerCommand = guarded ? ['sh', producerWrapper, text(installation?.launcher), launch, intent.producer_id] : undefined;
       claim.producers = [...producers, intent];
       await this.save(claimFile, claim);
       await this.worker.logger.log('INFO', 'cron.producer_intent', { ...this.correlation(claim), ...intent });
-      return { outcome: 'producer_intent_saved', ...intent };
+      return { outcome: 'producer_intent_saved', ...intent, ...(producerCommand ? { producer_command: producerCommand } : {}) };
     });
   }
 
-  async producer(launch: string, producerID: string, pid: number): Promise<ObjectValue> {
+  async producer(launch: string, producerID: string, pid: number, guarded = false): Promise<ObjectValue> {
     identifier(producerID);
     requireValue(Number.isSafeInteger(pid) && pid > 0, 'invalid_producer_pid');
     const identity = await this.inspectProcess(pid);
@@ -253,6 +337,10 @@ export class Cron {
       requireValue(claim?.launch_id === identifier(launch) && claim.brief && !claim.receipt && !claim.failure, 'stale_native_launch');
       const known = Array.isArray(claim.producers) ? claim.producers.map(object) : [];
       const intent = known.find(record => record.producer_id === producerID);
+      const details = { ...this.correlation(claim), producer_id: producerID, pid };
+      requireValue((claim.producer_mode === guardedProducerMode) === guarded && (intent?.mode === guardedProducerMode) === guarded,
+        'producer_guard_required', details);
+      if (guarded) requireValue(!this.verifiedStop(claim) && !claim.pending_result && !intent?.pid, 'producer_launch_fenced', details);
       requireValue(intent && (!intent.pid || (intent.pid === pid && intent.boot === identity.boot && intent.start === identity.start)), 'producer_intent_mismatch');
       const record = { ...intent, pid, boot: identity.boot, start: identity.start };
       claim.producers = known.map(prior => prior === intent ? record : prior);
@@ -323,8 +411,13 @@ export class Cron {
     requireValue(receipt.job_id === details.job_id && receipt.claim_id === details.claim_id && ['accepted', 'interrupted', 'cancelled'].includes(text(receipt.state)), 'terminal_receipt_unverified');
     await this.state.withLock('cron', async () => {
       const current = await this.read(claimFile);
-      requireValue(current?.claim_id === details.claim_id, 'stale_native_observation');
-      await this.save('cron-last-receipt.json', { ...details, receipt, settled_at: iso(this.state.sys.now()) });
+      if (current?.claim_id !== details.claim_id) {
+        const previous = await this.read('cron-last-receipt.json');
+        requireValue(previous?.claim_id === details.claim_id && previous.settlement_id === settlement.submission_id, 'stale_native_observation');
+        return;
+      }
+      requireValue(object(current.failure).submission_id === settlement.submission_id, 'stale_native_observation');
+      await this.save('cron-last-receipt.json', { ...details, receipt, settlement_id: settlement.submission_id, settled_at: iso(this.state.sys.now()) });
       const tick = await this.read(tickFile);
       if (tick?.pending && tick.sequence === current.sequence) {
         requireValue(object(tick.pending).checker_run_id === current.pull_run_id, 'poll_grant_conflict');
@@ -342,18 +435,28 @@ export class Cron {
 
   async observe(input: ObjectValue): Promise<ObjectValue> {
     const installation = await this.install();
-    const observation = await this.state.withLock('cron', async () => {
+    const observation = await this.state.withLock<{ active: ObjectValue; outcome: string; cause?: string }>('cron', async () => {
       const active = await this.read(claimFile);
       requireValue(active?.claim_id === input.claim_id && active.launch_id === input.launch_id, 'stale_native_observation');
       const tick = await this.read(occurrenceFile);
-      requireValue(tick && identifier(input.checker_job_id) === tick.checker_job_id && identifier(input.checker_run_id) === tick.checker_run_id, 'stale_observing_occurrence');
+      const occurrence = identifier(input.checker_run_id);
+      const details = { ...this.correlation(active), checker_run_id: occurrence };
+      requireValue(tick && identifier(input.checker_job_id) === tick.checker_job_id && occurrence === tick.checker_run_id, 'stale_observing_occurrence', details);
       const observedAt = time(input.observed_at);
-      requireValue(observedAt >= Math.max(time(active.claimed_at), time(tick.entered_at)) && (!active.observed_at || observedAt >= time(active.observed_at)) && observedAt <= this.state.sys.now(), 'stale_native_observation');
-      const checkerIDs = this.checkerIDs(active, tick.checker_run_id);
-      active.observing_checker_run_id = input.checker_run_id;
+      requireValue(observedAt >= Math.max(time(active.claimed_at), time(tick.entered_at)) && (!active.observed_at || observedAt >= time(active.observed_at)) &&
+        observedAt <= this.state.sys.now(), 'stale_native_observation', details);
+      const checkerIDs = this.checkerIDs(active, occurrence);
       const matches = input.matches;
       requireValue(Array.isArray(matches), 'native_lookup_matches_required');
-      if (matches.length === 0 && input.registration_rejection !== undefined) {
+      const pending = async (cause: string) => {
+        if (!active.native_lookup_pending) {
+          active.native_lookup_pending = true;
+          await this.save(claimFile, active);
+        }
+        return { active, outcome: 'recovery_pending', cause };
+      };
+      if (input.registration_rejection !== undefined) {
+        if (matches.length || input.execution !== undefined) return pending('native_registration_ambiguous');
         const rejected = object(input.registration_rejection);
         const expected = this.definition(active, installation);
         requireValue(rejected.outcome === 'not_created' && identifier(rejected.native_operation_id) &&
@@ -363,84 +466,118 @@ export class Cron {
         delete active.due_at;
         active.launch_id = this.state.sys.uuid();
         active.observed_at = input.observed_at;
+        active.observing_checker_run_id = occurrence;
         await this.save(claimFile, active);
         await this.worker.logger.log('WARN', 'cron.native_registration_rejected', { ...prior, next_launch_id: active.launch_id, native_operation_id: rejected.native_operation_id });
         return { active, outcome: 'prepare' };
       }
-      if (matches.length !== 1) return { active, outcome: 'recovery_pending', cause: matches.length === 0 ? 'native_registration_unobservable' : 'native_registration_ambiguous' };
-      const found = object(matches[0]);
-      const expected = this.definition(active, installation);
-      requireValue(Object.keys(expected).every(key => found[key] === expected[key]), 'native_definition_mismatch');
-      const jobID = identifier(found.native_job_id);
-      if (checkerIDs.includes(jobID)) return { active, outcome: 'recovery_pending', cause: 'native_job_id_is_checker_id' };
-      requireValue(!active.native_job_id || active.native_job_id === jobID, 'native_job_mismatch');
+      if (matches.length > 1) return pending('native_registration_ambiguous');
+      const found = matches.length === 1 ? object(matches[0]) : undefined;
+      const nested = found?.execution === undefined ? undefined : nativeExecution(found.execution);
+      const separate = input.execution === undefined ? undefined : nativeExecution(input.execution);
+      const execution = nested ?? separate;
+      await this.worker.logger.log('DEBUG', 'cron.native_evidence', {
+        ...details, observed_at: input.observed_at, match_count: matches.length,
+        definition_status: found?.status, nested_execution_status: nested && object(found?.execution).status,
+        separate_execution_status: separate && object(input.execution).status, nested, separate,
+      });
+      if (nested && separate && (nested.job !== separate.job || nested.run !== separate.run || nested.status !== separate.status)) {
+        return pending('native_execution_record_mismatch');
+      }
+      let jobID: string;
+      let status: string;
+      if (found) {
+        const expected = this.definition(active, installation);
+        requireValue(Object.keys(expected).every(key => found[key] === expected[key]), 'native_definition_mismatch', details);
+        jobID = identifier(found.native_job_id);
+        status = nativeStatus(found.status);
+        requireValue(!active.native_job_id || active.native_job_id === jobID, 'native_job_mismatch', details);
+      } else {
+        if (!execution || !active.native_status || execution.job !== active.native_job_id || execution.run !== active.native_run_id ||
+          !terminalNativeStates.includes(execution.status)) return pending('native_registration_unobservable');
+        jobID = execution.job;
+        status = execution.status;
+      }
+      if (checkerIDs.includes(jobID)) return pending('native_job_id_is_checker_id');
+      if (execution) {
+        if (execution.job !== jobID || execution.status !== status || found?.execution_never_started === true) return pending('native_execution_record_mismatch');
+        if (execution.run === jobID) return pending('native_execution_id_is_job_id');
+        if (checkerIDs.includes(execution.run)) return pending('native_execution_id_is_checker_id');
+        requireValue(!active.native_run_id || active.native_run_id === execution.run, 'native_execution_mismatch', details);
+      }
+      requireValue(!terminalNativeStates.includes(String(active.native_status)) || active.native_status === status, 'superseded_native_status', details);
+      const confirmedUnstarted = status === 'cancelled' && found?.execution_never_started === true && !active.native_run_id && !active.start_requested_at;
+      if ((status === 'running' || terminalNativeStates.includes(status)) && !execution && !confirmedUnstarted) return pending('native_execution_unobservable');
+      if (this.verifiedStop(active)) return { active, outcome: 'settle' };
       active.native_job_id = jobID;
-      active.observed_at = input.observed_at;
-      const status = text(found.status);
-      requireValue(['queued', 'running', 'unobservable', ...terminalNativeStates].includes(status), 'invalid_native_status');
-      if (found.execution !== undefined) {
-        const execution = object(found.execution);
-        if (execution.native_job_id !== jobID || execution.status !== status) {
-          return { active, outcome: 'recovery_pending', cause: 'native_execution_record_mismatch' };
-        }
-        const run = identifier(execution.native_run_id);
-        if (run === jobID) return { active, outcome: 'recovery_pending', cause: 'native_execution_id_is_job_id' };
-        if (checkerIDs.includes(run)) return { active, outcome: 'recovery_pending', cause: 'native_execution_id_is_checker_id' };
-        requireValue(!active.native_run_id || active.native_run_id === run, 'native_execution_mismatch');
-        active.native_run_id = run;
-      }
-      requireValue(!terminalNativeStates.includes(String(active.native_status)) || active.native_status === status, 'superseded_native_status');
-      const confirmedUnstarted = status === 'cancelled' && found.execution_never_started === true && !active.native_run_id && !active.start_requested_at;
-      if ((status === 'running' || terminalNativeStates.includes(status)) && found.execution === undefined && !confirmedUnstarted) {
-        return { active, outcome: 'recovery_pending', cause: 'native_execution_unobservable' };
-      }
+      if (execution) active.native_run_id = execution.run;
+      if (confirmedUnstarted) active.native_never_started = true;
+      delete active.native_lookup_pending;
       active.native_status = status;
+      active.observed_at = input.observed_at;
+      active.observing_checker_run_id = occurrence;
       await this.save(claimFile, active);
-      if (!terminalNativeStates.includes(status)) {
-        return { active, outcome: ['queued', 'running'].includes(status) ? status : 'recovery_pending' };
+      if (terminalNativeStates.includes(status)) {
+        await this.worker.logger.log(status === 'failed' ? 'WARN' : 'INFO', 'cron.native_observation', {
+          ...this.correlation(active), outcome: 'confirmed_stopped', native_status: status, execution_never_started: confirmedUnstarted,
+          evidence_source: found ? (nested ? 'definition_and_nested_execution' : separate ? 'definition_and_execution' : 'cancelled_before_start') : 'bound_run_history',
+        });
+        return { active, outcome: 'settle' };
       }
-      const delivery = await this.deliveryBlock(active);
-      if (delivery) return { active, outcome: 'recovery_pending', cause: delivery };
-      for (const value of Array.isArray(active.producers) ? active.producers : []) {
-        const saved = object(value);
-        if (!saved.pid) return { active, outcome: 'recovery_pending', cause: 'producer_launch_unobservable' };
-        const identity = await this.inspectProcess(integer(saved.pid));
-        if (!identity || identity.boot !== saved.boot || (!('missing' in identity) && (identity.start !== saved.start || identity.running))) {
-          return { active, outcome: 'recovery_pending', cause: 'producer_still_active_or_unobservable', producer_id: saved.producer_id };
-        }
-      }
-      return { active, outcome: 'settle', confirmedUnstarted };
+      return { active, outcome: status === 'unobservable' ? 'recovery_pending' : status };
     });
-    const details = this.correlation(observation.active);
-    if (observation.outcome !== 'settle') {
-      await this.worker.logger.log(observation.cause ? 'WARN' : 'DEBUG', 'cron.native_observation', { ...details, outcome: observation.outcome, cause: observation.cause, observed_at: input.observed_at, producer_id: observation.producer_id });
-      return { ...details, outcome: observation.outcome };
-    }
-    await this.worker.logger.log(observation.active.native_status === 'failed' ? 'WARN' : 'INFO', 'cron.native_observation', {
-      ...details, outcome: 'confirmed_stopped', native_status: observation.active.native_status, execution_never_started: observation.confirmedUnstarted });
-    if (!observation.active.receipt && !observation.active.failure && (observation.active.pending_result || (observation.active.brief && object(observation.active.brief).media))) {
+    if (observation.outcome === 'settle') return this.finishStopped(observation.active, identifier(input.checker_run_id));
+    const result = { ...this.correlation(observation.active), checker_run_id: identifier(input.checker_run_id), outcome: observation.outcome,
+      ...(observation.cause ? { cause: observation.cause } : {}) };
+    await this.worker.logger.log(observation.cause ? 'WARN' : 'DEBUG', 'cron.native_observation', { ...result, observed_at: input.observed_at });
+    return result;
+  }
+
+  private async stoppedClaim(proof: ObjectValue): Promise<ObjectValue> {
+    const saved = await this.read(claimFile);
+    const fields = ['claim_id', 'generation', 'launch_id', 'native_job_id', 'native_run_id', 'native_status', 'observed_at', 'observing_checker_run_id'];
+    requireValue(saved && this.verifiedStop(saved) && fields.every(field => encode(saved[field]) === encode(proof[field])), 'stale_native_observation', this.correlation(proof));
+    return saved;
+  }
+
+  private async finishStopped(proof: ObjectValue, occurrence: string): Promise<ObjectValue> {
+    const details = { ...this.correlation(proof), settling_checker_run_id: occurrence, native_status: proof.native_status };
+    const blocked = async (reason: ObjectValue): Promise<ObjectValue> => {
+      const result = { ...details, ...reason, outcome: 'recovery_pending' };
+      await this.worker.logger.log('WARN', 'cron.recovery_pending', result);
+      return result;
+    };
+    const { current, initialBlock } = await this.state.withLock('cron', async () => {
+      const current = await this.stoppedClaim(proof);
+      return { current, initialBlock: await this.stoppedBlock(current) };
+    });
+    if (initialBlock) return blocked(initialBlock);
+    if (current.failure) return this.settle(current, object(current.failure), occurrence);
+    if (!current.receipt && (current.pending_result || (current.brief && object(current.brief).media))) {
+      const jobID = identifier(current.job_id);
       try {
-        const replay = observation.active.pending_result ? await this.replayResult(identifier(details.job_id)) : await this.submit(identifier(details.job_id));
-        if (replay.outcome !== 'accepted') return replay;
+        const replay = current.pending_result ? await this.replayResult(jobID) : await this.submit(jobID);
+        if (replay.outcome !== 'accepted') return blocked({ cause: replay.cause });
       } catch (error) {
         if (!fencedResult(error) && !absentMediaResult(error) && !invalidDecision(error)) throw error;
         await this.worker.logger.log('WARN', 'cron.saved_result_unavailable', { ...details, cause: cause(error), ...(error instanceof Failure ? error.fields : {}) });
       }
     }
-    const settlement = await this.state.withLock('cron', async () => {
-      const saved = await this.read(claimFile);
-      requireValue(saved?.claim_id === details.claim_id && saved.launch_id === details.launch_id && (saved.native_run_id ?? null) === details.native_run_id &&
-        saved.observed_at === input.observed_at && saved.observing_checker_run_id === input.checker_run_id, 'stale_native_observation');
-      if (await this.deliveryBlock(saved)) return null;
+    const plan = await this.state.withLock('cron', async () => {
+      const saved = await this.stoppedClaim(proof);
+      const reason = await this.stoppedBlock(saved);
+      if (reason) return { reason };
       if (!saved.failure) {
         saved.failure = { protocol_version: 1, submission_id: this.state.sys.uuid(), claim_id: saved.claim_id, generation: saved.generation,
           launch_id: saved.launch_id, native_job_id: saved.native_job_id, native_run_id: saved.native_run_id ?? '',
-          reason: observation.confirmedUnstarted ? 'native_cancelled_before_start' : 'execution_confirmed_stopped' };
+          reason: saved.native_never_started ? 'native_cancelled_before_start' : 'execution_confirmed_stopped' };
         await this.save(claimFile, saved);
+        const unused = (Array.isArray(saved.producers) ? saved.producers : []).map(object).filter(producer => !producer.pid);
+        if (unused.length) await this.worker.logger.log('INFO', 'cron.unused_producers_retired', { ...details, producer_ids: unused.map(producer => producer.producer_id) });
       }
-      return object(saved.failure);
+      return { settlement: object(saved.failure) };
     });
-    if (!settlement) return { ...details, outcome: 'recovery_pending', cause: 'result_delivery_unsettled' };
-    return this.settle(observation.active, settlement);
+    if (plan.reason) return blocked(plan.reason);
+    return this.settle(proof, plan.settlement, occurrence);
   }
 }

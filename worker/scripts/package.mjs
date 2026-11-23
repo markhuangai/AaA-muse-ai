@@ -29,7 +29,7 @@ export function packageWorker(args = process.argv.slice(2), { directory = worker
   for (const name of ['dist', 'setup', 'LICENSE', 'README.md']) {
     cpSync(join(directory, name), join(staging, name), { recursive: true, filter: path => name !== 'dist' || !legacyModules.has(basename(path).split('.', 1)[0]) });
   }
-  const assets = ['setup/install.sh', 'setup/private-directory.sh', 'setup/SKILL.md'];
+  const assets = ['setup/install.sh', 'setup/private-directory.sh', 'setup/producer.sh', 'setup/SKILL.md'];
   writeFileSync(join(staging, 'package.json'), JSON.stringify(metadata, null, 2) + '\n', { mode: 0o600 });
   const result = JSON.parse(execute('npm', ['pack', staging, '--ignore-scripts', '--json', '--pack-destination', owned], { cwd: directory, encoding: 'utf8' }))[0];
   assert.equal(result.name, metadata.name);

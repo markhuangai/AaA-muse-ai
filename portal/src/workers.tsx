@@ -5,6 +5,13 @@ import type { WorkersController, WorkersView } from './worker-controller';
 export const timestamp = (value: string | null) => value ? new Date(value).toISOString().replace('T', ' ').replace(/\.\d+Z$/, ' UTC') : 'Not observed';
 const states: Record<string, string> = { recent: 'Recent contact', quiet: 'Quiet', offline: 'Offline', not_observed: 'Never seen', idle: 'Idle', busy: 'Busy', unknown: 'Unknown', pending_native_start: 'Pending native start', started: 'Execution started', terminal_receipt: 'Result accepted; awaiting settlement', recovery_pending: 'Recovery pending' };
 const stateName = (value: string) => states[value] ?? value;
+const busyReasons = new Map([
+  ['native_observation_pending', 'Waiting for native run evidence'],
+  ['result_delivery_active', 'Result delivery in progress'],
+  ['result_delivery_unobservable', 'Result delivery status unavailable'],
+  ['producer_launch_unobservable', 'Background process launch unverified'],
+  ['producer_still_active_or_unobservable', 'Waiting for the background process to stop'],
+]);
 
 function formatOfflineDuration(milliseconds: number) {
   const seconds = Math.floor(milliseconds / 1000);
@@ -81,6 +88,7 @@ function WorkerDetail({ worker, controller, view }: { worker: Worker; controller
         {worker.current_claim && <>
           <div><dt>Claim ID</dt><dd><code>{worker.current_claim.claim_id}</code></dd></div>
           <div><dt>Last observed stage</dt><dd>{stateName(worker.claim_stage ?? 'unknown')}</dd></div>
+          {worker.busy_reason && busyReasons.has(worker.busy_reason) && <div><dt>Last reported hold</dt><dd>{busyReasons.get(worker.busy_reason)}</dd></div>}
           <div><dt>Claimed at</dt><dd>{timestamp(worker.current_claim.claimed_at)}</dd></div>
           <div><dt>Deadline</dt><dd>{timestamp(worker.current_claim.deadline_at)}</dd></div>
           <div><dt>Started at</dt><dd>{timestamp(worker.claim_started_at ?? null)}</dd></div>
@@ -163,7 +171,11 @@ export function Workers({ controller }: { controller: WorkersController }) {
             <span className="num">{worker.connection_status !== 'offline' || worker.offline_for_ms === undefined ? '-' :
               formatOfflineDuration(worker.offline_for_ms + (view.stale ? 0 : Math.max(0, view.offlineClock - worker.receivedAt)))}</span>
           </td>
-          <td>{stateName(worker.work_status)}<span className="row-note">{worker.waiting_for_client_tool} client-tool waits</span></td>
+          <td>{stateName(worker.work_status)}
+            {worker.current_claim && worker.busy_reason && busyReasons.has(worker.busy_reason) &&
+              <span className="row-note">{busyReasons.get(worker.busy_reason)}</span>}
+            <span className="row-note">{worker.waiting_for_client_tool} client-tool waits</span>
+          </td>
         </tr>)}</tbody></table>}
     </section>
     <EnrollmentPanel controller={controller} view={view} />

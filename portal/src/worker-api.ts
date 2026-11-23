@@ -20,6 +20,7 @@ export interface Worker {
   current_claim?: { job_id: string; claim_id: string; claimed_at: string; deadline_at: string } | null;
   claim_age_ms?: number;
   claim_stage?: string;
+  busy_reason?: string;
   claim_started_at?: string;
   model_report?: ModelReport;
 }
@@ -57,6 +58,7 @@ export function isWorker(value: unknown): value is Worker {
     (value.current_claim === undefined || value.current_claim === null || (object(value.current_claim) && typeof value.current_claim.job_id === 'string' &&
       typeof value.current_claim.claim_id === 'string' && date(value.current_claim.claimed_at) && date(value.current_claim.deadline_at))) &&
     (value.claim_age_ms === undefined || integer(value.claim_age_ms)) && (value.claim_stage === undefined || typeof value.claim_stage === 'string') &&
+    (value.busy_reason === undefined || typeof value.busy_reason === 'string') &&
     (value.claim_started_at === undefined || date(value.claim_started_at)) &&
     (value.model_report === undefined || modelReport(value.model_report));
 }
