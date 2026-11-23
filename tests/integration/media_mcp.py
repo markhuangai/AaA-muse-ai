@@ -164,11 +164,20 @@ class MCPMedia:
                     return view["status"] == "interrupted" and view.get("reason") == "deadline_exceeded"
 
                 self.until(expired, "queued media did not expire under its one-second deadline", timeout=10)
-                events = self.mcp_diagnostic("operation_id", identity, self.origin_url)
-                expiry = next((event for event in events if event["msg"] == "job.deadline_exceeded"), None)
-                require(expiry is not None and expiry["level"] == "ERROR" and expiry["reason"] == "deadline_exceeded" and
-                        expiry["deadline_at"] == deadline and expiry["busy_hold"] is False,
-                        "the protected export could not explain the queued deadline failure")
+
+                def expiry_captured():
+                    events = self.mcp_diagnostic("operation_id", identity, self.origin_url)
+                    events.extend(self.mcp_diagnostic("operation_id", identity, self.sibling_origin))
+                    expiry = next((event for event in events if event["msg"] == "job.deadline_exceeded"), None)
+                    if expiry is None:
+                        return False
+                    require(expiry["level"] == "ERROR" and expiry["reason"] == "deadline_exceeded" and
+                            expiry["deadline_at"] == deadline and expiry["busy_hold"] is False,
+                            "the protected expiry record did not explain the queued deadline failure")
+                    return True
+
+                # The committing broker records the event after the shared state becomes visible.
+                self.until(expiry_captured, "neither broker exported the queued media expiry", timeout=10)
             else:
                 self.cancel(identity)
         self.add("media.timeout_bounds_cross_transport_and_diagnostics")
