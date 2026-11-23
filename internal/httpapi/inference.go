@@ -128,8 +128,8 @@ func (h *Handler) inferenceRequest(w *response, r *http.Request, logger *slog.Lo
 			var evidence []inference.InterruptionEvidence
 			if values := r.Header.Values("X-Muse-Interruption"); len(values) != 0 {
 				status, failure, _ := strings.Cut(values[0], "/")
-				observation := inference.InterruptionEvidence{NativeStatus: status, ResultFailure: failure}
-				if len(values) != 1 || !observation.ValidNative() {
+				observation, valid := inference.ParseNativeInterruptionEvidence(status, failure)
+				if len(values) != 1 || !valid {
 					err = inference.Reject("invalid_interruption_evidence", 400)
 					break
 				}

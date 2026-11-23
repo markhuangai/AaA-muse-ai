@@ -6,17 +6,36 @@ type InterruptionEvidence struct {
 	ResultFailure string `json:"result_failure,omitempty"`
 }
 
-func (d InterruptionEvidence) ValidNative() bool {
-	switch d.NativeStatus {
-	case "completed", "failed", "cancelled":
+func ParseNativeInterruptionEvidence(status, failure string) (InterruptionEvidence, bool) {
+	var evidence InterruptionEvidence
+	// Use fixed values so diagnostics never retain request header text.
+	switch status {
+	case "completed":
+		evidence.NativeStatus = "completed"
+	case "failed":
+		evidence.NativeStatus = "failed"
+	case "cancelled":
+		evidence.NativeStatus = "cancelled"
 	default:
-		return false
+		return InterruptionEvidence{}, false
 	}
-	switch d.ResultFailure {
-	case "", "media_output_missing", "media_output_invalid", "decision_rejected":
-		return true
+	switch failure {
+	case "":
+	case "media_output_missing":
+		evidence.ResultFailure = "media_output_missing"
+	case "media_output_invalid":
+		evidence.ResultFailure = "media_output_invalid"
+	case "decision_rejected":
+		evidence.ResultFailure = "decision_rejected"
+	default:
+		return InterruptionEvidence{}, false
 	}
-	return false
+	return evidence, true
+}
+
+func (d InterruptionEvidence) ValidNative() bool {
+	_, valid := ParseNativeInterruptionEvidence(d.NativeStatus, d.ResultFailure)
+	return valid
 }
 
 func (e Experiment) ReasonMessage() string {

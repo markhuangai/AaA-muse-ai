@@ -40,10 +40,18 @@ func TestPublicInterruptionExplanations(t *testing.T) {
 		valid           bool
 	}{
 		{"completed", "", true}, {"failed", "media_output_invalid", true}, {"cancelled", "decision_rejected", true},
+		{"completed", "media_output_missing", true},
 		{"running", "", false}, {"failed", "provider-private-data", false},
 	} {
-		if got := (InterruptionEvidence{NativeStatus: tc.status, ResultFailure: tc.failure}).ValidNative(); got != tc.valid {
-			t.Errorf("%+v: valid=%t", tc, got)
+		evidence, valid := ParseNativeInterruptionEvidence(tc.status, tc.failure)
+		if valid != tc.valid {
+			t.Errorf("%+v: valid=%t", tc, valid)
+		}
+		if valid && (evidence.NativeStatus != tc.status || evidence.ResultFailure != tc.failure) {
+			t.Errorf("%+v: wrong evidence %+v", tc, evidence)
+		}
+		if !valid && evidence != (InterruptionEvidence{}) {
+			t.Errorf("%+v: rejected evidence retained values %+v", tc, evidence)
 		}
 	}
 }
