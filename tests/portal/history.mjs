@@ -113,12 +113,43 @@ async function emptyViews() {
     passed('portal.history_empty', { width }); await context.close();
   }
 }
+async function mediaHistory(page, jobs) {
+  const labels = {
+    queued: 'Queued', claimed: 'Claimed and awaiting start', started: 'Start acknowledged',
+    completed: 'Completed', cancelled: 'Cancelled',
+  };
+  for (const [stage, id] of Object.entries(jobs)) {
+    const row = page.getByRole('row').filter({ has: page.getByRole('button', { name: id, exact: true }) });
+    await expect(row).toContainText('Media job · prompt_wav');
+    await expect(row).toContainText('Owner fixture-client');
+    await expect(row).toContainText(labels[stage]);
+  }
+  for (const [stage, id] of Object.entries(jobs)) {
+    const response = await open(page, id);
+    expect((await response.json()).kind).toBe('media');
+    const summary = page.getByRole('region', { name: 'Media job', exact: true });
+    await expect(summary.getByText(labels[stage], { exact: true })).toBeVisible();
+    await expect(summary.getByText('fixture-client', { exact: true })).toBeVisible();
+    await expect(summary.getByText('Deadline', { exact: true })).toBeVisible();
+    await expect(summary.getByText('Worker hold', { exact: true })).toBeVisible();
+    if (stage === 'completed' || stage === 'cancelled') {
+      await expect(summary.getByText('Awaiting worker settlement', { exact: true })).toBeVisible();
+    }
+    if (stage === 'cancelled') await expect(summary.getByText('operator_cancelled', { exact: true })).toBeVisible();
+    const timeline = page.getByRole('region', { name: 'Conversation timeline' });
+    await expect(timeline.getByText('Media job snapshot', { exact: true })).toBeVisible();
+    await expect(timeline.getByText('Time not recorded', { exact: true })).toBeVisible();
+    await expect(page.getByText(/Legacy (request|provenance)/)).toHaveCount(0);
+  }
+  passed('portal.history_media_job_progress', { records: Object.keys(jobs).length });
+}
 async function viewports() {
   const data = fixture.fixtures;
   for (const [index, width] of [1440, 768, 390].entries()) {
     const context = await browser.newContext({ viewport: { width, height: width === 390 ? 844 : 900 }, serviceWorkers: 'block', permissions: ['clipboard-read', 'clipboard-write'] }); const page = await context.newPage();
     const origins = new Set(); page.on('request', request => origins.add(new URL(request.url()).origin));
     await login(page); await expect(page.locator('tbody tr')).toHaveCount(50); await screenshot(page, 'list', width);
+    await mediaHistory(page, data.media);
     await open(page, data.native.first.id);
     const recorded = page.getByRole('region', { name: 'Request detail' });
     await expect(recorded.locator('pre').filter({ hasText: '9007199254740993' }).first()).toBeVisible();

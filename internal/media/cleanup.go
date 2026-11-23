@@ -55,7 +55,7 @@ func (s *Store) Cleanup(ctx context.Context, logger *slog.Logger, now time.Time,
 			if statErr != nil {
 				return statErr
 			}
-			if now.Sub(info.ModTime()) <= JobTimeout {
+			if now.Sub(info.ModTime()) <= OrphanGrace {
 				continue
 			}
 			state = "orphan"

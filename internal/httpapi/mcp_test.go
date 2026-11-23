@@ -147,6 +147,7 @@ func TestMCPAdmissionFailures(t *testing.T) {
 	for _, tc := range []struct{ body, reason string }{
 		{strings.ReplaceAll(askMCP, "question", " "), "invalid_prompt"},
 		{strings.ReplaceAll(askMCP, "one-text", "!"), "invalid_submission_id"},
+		{`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"generate_video","arguments":{"submission_id":"media"}}}`, "invalid_media_request"},
 		{`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"generate_video","arguments":{"prompt":"rain","submission_id":"media"}}}`, "service_unavailable"},
 		{`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"download_video","arguments":{"job_id":"invalid"}}}`, "invalid_job_id"},
 	} {
@@ -164,5 +165,30 @@ func TestMCPAdmissionFailures(t *testing.T) {
 	h.ServeHTTP(out, mcpRequest(askMCP))
 	if out.Code != 503 || strings.Contains(out.Body.String(), "request_id") {
 		t.Fatal("MCP admitted work with a failed diagnostics sink")
+	}
+}
+
+func TestMCPMediaRejectsInvalidTimeout(t *testing.T) {
+	h, db, _, _ := inferenceHTTPFixture(t)
+	h.Broker.Media = media.New(t.TempDir())
+	for _, invalid := range []string{"null", "3601", "1.5", `"60"`} {
+		out := httptest.NewRecorder()
+		h.ServeHTTP(out, mcpRequest(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"generate_video","arguments":{"prompt":"private-timeout-brief","submission_id":"media","timeout_seconds":`+invalid+`}}}`))
+		if out.Code != 200 || !strings.Contains(out.Body.String(), `"isError":true`) || !strings.Contains(out.Body.String(), `"text":"invalid_media_timeout"`) {
+			t.Fatal("invalid timeout did not return the media tool error")
+		}
+		var diagnosed bool
+		for _, event := range chatEvents(t, db.capture, out.Header().Get("X-Request-Id")) {
+			if event["msg"] == "mcp.tool_rejected" && event["cause"] == "invalid_media_timeout" && event["level"] == "WARN" && event["client_id"] == "client" {
+				diagnosed = true
+			}
+			encoded, _ := json.Marshal(event)
+			if strings.Contains(string(encoded), "private-timeout-brief") {
+				t.Fatal("timeout diagnostics retained a raw prompt")
+			}
+		}
+		if state := db.states[""]; !diagnosed || (state != nil && len(state.Jobs) != 0) {
+			t.Fatal("invalid timeout was admitted or lacked protected diagnosis")
+		}
 	}
 }

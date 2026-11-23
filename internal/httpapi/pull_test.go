@@ -33,6 +33,12 @@ func pullHTTP(t *testing.T, path string) *Handler {
 
 func pullHTTPClock(t *testing.T, path string, now func() time.Time) *Handler {
 	t.Helper()
+	handler, _ := openPullHTTP(t, path, now)
+	return handler
+}
+
+func openPullHTTP(t *testing.T, path string, now func() time.Time) (*Handler, *sqlite.Repository) {
+	t.Helper()
 	repository, err := sqlite.OpenWithClock(t.Context(), path, now)
 	if err != nil {
 		t.Fatal(err)
@@ -45,40 +51,108 @@ func pullHTTPClock(t *testing.T, path string, now func() time.Time) *Handler {
 	handler.Now = now
 	handler.Workers = service.NewWorkers(repository, handler.Authority, rand.Reader, now)
 	handler.Broker = service.NewBroker(repository, rand.Reader, now, nil)
-	return handler
+	return handler, repository
 }
 
-func TestNativePullOfflineVideoKeepsOriginalDeadlineAndReceipt(t *testing.T) {
+func submitVideo(handler *Handler, key, submission string, seconds int) *httptest.ResponseRecorder {
+	body := fmt.Sprintf(`{"submission_id":%q,"prompt":"fixture","timeout_seconds":%d}`, submission, seconds)
+	request := httptest.NewRequest(http.MethodPost, mediaJobs, strings.NewReader(body))
+	request.Header.Set("Authorization", "Bearer "+key)
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	return response
+}
+
+func mediaVideoFixture(t *testing.T) []byte {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "fixture.mp4")
+	if output, err := exec.CommandContext(t.Context(), "ffmpeg", "-v", "error", "-f", "lavfi", "-i", "color=black:s=64x48:r=8",
+		"-t", "1", "-c:v", "mpeg4", path).CombinedOutput(); err != nil {
+		t.Fatalf("generate valid MP4 fixture: %v: %s", err, output)
+	}
+	video, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return video
+}
+
+func uploadVideo(handler *Handler, key string, grant *inference.Grant, video []byte) *httptest.ResponseRecorder {
+	request := httptest.NewRequest(http.MethodPut, "/api/v1/worker/jobs/"+grant.JobID+"/artifact", bytes.NewReader(video))
+	request.Header.Set("Authorization", "Bearer "+key)
+	request.Header.Set("Content-Type", "video/mp4")
+	request.Header.Set("X-Muse-Lease-Id", grant.ClaimID)
+	request.Header.Set("X-Muse-Generation", fmt.Sprint(grant.Generation))
+	request.Header.Set("X-Muse-Artifact-Sha256", fmt.Sprintf("%x", sha256.Sum256(video)))
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	return response
+}
+
+func mediaSQLiteDirectory(t *testing.T) string {
+	t.Helper()
 	root := t.TempDir()
 	if err := os.Chmod(root, 0700); err != nil {
 		t.Fatal(err)
 	}
+	return root
+}
+
+func TestNativePullOfflineVideoKeepsOriginalDeadlineAndReceipt(t *testing.T) {
+	root := mediaSQLiteDirectory(t)
 	now := time.Now().UTC().Truncate(time.Second)
+	submittedAt := now
 	clock := func() time.Time { return now }
-	first, second := pullHTTPClock(t, filepath.Join(root, "shared.sqlite3"), clock), pullHTTPClock(t, filepath.Join(root, "shared.sqlite3"), clock)
+	database := filepath.Join(root, "shared.sqlite3")
+	first, repository := openPullHTTP(t, database, clock)
+	second := pullHTTPClock(t, database, clock)
 	first.Broker.Media = media.New(root)
 	second.Broker.Media = media.New(root)
 	key := enrollNative(t, first)
 	const client = "client-private-sentinel"
-	var created struct {
-		JobID string `json:"job_id"`
+	var created service.MediaStatus
+	nativeResponse(t, submitVideo(first, client, "offline-video", 1800), 202, &created)
+	if !created.CreatedAt.Equal(submittedAt) || !created.DeadlineAt.Equal(submittedAt.Add(30*time.Minute)) {
+		t.Fatal("submission recorded the wrong deadline")
 	}
-	request := httptest.NewRequest(http.MethodPost, "/api/v1/media/jobs", bytes.NewBufferString(`{"submission_id":"offline-video","prompt":"fixture"}`))
-	request.Header.Set("Authorization", "Bearer "+client)
-	request.Header.Set("Content-Type", "application/json")
-	response := httptest.NewRecorder()
-	first.ServeHTTP(response, request)
-	nativeResponse(t, response, 202, &created)
+	now = submittedAt.Add(9 * time.Minute)
 	var result inference.PullResult
-	nativeResponse(t, nativePost(first, "/api/v1/worker/pull", key, inference.Pull{Version: 1, Sequence: 1,
+	nativeResponse(t, nativePost(second, "/api/v1/worker/pull", key, inference.Pull{Version: 1, Sequence: 1,
 		Checker: "checker", Occurrence: "tick-one", ScheduledAt: now, EnteredAt: now, MediaJobs: true}), 200, &result)
 	grant := result.Job
-	if grant == nil || grant.JobID != created.JobID || !grant.DeadlineAt.Equal(now.Add(15*time.Minute)) {
+	if grant == nil || grant.JobID != created.ID || !grant.DeadlineAt.Equal(created.DeadlineAt) || !grant.ClaimedAt.Equal(now) {
 		t.Fatal("media claim lost its submission-based deadline")
 	}
 	path := "/api/v1/worker/jobs/" + grant.JobID
 	nativeResponse(t, nativePost(first, path+"/start", key, inference.WorkStart{Version: 1, ClaimID: grant.ClaimID,
 		Generation: grant.Generation, LaunchID: "video-launch", NativeJob: "video-once"}), 200, nil)
+	type projectedMedia struct {
+		Kind      string    `json:"kind"`
+		Owner     string    `json:"owner"`
+		Profile   string    `json:"profile"`
+		StartedAt time.Time `json:"started_at"`
+	}
+	checkHistory := func(record projectedMedia) {
+		t.Helper()
+		if record.Kind != "media" || record.Owner != "client" || record.Profile != media.PromptVideoProfile || !record.StartedAt.Equal(now) {
+			t.Fatal("history projection lost recorded media metadata")
+		}
+	}
+	for _, scope := range []string{"requests", "conversations"} {
+		route := "/api/v1/admin/" + scope
+		var page struct {
+			Items []projectedMedia `json:"items"`
+		}
+		nativeResponse(t, call(second, http.MethodGet, route, "Bearer "+testManagementKey, nil), 200, &page)
+		if len(page.Items) != 1 {
+			t.Fatal("media job must appear once in each history list")
+		}
+		checkHistory(page.Items[0])
+		var detail projectedMedia
+		nativeResponse(t, call(second, http.MethodGet, route+"/"+grant.JobID, "Bearer "+testManagementKey, nil), 200, &detail)
+		checkHistory(detail)
+	}
 	for _, boundary := range []struct {
 		elapsed time.Duration
 		status  string
@@ -97,26 +171,7 @@ func TestNativePullOfflineVideoKeepsOriginalDeadlineAndReceipt(t *testing.T) {
 			t.Fatalf("incorrect claim age or presence at %s: %s", boundary.elapsed, view.ConnectionStatus)
 		}
 	}
-	videoPath := filepath.Join(t.TempDir(), "fixture.mp4")
-	if output, err := exec.CommandContext(t.Context(), "ffmpeg", "-v", "error", "-f", "lavfi", "-i", "color=black:s=64x48:r=8",
-		"-t", "1", "-c:v", "mpeg4", videoPath).CombinedOutput(); err != nil {
-		t.Fatalf("generate valid MP4 fixture: %v: %s", err, output)
-	}
-	video, err := os.ReadFile(videoPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	upload := func(handler *Handler) *httptest.ResponseRecorder {
-		request := httptest.NewRequest(http.MethodPut, path+"/artifact", bytes.NewReader(video))
-		request.Header.Set("Authorization", "Bearer "+key)
-		request.Header.Set("Content-Type", "video/mp4")
-		request.Header.Set("X-Muse-Lease-Id", grant.ClaimID)
-		request.Header.Set("X-Muse-Generation", fmt.Sprint(grant.Generation))
-		request.Header.Set("X-Muse-Artifact-Sha256", fmt.Sprintf("%x", sha256.Sum256(video)))
-		response := httptest.NewRecorder()
-		handler.ServeHTTP(response, request)
-		return response
-	}
+	video := mediaVideoFixture(t)
 	probe := func(credential, hash, size string) *httptest.ResponseRecorder {
 		request := httptest.NewRequest(http.MethodGet, path+"/media/receipt", nil)
 		request.Header.Set("Authorization", "Bearer "+credential)
@@ -138,14 +193,22 @@ func TestNativePullOfflineVideoKeepsOriginalDeadlineAndReceipt(t *testing.T) {
 	nativeResponse(t, probe(key, hash, "0"), 411, nil)
 	nativeResponse(t, probe(key, hash, fmt.Sprint(media.ArtifactLimit+1)), 413, nil)
 	nativeResponse(t, probe(key, "not-a-hash", size), 400, nil)
-	accepted := upload(second)
+	accepted := uploadVideo(second, key, grant, video)
 	var receipt service.ArtifactReceipt
 	nativeResponse(t, accepted, 200, &receipt)
 	if !receipt.Accepted || receipt.ExpiresAt == nil || !receipt.ExpiresAt.Equal(now.Add(10*time.Minute)) {
 		t.Fatal("download lifetime did not begin at verified storage")
 	}
+	var committed service.MediaStatus
+	nativeResponse(t, call(second, http.MethodGet, mediaJobs+"/"+grant.JobID, "Bearer "+client, nil), 200, &committed)
+	if committed.CommittedAt == nil || !committed.CommittedAt.After(submittedAt.Add(15*time.Minute)) || !committed.DeadlineAt.Equal(created.DeadlineAt) {
+		t.Fatal("artifact did not commit after the old deadline under the original longer deadline")
+	}
+	repository.Close()
+	first = pullHTTPClock(t, database, clock)
+	first.Broker.Media = media.New(root)
 	now = grant.DeadlineAt.Add(time.Second)
-	replay := upload(first)
+	replay := uploadVideo(first, key, grant, video)
 	nativeResponse(t, replay, 200, nil)
 	if !bytes.Equal(accepted.Body.Bytes(), replay.Body.Bytes()) {
 		t.Fatal("deadline changed the accepted upload receipt")
@@ -161,6 +224,90 @@ func TestNativePullOfflineVideoKeepsOriginalDeadlineAndReceipt(t *testing.T) {
 	if download.Code != 200 || !bytes.Equal(download.Body.Bytes(), video) {
 		t.Fatal("downloaded bytes differ from the original verified MP4")
 	}
+}
+
+func TestNativeMediaUploadAtDeadlinePreservesWorkerHold(t *testing.T) {
+	root := mediaSQLiteDirectory(t)
+	now := time.Now().UTC().Truncate(time.Second)
+	clock := func() time.Time { return now }
+	database := filepath.Join(root, "shared.sqlite3")
+	first, second := pullHTTPClock(t, database, clock), pullHTTPClock(t, database, clock)
+	first.Broker.Media, second.Broker.Media = media.New(root), media.New(root)
+	key := enrollNative(t, first)
+	const client = "client-private-sentinel"
+	var created service.MediaStatus
+	nativeResponse(t, submitVideo(first, client, "deadline-video", 1), 202, &created)
+	var pulled inference.PullResult
+	nativeResponse(t, nativePost(second, "/api/v1/worker/pull", key, inference.Pull{Version: 1, Sequence: 1,
+		Checker: "checker", Occurrence: "tick-one", ScheduledAt: now, EnteredAt: now, MediaJobs: true}), 200, &pulled)
+	grant := pulled.Job
+	if grant == nil || grant.JobID != created.ID || !grant.DeadlineAt.Equal(now.Add(time.Second)) {
+		t.Fatal("one-second media job was not claimed before its deadline")
+	}
+	nativeResponse(t, nativePost(second, "/api/v1/worker/jobs/"+grant.JobID+"/start", key, inference.WorkStart{Version: 1,
+		ClaimID: grant.ClaimID, Generation: grant.Generation, LaunchID: "deadline-launch", NativeJob: "deadline-once"}), 200, nil)
+	video := mediaVideoFixture(t)
+	now = grant.DeadlineAt
+	nativeResponse(t, uploadVideo(first, key, grant, video), 409, nil)
+	var expired service.MediaStatus
+	nativeResponse(t, call(second, http.MethodGet, mediaJobs+"/"+grant.JobID, "Bearer "+client, nil), 200, &expired)
+	if expired.State != "interrupted" || expired.Reason != "deadline_exceeded" || expired.Artifact != nil || !expired.DeadlineAt.Equal(created.DeadlineAt) {
+		t.Fatal("first upload at the deadline altered media state")
+	}
+	var worker workerView
+	nativeResponse(t, call(first, http.MethodGet, "/api/v1/worker/status", "Bearer "+key, nil), 200, &worker)
+	if worker.Claim == nil || worker.Claim.ClaimID != grant.ClaimID || worker.ClaimStage != "recovery_pending" || worker.WorkStatus != "busy" {
+		t.Fatal("media expiry released the worker before reconciliation")
+	}
+}
+
+func TestMediaLegacySubmissionReceiptAcrossHTTPAndMCP(t *testing.T) {
+	root := mediaSQLiteDirectory(t)
+	now := time.Now().UTC().Truncate(time.Second)
+	clock := func() time.Time { return now }
+	database := filepath.Join(root, "shared.sqlite3")
+	first, repository := openPullHTTP(t, database, clock)
+	second := pullHTTPClock(t, database, clock)
+	first.Broker.Media, second.Broker.Media = media.New(root), media.New(root)
+	const id = "00000000000000000000000000000001"
+	const submission = "legacy-video"
+	deadline := now.Add(15 * time.Minute)
+	legacy := service.MediaStatus{ID: id, State: "queued", Profile: media.PromptVideoProfile, CreatedAt: now, DeadlineAt: deadline}
+	result, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// This was the durable hash input before media admission accepted a timeout.
+	promptHash := fmt.Sprintf("%x", sha256.Sum256([]byte("fixture")))
+	oldInput := fmt.Sprintf(`{"Operation":"media_create","Experiment":"","Job":"","Input":{"Record":{"owner":"client","profile":"prompt_video","prompt_sha256":%q},"Target":""}}`, promptHash)
+	hash := fmt.Sprintf("%x", sha256.Sum256([]byte(oldInput)))
+	ref := inference.Ref{Routing: true, Full: true, Principal: "media:client", SubmissionID: submission}
+	if err = repository.WithinInference(t.Context(), ref, func(state *inference.State) error {
+		state.Receipt = &inference.Receipt{Principal: ref.Principal, SubmissionID: submission, InputHash: hash, Result: result}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(2 * time.Minute)
+	retry := submitVideo(first, "client-private-sentinel", submission, 900)
+	nativeResponse(t, retry, 202, nil)
+	if !bytes.Equal(bytes.TrimSpace(retry.Body.Bytes()), result) {
+		t.Fatal("HTTP could not recover the pre-upgrade result")
+	}
+	request := mcpRequest(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"generate_video","arguments":{"prompt":"fixture","submission_id":"legacy-video"}}}`)
+	mcp := httptest.NewRecorder()
+	second.ServeHTTP(mcp, request)
+	var replay struct {
+		Result struct {
+			IsError           bool                `json:"isError"`
+			StructuredContent service.MediaStatus `json:"structuredContent"`
+		} `json:"result"`
+	}
+	nativeResponse(t, mcp, 200, &replay)
+	if replay.Result.IsError || replay.Result.StructuredContent.ID != id || !replay.Result.StructuredContent.DeadlineAt.Equal(deadline) {
+		t.Fatal("MCP could not recover the pre-upgrade job and deadline")
+	}
+	nativeResponse(t, submitVideo(second, "client-private-sentinel", submission, 901), 409, nil)
 }
 
 func TestNativePullRejectsOldOccurrencesAndRevokedAuthority(t *testing.T) {

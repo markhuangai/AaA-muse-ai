@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -8,6 +9,7 @@ import re
 import secrets
 import shutil
 import subprocess
+import wave
 
 from chat import DecisionPeer
 from portal import Portal, source_identity
@@ -16,6 +18,60 @@ from service import require
 
 
 class PortalHistory(Portal, Routing):
+    def media_fixtures(self):
+        jobs = {}
+        for label in ("claimed", "started", "completed", "cancelled", "queued"):
+            request = {"prompt": "Private media history brief", "submission_id": "history-media-" + label,
+                       "format": "wav", "timeout_seconds": 1800}
+            job, _ = self.checked("/api/v1/media/jobs", self.client, "POST", request, want=202)
+            identity = job["job_id"]
+            jobs[label] = identity
+            if label == "queued":
+                break
+            worker = self.new_worker()
+            peer = self.pull_peer(worker)
+            grant = peer.poll(media_jobs=True, prompt_wav=True)
+            require(grant is not None and grant["job_id"] == identity and grant["deadline_at"] == job["deadline_at"],
+                    "media fixture claimed the wrong job or deadline")
+            if label == "claimed":
+                continue
+            started, _, _ = peer.begin(grant)
+            if label == "completed":
+                output = io.BytesIO()
+                with wave.open(output, "wb") as track:
+                    track.setparams((1, 2, 16000, 0, "NONE", "not compressed"))
+                    track.writeframes(bytes(8000))
+                wav = output.getvalue()
+                headers = {"Content-Type": "audio/wav", "X-Muse-Lease-Id": started["lease_id"],
+                           "X-Muse-Generation": str(started["generation"]), "X-Muse-Artifact-Sha256": hashlib.sha256(wav).hexdigest()}
+                status, _, receipt = self.api("/api/v1/worker/jobs/" + identity + "/artifact", worker["credential"], "PUT", raw=wav, headers=headers)
+                require(status == 200 and json.loads(receipt)["accepted"], "controlled media fixture did not accept valid WAV")
+            elif label == "cancelled":
+                self.cancel(identity)
+
+        def assert_media(value):
+            require(value["kind"] == "media" and value["owner"] == "fixture-client" and value["profile"] == "prompt_wav",
+                    "management history lost recorded media metadata")
+
+        for identity in jobs.values():
+            detail = self.detail({"id": identity})
+            assert_media(detail)
+            conversation = self.checked("/api/v1/admin/conversations/" + identity, self.admin)[0]
+            assert_media(conversation)
+            timeline = self.timeline(identity)
+            require(len(timeline) == 1 and timeline[0]["kind"] == "media_job_snapshot" and timeline[0]["sequence"] == 0 and
+                    timeline[0]["time"] is None and timeline[0]["details"]["assignment"] == detail["assignment"],
+                    "media timeline changed the recorded assignment or invented an event time")
+        require(self.detail({"id": jobs["started"]})["execution"]["remote_outcome"] == "not_started",
+                "fixture does not distinguish recorded start from the underlying remote outcome")
+        for route in ("requests", "conversations"):
+            page = self.checked("/api/v1/admin/" + route + "?limit=10", self.admin)[0]
+            require({item["id"] for item in page["items"]} == set(jobs.values()), "media history omitted or duplicated a job")
+            for item in page["items"]:
+                assert_media(item)
+        self.receipt("portal.history_media_projections", kinds=["media"], cases=len(jobs), retained_timeline_time=True)
+        return jobs
+
     def native_timeline(self):
         worker = self.new_worker()
         peer = self.pull_peer(worker)
@@ -280,6 +336,12 @@ class PortalHistory(Portal, Routing):
         require(any(event["msg"] == "history.query_exchange" and "admitted-history-" in json.dumps(event) for event in events), "full admitted history was replaced with hashes or omitted")
         outputs = [event["output"] for event in events if event["msg"] == "history.query_exchange" and isinstance(event.get("output"), dict) and isinstance(event["output"].get("request"), dict)]
         require(any(output["request"].get("input", {}).get("messages", [{}, {}])[1].get("text") == self.history_payload for output in outputs if len(output["request"].get("input", {}).get("messages", [])) >= 2), "protected capture did not reconstruct the exact admitted large input")
+        require(any(event["msg"] == "history.query_exchange" and event["level"] == "DEBUG" and
+                    event["output"].get("kind") == "media" and event["output"]["owner"] == "fixture-client" and
+                    isinstance(event["output"].get("assignment"), dict) and event["output"]["assignment"].get("started_at") and
+                    event["output"]["execution"]["remote_outcome"] == "not_started"
+                    for event in events if isinstance(event.get("output"), dict)),
+                "protected history exchange could not explain recorded media progress")
         self.receipt("portal.history_capture_protection", info_filter=True, complete=True, credential_scan=True, max_chunk_bytes=6144, live_qualification=False)
 
 
@@ -299,15 +361,16 @@ def main():
         h.baseline()
         image_id = h.inspect(args.image)["Id"]
         h.setup()
-        h.main_service, h.origin_url, _ = h.launch()
+        h.main_service, h.origin_url, _ = h.launch(media_volume=h.volume("media"))
         h.ready(h.main_service, h.origin_url)
         h.browser("empty", {})
+        media = h.media_fixtures()
         native = h.native_timeline()
         legacy = h.seed_legacy_pages(native["worker_id"])
         nul = h.nul_histories()
         boundaries = h.routing_fixtures()
         cancellation = h.cancellation_fixtures()
-        h.browser("history", {"native": native, "legacy": legacy, "nul": nul, "boundaries": boundaries, "cancellation": cancellation})
+        h.browser("history", {"native": native, "legacy": legacy, "media": media, "nul": nul, "boundaries": boundaries, "cancellation": cancellation})
         h.final_evidence()
         require(source_identity() == identity, "source changed during history validation")
         outcome = "passed"

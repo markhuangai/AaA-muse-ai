@@ -26,7 +26,7 @@ const (
 	ArtifactLimit   = 32 << 20
 	PixelLimit      = 16_000_000
 	Lifetime        = 10 * time.Minute
-	JobTimeout      = 15 * time.Minute
+	OrphanGrace     = 15 * time.Minute
 	TransferTimeout = 120 * time.Second
 )
 

@@ -25,6 +25,22 @@ type MediaStatus struct {
 	Reason      string                     `json:"reason,omitempty"`
 }
 
+const (
+	DefaultMediaTimeoutSeconds = 900
+	MaxMediaTimeoutSeconds     = 3600
+)
+
+func mediaTimeoutSeconds(input json.RawMessage) (int, error) {
+	if input == nil {
+		return DefaultMediaTimeoutSeconds, nil
+	}
+	var seconds int
+	if err := json.Unmarshal(input, &seconds); err != nil || seconds < 1 || seconds > MaxMediaTimeoutSeconds {
+		return 0, inference.Reject("invalid_media_timeout", 400, "field", "timeout_seconds", "minimum", 1, "maximum", MaxMediaTimeoutSeconds)
+	}
+	return seconds, nil
+}
+
 func mediaStatus(e *inference.Experiment, j *inference.Job) MediaStatus {
 	return MediaStatus{ID: j.ID, State: e.State, Profile: j.Media.Profile, CreatedAt: e.CreatedAt, DeadlineAt: e.DeadlineAt, CommittedAt: j.Media.CommittedAt, ExpiresAt: j.Media.ExpiresAt, Artifact: j.Media.Artifact, Reason: e.Reason}
 }
@@ -40,7 +56,7 @@ func supportsMedia(connection inference.Connection, profile string) bool {
 	return connection.MediaJobs && (profile != media.PromptWAVProfile || connection.PromptWAV)
 }
 
-func (b *Broker) SubmitPromptMedia(ctx context.Context, l *slog.Logger, owner, submission, format, prompt string) (json.RawMessage, error) {
+func (b *Broker) SubmitPromptMedia(ctx context.Context, l *slog.Logger, owner, submission, format, prompt string, timeout json.RawMessage) (json.RawMessage, error) {
 	stage, err := b.Media.Begin()
 	if err != nil {
 		return nil, err
@@ -49,7 +65,7 @@ func (b *Broker) SubmitPromptMedia(ctx context.Context, l *slog.Logger, owner, s
 	if err = stage.GeneratedPrompt(format, prompt); err != nil {
 		return nil, err
 	}
-	return b.SubmitMedia(ctx, l, stage, owner, submission, "")
+	return b.SubmitMedia(ctx, l, stage, owner, submission, "", timeout)
 }
 
 func CloseMediaStage(l *slog.Logger, stage *media.Stage) {
@@ -58,15 +74,24 @@ func CloseMediaStage(l *slog.Logger, stage *media.Stage) {
 	}
 }
 
-func (b *Broker) SubmitMedia(ctx context.Context, l *slog.Logger, p *media.Stage, owner, submission, target string) (json.RawMessage, error) {
+func (b *Broker) SubmitMedia(ctx context.Context, l *slog.Logger, p *media.Stage, owner, submission, target string, timeout json.RawMessage) (json.RawMessage, error) {
 	if err := inference.VersionAndID(1, submission); err != nil {
+		return nil, err
+	}
+	seconds, err := mediaTimeoutSeconds(timeout)
+	if err != nil {
 		return nil, err
 	}
 	p.Record.Owner = owner
 	input := struct {
-		Record inference.Media
-		Target string
-	}{p.Record, target}
+		Record         inference.Media
+		Target         string
+		TimeoutSeconds int `json:",omitempty"`
+	}{Record: p.Record, Target: target}
+	// Omit the default so existing media submission hashes still match.
+	if seconds != DefaultMediaTimeoutSeconds {
+		input.TimeoutSeconds = seconds
+	}
 	ref := inference.Ref{Routing: true, Full: true, Principal: "media:" + owner, SubmissionID: submission}
 	if media.AudioTrial(p.Record.Profile) {
 		ref.Principal = "media-trial:" + owner
@@ -83,13 +108,14 @@ func (b *Broker) SubmitMedia(ctx context.Context, l *slog.Logger, p *media.Stage
 		if err != nil {
 			return nil, err
 		}
-		e := &inference.Experiment{ID: id, ConversationID: id, WorkerID: target, State: "queued", CurrentJobID: id, CreatedAt: s.Now, DeadlineAt: s.Now.Add(media.JobTimeout), RemoteOutcome: "not_started"}
+		e := &inference.Experiment{ID: id, ConversationID: id, WorkerID: target, State: "queued", CurrentJobID: id, CreatedAt: s.Now, DeadlineAt: s.Now.Add(time.Duration(seconds) * time.Second), RemoteOutcome: "not_started"}
 		j := &inference.Job{ID: id, Version: 1, WorkerID: e.WorkerID, ExperimentID: id, ConversationID: id, State: "queued", CreatedAt: s.Now, DeadlineAt: e.DeadlineAt, Media: &p.Record, Context: inference.Delivery{Kind: "full", ReceiptID: id, CanonicalSHA256: hash, Messages: []inference.Item{}, Tools: []inference.Tool{}}}
 		if err = p.Install(b.Media.Dir, id); err != nil {
 			return nil, err
 		}
 		s.Experiments[id], s.Jobs[id] = e, j
-		event(ev, slog.LevelInfo, "media.submitted", s, j, "client_id", owner, "profile", j.Media.Profile, "input_bytes", j.Media.InputSize, "input_sha256", j.Media.InputHash, "prompt_sha256", j.Media.PromptHash)
+		event(ev, slog.LevelInfo, "media.submitted", s, j, "client_id", owner, "profile", j.Media.Profile, "created_at", j.CreatedAt,
+			"timeout_seconds", seconds, "input_bytes", j.Media.InputSize, "input_sha256", j.Media.InputHash, "prompt_sha256", j.Media.PromptHash)
 		return mediaStatus(e, j), nil
 	})
 }

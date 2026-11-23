@@ -9,11 +9,12 @@ Send the named model-client key as a Bearer credential. These examples assume `O
 ```sh
 curl --header @"$CLIENT_HEADER" \
   -F 'submission_id=river-001' -F 'image=@river.webp;type=image/webp' \
+  -F 'timeout_seconds=1800' \
   -F 'prompt=Move the camera slowly towards the far bank.' \
   "$ORIGIN/api/v1/media/jobs"
 
 curl --header @"$CLIENT_HEADER" --json \
-  '{"submission_id":"river-002","prompt":"A watercolor river at dawn. Mist drifts across the water."}' \
+  '{"submission_id":"river-002","prompt":"A watercolor river at dawn. Mist drifts across the water.","timeout_seconds":1800}' \
   "$ORIGIN/api/v1/media/jobs"
 
 curl --header @"$CLIENT_HEADER" "$ORIGIN/api/v1/media/jobs/$JOB_ID"
@@ -23,9 +24,11 @@ curl --fail --header @"$CLIENT_HEADER" --output river.mp4 \
 
 JSON accepts an optional `format` of `mp4` or `wav`. The default is `mp4`. For a WAV submit `{"submission_id":"audio-001","format":"wav","prompt":"Make a short recording introducing the trail guide."}`. Muse receives the brief and chooses an available producer. The installed worker must advertise support for prompt-to-WAV jobs.
 
-The submission response is HTTP 202 with `job_id`, status, profile and timestamps. Repeating the same submission ID, prompt and image under the same owner returns the original job. Changed inputs under that ID return 409. The broker stages the inputs even if no compatible slot is currently free. The job deadline is 15 minutes from admission; a quiet or offline badge does not shorten it.
+The submission response is HTTP 202 with `job_id`, status, profile, `created_at` and `deadline_at`. The optional `timeout_seconds` accepts whole seconds from 1 through 3600 and defaults to 900. The clock starts when the broker accepts the submission and includes queue time, worker launch, generation and upload. A timeout of 1800 seconds leaves 20 minutes for work after a 10-minute queue wait. Each status poll returns the same `deadline_at`.
 
-Multipart accepts one static WebP, PNG or JPEG, up to 8 MiB and 16 million pixels. Prompt text is limited to 4 KiB of UTF-8. JSON prompt-only jobs generate a private still with native Muse and animate it using the same prompt. The one-minute checker hands a pulled claim to a separate native work run. `cron-start` verifies the claim before revealing the private brief. After generation, `media-finish` streams the bounded original file through the service origin. Each transfer has a 120-second deadline.
+Repeat the same submission ID, prompt, format, image and effective timeout under the same owner to recover the original job and deadline. Explicit `900` and omission are equivalent. Changing the timeout or another input under the same ID returns 409. The broker stages valid inputs even when all compatible slots are occupied.
+
+Multipart accepts one static WebP, PNG or JPEG, up to 8 MiB and 16 million pixels. Prompt text is limited to 4 KiB of UTF-8. JSON prompt-only jobs generate a private still with native Muse and animate it using the same prompt. The one-minute checker hands a pulled claim to a separate native work run. `cron-start` verifies the claim before revealing the private brief. After generation, `media-finish` streams the bounded original file through the service origin.
 
 Completed status includes `committed_at`, `expires_at` and the measured `artifact`. The receipt records media type, bytes, SHA-256, duration and streams. Video also includes its measured dimensions, frame rate and frame count. Artifacts are limited to 32 MiB. Pending status includes `retry_after_seconds: 60`. The existing authenticated artifact route returns 409 while pending and 410 at or after expiry. Unknown jobs and another client's jobs return 404. Exact retries preserve the original deadline.
 
@@ -38,12 +41,12 @@ Configure an MCP client that supports Streamable HTTP and custom request headers
 | Tool | Input | Result |
 | --- | --- | --- |
 | `ask_muse` | `prompt`, `submission_id` | One independent Muse answer in the call, with `text` and `request_id` |
-| `generate_wav` | `prompt`, `submission_id` | A new prompt-to-WAV job ID |
-| `generate_video` | `prompt`, `submission_id` | A new MP4 job ID using Muse's still generation and animation |
-| `download_wav` | `job_id` | WAV job state and ready download URL |
-| `download_video` | `job_id` | MP4 job state and ready download URL |
+| `generate_wav` | `prompt`, `submission_id`, optional `timeout_seconds` | WAV job ID and `deadline_at` |
+| `generate_video` | `prompt`, `submission_id`, optional `timeout_seconds` | MP4 job ID and `deadline_at` using Muse's still generation and animation |
+| `download_wav` | `job_id` | WAV job state, `deadline_at` and download URL when ready |
+| `download_video` | `job_id` | MP4 job state, `deadline_at` and download URL when ready |
 
-Poll the matching download tool every 60 seconds while it returns `retry_after_seconds: 60`. Once the result includes `download_url` and `expires_at`, fetch the URL directly. Stop polling when a terminal result returns a `reason`. Reuse the original `submission_id` to recover a lost reply. A repeat of the same media submission through MCP or HTTP returns the original job. A changed format or prompt under the same ID conflicts.
+For a 30-minute MCP submission, include `"timeout_seconds": 1800` in the generation tool arguments. Poll the matching download tool every 60 seconds while it returns `retry_after_seconds: 60`. Once the result includes `download_url` and `expires_at`, fetch the URL directly. Stop polling when a terminal result returns a `reason`. Retry the same submission through MCP or HTTP to recover a lost reply and its original deadline.
 
 Configure the HTTPS proxy to allowlist its public hostnames and pass the accepted public `Host` to the broker. Links use that hostname and port. Scope access logging for `/downloads/` to a route label without the path or disable it for that route. Keep request and response bodies out of proxy logging. If the client sends `Origin`, use the broker's public HTTPS origin. [Deployment guide](deployment.md#fresh-install)
 
@@ -56,6 +59,8 @@ The worker stages each new job in a private `0700` directory under `/tmp` on the
 
 The service verifies the byte count, SHA-256, actual stream properties and decode, syncs the original file, checks the current worker lease and commits its receipt. An uncertain native generation preserves the assignment hold and requires reconciliation before another generation. The service removes inputs at terminal status and removes the output and its share credential at expiry, including overdue files discovered on startup. SQLite stores the minimal job receipt. Its status remains available after expiry.
 
+Each transfer has a 120-second limit within the job deadline. The ten-minute download window starts at verified storage. Cleanup applies a separate 15-minute grace period to unknown spool files.
+
 Media inspection uses the Alpine FFmpeg package as separate local processes. The distribution package includes GPL and LGPL components. [Alpine package and source recipe](https://pkgs.alpinelinux.org/package/v3.24/community/x86_64/ffmpeg) · [FFmpeg source and licensing](https://ffmpeg.org/legal.html)
 
 ## Management audio trials
@@ -64,7 +69,7 @@ Media inspection uses the Alpine FFmpeg package as separate local processes. The
 
 ## Diagnosis and live verification
 
-Collect the broker's protected `/api/v1/admin/diagnostics/export?operation_id=JOB_ID` and the worker's `diagnostics-export --operation-id JOB_ID --decode`. Reconstruct the broker export with `decodeExport` from `tools/qualification-evidence.mjs` and check completeness before filtering. Use request IDs to find rejected admissions before a job exists. Follow the authenticated worker, assignment generation, original digest and byte counts, rejected stage and cause, commit time, expiry and cleanup. The `media.link_ready`, `media.link_opened` and `media.link_rejected` events identify link outcomes without storing the credential. Media captures omit raw prompts, source images and artifact bytes. MCP text exchanges use the existing private redacted history diagnostics.
+Collect the broker's protected `/api/v1/admin/diagnostics/export?operation_id=JOB_ID` and the worker's `diagnostics-export --operation-id JOB_ID --decode`. Reconstruct the broker export with `decodeExport` from `tools/qualification-evidence.mjs` and check completeness before filtering. Use request IDs to find WARN `media.rejected` or `mcp.tool_rejected` before a job exists. Join INFO `media.submitted`, `job.claimed`, `job.work_started` and `media.committed` by job ID to compare the selected timeout, deadline, worker start and accepted bytes. ERROR `job.deadline_exceeded` identifies the expired deadline and any retained worker hold. The `media.link_ready`, `media.link_opened` and `media.link_rejected` events identify link outcomes without storing the credential. Media captures omit raw prompts, source images and artifact bytes. MCP text exchanges use the existing private redacted history diagnostics.
 
 The owner accepted the `0.1.0-rc.15` TLS results and the controlled `/tmp` tests for closing #50 and #51 on merge of the follow-up PR. A TLS run with the revised installed worker remains pending. [Audio and delivery results](https://github.com/markhuangai/AaA-muse-ai/issues/50#issuecomment-6996811354) · [Video and cleanup results](https://github.com/markhuangai/AaA-muse-ai/issues/51#issuecomment-6996811661)
 

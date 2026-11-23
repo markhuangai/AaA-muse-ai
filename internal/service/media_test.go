@@ -3,6 +3,7 @@ package service
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"os"
 	"path/filepath"
@@ -32,16 +33,16 @@ func TestMediaReceiptAndOwnership(t *testing.T) {
 		return p
 	}
 	message := "private request text with distinctive sentinel"
-	data, err := b.SubmitMedia(ctx, logger, makeStage(message), "alice", "create-media", "")
+	data, err := b.SubmitMedia(ctx, logger, makeStage(message), "alice", "create-media", "", nil)
 	status := decodeResult[MediaStatus](t, data, err)
 	if status.DeadlineAt.Sub(status.CreatedAt) != 15*time.Minute {
 		t.Fatal(status)
 	}
-	data, err = b.SubmitMedia(ctx, logger, makeStage(message), "alice", "create-media", "")
+	data, err = b.SubmitMedia(ctx, logger, makeStage(message), "alice", "create-media", "", json.RawMessage(`900`))
 	if decodeResult[MediaStatus](t, data, err).ID != status.ID {
 		t.Fatal("retry duplicated job")
 	}
-	_, err = b.SubmitMedia(ctx, logger, makeStage("changed"), "alice", "create-media", "")
+	_, err = b.SubmitMedia(ctx, logger, makeStage("changed"), "alice", "create-media", "", nil)
 	requireInferenceReason(t, err, "submission_conflict")
 	_, _, err = b.ReadMedia(ctx, logger, "bob", status.ID, false)
 	requireInferenceReason(t, err, "media_not_found")

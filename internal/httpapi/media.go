@@ -75,9 +75,10 @@ func isMediaRoute(route string) bool {
 }
 
 type mediaRequest struct {
-	Prompt     string          `json:"prompt"`
-	Submission string          `json:"submission_id"`
-	Format     json.RawMessage `json:"format,omitempty"`
+	Prompt         string          `json:"prompt"`
+	Submission     string          `json:"submission_id"`
+	Format         json.RawMessage `json:"format,omitempty"`
+	TimeoutSeconds json.RawMessage `json:"timeout_seconds,omitempty"`
 }
 type trialRequest struct {
 	FixtureHash string `json:"fixture_sha256,omitempty"`
@@ -149,6 +150,10 @@ func readMediaRequest(ctx context.Context, r *http.Request, store *media.Store, 
 				input.Prompt, err = boundedText(part, media.PromptLimit)
 			case "submission_id":
 				input.Submission, err = boundedText(part, 128)
+			case "timeout_seconds":
+				var timeout string
+				timeout, err = boundedText(part, 32)
+				input.TimeoutSeconds = json.RawMessage(timeout)
 			case "image":
 				buf := bufio.NewReader(part)
 				head, readErr := buf.Peek(512)
@@ -203,7 +208,10 @@ func (h *Handler) serveMedia(w *response, r *http.Request, l *slog.Logger, route
 			return
 		}
 	}
-	l = l.With("job_id", id, "operation_id", id, "client_id", owner, "worker_id", worker)
+	l = l.With("client_id", owner, "worker_id", worker)
+	if id != "" {
+		l = l.With("job_id", id, "operation_id", id)
+	}
 	var err error
 	switch route {
 	case mediaJobs, mediaTrials:
@@ -295,6 +303,7 @@ func (h *Handler) submitMedia(w *response, r *http.Request, ctx context.Context,
 	}
 	defer service.CloseMediaStage(l, stage)
 	var submission, target string
+	var timeout json.RawMessage
 	if route == mediaTrials {
 		data, err := boundedText(r.Body, 2048)
 		if err != nil {
@@ -315,9 +324,9 @@ func (h *Handler) submitMedia(w *response, r *http.Request, ctx context.Context,
 		if err != nil {
 			return err
 		}
-		submission = input.Submission
+		submission, timeout = input.Submission, input.TimeoutSeconds
 	}
-	reply, err := h.Broker.SubmitMedia(ctx, l, stage, owner, submission, target)
+	reply, err := h.Broker.SubmitMedia(ctx, l, stage, owner, submission, target, timeout)
 	if err == nil {
 		writeJSON(w, 202, reply)
 	}

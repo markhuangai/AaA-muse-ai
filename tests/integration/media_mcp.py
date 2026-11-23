@@ -1,5 +1,6 @@
 """MCP contract checks against the packed worker and shared media broker."""
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 import hashlib
 import http.client
 import json
@@ -92,9 +93,19 @@ class MCPMedia:
         return path
 
     def mcp_preflight(self):
-        names = {tool["name"] for tool in self.mcp_call()}
-        require(names == {"ask_muse", "generate_wav", "generate_video", "download_wav", "download_video"},
+        tools = {tool["name"]: tool for tool in self.mcp_call()}
+        require(set(tools) == {"ask_muse", "generate_wav", "generate_video", "download_wav", "download_video"},
                 "MCP discovery exposed the wrong tools")
+        for name, tool in tools.items():
+            schema = tool["inputSchema"]
+            timeout = schema.get("properties", {}).get("timeout_seconds")
+            if name in ("generate_video", "generate_wav"):
+                require(timeout is not None and timeout["type"] == "integer" and timeout["default"] == 900 and
+                        timeout["minimum"] == 1 and timeout["maximum"] == 3600 and "timeout_seconds" not in schema["required"],
+                        "MCP generation discovery lost the optional timeout bounds")
+                require("deadline_at" in tool["outputSchema"]["properties"], "MCP generation discovery omitted the deadline")
+            else:
+                require(timeout is None, "unrelated MCP tool advertised a media timeout")
         # The explicit older protocol handshake also checks the wire cache policy.
         initialize = {"jsonrpc": "2.0", "id": 1, "method": "initialize",
                       "params": {"protocolVersion": "2025-11-25", "capabilities": {},
@@ -121,21 +132,67 @@ class MCPMedia:
                      {"protocol_version": 1, "submission_id": secrets.token_hex(16)})
         self.add("mcp.discovery_authority_and_worker_capability")
 
+    def mcp_timeout_contract(self):
+        route = "/api/v1/media/jobs"
+        fields = {"prompt": "private-media-timeout-" + secrets.token_hex(16), "submission_id": secrets.token_hex(16)}
+        for seconds in (0, -1, 3601, 1.5, None, True, "60", {"seconds": 60}):
+            args = {**fields, "timeout_seconds": seconds}
+            result = self.mcp_call("generate_video", args)
+            require(result.get("error") == "invalid_media_timeout", "MCP accepted an invalid timeout")
+            event = self.mcp_rejection(result["_request_id"], "mcp.tool_rejected", "invalid_media_timeout", owner="fixture-client")
+            require(event["evidence"] == {"field": "timeout_seconds", "minimum": 1, "maximum": 3600},
+                    "MCP rejection omitted the applicable timeout policy")
+            status, headers, body = self.api(route, self.client, "POST", args)
+            require(status == 400 and json.loads(body)["error"] == "invalid_media_timeout", "JSON accepted an invalid timeout")
+            self.mcp_rejection(headers["X-Request-Id"], "media.rejected", "invalid_media_timeout", owner="fixture-client")
+
+        for seconds in (1, 3600):
+            args = {**fields, "submission_id": secrets.token_hex(16), "timeout_seconds": seconds}
+            job = self.mcp_call("generate_video", args)
+            status = self.checked(route, self.client, "POST", args, want=202, origin=self.sibling_origin)[0]
+            identity = job["job_id"]
+            deadline = status["deadline_at"]
+            require(status["job_id"] == identity and job["deadline_at"] == deadline and
+                    (datetime.fromisoformat(deadline) - datetime.fromisoformat(status["created_at"])).total_seconds() == seconds,
+                    "cross-broker HTTP and MCP retries changed the submitted deadline")
+            require(self.mcp_call("download_video", {"job_id": identity})["deadline_at"] == deadline, "MCP polling changed the deadline")
+            require(self.api(route, self.client, "POST", {**args, "timeout_seconds": 900}, origin=self.sibling_origin)[0] == 409,
+                    "a changed media timeout reused an existing submission")
+            if seconds == 1:
+                def expired():
+                    view = self.checked(route + "/" + identity, self.client)[0]
+                    return view["status"] == "interrupted" and view.get("reason") == "deadline_exceeded"
+
+                self.until(expired, "queued media did not expire under its one-second deadline", timeout=10)
+                events = self.mcp_diagnostic("operation_id", identity, self.origin_url)
+                expiry = next((event for event in events if event["msg"] == "job.deadline_exceeded"), None)
+                require(expiry is not None and expiry["level"] == "ERROR" and expiry["reason"] == "deadline_exceeded" and
+                        expiry["deadline_at"] == deadline and expiry["busy_hold"] is False,
+                        "the protected export could not explain the queued deadline failure")
+            else:
+                self.cancel(identity)
+        self.add("media.timeout_bounds_cross_transport_and_diagnostics")
+
     def mcp_generated_wav(self, worker):
         jobs = []
         for frequency in (385, 526):
             fields = {"prompt": "private-audio-brief-" + secrets.token_hex(16) + f" tone at {frequency} Hz",
                       "submission_id": secrets.token_hex(16)}
+            if frequency == 526:
+                fields["timeout_seconds"] = 1800
             job = self.mcp_call("generate_wav", fields)
             identity = job["job_id"]
             status = self.checked("/api/v1/media/jobs", self.client, "POST", {**fields, "format": "wav"}, want=202,
                                   origin=self.sibling_origin)[0]
-            require(status["job_id"] == identity and job["status"] == "queued", "cross-interface WAV retry created new work")
+            require(status["job_id"] == identity and job["status"] == "queued" and job["deadline_at"] == status["deadline_at"] and
+                    (datetime.fromisoformat(status["deadline_at"]) - datetime.fromisoformat(status["created_at"])).total_seconds() ==
+                    fields.get("timeout_seconds", 900), "cross-interface WAV retry changed the job or deadline")
             changed = self.mcp_call("generate_video", fields)
             require(changed.get("error") == "submission_conflict", "changed-format submission did not conflict")
             self.mcp_rejection(changed["_request_id"], "mcp.tool_rejected", "submission_conflict", owner="fixture-client")
             pending = self.mcp_call("download_wav", {"job_id": identity})
-            require(pending.get("retry_after_seconds") == 60 and "download_url" not in pending, "pending audio produced a URL")
+            require(pending.get("retry_after_seconds") == 60 and "download_url" not in pending and
+                    pending["deadline_at"] == job["deadline_at"], "pending audio changed the deadline or exposed a URL")
             self.claim_work(worker, identity)
             shown = self.start_work(worker)
             spool, progress = self.worker_media_directory(worker, identity, shown)

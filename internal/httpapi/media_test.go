@@ -161,6 +161,7 @@ func TestMediaMultipartBoundary(t *testing.T) {
 		w := multipart.NewWriter(&b)
 		w.WriteField("prompt", "motion")
 		w.WriteField("submission_id", "image1")
+		w.WriteField("timeout_seconds", "1800")
 		if kind == "duplicate" {
 			w.WriteField("prompt", "other")
 		}
@@ -187,7 +188,7 @@ func TestMediaMultipartBoundary(t *testing.T) {
 		}
 		in, err := readMediaRequest(r.Context(), r, store, stage)
 		stage.Close()
-		if kind == "valid" && (err != nil || in.Submission != "image1" || stage.Record.InputType != "image/png") || kind != "valid" && err == nil {
+		if kind == "valid" && (err != nil || in.Submission != "image1" || string(in.TimeoutSeconds) != "1800" || stage.Record.InputType != "image/png") || kind != "valid" && err == nil {
 			t.Fatal(kind, in, err)
 		}
 	}

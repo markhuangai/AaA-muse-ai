@@ -46,6 +46,10 @@ function AssignmentWorkers({ entry, view }: { entry: TimelineEntry; view: Histor
   const ids = [...new Set([details.worker_id, details.expected_worker_id, details.observed_worker_id, assignment?.worker_id].filter((id): id is string => typeof id === 'string' && !!id))];
   return <>{ids.map(id => <p className="trace" key={id}>{id === details.expected_worker_id ? 'Previous worker' : id === details.observed_worker_id ? 'Selected worker' : 'Recorded worker'} <Identifier label="recorded worker ID" value={id} /><CurrentName id={id} view={view} /></p>)}</>;
 }
+function mediaProgress(state: string, started: string | null | undefined) {
+  if (state === 'inference') return started ? 'Start acknowledged' : 'Claimed and awaiting start';
+  return state.charAt(0).toUpperCase() + state.slice(1);
+}
 function RequestList({ controller, view, select }: { controller: HistoryController; view: HistoryView; select: (id: string) => void }) {
   const [conversation, setConversation] = useState(view.conversation), [requestID, setRequestID] = useState('');
   const submitFilter = (event: FormEvent) => { event.preventDefault(); void controller.filter(conversation); };
@@ -56,8 +60,17 @@ function RequestList({ controller, view, select }: { controller: HistoryControll
     <ReadNotice read={read} />
     {read.cursor && <p className="field-note">Older request page. New arrivals do not move this page; use First requests page to see them.</p>}
     {read.value === null ? <p className="empty-state">{read.loading ? 'Loading recorded requests…' : 'Request history is unavailable. Use Refresh history to retry.'}</p> : !read.value.items.length ? <p className="empty-state">No recorded requests match this conversation. Clear the filter or wait for a model client to submit work.</p> : <table className="requests-table"><thead><tr><th scope="col">Request / session</th><th scope="col">Recorded state</th><th scope="col">Assigned worker</th><th scope="col" className="num">Created UTC</th></tr></thead><tbody>{read.value.items.map((request: RequestSummary) => <tr key={request.id}>
-      <td><button className="text-action request-link" onClick={() => select(request.id)} disabled={view.pending}><code>{request.id}</code></button><span className="row-note">Session <code>{request.session_id || 'Not recorded'}</code></span><span className="row-note">Client {request.client_id ?? 'Not recorded'} · {request.kind}</span></td>
-      <td>{request.state}{request.reason && <span className="row-note">{request.reason}</span>}</td><td><code className="worker-id">{request.worker_id || 'Unassigned'}</code><CurrentName id={request.worker_id} view={view} /></td><td className="num">{timestamp(request.created_at)}</td>
+      <td>
+        <button className="text-action request-link" onClick={() => select(request.id)} disabled={view.pending}><code>{request.id}</code></button>
+        {request.kind === 'media' ? <>
+          <span className="row-note">Media job · {request.profile}</span>
+          <span className="row-note">Owner {request.owner}</span>
+        </> : <>
+          <span className="row-note">Session <code>{request.session_id || 'Not recorded'}</code></span>
+          <span className="row-note">Client {request.client_id ?? 'Not recorded'} · {request.kind}</span>
+        </>}
+      </td>
+      <td>{request.kind === 'media' ? mediaProgress(request.state, request.started_at) : request.state}{request.reason && <span className="row-note">{request.reason}</span>}</td><td><code className="worker-id">{request.worker_id || 'Unassigned'}</code><CurrentName id={request.worker_id} view={view} /></td><td className="num">{timestamp(request.created_at)}</td>
     </tr>)}</tbody></table>}
     <Paging read={read} label="Requests" next={() => void controller.page('list', 'next')} previous={() => void controller.page('list', 'previous')} first={() => void controller.page('list', 'first')} />
   </section>;
@@ -72,7 +85,39 @@ export function ReplayBoundary({ detail }: { detail: RequestDetail }) {
     detail.kind === 'legacy' ? 'Legacy records do not establish the native session replacement contract.' : 'No safe prior final-answer boundary was recorded. Automatic replacement is not permitted.';
   return <p className="field-note">{explanation}</p>;
 }
+function MediaSnapshot({ detail, view }: { detail: RequestDetail & { kind: 'media' }; view: HistoryView }) {
+  const { assignment, delivery, execution, request } = detail;
+  const media = object(assignment.media) ? assignment.media : null;
+  const awaitingSettlement = assignment.held && execution.state !== 'inference';
+  return <>
+    <section className="data-panel history-summary" aria-labelledby="media-state">
+      <h3 id="media-state">Media job</h3>
+      <dl className="identity-list">
+        <div><dt>State</dt><dd>{mediaProgress(execution.state, assignment.started_at)}</dd></div>
+        {execution.reason && <div><dt>Reason</dt><dd>{execution.reason}</dd></div>}
+        <div><dt>Owner</dt><dd>{detail.owner}</dd></div>
+        <div><dt>Profile</dt><dd>{detail.profile}</dd></div>
+        <div><dt>Job ID</dt><dd><Identifier label="job ID" value={execution.current_job_id} /></dd></div>
+        <div><dt>Conversation ID</dt><dd><Identifier label="conversation ID" value={request.conversation_id} /></dd></div>
+        <div><dt>Worker hold</dt><dd>{awaitingSettlement ? 'Awaiting worker settlement' : assignment.held ? 'Held' : 'None recorded'}</dd></div>
+        <div><dt>Worker ID</dt><dd><Identifier label="worker ID" value={execution.worker_id || ''} /><CurrentName id={execution.worker_id} view={view} /></dd></div>
+        <div><dt>Submitted</dt><dd>{recordedTime(execution.created_at)}</dd></div>
+        <div><dt>Deadline</dt><dd>{recordedTime(execution.deadline_at)}</dd></div>
+        <div><dt>Claimed</dt><dd>{recordedTime(assignment.claimed_at)}</dd></div>
+        <div><dt>Start acknowledgement</dt><dd>{recordedTime(assignment.started_at)}</dd></div>
+        <div><dt>Artifact committed</dt><dd>{recordedTime(media?.committed_at)}</dd></div>
+      </dl>
+      {awaitingSettlement && <p className="field-note">The worker remains reserved until the original media run is reconciled.</p>}
+    </section>
+    <section className="data-panel history-content" aria-labelledby="media-records">
+      <h3 id="media-records">Recorded media snapshots</h3>
+      <details><summary>Complete recorded request snapshot</summary><pre>{json(request)}</pre></details>
+      <details><summary>Recorded media assignment</summary><pre>{json({ assignment, delivery })}</pre></details>
+    </section>
+  </>;
+}
 function Snapshot({ detail, view }: { detail: RequestDetail; view: HistoryView }) {
+  if (detail.kind === 'media') return <MediaSnapshot detail={detail} view={view} />;
   const request = detail.request, execution = detail.execution;
   const input = object(request.input) ? request.input : request;
   const response = object(request.response_metadata) ? request.response_metadata : null;
@@ -103,9 +148,9 @@ function Timeline({ controller, view }: { controller: HistoryController; view: H
   const read = view.timeline;
   return <section className="data-panel history-timeline" aria-labelledby="timeline-title" aria-busy={read.loading}><h3 id="timeline-title">Conversation timeline</h3><p className="field-note">Chronological service records across this conversation. The selected request is marked. Earlier pages stay anchored while new events arrive.</p><ReadNotice read={read} />
     {read.value === null ? <p className="empty-state">{read.loading ? 'Loading conversation timeline…' : 'Timeline unavailable. Refresh to retry.'}</p> : !read.value.items.length ? <p className="empty-state">No timeline records are available.</p> : <ol className="timeline-events">{read.value.items.map((entry: TimelineEntry) => <li key={entry.sequence} className={entry.request_id === view.selectedID ? 'selected-request-event' : undefined}>
-      <div className="event-heading"><strong>{entry.kind}</strong><span className="num">{entry.time ? timestamp(entry.time) : 'Time not recorded'}</span></div><p className="row-note">Sequence {entry.sequence} · {entry.level || 'Level not recorded'} · {entry.request_id === view.selectedID ? 'Selected request' : 'Related request'}</p>
+      <div className="event-heading"><strong>{entry.kind === 'media_job_snapshot' ? 'Media job snapshot' : entry.kind}</strong><span className="num">{entry.time ? timestamp(entry.time) : 'Time not recorded'}</span></div><p className="row-note">Sequence {entry.sequence} · {entry.level || 'Level not recorded'} · {entry.request_id === view.selectedID ? 'Selected request' : 'Related request'}</p>
       {entry.request_id && <p className="trace">Request <Identifier label="timeline request ID" value={entry.request_id} />{' '}{entry.request_id !== view.selectedID && <button className="text-action" onClick={() => void controller.select(entry.request_id!)}>Open related request</button>}</p>}
-      {entry.provenance === 'unavailable' && <p className="field-note">Legacy provenance is unavailable; this is a retained snapshot.</p>}
+      {entry.provenance === 'unavailable' && entry.kind !== 'media_job_snapshot' && <p className="field-note">Legacy provenance is unavailable; this is a retained snapshot.</p>}
       <AssignmentWorkers entry={entry} view={view} />
       {entry.item && <><p className="row-note">{entry.item.source === 'client_provided' ? 'Client-provided context' : entry.item.source === 'server_observed' ? 'Decision accepted by the service' : 'Recorded item; source not established'}</p><pre>{json(entry.item)}</pre></>}
       {entry.details && <details open={entry.kind === 'dispatch.reassigned' || entry.kind === 'dispatch.pin_released' || entry.kind === 'portal.cancel_result'}><summary>Recorded event details</summary><pre>{json(entry.details)}</pre></details>}
@@ -125,7 +170,7 @@ function Detail({ controller, view, back }: { controller: HistoryController; vie
     <div className="detail-heading"><div><h2 tabIndex={-1} ref={title}>Request detail</h2><Identifier label="request ID" value={view.selectedID} /></div><button className="danger-action" disabled={disabled} onClick={() => setConfirming(view.selectedID)}>{view.pending ? 'Cancelling…' : 'Cancel request'}</button></div>
     <ReadNotice read={read} /><Correlation requestID={read.requestID} operationID={read.operationID} />
     {detail ? <>{detail.kind === 'legacy' && <p className="snapshot-label">Legacy request · Native session identity and historical provenance may be unavailable.</p>}<HistoryBoundary controller={controller} resource="detail"><div className="history-fact-grid"><Snapshot detail={detail} view={view} /></div></HistoryBoundary><HistoryBoundary controller={controller} resource="timeline"><Timeline controller={controller} view={view} /></HistoryBoundary></> : <p className="empty-state">{read.loading ? 'Loading request detail…' : 'No request detail is available.'}</p>}
-    <dialog ref={dialog} aria-labelledby="cancel-request-title" aria-describedby="cancel-request-description" onCancel={() => setConfirming('')} onClose={() => setConfirming('')}><h2 id="cancel-request-title">Cancel this request?</h2><p className="confirm-identity"><code>{confirming}</code></p><p id="cancel-request-description">The broker fences future acceptance for cancellable work. Remote stopping is best effort and may remain unknown. Accepted client tools and retained history are preserved.</p><form onSubmit={event => { event.preventDefault(); const id = confirming; close(); void controller.cancel(id); }}><button type="button" autoFocus onClick={close}>Keep request</button><button type="submit" className="danger-action" disabled={disabled}>Confirm cancellation</button></form></dialog>
+    <dialog ref={dialog} aria-labelledby="cancel-request-title" aria-describedby="cancel-request-description" onCancel={() => setConfirming('')} onClose={() => setConfirming('')}><h2 id="cancel-request-title">Cancel this request?</h2><p className="confirm-identity"><code>{confirming}</code></p><p id="cancel-request-description">The broker fences future acceptance for cancellable work. Remote stopping is best effort and may remain unknown. {detail?.kind === 'media' ? 'Any unresolved worker hold and retained media history are preserved.' : 'Accepted client tools and retained history are preserved.'}</p><form onSubmit={event => { event.preventDefault(); const id = confirming; close(); void controller.cancel(id); }}><button type="button" autoFocus onClick={close}>Keep request</button><button type="submit" className="danger-action" disabled={disabled}>Confirm cancellation</button></form></dialog>
   </section>;
 }
 export function Requests({ controller }: { controller: HistoryController }) {

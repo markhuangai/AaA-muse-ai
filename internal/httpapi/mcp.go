@@ -10,7 +10,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/markhuangai/AaA-muse-ai/internal/inference"
+	"github.com/markhuangai/AaA-muse-ai/internal/service"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -32,6 +34,22 @@ type mcpPrompt struct {
 	Submission string `json:"submission_id" jsonschema:"A caller-chosen retry ID. Reuse it for the same submission."`
 }
 
+type mcpMediaPrompt struct {
+	Prompt         string          `json:"prompt"`
+	Submission     string          `json:"submission_id"`
+	TimeoutSeconds json.RawMessage `json:"timeout_seconds,omitempty"`
+}
+
+var mcpMediaInputSchema = map[string]any{
+	"type": "object", "required": []string{"prompt", "submission_id"}, "additionalProperties": false,
+	"properties": map[string]any{
+		"prompt":        map[string]any{"type": "string", "description": "The media generation prompt"},
+		"submission_id": map[string]any{"type": "string", "description": "Reuse this ID to retry the same submission"},
+		"timeout_seconds": map[string]any{"type": "integer", "minimum": 1, "maximum": service.MaxMediaTimeoutSeconds,
+			"default": service.DefaultMediaTimeoutSeconds, "description": "Whole seconds from submission, including time queued."},
+	},
+}
+
 type mcpJob struct {
 	ID string `json:"job_id" jsonschema:"The job ID returned when media generation was submitted"`
 }
@@ -48,6 +66,7 @@ type mcpMediaResult struct {
 	Reason            string `json:"reason,omitempty"`
 	DownloadURL       string `json:"download_url,omitempty"`
 	ExpiresAt         string `json:"expires_at,omitempty"`
+	DeadlineAt        string `json:"deadline_at"`
 }
 
 func (h *Handler) InitMCP() {
@@ -61,8 +80,15 @@ func (h *Handler) newMCPHandler() http.Handler {
 	}
 	server := mcp.NewServer(&mcp.Implementation{Name: "aaa-muse-ai", Version: version}, nil)
 	mcp.AddTool(server, &mcp.Tool{Name: "ask_muse", Description: "Send an independent text prompt to Muse and wait for the answer."}, h.askMuse)
-	mcp.AddTool(server, &mcp.Tool{Name: "generate_wav", Description: "Submit a prompt for a WAV. Poll download_wav with the job ID every 60 seconds."}, h.generateMCPMedia("wav"))
-	mcp.AddTool(server, &mcp.Tool{Name: "generate_video", Description: "Submit a prompt for an MP4. Poll download_video with the job ID every 60 seconds."}, h.generateMCPMedia("mp4"))
+	mediaOutputSchema, err := jsonschema.For[mcpMediaResult](nil)
+	if err != nil {
+		panic(err)
+	}
+	// The raw handler validates the original integer and logs rejections before SDK schema coercion.
+	server.AddTool(&mcp.Tool{Name: "generate_wav", InputSchema: mcpMediaInputSchema, OutputSchema: mediaOutputSchema,
+		Description: "Submit a prompt for a WAV. Poll download_wav with the job ID every 60 seconds."}, h.generateMCPMedia("wav"))
+	server.AddTool(&mcp.Tool{Name: "generate_video", InputSchema: mcpMediaInputSchema, OutputSchema: mediaOutputSchema,
+		Description: "Submit a prompt for an MP4. Poll download_video with the job ID every 60 seconds."}, h.generateMCPMedia("mp4"))
 	mcp.AddTool(server, &mcp.Tool{Name: "download_wav", Description: "Check a WAV job and get its temporary download link once ready."}, h.downloadMCPMedia("audio/wav"))
 	mcp.AddTool(server, &mcp.Tool{Name: "download_video", Description: "Check an MP4 job and get its temporary download link once ready."}, h.downloadMCPMedia("video/mp4"))
 	return mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server }, &mcp.StreamableHTTPOptions{
@@ -204,24 +230,39 @@ func (h *Handler) finishMCPOutput(w *response, controller *http.ResponseControll
 	}
 }
 
-func (h *Handler) generateMCPMedia(format string) mcp.ToolHandlerFor[mcpPrompt, mcpMediaResult] {
-	return func(ctx context.Context, request *mcp.CallToolRequest, input mcpPrompt) (*mcp.CallToolResult, mcpMediaResult, error) {
+func mcpMediaFailure(l *slog.Logger, err error) (*mcp.CallToolResult, error) {
+	var result mcp.CallToolResult
+	result.SetError(mcpFailure(l, err))
+	return &result, nil
+}
+
+func (h *Handler) generateMCPMedia(format string) mcp.ToolHandler {
+	return func(ctx context.Context, request *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		exchange, ctx, cleanup := startMCPTool(ctx)
 		defer cleanup()
 		l := exchange.logger.With("tool", request.Params.Name, "format", format)
-		if h.Broker.Media == nil {
-			return nil, mcpMediaResult{}, mcpFailure(l, errors.New("media_store_unavailable"))
+		var input mcpMediaPrompt
+		if err := decodeInferenceInput(request.Params.Arguments, &input, "prompt", "submission_id"); err != nil {
+			return mcpMediaFailure(l, inference.Reject("invalid_media_request", 400))
 		}
-		data, err := h.Broker.SubmitPromptMedia(ctx, l, exchange.owner, input.Submission, format, input.Prompt)
+		if h.Broker.Media == nil {
+			return mcpMediaFailure(l, errors.New("media_store_unavailable"))
+		}
+		data, err := h.Broker.SubmitPromptMedia(ctx, l, exchange.owner, input.Submission, format, input.Prompt, input.TimeoutSeconds)
 		if err != nil {
-			return nil, mcpMediaResult{}, mcpFailure(l, err)
+			return mcpMediaFailure(l, err)
 		}
 		var job mcpMediaResult
 		if err = json.Unmarshal(data, &job); err != nil {
-			return nil, mcpMediaResult{}, mcpFailure(l, err)
+			return mcpMediaFailure(l, err)
 		}
 		job.RetryAfterSeconds = 60
-		return nil, job, nil
+		payload, err := json.Marshal(job)
+		if err != nil {
+			return mcpMediaFailure(l, err)
+		}
+		return &mcp.CallToolResult{StructuredContent: json.RawMessage(payload),
+			Content: []mcp.Content{&mcp.TextContent{Text: string(payload)}}}, nil
 	}
 }
 
@@ -242,7 +283,7 @@ func (h *Handler) downloadMCPMedia(kind string) mcp.ToolHandlerFor[mcpJob, mcpMe
 			return nil, mcpMediaResult{}, mcpFailure(l, err)
 		}
 		result := mcpMediaResult{ID: status.ID, State: status.State, Reason: status.Reason,
-			RetryAfterSeconds: status.RetryAfterSeconds, DownloadURL: status.DownloadURL}
+			RetryAfterSeconds: status.RetryAfterSeconds, DownloadURL: status.DownloadURL, DeadlineAt: status.DeadlineAt.Format(time.RFC3339Nano)}
 		if status.Expired {
 			result.State, result.Reason = "expired", "artifact_expired"
 		}
