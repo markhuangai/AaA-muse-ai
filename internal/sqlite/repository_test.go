@@ -11,6 +11,9 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/markhuangai/AaA-muse-ai/internal/inference"
+	"github.com/markhuangai/AaA-muse-ai/internal/worker"
 )
 
 func privatePath(t *testing.T) string {
@@ -62,8 +65,11 @@ func TestNativePullWinnerAndDueWorkUseSeekIndexes(t *testing.T) {
 		query, index string
 		parameters   []any
 	}{
-		{nextPullJob, "aaa_pull_queue_head", []any{"worker", 2, time.Now().UnixMicro()}},
-		{nextPullJob, "aaa_pull_queue_head", []any{"", 0, time.Now().UnixMicro()}},
+		{nextPullJob, "aaa_pull_queue_head", []any{"worker", 2, time.Now().UnixMicro(), 0, ""}},
+		{nextPullJob, "aaa_pull_queue_head", []any{"", 0, time.Now().UnixMicro(), 0, ""}},
+		{nextModelPullJob, "aaa_pull_queue_model_head", []any{"worker", 0, time.Now().UnixMicro(), 0, "after"}},
+		{betterPullWorkers, "aaa_weekly_usage_rank", []any{80, time.Now().Add(-2 * time.Minute).UnixMicro(), time.Now().UnixMicro(), "1"}},
+		{exhaustedPullWorkers, "aaa_weekly_usage_rank", []any{time.Now().Add(-2 * time.Minute).UnixMicro(), time.Now().UnixMicro()}},
 		{heldPullJob, "aaa_worker_single_held_turn", []any{"worker"}},
 		{duePullExperiments, "aaa_experiments_due", []any{time.Now().UnixMicro()}},
 		{duePullPins, "aaa_queued_pins_due", []any{time.Now().UnixMicro()}},
@@ -81,10 +87,11 @@ func TestNativePullWinnerAndDueWorkUseSeekIndexes(t *testing.T) {
 				if err := rows.Scan(&node, &parent, &unused, &detail); err != nil {
 					t.Fatal(err)
 				}
+				head := check.query == nextPullJob || check.query == nextModelPullJob
 				if strings.HasPrefix(detail, "SEARCH ") && strings.Contains(detail, check.index) {
-					seek = check.query != nextPullJob || strings.Contains(detail, "(target=? AND capability=? AND shift=? AND bucket=?)")
+					seek = !head || strings.Contains(detail, "(target=? AND capability=? AND shift=? AND bucket=?")
 				} else if strings.HasPrefix(detail, "SCAN aaa_") || strings.HasPrefix(detail, "SCAN job") ||
-					(strings.Contains(detail, "TEMP B-TREE") && (check.query != nextPullJob || parent != 0)) {
+					(strings.Contains(detail, "TEMP B-TREE") && ((!head && check.query != betterPullWorkers) || parent != 0)) {
 					t.Fatalf("native lookup used unbounded work: %s", detail)
 				}
 			}
@@ -134,7 +141,7 @@ func TestNativePullWinnerSkipsExpiredQueueAndPreservesOrder(t *testing.T) {
 		{"other-worker", 1, "open-first"},
 	} {
 		if err := repo.read(t.Context(), func(tx *sql.Tx) error {
-			winner, err := pickPullJob(t.Context(), tx, check.worker, check.kind, now)
+			winner, _, err := pickPullJob(t.Context(), tx, check.worker, "1", check.kind, now, &inference.PullTiming{})
 			if err == nil && winner.job != check.want {
 				t.Errorf("winner for %s/%d = %s, want %s", check.worker, check.kind, winner.job, check.want)
 			}
@@ -147,9 +154,62 @@ func TestNativePullWinnerSkipsExpiredQueueAndPreservesOrder(t *testing.T) {
 	execute(t, repo, "UPDATE aaa_inference_jobs SET state='claimed',held=1 WHERE id='target-first-b'")
 	execute(t, repo, "DELETE FROM aaa_inference_jobs WHERE id='target-late'")
 	if err := repo.read(t.Context(), func(tx *sql.Tx) error {
-		winner, err := pickPullJob(t.Context(), tx, "worker", 0, now)
+		winner, _, err := pickPullJob(t.Context(), tx, "worker", "1", 0, now, &inference.PullTiming{})
 		if err == nil && winner.job != "backlog-1" {
 			t.Errorf("winner after target changes = %s, want backlog-1", winner.job)
+		}
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWeeklyUsageMigrationKeepsVersionFourQueueAndReceipt(t *testing.T) {
+	repo := openRepo(t, privatePath(t))
+	for i := 0; i < 4; i++ {
+		execute(t, repo, migrations[i])
+		execute(t, repo, "INSERT INTO aaa_schema_migrations(version,checksum) VALUES(?1,?2)", i+1, migrationChecksums[i])
+	}
+	now := time.Now().UTC().Truncate(time.Second)
+	stamp := now.UnixMicro()
+	execute(t, repo, "INSERT INTO aaa_workers(id,name,credential_hash,registered_at) VALUES('old-worker','old-worker',zeroblob(32),?1)", stamp)
+	execute(t, repo, `INSERT INTO aaa_worker_polls(worker_id,sequence,scheduled_at,last_poll_at,input_hash,result,previous_pin)
+		VALUES('old-worker',7,?1,?1,'old-hash',X'7B226A6F62223A6E756C6C7D','')`, stamp)
+	execute(t, repo, `INSERT INTO aaa_conversations(id,client_id,session_id,created_at,pending_call_id,current_request_id,data)
+		VALUES('conversation','client','session',?1,'','candidate',X'7B7D')`, stamp)
+	for _, id := range []string{"older-trial", "candidate", "held"} {
+		execute(t, repo, `INSERT INTO aaa_experiments(id,worker_id,state,deadline_at,created_at,conversation_id,current_job_id,data)
+			VALUES(?1,'old-worker','queued',?2,?3,'conversation',?1,X'7B7D')`, id, now.Add(5*time.Minute).UnixMicro(), stamp)
+		execute(t, repo, `INSERT INTO aaa_inference_jobs(id,worker_id,experiment_id,state,held,created_at,has_media,data,context,deadline_at,capability)
+			VALUES(?1,'old-worker',?1,CASE WHEN ?1='held' THEN 'claimed' ELSE 'queued' END,?1='held',?2,0,X'7B7D',X'7B7D',?3,0)`,
+			id, stamp, now.Add(5*time.Minute).UnixMicro())
+	}
+	execute(t, repo, `INSERT INTO aaa_model_requests(id,conversation_id,client_id,response_id,created_at,replay_hash,incomplete_delivery,data)
+		VALUES('candidate','conversation','client','response',?1,'old-replay',0,X'7B7D')`, stamp)
+	if err := repo.Bootstrap(t.Context()); err != nil {
+		t.Fatal(err, Classify(err).Detail())
+	}
+	if err := repo.write(t.Context(), func(tx *sql.Tx) error {
+		sample, err := readWeeklyUsage(t.Context(), tx, "old-worker")
+		if err != nil || sample != nil {
+			t.Fatalf("migration invented a quota reading: %v %v", sample, err)
+		}
+		var sequence int
+		var hash, receipt string
+		if err := tx.QueryRowContext(t.Context(), "SELECT sequence,input_hash,result FROM aaa_worker_polls WHERE worker_id='old-worker'").
+			Scan(&sequence, &hash, &receipt); err != nil || sequence != 7 || hash != "old-hash" || receipt != `{"job":null}` {
+			t.Fatalf("migration changed a pull receipt: %d %s %s %v", sequence, hash, receipt, err)
+		}
+		var held bool
+		if err := tx.QueryRowContext(t.Context(), heldPullJob, "old-worker").Scan(&held); err != nil || !held {
+			t.Fatalf("migration lost a held job: %v", err)
+		}
+		if _, err := recordWeeklyUsage(t.Context(), tx, "old-worker", &worker.WeeklyUsage{UsedPercent: 100, ObservedAt: now}, now, now); err != nil {
+			return err
+		}
+		pick, previous, err := pickPullJob(t.Context(), tx, "other", "1", 0, now, &inference.PullTiming{})
+		if pick.job != "candidate" || previous != "old-worker" {
+			t.Fatalf("pre-upgrade client job not selectable or probe transferred: %v %s", pick, previous)
 		}
 		return err
 	}); err != nil {
@@ -305,8 +365,8 @@ func TestSQLiteUnsafeFileAndSchemaRejections(t *testing.T) {
 	})
 	t.Run("ledger", func(t *testing.T) {
 		repo := newRepo(t)
-		execute(t, repo, "UPDATE aaa_schema_migrations SET version=5 WHERE version=4")
-		if f := failReason(t, repo.Bootstrap(t.Context()), "schema_version_incompatible"); f.Observed != "5" || f.Expected != "4" {
+		execute(t, repo, "UPDATE aaa_schema_migrations SET version=?1 WHERE version=?2", SchemaVersion+1, SchemaVersion)
+		if f := failReason(t, repo.Bootstrap(t.Context()), "schema_version_incompatible"); f.Observed != "6" || f.Expected != "5" {
 			t.Fatal(f)
 		}
 		execute(t, repo, "UPDATE aaa_schema_migrations SET checksum='changed' WHERE version=1")

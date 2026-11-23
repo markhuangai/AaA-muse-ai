@@ -63,16 +63,31 @@ func ownedHistory(ctx context.Context, tx *sql.Tx, ref *inference.Ref) error {
 	if c.ID == "" {
 		return nil
 	}
-	if c.WorkerID != "" && ref.WorkerID != "" && ref.WorkerID != c.WorkerID {
-		return inference.Reject("session_worker_conflict", 409, "expected_worker_id", c.WorkerID, "observed_worker_id", ref.WorkerID)
-	}
-	ref.WorkerID, ref.ConversationID = c.WorkerID, c.ID
+	targetChanged := c.WorkerID != "" && ref.WorkerID != "" && ref.WorkerID != c.WorkerID
+	var replayID string
+	var priorInput []byte
 	if ref.ReplayHash != "" {
-		err := tx.QueryRowContext(ctx, "SELECT id FROM aaa_model_requests WHERE conversation_id=?1 AND replay_hash=?2", c.ID, ref.ReplayHash).Scan(&ref.ExperimentID)
+		err := tx.QueryRowContext(ctx, `SELECT id,CASE WHEN ?3 THEN data END FROM aaa_model_requests
+			WHERE conversation_id=?1 AND replay_hash=?2`, c.ID, ref.ReplayHash, targetChanged).Scan(&replayID, &priorInput)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return err
 		}
+		if replayID != "" {
+			ref.ExperimentID = replayID
+		}
 	}
+	if targetChanged {
+		var admitted inference.Request
+		if replayID != "" {
+			if err := decodeInference(priorInput, &admitted); err != nil {
+				return err
+			}
+		}
+		if admitted.Input.WorkerID != ref.WorkerID {
+			return inference.Reject("session_worker_conflict", 409, "expected_worker_id", c.WorkerID, "observed_worker_id", ref.WorkerID)
+		}
+	}
+	ref.WorkerID, ref.ConversationID = c.WorkerID, c.ID
 	return nil
 }
 

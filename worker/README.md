@@ -37,6 +37,8 @@ during transient retry backoff. [Paired versions and rollback](../docs/releases.
 
 ## Recovery and diagnosis
 
+The paired helper uses the native `subscription-status status` command during each fresh idle pull or busy check-in. The checker sends the weekly percentage, observation time and any recognized reset label through its authenticated HTTPS request. A failed read leaves the check running. Diagnose `cron.weekly_usage_unavailable` in the private export and join it to the check-in by checker run ID. The broker rejects expired samples for routing, and a retry of a pending pull carries its original observation.
+
 A checker can finish while a one-time job is still queued or active. Use native run identity and observable producer identity, not a green checker run, an absent listing, elapsed time, or PID alone. Unknown status retains the claim. A cancelled or expired job cannot start or accept a new result. A previously accepted receipt can still reconcile; the broker releases an accepted claim only after the worker confirms the old work stopped. Revoking the worker blocks the credential and does not prove native work stopped.
 
 A check never retries a file upload while the original result helper is active. The helper records its process identity alongside the exact saved result. Once native work and its producers have stopped, recovery checks for an accepted media receipt before sending file bytes again. Unknown delivery identity keeps the hold.

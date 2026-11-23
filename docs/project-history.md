@@ -2,6 +2,46 @@
 
 These entries record decisions and evidence at the dates shown. See the release guide for the current publication and qualification rules. [Paired product releases](releases.md)
 
+## Weekly account allowance routing
+
+The owner approved weekly usage reporting and pre-claim routing at base
+`4854f3d924019c20482bb579af36cccab49568da`. An interactive Muse report identified
+`subscription-status status` and showed 33% of the weekly allowance used.
+Unattended collection by the installed one-minute checker still needs a
+separately authorized live observation. The command’s separate additional-token
+line cannot drive routing. [Native command reference](https://github.com/win4r/MuseAI-Skills/blob/e222ba4391b6270ba394cd2b8c3809ff959ab609/opt/hatch/skills/subscription-status/SKILL.md#L9-L19)
+
+The owner chose up to one check of preference for the freest eligible slot,
+unknown-usage fallback, healthy session affinity, and transfer of queued client
+turns from freshly exhausted workers. The committed pickup stays with its
+worker through settlement. The Workers page shows usage, observation time and
+reported reset. Schema 005 keeps a latest sample alongside the existing
+SQLite queue and receipts. Paired updates activate the helper on the saved
+checker. Delivery ends at a reviewed PR.
+
+The independent audit was conformant in round five at changed-file digest
+`7cc8308959ffb4e17f087429b73b7fab30a11400fa751c0b59311fe94ec4e3b6` before the
+final controlled checks. An initial unit run caught an overly broad replay
+exception. The broker now verifies the original requested worker before
+accepting an exact retry after a pin moves. The first packed transport run
+caught a missing worker ID in quota diagnostics. The checker now uses the
+logger’s enrolled worker identity. Local published-port timeouts and a missing
+Docker Desktop credential helper led to test reruns using the harness’s direct
+Docker network and an isolated anonymous configuration for the public registry.
+
+By `2026-11-23T21:36:32Z`, worker transport, worker updates, routing, Chat,
+Responses, media and the Workers browser suite passed at working-source digest
+`30cc4450ff720169bec8fa19b2454ab2b6b53ff7441b28a222b9d19d1c746c2a` before this
+evidence note. Two brokers selected the 33%-used worker after the 80%-used
+worker polled first, then reversed their choice after the readings changed.
+Protected exports joined the packed worker and both brokers by occurrence,
+worker and job. The browser checked fresh, stale and unknown readings at
+1440, 768 and 390 pixels. Both wire-compatibility directions and migration
+from a populated schema-4 store passed. All six unit coverage gates, file
+limits, CI policy and workflow lint passed. The service covered 6,552 of 7,278
+statements, the worker 3,240 of 3,479 and the portal 1,167 of 1,283. The
+controlled suites verified removal of their Docker fixtures.
+
 ## Worker version matching
 
 On November 23, 2026 the owner approved automatic installation of the exact

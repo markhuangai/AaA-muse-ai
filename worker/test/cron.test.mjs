@@ -40,21 +40,29 @@ async function installed(t) {
 
 test('checker coalesces delayed ticks and replays the exact persisted empty pull', async t => {
   const f = await installed(t);
+  let samples = 0;
+  const readUsage = async () => ({ reading: { used_percent: ++samples } });
+  const firstCron = new Cron(f.worker, undefined, undefined, readUsage);
   let lost = true;
   f.broker.override = ({ path }) => {
     assert.equal(path, '/api/v1/worker/pull');
     if (lost) { lost = false; throw disconnect(); }
     return reply({ job: null });
   };
-  assert.equal((await f.cron.check(f.tick(0, 60_100))).outcome, 'coalesced');
+  assert.equal((await firstCron.check(f.tick(0, 60_100))).outcome, 'coalesced');
   assert.equal(f.broker.calls.length, 0);
   const first = f.tick(1);
-  await assert.rejects(f.cron.check(first), /broker_unreachable/);
+  await assert.rejects(firstCron.check(first), /broker_unreachable/);
   f.advance(60_000);
-  assert.equal((await f.cron.check(f.tick(2))).outcome, 'idle');
+  const restartedCron = new Cron(f.worker, undefined, undefined, readUsage);
+  assert.equal((await restartedCron.check(f.tick(2))).outcome, 'idle');
   assert.equal(f.broker.calls.length, 2);
   assert.equal(f.broker.calls[0].options.body, f.broker.calls[1].options.body);
-  assert.equal((await f.cron.check(first)).outcome, 'coalesced');
+  const reading = call => call.options.headers['X-Muse-Worker-Weekly-Usage'];
+  assert.equal(reading(f.broker.calls[0]), reading(f.broker.calls[1]));
+  assert.equal(JSON.parse(Buffer.from(reading(f.broker.calls[0]), 'base64url')).used_percent, 1);
+  assert.equal(samples, 1);
+  assert.equal((await restartedCron.check(first)).outcome, 'coalesced');
   assert.equal(f.broker.calls.length, 2);
 });
 

@@ -50,14 +50,15 @@ type Assignment struct {
 }
 
 type Pull struct {
-	Version     int       `json:"protocol_version"`
-	Sequence    int64     `json:"sequence"`
-	Checker     string    `json:"checker_job_id"`
-	Occurrence  string    `json:"checker_run_id"`
-	ScheduledAt time.Time `json:"scheduled_at"`
-	EnteredAt   time.Time `json:"entered_at"`
-	MediaJobs   bool      `json:"media_jobs"`
-	PromptWAV   bool      `json:"prompt_wav"`
+	Version     int                 `json:"protocol_version"`
+	Sequence    int64               `json:"sequence"`
+	Checker     string              `json:"checker_job_id"`
+	Occurrence  string              `json:"checker_run_id"`
+	ScheduledAt time.Time           `json:"scheduled_at"`
+	EnteredAt   time.Time           `json:"entered_at"`
+	MediaJobs   bool                `json:"media_jobs"`
+	PromptWAV   bool                `json:"prompt_wav"`
+	WeeklyUsage *worker.WeeklyUsage `json:"-"`
 }
 
 type Grant struct {
@@ -75,20 +76,38 @@ type PullResult struct {
 }
 
 type PullTiming struct {
-	Acquire     time.Duration
-	Select      time.Duration
-	PreviousPin string
-	Update      worker.UpdateStatus
+	Acquire           time.Duration
+	Select            time.Duration
+	PreviousPin       string
+	PreviousPinReason string
+	Update            worker.UpdateStatus
+	UsageResult       string
+	UsageDecision     string
+	EffectiveUsage    *worker.WeeklyUsage
+	UsageDeferrals    []UsageDeferral
 }
 
+type UsageDeferral struct {
+	JobID           string    `json:"job_id"`
+	OperationID     string    `json:"operation_id"`
+	PreferredWorker string    `json:"preferred_worker_id"`
+	PercentUsed     float64   `json:"used_percent"`
+	ObservedAt      time.Time `json:"observed_at"`
+	Until           time.Time `json:"until"`
+}
+
+const OfflinePinReason = "offline_before_claim_and_context"
+const ExhaustedPinReason = "weekly_allowance_exhausted_before_claim"
+
 type BusyCheck struct {
-	Version     int       `json:"protocol_version"`
-	ClaimID     string    `json:"claim_id"`
-	Generation  int64     `json:"generation"`
-	Checker     string    `json:"checker_job_id"`
-	Occurrence  string    `json:"checker_run_id"`
-	ScheduledAt time.Time `json:"scheduled_at"`
-	Reason      string    `json:"hold_reason,omitempty"`
+	Version     int                 `json:"protocol_version"`
+	ClaimID     string              `json:"claim_id"`
+	Generation  int64               `json:"generation"`
+	Checker     string              `json:"checker_job_id"`
+	Occurrence  string              `json:"checker_run_id"`
+	ScheduledAt time.Time           `json:"scheduled_at"`
+	Reason      string              `json:"hold_reason,omitempty"`
+	WeeklyUsage *worker.WeeklyUsage `json:"-"`
 }
 
 type BusyPresence struct {
@@ -99,8 +118,9 @@ type BusyPresence struct {
 }
 
 type PresenceReceipt struct {
-	Recorded   bool      `json:"recorded"`
-	ReceivedAt time.Time `json:"received_at"`
+	Recorded    bool      `json:"recorded"`
+	ReceivedAt  time.Time `json:"received_at"`
+	UsageResult string    `json:"-"`
 }
 
 type WorkStart struct {
@@ -305,24 +325,25 @@ func (c Connection) Status(now time.Time) string {
 }
 
 type Projection struct {
-	ConnectionStatus     string               `json:"connection_status"`
-	OfflineForMS         *int64               `json:"offline_for_ms,omitempty"`
-	WorkStatus           string               `json:"work_status"`
-	CurrentJob           *Assignment          `json:"current_job"`
-	WaitingForTool       int                  `json:"waiting_for_client_tool"`
-	LastHeartbeatAt      *time.Time           `json:"last_heartbeat_at"`
-	InferenceReadiness   string               `json:"inference_readiness"`
-	Qualification        *Qualification       `json:"qualification,omitempty"`
-	QualificationHistory []Qualification      `json:"qualification_history"`
-	ModelReport          *ModelReport         `json:"model_report,omitempty"`
-	LastPollAt           *time.Time           `json:"last_poll_at"`
-	NativeContactAt      *time.Time           `json:"-"`
-	Update               *worker.UpdateStatus `json:"worker_update,omitempty"`
-	BusyReason           string               `json:"busy_reason,omitempty"`
-	Claim                *Grant               `json:"current_claim"`
-	ClaimAgeMS           *int64               `json:"claim_age_ms,omitempty"`
-	ClaimStage           string               `json:"claim_stage,omitempty"`
-	ClaimStartedAt       *time.Time           `json:"claim_started_at,omitempty"`
+	ConnectionStatus     string                  `json:"connection_status"`
+	OfflineForMS         *int64                  `json:"offline_for_ms,omitempty"`
+	WorkStatus           string                  `json:"work_status"`
+	CurrentJob           *Assignment             `json:"current_job"`
+	WaitingForTool       int                     `json:"waiting_for_client_tool"`
+	LastHeartbeatAt      *time.Time              `json:"last_heartbeat_at"`
+	InferenceReadiness   string                  `json:"inference_readiness"`
+	Qualification        *Qualification          `json:"qualification,omitempty"`
+	QualificationHistory []Qualification         `json:"qualification_history"`
+	ModelReport          *ModelReport            `json:"model_report,omitempty"`
+	LastPollAt           *time.Time              `json:"last_poll_at"`
+	NativeContactAt      *time.Time              `json:"-"`
+	Update               *worker.UpdateStatus    `json:"worker_update,omitempty"`
+	WeeklyUsage          *worker.WeeklyUsageView `json:"weekly_usage,omitempty"`
+	BusyReason           string                  `json:"busy_reason,omitempty"`
+	Claim                *Grant                  `json:"current_claim"`
+	ClaimAgeMS           *int64                  `json:"claim_age_ms,omitempty"`
+	ClaimStage           string                  `json:"claim_stage,omitempty"`
+	ClaimStartedAt       *time.Time              `json:"claim_started_at,omitempty"`
 }
 
 type Receipt struct {
@@ -360,6 +381,8 @@ type State struct {
 	LastPollAt            *time.Time
 	LastContactAt         *time.Time
 	WorkerUpdate          *worker.UpdateStatus
+	WeeklyUsage           *worker.WeeklyUsage
+	QuotaTransferFrom     string
 	Experiments           map[string]*Experiment
 	Jobs                  map[string]*Job
 	Receipt               *Receipt

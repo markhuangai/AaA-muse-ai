@@ -164,8 +164,34 @@ class Updates(WorkerSetup):
         time.sleep(30.5)
 
     def native_cli(self, worker, *args, input_text=None, want=0):
-        return self.command(worker, [worker["receipt"]["launcher"], *args], input_text=input_text, want=want,
+        entry = worker.get("weekly_usage_fixture_worker", [worker["receipt"]["launcher"]])
+        return self.command(worker, [*entry, *args], input_text=input_text, want=want,
                             extra=("-e", "PATH=/fixture/bin:/usr/local/bin:/usr/bin:/bin")).stdout
+
+    def check_weekly_wire_compatibility(self, worker):
+        source = Path(self.releases[RC]["archive"]).parent / "unpacked" / "package"
+        helper = self.assets.public / "usage-worker"
+        shutil.copytree(source, helper)
+        command = self.assets.public / "bin" / "subscription-status"
+        command.write_text(r"""#!/bin/sh
+test "$#" = 1 && test "$1" = status || exit 1
+printf '%s\n' 'Usage: 33% of free weekly limit.' 'Weekly limit resets Nov 29 at 7:49 AM EST' 'Additional tokens: 89% used (provider-private)'
+""")
+        command.chmod(0o755)
+        worker["weekly_usage_fixture_worker"] = ["node", "/fixture/usage-worker/dist/main.js"]
+        try:
+            check = self.tick(worker)
+            require(check["outcome"] == "idle", "the stock broker rejected the new helper's usage contact")
+            decoded = self.native_cli(worker, "diagnostics-export", "--decode")
+            records = [json.loads(line) for line in decoded.splitlines()]
+            require(any(record.get("msg") == "worker.http_exchange" and record.get("http_status") == 200 and
+                        record.get("checker_run_id") == check["checker_run_id"] and record.get("weekly_usage", {}).get("used_percent") == 33
+                        for record in records),
+                    "the new package did not include its normalized reading in the contacted check")
+            require("provider-private" not in decoded, "private command output entered worker captures")
+        finally:
+            worker.pop("weekly_usage_fixture_worker")
+        self.receipt("worker_updates.weekly_usage_new_helper_old_broker", stock_image=STOCK, worker_version=RC)
 
     def record_update(self, worker, expected, version=None):
         update = self.status(worker)["worker_update"]
@@ -218,6 +244,7 @@ class Updates(WorkerSetup):
         self.checker(worker)
         checker = (worker["state"] / "cron-installation.json").read_bytes()
         require(self.job(worker, "stock job")["state"] == "completed", "historical worker fixture could not serve real work")
+        self.check_weekly_wire_compatibility(worker)
         historical = self.job(worker, "historical failed", fail=True)
         unspecified = self.job(worker, "historical with missing reason", fail=True)
         self.sql("UPDATE aaa_experiments SET data=CAST(json_remove(CAST(data AS TEXT),'$.reason') AS BLOB) WHERE id='" + unspecified["id"] + "'")
@@ -225,6 +252,7 @@ class Updates(WorkerSetup):
         self.stop(self.broker)
         self.paired(RC)
         require(self.tick(worker)["outcome"] == "idle", "legacy worker lost its regular poll")
+        require("weekly_usage" not in self.worker_projection(worker)[0], "legacy helper fabricated a weekly report")
         self.record_update(worker, "adoption_required", "1.0.0")
         update, _ = self.checked("/api/v1/admin/workers/" + worker["worker"]["id"] + "/update-prompt", self.admin, "POST", {"origin": self.proxy.origin})
         shell = update["update_prompt"].split("```bash\n", 1)[1].split("```", 1)[0]
@@ -234,7 +262,10 @@ class Updates(WorkerSetup):
         self.record_update(worker, "confirmed", RC)
         require((worker["state"] / "cron-installation.json").read_bytes() == checker and
                 (worker["state"] / "credential.key").read_text().strip() == worker["credential"], "adoption changed scheduler or credential")
-        self.receipt("worker_updates.stock_adopted", version=RC)
+        usage = self.worker_projection(worker)[0]["weekly_usage"]
+        require(usage["used_percent"] == 33 and not usage["stale"] and usage["reset_label"] == "Nov 29 at 7:49 AM EST",
+                "the original checker did not report normalized usage after adoption")
+        self.receipt("worker_updates.stock_adopted", version=RC, original_checker_reports_usage=True)
 
         historical = self.experiment(historical["id"])
         unspecified = self.experiment(unspecified["id"])

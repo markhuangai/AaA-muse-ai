@@ -5,24 +5,12 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/markhuangai/AaA-muse-ai/internal/inference"
 	"github.com/markhuangai/AaA-muse-ai/internal/worker"
 )
-
-type pollCandidate struct {
-	job, experiment string
-	created         int64
-}
-
-const nextPullJob = `SELECT job.id, job.experiment_id, job.created_at
- FROM aaa_pull_levels AS level CROSS JOIN aaa_inference_jobs AS job
- WHERE ((level.shift<63 AND ((?3 >> level.shift) & 1)=0) OR (level.shift=63 AND ?3<0))
- AND job.id=(SELECT job_id FROM aaa_pull_queue INDEXED BY aaa_pull_queue_head
-   WHERE target=?1 AND capability=?2 AND shift=level.shift AND bucket=(?3 >> level.shift)+1
-   ORDER BY created_at,job_id LIMIT 1)
- ORDER BY job.created_at,job.id LIMIT 1`
 
 const heldPullJob = `SELECT EXISTS (SELECT 1 FROM aaa_inference_jobs WHERE worker_id=?1 AND held)`
 
@@ -32,30 +20,7 @@ const duePullExperiments = `SELECT id FROM aaa_experiments
 const duePullPins = `SELECT id FROM aaa_inference_jobs
 	WHERE state='queued' AND pin_check_at IS NOT NULL AND pin_check_at<=?1 ORDER BY pin_check_at,id LIMIT 32`
 
-func pickPullJob(ctx context.Context, tx *sql.Tx, workerID string, maxCapability int, now time.Time) (pollCandidate, error) {
-	for _, target := range []string{workerID, ""} {
-		var oldest pollCandidate
-		for capability := 0; capability <= maxCapability; capability++ {
-			var candidate pollCandidate
-			err := tx.QueryRowContext(ctx, nextPullJob, target, capability, now.UnixMicro()).Scan(&candidate.job, &candidate.experiment, &candidate.created)
-			if errors.Is(err, sql.ErrNoRows) {
-				continue
-			}
-			if err != nil {
-				return oldest, err
-			}
-			if oldest.job == "" || candidate.created < oldest.created || (candidate.created == oldest.created && candidate.job < oldest.job) {
-				oldest = candidate
-			}
-		}
-		if oldest.job != "" {
-			return oldest, nil
-		}
-	}
-	return pollCandidate{}, nil
-}
-
-func loadPullCandidate(ctx context.Context, tx *sql.Tx, candidate pollCandidate, state *inference.State) error {
+func loadPullCandidate(ctx context.Context, tx *sql.Tx, candidate pullCandidate, state *inference.State) error {
 	var raw []byte
 	if err := tx.QueryRowContext(ctx, "SELECT data FROM aaa_inference_jobs WHERE id=?1", candidate.job).Scan(&raw); err != nil {
 		return err
@@ -112,6 +77,10 @@ func (r *Repository) RecordBusyPresence(ctx context.Context, credential [32]byte
 		if err != nil || !receipt.Recorded {
 			return err
 		}
+		receipt.UsageResult, err = recordWeeklyUsage(ctx, tx, workerID, input.WeeklyUsage, input.ScheduledAt, receipt.ReceivedAt)
+		if err != nil {
+			return err
+		}
 		raw, err = json.Marshal(&job)
 		if err != nil {
 			return err
@@ -145,8 +114,9 @@ func (r *Repository) WithinPull(ctx context.Context, credential [32]byte, input 
 		var sequence, scheduled int64
 		var priorHash string
 		var saved []byte
-		var previousPin string
-		err = tx.QueryRowContext(ctx, "SELECT sequence,scheduled_at,input_hash,result,previous_pin FROM aaa_worker_polls WHERE worker_id=?1", workerID).Scan(&sequence, &scheduled, &priorHash, &saved, &previousPin)
+		var previousPin, previousPinReason string
+		err = tx.QueryRowContext(ctx, "SELECT sequence,scheduled_at,input_hash,result,previous_pin,previous_pin_reason FROM aaa_worker_polls WHERE worker_id=?1", workerID).
+			Scan(&sequence, &scheduled, &priorHash, &saved, &previousPin, &previousPinReason)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return err
 		}
@@ -162,9 +132,15 @@ func (r *Repository) WithinPull(ctx context.Context, credential [32]byte, input 
 			}
 			replayed = true
 			timing.PreviousPin = previousPin
+			timing.PreviousPinReason = previousPinReason
+			timing.UsageResult = "poll_replayed"
 		case input.ScheduledAt.UnixMicro() <= scheduled:
 			return inference.Reject("obsolete_occurrence", 409)
 		default:
+			timing.UsageResult, err = recordWeeklyUsage(ctx, tx, workerID, input.WeeklyUsage, input.ScheduledAt, now)
+			if err != nil {
+				return err
+			}
 			var held bool
 			if err = tx.QueryRowContext(ctx, heldPullJob, workerID).Scan(&held); err != nil {
 				return err
@@ -174,15 +150,24 @@ func (r *Repository) WithinPull(ctx context.Context, credential [32]byte, input 
 			if err != nil {
 				return err
 			}
+			var availableCapability *int
+			major, _, _ := strings.Cut(contact.Version, ".")
+			timing.UsageDecision = "worker_unavailable"
 			if work {
+				availableCapability = &capability
 				lookupStarted := time.Now()
-				candidate, err := pickPullJob(ctx, tx, workerID, capability, now)
+				timing.EffectiveUsage, err = readWeeklyUsage(ctx, tx, workerID)
+				if err != nil {
+					return err
+				}
+				candidate, transferFrom, err := pickPullJob(ctx, tx, workerID, major, capability, now, &timing)
 				timing.Select = time.Since(lookupStarted)
 				if err != nil {
 					return err
 				}
 				if candidate.job != "" {
-					state := &inference.State{Now: now, WorkerID: workerID, Jobs: map[string]*inference.Job{}, Experiments: map[string]*inference.Experiment{}}
+					state := &inference.State{Now: now, WorkerID: workerID, Jobs: map[string]*inference.Job{},
+						Experiments: map[string]*inference.Experiment{}, QuotaTransferFrom: transferFrom}
 					if err = loadPullCandidate(ctx, tx, candidate, state); err != nil {
 						return err
 					}
@@ -199,6 +184,10 @@ func (r *Repository) WithinPull(ctx context.Context, credential [32]byte, input 
 						return err
 					}
 					timing.PreviousPin = state.Jobs[candidate.job].ReroutedFrom
+					timing.PreviousPinReason = inference.OfflinePinReason
+					if transferFrom != "" {
+						timing.PreviousPinReason = inference.ExhaustedPinReason
+					}
 					if err = saveInference(ctx, tx, inference.Ref{}, state, before); err != nil {
 						return err
 					}
@@ -211,9 +200,11 @@ func (r *Repository) WithinPull(ctx context.Context, credential [32]byte, input 
 			if err != nil {
 				return err
 			}
-			if _, err = tx.ExecContext(ctx, `INSERT INTO aaa_worker_polls(worker_id,sequence,scheduled_at,last_poll_at,input_hash,result,previous_pin)
-				VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(worker_id) DO UPDATE SET sequence=excluded.sequence,scheduled_at=excluded.scheduled_at,
-				last_poll_at=excluded.last_poll_at,input_hash=excluded.input_hash,result=excluded.result,previous_pin=excluded.previous_pin`, workerID, input.Sequence, input.ScheduledAt.UnixMicro(), now.UnixMicro(), hash, encoded, timing.PreviousPin); err != nil {
+			if _, err = tx.ExecContext(ctx, `INSERT INTO aaa_worker_polls(worker_id,sequence,scheduled_at,last_poll_at,input_hash,result,previous_pin,previous_pin_reason,available_capability,available_major)
+				VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) ON CONFLICT(worker_id) DO UPDATE SET sequence=excluded.sequence,scheduled_at=excluded.scheduled_at,
+				last_poll_at=excluded.last_poll_at,input_hash=excluded.input_hash,result=excluded.result,previous_pin=excluded.previous_pin,
+				previous_pin_reason=excluded.previous_pin_reason,available_capability=excluded.available_capability,available_major=excluded.available_major`, workerID, input.Sequence,
+				input.ScheduledAt.UnixMicro(), now.UnixMicro(), hash, encoded, timing.PreviousPin, timing.PreviousPinReason, availableCapability, major); err != nil {
 				return err
 			}
 		}
