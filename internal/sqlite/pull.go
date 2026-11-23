@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/markhuangai/AaA-muse-ai/internal/inference"
+	"github.com/markhuangai/AaA-muse-ai/internal/worker"
 )
 
 type pollCandidate struct {
@@ -87,7 +88,7 @@ func nativeWorker(ctx context.Context, tx *sql.Tx, credential [32]byte) (id stri
 	return
 }
 
-func (r *Repository) RecordBusyPresence(ctx context.Context, credential [32]byte, jobID string, record func(*inference.Job, time.Time) (inference.PresenceReceipt, error)) (receipt inference.PresenceReceipt, workerID, operationID string, err error) {
+func (r *Repository) RecordBusyPresence(ctx context.Context, credential [32]byte, jobID string, input inference.BusyCheck, contact worker.Contact, record func(*inference.Job, time.Time) (inference.PresenceReceipt, error)) (receipt inference.PresenceReceipt, workerID, operationID string, err error) {
 	err = r.write(ctx, func(tx *sql.Tx) error {
 		var err error
 		workerID, err = nativeWorker(ctx, tx, credential)
@@ -115,13 +116,23 @@ func (r *Repository) RecordBusyPresence(ctx context.Context, credential [32]byte
 		if err != nil {
 			return err
 		}
-		_, err = tx.ExecContext(ctx, "UPDATE aaa_inference_jobs SET data=?2 WHERE id=?1", jobID, raw)
-		return err
+		if _, err = tx.ExecContext(ctx, "UPDATE aaa_inference_jobs SET data=?2 WHERE id=?1", jobID, raw); err != nil {
+			return err
+		}
+		if contact.Version == "" {
+			return nil
+		}
+		state, err := readWorkerUpdate(ctx, tx, workerID)
+		if err != nil {
+			return err
+		}
+		state.Observe(contact, input.ScheduledAt, receipt.ReceivedAt)
+		return saveWorkerUpdate(ctx, tx, workerID, state)
 	})
 	return
 }
 
-func (r *Repository) WithinPull(ctx context.Context, credential [32]byte, input inference.Pull, hash string, capability int, claim func(*inference.State) (*inference.Grant, error)) (result inference.PullResult, workerID string, replayed bool, timing inference.PullTiming, err error) {
+func (r *Repository) WithinPull(ctx context.Context, credential [32]byte, input inference.Pull, hash string, capability int, contact worker.Contact, broker worker.UpdateBroker, claim func(*inference.State) (*inference.Grant, error)) (result inference.PullResult, workerID string, replayed bool, timing inference.PullTiming, err error) {
 	started, acquired := time.Now(), false
 	err = r.write(ctx, func(tx *sql.Tx) error {
 		timing.Acquire, acquired = time.Since(started), true
@@ -158,7 +169,12 @@ func (r *Repository) WithinPull(ctx context.Context, credential [32]byte, input 
 			if err = tx.QueryRowContext(ctx, heldPullJob, workerID).Scan(&held); err != nil {
 				return err
 			}
-			if !held {
+			var work bool
+			result.Update, timing.Update, work, err = decideUpdate(ctx, tx, now, workerID, input, contact, broker, held)
+			if err != nil {
+				return err
+			}
+			if work {
 				lookupStarted := time.Now()
 				candidate, err := pickPullJob(ctx, tx, workerID, capability, now)
 				timing.Select = time.Since(lookupStarted)

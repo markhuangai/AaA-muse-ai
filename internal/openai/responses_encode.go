@@ -46,7 +46,11 @@ func ResponseObject(r inference.RequestView, model, status, reason string) (map[
 	var failure, instructions, previous any
 	tools := []any{}
 	if reason != "" {
-		failure = map[string]any{"code": reason, "message": strings.ReplaceAll(reason, "_", " ")}
+		message := r.ReasonMessage
+		if message == "" {
+			message = strings.ReplaceAll(reason, "_", " ")
+		}
+		failure = map[string]any{"code": reason, "message": message}
 	}
 	if r.Response != nil {
 		if r.Response.Instructions != nil {

@@ -86,7 +86,14 @@ func (h *Handler) inferenceRequest(w *response, r *http.Request, logger *slog.Lo
 		err = decodeInferenceInput(body, &input, "protocol_version", "sequence", "checker_job_id", "checker_run_id", "scheduled_at", "entered_at", "media_jobs", "prompt_wav")
 		if err == nil {
 			var pulled inference.PullResult
-			pulled, w.workerID, err = h.Broker.PullWork(r.Context(), logger, strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "), input)
+			var contactErr error
+			contact, contactErr := readWorkerContact(r)
+			if contactErr != nil {
+				err = contactErr
+				break
+			}
+			contact.Incompatible = !h.Service.Build().Compatible(contact.Version)
+			pulled, w.workerID, err = h.Broker.PullWork(r.Context(), logger, strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "), input, contact)
 			if err == nil {
 				writeJSON(w, code, pulled)
 				return
@@ -103,7 +110,12 @@ func (h *Handler) inferenceRequest(w *response, r *http.Request, logger *slog.Lo
 		err = decodeInferenceInput(body, &input, "protocol_version", "claim_id", "generation", "checker_job_id", "checker_run_id", "scheduled_at")
 		if err == nil {
 			var receipt inference.PresenceReceipt
-			receipt, w.workerID, err = h.Broker.BusyCheck(r.Context(), logger, strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "), id, input)
+			contact, contactErr := readWorkerContact(r)
+			if contactErr != nil {
+				err = contactErr
+				break
+			}
+			receipt, w.workerID, err = h.Broker.BusyCheck(r.Context(), logger, strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "), id, input, contact)
 			if err == nil {
 				writeJSON(w, code, receipt)
 				return
@@ -113,7 +125,19 @@ func (h *Handler) inferenceRequest(w *response, r *http.Request, logger *slog.Lo
 		var input inference.Interruption
 		err = decodeInferenceInput(body, &input, "protocol_version", "submission_id", "claim_id", "generation", "launch_id", "native_job_id", "native_run_id", "reason")
 		if err == nil {
-			result, err = h.Broker.InterruptWork(r.Context(), logger, identity.ID, id, input)
+			var evidence []inference.InterruptionEvidence
+			if values := r.Header.Values("X-Muse-Interruption"); len(values) != 0 {
+				status, failure, _ := strings.Cut(values[0], "/")
+				observation := inference.InterruptionEvidence{NativeStatus: status, ResultFailure: failure}
+				if len(values) != 1 || !observation.ValidNative() {
+					err = inference.Reject("invalid_interruption_evidence", 400)
+					break
+				}
+				logger.Debug("worker.interruption_evidence", "job_id", id, "claim_id", input.ClaimID,
+					"native_job_id", input.NativeJob, "native_run_id", input.NativeRun, "submission_id", input.SubmissionID, "evidence", observation)
+				evidence = append(evidence, observation)
+			}
+			result, err = h.Broker.InterruptWork(r.Context(), logger, identity.ID, id, input, evidence...)
 		}
 	case "/api/v1/admin/experiments":
 		var input inference.Create

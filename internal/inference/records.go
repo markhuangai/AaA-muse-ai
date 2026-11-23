@@ -3,6 +3,8 @@ package inference
 import (
 	"encoding/json"
 	"time"
+
+	"github.com/markhuangai/AaA-muse-ai/internal/worker"
 )
 
 const Version = 1
@@ -68,13 +70,15 @@ type Grant struct {
 }
 
 type PullResult struct {
-	Job *Grant `json:"job"`
+	Job    *Grant              `json:"job"`
+	Update *worker.UpdateOffer `json:"update,omitempty"`
 }
 
 type PullTiming struct {
 	Acquire     time.Duration
 	Select      time.Duration
 	PreviousPin string
+	Update      worker.UpdateStatus
 }
 
 type BusyCheck struct {
@@ -164,18 +168,19 @@ type Cancel struct {
 }
 
 type Experiment struct {
-	ID             string    `json:"id"`
-	ConversationID string    `json:"conversation_id"`
-	WorkerID       string    `json:"worker_id"`
-	State          string    `json:"state"`
-	CurrentJobID   string    `json:"current_job_id"`
-	CreatedAt      time.Time `json:"created_at"`
-	DeadlineAt     time.Time `json:"deadline_at"`
-	Tools          []Tool    `json:"tools"`
-	Messages       []Item    `json:"messages"`
-	FinalText      string    `json:"final_text,omitempty"`
-	Reason         string    `json:"reason,omitempty"`
-	RemoteOutcome  string    `json:"remote_outcome"`
+	ID             string                `json:"id"`
+	ConversationID string                `json:"conversation_id"`
+	WorkerID       string                `json:"worker_id"`
+	State          string                `json:"state"`
+	CurrentJobID   string                `json:"current_job_id"`
+	CreatedAt      time.Time             `json:"created_at"`
+	DeadlineAt     time.Time             `json:"deadline_at"`
+	Tools          []Tool                `json:"tools"`
+	Messages       []Item                `json:"messages"`
+	FinalText      string                `json:"final_text,omitempty"`
+	Reason         string                `json:"reason,omitempty"`
+	RemoteOutcome  string                `json:"remote_outcome"`
+	Interruption   *InterruptionEvidence `json:"interruption,omitempty"`
 }
 
 func (e Experiment) Terminal() bool {
@@ -300,23 +305,24 @@ func (c Connection) Status(now time.Time) string {
 }
 
 type Projection struct {
-	ConnectionStatus     string          `json:"connection_status"`
-	OfflineForMS         *int64          `json:"offline_for_ms,omitempty"`
-	WorkStatus           string          `json:"work_status"`
-	CurrentJob           *Assignment     `json:"current_job"`
-	WaitingForTool       int             `json:"waiting_for_client_tool"`
-	LastHeartbeatAt      *time.Time      `json:"last_heartbeat_at"`
-	InferenceReadiness   string          `json:"inference_readiness"`
-	Qualification        *Qualification  `json:"qualification,omitempty"`
-	QualificationHistory []Qualification `json:"qualification_history"`
-	ModelReport          *ModelReport    `json:"model_report,omitempty"`
-	LastPollAt           *time.Time      `json:"last_poll_at"`
-	NativeContactAt      *time.Time      `json:"-"`
-	BusyReason           string          `json:"busy_reason,omitempty"`
-	Claim                *Grant          `json:"current_claim"`
-	ClaimAgeMS           *int64          `json:"claim_age_ms,omitempty"`
-	ClaimStage           string          `json:"claim_stage,omitempty"`
-	ClaimStartedAt       *time.Time      `json:"claim_started_at,omitempty"`
+	ConnectionStatus     string               `json:"connection_status"`
+	OfflineForMS         *int64               `json:"offline_for_ms,omitempty"`
+	WorkStatus           string               `json:"work_status"`
+	CurrentJob           *Assignment          `json:"current_job"`
+	WaitingForTool       int                  `json:"waiting_for_client_tool"`
+	LastHeartbeatAt      *time.Time           `json:"last_heartbeat_at"`
+	InferenceReadiness   string               `json:"inference_readiness"`
+	Qualification        *Qualification       `json:"qualification,omitempty"`
+	QualificationHistory []Qualification      `json:"qualification_history"`
+	ModelReport          *ModelReport         `json:"model_report,omitempty"`
+	LastPollAt           *time.Time           `json:"last_poll_at"`
+	NativeContactAt      *time.Time           `json:"-"`
+	Update               *worker.UpdateStatus `json:"worker_update,omitempty"`
+	BusyReason           string               `json:"busy_reason,omitempty"`
+	Claim                *Grant               `json:"current_claim"`
+	ClaimAgeMS           *int64               `json:"claim_age_ms,omitempty"`
+	ClaimStage           string               `json:"claim_stage,omitempty"`
+	ClaimStartedAt       *time.Time           `json:"claim_started_at,omitempty"`
 }
 
 type Receipt struct {
@@ -353,6 +359,7 @@ type State struct {
 	Connection            Connection
 	LastPollAt            *time.Time
 	LastContactAt         *time.Time
+	WorkerUpdate          *worker.UpdateStatus
 	Experiments           map[string]*Experiment
 	Jobs                  map[string]*Job
 	Receipt               *Receipt

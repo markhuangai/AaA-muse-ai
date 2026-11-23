@@ -16,7 +16,7 @@ func chatRoute(path string) bool {
 	return path == "/v1/models" || path == "/v1/chat/completions" || path == "/v1/responses"
 }
 
-func chatErrorValue(status int, reason, param string) any {
+func chatErrorValue(status int, reason, param string, explanation ...string) any {
 	kind := "invalid_request_error"
 	if status == 401 {
 		kind = "authentication_error"
@@ -29,7 +29,11 @@ func chatErrorValue(status int, reason, param string) any {
 	if param != "" {
 		parameter = param
 	}
-	return map[string]any{"error": map[string]any{"message": strings.ReplaceAll(reason, "_", " "), "type": kind, "param": parameter, "code": reason}}
+	message := strings.ReplaceAll(reason, "_", " ")
+	if len(explanation) != 0 && explanation[0] != "" {
+		message = explanation[0]
+	}
+	return map[string]any{"error": map[string]any{"message": message, "type": kind, "param": parameter, "code": reason}}
 }
 
 func chatFailure(err error) (int, string, string) {
@@ -50,9 +54,18 @@ func chatFailure(err error) (int, string, string) {
 	return 503, "service_unavailable", ""
 }
 
+func failureMessage(err error) string {
+	var rejected *inference.Rejection
+	if errors.As(err, &rejected) {
+		message, _ := rejected.Fields["reason_message"].(string)
+		return message
+	}
+	return ""
+}
+
 func writeChatError(w *response, err error) {
 	status, reason, param := chatFailure(err)
-	writeJSON(w, status, chatErrorValue(status, reason, param))
+	writeJSON(w, status, chatErrorValue(status, reason, param, failureMessage(err)))
 }
 
 func (h *Handler) chatRequest(w *response, r *http.Request, logger *slog.Logger, client string, body []byte) {

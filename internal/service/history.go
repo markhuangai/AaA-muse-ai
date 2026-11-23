@@ -75,7 +75,11 @@ func (b *Broker) submitRequest(ctx context.Context, logger *slog.Logger, client,
 						j.ID = e.CurrentJobID
 					}
 					event(events, slog.LevelInfo, "history.reconciled", s, j, "client_id", client, "session_id", c.SessionID, "request_record_id", r.ID, "matched_from", 0, "matched_to", r.InputCount, "appended_from", c.ItemCount, "appended_to", c.ItemCount, "reason", "admitted_request_replay")
-					return r.View(false), nil
+					view := r.View(false)
+					if experiment := s.Experiments[r.ID]; experiment != nil {
+						view.ReasonMessage = experiment.ReasonMessage()
+					}
+					return view, nil
 				}
 			}
 			if r := s.Requests[c.CurrentRequestID]; r != nil && (r.State == "queued" || r.State == "inference") {

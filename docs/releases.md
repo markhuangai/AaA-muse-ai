@@ -6,8 +6,7 @@ worker contract in both version orders. Product versions and
 `protocol_version: 1` identify separate contracts.
 
 Workers advertise `X-Muse-Worker-Version` on HTTPS requests. Services
-return `X-Muse-Service-Version`. Incompatible enrollment, pulls and
-starts return HTTP 426 `update_required` before granting new authority. Malformed
+return `X-Muse-Service-Version`. Incompatible enrollment and starts return HTTP 426 `update_required`. Capable workers can negotiate an update without claiming work. Malformed
 or duplicate version headers return 400. Only major-zero services accept an
 absent legacy header. Legacy status never proves an exact installed version.
 New nonzero workers preflight a legacy server before sending an enrollment code.
@@ -20,6 +19,36 @@ with manual corrective action and no retry or installation. Export the broker
 diagnostics by the recorded request ID and the worker's protected diagnostics
 through the existing CLI. Keep credential files private; never copy their values
 into the diagnostic request or report. Missing captures remain incomplete.
+
+## Automatic worker updates
+
+An idle updater-enabled worker follows the exact package paired with the deployed
+broker. The target can be a release candidate, a stable release or an earlier
+updater-enabled release. Workers fetch the canonical public archive over HTTPS
+and verify its digest, version and source before switching the existing launcher.
+A worker reports the running version on authenticated pickup and busy check-in.
+The target becomes confirmed after the same worker makes a fresh pickup from it.
+
+Apply the first updater-enabled broker release with all older broker processes
+stopped. Back up the SQLite store before the service applies migration 004.
+Automatic rollback starts with the first updater-enabled release. Older brokers
+require a compatible store and an operator-managed rollback. Later updater-enabled
+brokers defer worker package switches while active brokers advertise different
+release pins. A same-version digest conflict calls for verifying the deployed
+images and release receipt.
+
+An automatic major transition requires the paired image and archive to declare
+support for the source worker's updater, state, credential and native checker.
+The portal shows **Migration required** when that declaration is missing.
+The major-0 to major-1 cutover uses separate configuration, credentials and storage.
+
+From **Workers**, open an existing major-1 worker and copy **Enable automatic
+updates** into its own Muse goal once. Wait for a fresh pickup to report the
+target version. A worker with active or uncertain work waits for reconciliation.
+If a download fails and the previous release is compatible and verified, the
+worker serves jobs during retry backoff. An integrity failure calls for operator
+inspection of the paired archive. An uncertain launcher switch keeps the worker
+reserved pending recovery.
 
 ## Publication
 
@@ -76,7 +105,8 @@ The historical `v0.1.0` candidate still reserves its npm version. Version
 conflicts require an eligible unused version; never republish historical bytes
 under an existing tag.
 After a complete `1.0.0` publication, the next eligible merge starts the
-`1.0.1-rc.0` series. A major release requires a manual worker upgrade.
+`1.0.1-rc.0` series. An automatic transition to a new major requires the
+migration declaration in both the broker image and the worker archive.
 
 The workflow builds and smoke-tests the requested version from the verified RC
 commit and tree. It checks the same worker on Node 22.12.0 and freezes
@@ -152,7 +182,7 @@ qualification evidence.
 
 ## Major-1 clean cutover
 
-An incompatible worker never downloads or installs replacement code. Use the
+For a major-0 installation, use the
 service's paired release receipt for the exact version and trusted archive
 digest. Major 1 does not reuse major-0 configuration, keys, worker enrollment,
 job history or download references. Start with fresh configuration, storage and

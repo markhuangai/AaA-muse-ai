@@ -12,10 +12,11 @@ import (
 
 type Database interface{ Ping(context.Context) error }
 type Build struct {
-	Version       string     `json:"version"`
-	Revision      string     `json:"revision"`
-	Dirty         bool       `json:"dirty"`
-	WorkerPackage PackagePin `json:"worker_package"`
+	Version          string     `json:"version"`
+	Revision         string     `json:"revision"`
+	Dirty            bool       `json:"dirty"`
+	WorkerPackage    PackagePin `json:"worker_package"`
+	WorkerUpdateFrom string     `json:"-"`
 }
 type Status struct {
 	Build         Build         `json:"build"`

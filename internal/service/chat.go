@@ -28,7 +28,11 @@ func (b *Broker) AwaitRequest(ctx context.Context, logger *slog.Logger, client s
 			if view.Reason == "deadline_exceeded" {
 				status = 504
 			}
-			return view, inference.Reject(view.Reason, status)
+			reason := view.Reason
+			if reason == "" {
+				reason = "interruption_reason_unavailable"
+			}
+			return view, inference.Reject(reason, status, "reason_message", view.ReasonMessage)
 		}
 		if !b.now().Before(deadline) {
 			return view, inference.Reject("deadline_exceeded", 504)

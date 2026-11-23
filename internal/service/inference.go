@@ -13,6 +13,7 @@ import (
 	"github.com/markhuangai/AaA-muse-ai/internal/inference"
 	"github.com/markhuangai/AaA-muse-ai/internal/media"
 	"github.com/markhuangai/AaA-muse-ai/internal/sqlite"
+	"github.com/markhuangai/AaA-muse-ai/internal/worker"
 )
 
 type InferenceRepository interface {
@@ -21,11 +22,12 @@ type InferenceRepository interface {
 }
 
 type Broker struct {
-	Media  *media.Store
-	repo   InferenceRepository
-	random io.Reader
-	now    func() time.Time
-	Wait   func(context.Context, time.Duration) error
+	Media        *media.Store
+	repo         InferenceRepository
+	random       io.Reader
+	now          func() time.Time
+	Wait         func(context.Context, time.Duration) error
+	updateBroker worker.UpdateBroker
 }
 
 func NewBroker(repo InferenceRepository, random io.Reader, now func() time.Time, wait func(context.Context, time.Duration) error) *Broker {
@@ -93,15 +95,19 @@ func project(s *inference.State) inference.Projection {
 	return p
 }
 
-func finish(s *inference.State, e *inference.Experiment, state, reason string, events *[]inferenceEvent) {
+func finish(s *inference.State, e *inference.Experiment, state, reason string, events *[]inferenceEvent, native ...inference.InterruptionEvidence) {
 	if e.Terminal() {
 		return
 	}
-	previousBoundary := "client_tool_wait"
-	if e.State == "queued" && e.CurrentJobID == "" {
-		previousBoundary = "dispatch_queue"
+	previousBoundary := interruptionStage(e, s.Jobs[e.CurrentJobID])
+	if state == "interrupted" {
+		e.Interruption = &inference.InterruptionEvidence{Stage: previousBoundary}
+		if len(native) != 0 {
+			e.Interruption.NativeStatus, e.Interruption.ResultFailure = native[0].NativeStatus, native[0].ResultFailure
+		}
 	}
 	e.State, e.Reason, e.RemoteOutcome = state, reason, "not_started"
+	explanation := e.ReasonMessage()
 	emitted := false
 	for _, j := range s.Jobs {
 		if j.ExperimentID != e.ID || (j.State != "queued" && j.State != "claimed") {
@@ -119,7 +125,7 @@ func finish(s *inference.State, e *inference.Experiment, state, reason string, e
 		if reason == "operator_cancelled" {
 			level, name = slog.LevelInfo, "experiment.cancelled"
 		}
-		event(events, level, name, s, j, "reason", reason, "remote_outcome", e.RemoteOutcome, "busy_hold", j.Held, "last_heartbeat_at", s.Connection.LastAckAt, "created_at", j.CreatedAt)
+		event(events, level, name, s, j, "reason", reason, "remote_outcome", e.RemoteOutcome, "busy_hold", j.Held, "last_heartbeat_at", s.Connection.LastAckAt, "created_at", j.CreatedAt, "reason_message", explanation, "interruption", e.Interruption)
 		if j.Held {
 			uncertain(events, s, j, "claimed_inference", reason)
 		}
@@ -132,9 +138,28 @@ func finish(s *inference.State, e *inference.Experiment, state, reason string, e
 		if reason == "operator_cancelled" {
 			level, name = slog.LevelInfo, "experiment.cancelled"
 		}
-		event(events, level, name, s, &inference.Job{ID: e.CurrentJobID, ExperimentID: e.ID, ConversationID: e.ConversationID, State: state, DeadlineAt: e.DeadlineAt}, "reason", reason, "remote_outcome", e.RemoteOutcome, "previous_boundary", previousBoundary, "queue_wait_ms", s.Now.Sub(e.CreatedAt).Milliseconds(), "created_at", e.CreatedAt)
+		event(events, level, name, s, &inference.Job{ID: e.CurrentJobID, ExperimentID: e.ID, ConversationID: e.ConversationID, State: state, DeadlineAt: e.DeadlineAt}, "reason", reason, "remote_outcome", e.RemoteOutcome, "previous_boundary", previousBoundary, "queue_wait_ms", s.Now.Sub(e.CreatedAt).Milliseconds(), "created_at", e.CreatedAt, "reason_message", explanation, "interruption", e.Interruption)
 	}
 	*events = append(*events, inferenceEvent{"experiment.outcome", slog.LevelInfo, []any{"operation_id", e.ID, "experiment_id", e.ID, "conversation_id", e.ConversationID, "worker_id", e.WorkerID, "state", e.State, "reason", reason, "remote_outcome", e.RemoteOutcome}})
+}
+
+func interruptionStage(e *inference.Experiment, job *inference.Job) string {
+	switch e.State {
+	case "queued":
+		return "dispatch_queue"
+	case "waiting_for_tool":
+		return "client_tool_wait"
+	}
+	if job != nil {
+		if job.StartedAt != nil {
+			return "native_execution"
+		}
+		if nativeClaim(job) {
+			return "awaiting_native_start"
+		}
+		return "claimed"
+	}
+	return ""
 }
 
 func markOffline(s *inference.State, events *[]inferenceEvent, reason string, since *time.Time) {
@@ -410,6 +435,7 @@ func (b *Broker) Projection(ctx context.Context, logger *slog.Logger, id string,
 			p.OfflineForMS = &elapsed
 		}
 		applyPullProjection(&p, s)
+		p.Update = s.WorkerUpdate
 		return p, nil
 	})
 	return p, err
@@ -464,9 +490,14 @@ func (b *Broker) Sweep(ctx context.Context, logger *slog.Logger) error {
 }
 
 func (b *Broker) Run(ctx context.Context, logger *slog.Logger) {
+	renewAt := b.now().Add(updateBrokerInterval)
 	for b.Wait(ctx, time.Second) == nil {
 		if ctx.Err() != nil {
 			return
+		}
+		if b.updateBroker.ID != "" && !b.now().Before(renewAt) {
+			_ = b.renewUpdateBroker(ctx, logger)
+			renewAt = b.now().Add(updateBrokerInterval)
 		}
 		_ = b.Sweep(ctx, logger)
 		if err := b.CleanupMedia(ctx, logger); err != nil {

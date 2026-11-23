@@ -4,11 +4,30 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+
+	"github.com/markhuangai/AaA-muse-ai/internal/worker"
 )
 
 const DevelopmentVersion = "1.0.0-dev.0"
 const WorkerVersionHeader = "X-Muse-Worker-Version"
 const ServiceVersionHeader = "X-Muse-Service-Version"
+const WorkerUpdaterHeader = "X-Muse-Worker-Updater"
+const WorkerDigestHeader = "X-Muse-Worker-SHA256"
+
+var sourceRevision = regexp.MustCompile(`^[a-f0-9]{40}$`)
+var supportedMajors = regexp.MustCompile(`^(?:[1-9][0-9]*)(?:,[1-9][0-9]*)*$`)
+
+func ValidWorkerDigest(digest string) bool { return archiveDigest.MatchString(digest) }
+
+func (b Build) UpdateTarget() *worker.UpdateTarget {
+	b = b.Normalized()
+	major, valid := ReleaseMajor(b.Version)
+	if !valid || major == 0 || strings.Contains(b.Version, "-dev.") || !archiveDigest.MatchString(b.WorkerPackage.SHA256) ||
+		!sourceRevision.MatchString(b.Revision) || (b.WorkerUpdateFrom != "" && !supportedMajors.MatchString(b.WorkerUpdateFrom)) {
+		return nil
+	}
+	return &worker.UpdateTarget{PackagePin: b.WorkerPackage, Source: b.Revision, Contract: worker.UpdateContract, FromMajors: b.WorkerUpdateFrom}
+}
 
 var releaseVersion = regexp.MustCompile(`^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(dev|rc)\.(0|[1-9][0-9]*))?$`)
 var archiveDigest = regexp.MustCompile(`^[a-f0-9]{64}$`)

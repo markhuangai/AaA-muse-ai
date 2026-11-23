@@ -266,7 +266,7 @@ func (h *Handler) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 			logger = logger.With("portal_session_id", identity.ID)
 		}
 		if route != mcpRoute && role == "unauthenticated" && strings.HasPrefix(authorization, "Bearer ") && strings.HasPrefix(credential, auth.WorkerPrefix) && h.Workers != nil {
-			if route == "/api/v1/worker/pull" || route == workerPresenceRoute {
+			if route == "/api/v1/worker/pull" || route == workerPresenceRoute || route == workerUpdateRoute {
 				role = "worker"
 			} else {
 				record, err := h.Workers.Authenticate(r.Context(), logger, credential)
@@ -366,6 +366,10 @@ func (h *Handler) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 		h.export(w, r, logger)
 	case "/api/v1/admin/setup-prompts":
 		h.setupRequest(w, r, logger, body)
+	case workerUpdateRoute:
+		h.workerUpdateRequest(w, r, logger, body)
+	case adoptionPromptRoute:
+		h.adoptionPrompt(w, r, logger, requestedWorker, body)
 	case "/v1/models", "/v1/chat/completions":
 		h.chatRequest(w, r, logger, clientID, body)
 	case "/v1/responses":

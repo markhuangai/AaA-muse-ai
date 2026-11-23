@@ -79,6 +79,8 @@ func portalWorkerAction(route string) (string, string) {
 		return "worker.rename", "worker"
 	case "/api/v1/admin/workers/{id}/revoke":
 		return "worker.revoke", "worker"
+	case adoptionPromptRoute:
+		return "worker.update_prompt", "worker"
 	default:
 		return "", ""
 	}

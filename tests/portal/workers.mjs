@@ -166,6 +166,7 @@ async function viewports() {
     if (width === 390) await expect(row(fixture.workers.offline_id).locator('.offline-label')).toBeVisible();
     expect(await page.evaluate(() => window.__unsafe === undefined && document.querySelector('tbody img') === null)).toBe(true);
     await expect(row(fixture.workers.never_id)).toContainText('Never seen');
+    await expect(row(fixture.workers.never_id)).toContainText('Version Not reported');
     await expect(row(fixture.workers.quiet_id)).toContainText('Quiet');
     await expect(page.getByRole('columnheader', { name: 'Qualification' })).toHaveCount(0);
     await expect(row(fixture.workers.busy_id)).toContainText('Busy');
@@ -192,7 +193,7 @@ async function viewports() {
     await expect(page.getByText('Execution started', { exact: true })).toBeVisible();
     await expect(page.getByText('Deadline', { exact: true })).toBeVisible();
     await expect(page.getByRole('heading', { name: 'Inference qualification' })).toHaveCount(0);
-    await expect(page.getByText('Installed version', { exact: true }).locator('..')).toContainText('Not reported');
+    await expect(page.getByText('Installed version', { exact: true }).locator('..')).toContainText(fixture.pin.version);
     await expect(page.getByText('Not independently observed', { exact: true })).toBeVisible();
     const acceptedName = `Research agent ${width} 名称`;
     await page.getByLabel('Display name', { exact: true }).fill(`  ${acceptedName}  `);

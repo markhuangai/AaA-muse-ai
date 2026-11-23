@@ -19,6 +19,7 @@ import (
 	"github.com/markhuangai/AaA-muse-ai/internal/diagnostics"
 	"github.com/markhuangai/AaA-muse-ai/internal/inference"
 	"github.com/markhuangai/AaA-muse-ai/internal/service"
+	"github.com/markhuangai/AaA-muse-ai/internal/worker"
 )
 
 type httpInferenceStore struct {
@@ -31,7 +32,7 @@ type httpInferenceStore struct {
 	sequence int64
 }
 
-func (m *httpInferenceStore) WithinPull(ctx context.Context, digest [32]byte, _ inference.Pull, _ string, capability int, claim func(*inference.State) (*inference.Grant, error)) (inference.PullResult, string, bool, inference.PullTiming, error) {
+func (m *httpInferenceStore) WithinPull(ctx context.Context, digest [32]byte, _ inference.Pull, _ string, capability int, _ worker.Contact, _ worker.UpdateBroker, claim func(*inference.State) (*inference.Grant, error)) (inference.PullResult, string, bool, inference.PullTiming, error) {
 	identity, err := m.workers.AuthenticateWorker(ctx, digest)
 	if err != nil {
 		return inference.PullResult{}, "", false, inference.PullTiming{}, err
@@ -344,6 +345,68 @@ func TestRetiredWorkerRoutesDoNotProvideAuthority(t *testing.T) {
 	}
 	wrapped := &responseWriterProbe{header: http.Header{}}
 	h.ServeHTTP(wrapped, httptest.NewRequest("GET", "/healthz", nil))
+}
+
+func TestNativeInterruptionEvidencePersistsAcrossReceiptReplay(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	h := pullHTTPClock(t, filepath.Join(mediaSQLiteDirectory(t), "state.sqlite3"), func() time.Time { return now })
+	key := enrollNative(t, h)
+	var enrolled workerView
+	nativeResponse(t, call(h, http.MethodGet, "/api/v1/worker/status", "Bearer "+key, nil), 200, &enrolled)
+	var task inference.Experiment
+	nativeResponse(t, versionedHTTP(h, http.MethodPost, "/api/v1/admin/experiments", testManagementKey, worker.Contact{}, inference.Create{
+		Version: 1, SubmissionID: "evidence", WorkerID: enrolled.ID, TimeoutSeconds: 300,
+		Messages: []inference.Item{{Type: "message", Role: "user", Text: "fixture"}}, Tools: []inference.Tool{},
+	}), 201, &task)
+	var pulled inference.PullResult
+	nativeResponse(t, nativePost(h, "/api/v1/worker/pull", key, inference.Pull{Version: 1, Sequence: 1,
+		Checker: "checker", Occurrence: "pickup", ScheduledAt: now, EnteredAt: now}), 200, &pulled)
+	if pulled.Job == nil || pulled.Job.JobID != task.CurrentJobID {
+		t.Fatal("worker did not claim the task")
+	}
+	job := pulled.Job
+	route := "/api/v1/worker/jobs/" + job.JobID
+	nativeResponse(t, nativePost(h, route+"/start", key, inference.WorkStart{Version: 1, ClaimID: job.ClaimID,
+		Generation: job.Generation, LaunchID: "launch", NativeJob: "once"}), 200, nil)
+	input := inference.Interruption{Version: 1, SubmissionID: "stopped", ClaimID: job.ClaimID, Generation: job.Generation,
+		LaunchID: "launch", NativeJob: "once", NativeRun: "execution", Reason: "execution_confirmed_stopped"}
+	settle := func(metadata ...string) *httptest.ResponseRecorder {
+		t.Helper()
+		body, err := json.Marshal(input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		request := httptest.NewRequest(http.MethodPost, route+"/interrupt", bytes.NewReader(body))
+		request.Header.Set("Authorization", "Bearer "+key)
+		request.Header.Set(service.WorkerVersionHeader, service.DevelopmentVersion)
+		for _, value := range metadata {
+			request.Header.Add("X-Muse-Interruption", value)
+		}
+		result := httptest.NewRecorder()
+		h.ServeHTTP(result, request)
+		return result
+	}
+	nativeResponse(t, settle("running"), 400, nil)
+	nativeResponse(t, settle("failed", "completed"), 400, nil)
+	input.Reason, input.NativeRun = "native_cancelled_before_start", ""
+	nativeResponse(t, settle("cancelled"), 400, nil)
+	input.Reason, input.NativeRun = "execution_confirmed_stopped", "execution"
+	first := settle("failed")
+	nativeResponse(t, first, 200, nil)
+	again := settle("completed")
+	nativeResponse(t, again, 200, nil)
+	if !bytes.Equal(first.Body.Bytes(), again.Body.Bytes()) {
+		t.Fatal("optional interruption evidence changed the settlement receipt")
+	}
+	var recorded struct {
+		inference.Experiment
+		Message string `json:"reason_message"`
+	}
+	nativeResponse(t, call(h, http.MethodGet, "/api/v1/admin/experiments/"+task.ID, "Bearer "+testManagementKey, nil), 200, &recorded)
+	if recorded.Interruption == nil || recorded.Interruption.NativeStatus != "failed" ||
+		recorded.Interruption.Stage != "native_execution" || !strings.Contains(recorded.Message, "native run failed") {
+		t.Fatal("the first native outcome and execution stage were not preserved")
+	}
 }
 
 type responseWriterProbe struct{ header http.Header }

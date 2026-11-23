@@ -164,6 +164,10 @@ class MCPMedia:
                     return view["status"] == "interrupted" and view.get("reason") == "deadline_exceeded"
 
                 self.until(expired, "queued media did not expire under its one-second deadline", timeout=10)
+                http_status = self.checked(route + "/" + identity, self.client)[0]
+                mcp_status = self.mcp_call("download_video", {"job_id": identity})
+                require(http_status["reason_message"] == mcp_status["reason_message"] ==
+                        "The deadline passed before a worker claimed this task.", "HTTP and MCP disagreed on the queued media explanation")
 
                 def expiry_captured():
                     events = self.mcp_diagnostic("operation_id", identity, self.origin_url)

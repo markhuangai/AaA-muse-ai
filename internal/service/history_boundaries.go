@@ -22,6 +22,7 @@ func (b *Broker) ReadRequest(ctx context.Context, logger *slog.Logger, client, i
 		}
 		r.State, r.Reason = s.Experiments[id].State, s.Experiments[id].Reason
 		view = r.View(true)
+		view.ReasonMessage = s.Experiments[id].ReasonMessage()
 		return view, nil
 	})
 	return view, err
@@ -49,7 +50,9 @@ func (b *Broker) CancelRequest(ctx context.Context, logger *slog.Logger, client,
 		}
 		finish(s, e, "cancelled", "operator_cancelled", events)
 		r.State, r.Reason = e.State, e.Reason
-		return r.View(false), nil
+		view := r.View(false)
+		view.ReasonMessage = e.ReasonMessage()
+		return view, nil
 	})
 	if err == nil {
 		err = inference.Decode(data, &view)

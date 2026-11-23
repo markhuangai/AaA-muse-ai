@@ -22,6 +22,19 @@ The installed launcher passes the correct state directory. Source builds can use
 | `cron-observe --input FILE` | Reconcile the exact native job and execution after a real checker occurrence. |
 | `status` / `doctor` / `diagnostics-export` | Inspect broker observations or export protected evidence. |
 
+## Paired updates
+
+New installations receive automatic updates through the existing one-minute
+checker. For an existing major-1 installation, paste the **Enable automatic
+updates** prompt from its Workers drawer into the same Muse goal. Use the same
+VM user and keep the existing checker, worker credential and state directory.
+Wait for an authenticated pickup to confirm the version you see in the portal.
+
+The helper verifies the paired archive before replacing the launcher and retains
+the previous bundle during recovery. It pauses new work during an uncertain
+switch. If it can verify the previous compatible bundle, it resumes work there
+during transient retry backoff. [Paired versions and rollback](../docs/releases.md#automatic-worker-updates)
+
 ## Recovery and diagnosis
 
 A checker can finish while a one-time job is still queued or active. Use native run identity and observable producer identity, not a green checker run, an absent listing, elapsed time, or PID alone. Unknown status retains the claim. A cancelled or expired job cannot start or accept a new result. A previously accepted receipt can still reconcile; the broker releases an accepted claim only after the worker confirms the old work stopped. Revoking the worker blocks the credential and does not prove native work stopped.

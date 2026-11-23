@@ -305,8 +305,8 @@ func TestSQLiteUnsafeFileAndSchemaRejections(t *testing.T) {
 	})
 	t.Run("ledger", func(t *testing.T) {
 		repo := newRepo(t)
-		execute(t, repo, "UPDATE aaa_schema_migrations SET version=4 WHERE version=3")
-		if f := failReason(t, repo.Bootstrap(t.Context()), "schema_version_incompatible"); f.Observed != "4" || f.Expected != "3" {
+		execute(t, repo, "UPDATE aaa_schema_migrations SET version=5 WHERE version=4")
+		if f := failReason(t, repo.Bootstrap(t.Context()), "schema_version_incompatible"); f.Observed != "5" || f.Expected != "4" {
 			t.Fatal(f)
 		}
 		execute(t, repo, "UPDATE aaa_schema_migrations SET checksum='changed' WHERE version=1")

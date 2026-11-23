@@ -124,6 +124,13 @@ func (r *Repository) WithinInference(ctx context.Context, ref inference.Ref, app
 				return err
 			}
 			s.LastPollAt = instant(polled)
+			update, err := readWorkerUpdate(ctx, tx, s.WorkerID)
+			if err != nil {
+				return err
+			}
+			if update.ObservedAt != nil || update.State != "" {
+				s.WorkerUpdate = &update
+			}
 		}
 		if err = loadInference(ctx, tx, ref, s); err != nil {
 			return err
