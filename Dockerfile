@@ -6,6 +6,7 @@ FROM node:24.22.2-alpine3.24@sha256:a34ab6d7f6f4813f4d0c5469d74685604b962fbdbf57
 WORKDIR /src
 COPY package.json package-lock.json ./
 COPY worker/package.json ./worker/package.json
+RUN node -e "const u=require('./worker/package.json').aaa_muse_update; if(u.contract!=='native-cron-v1'||!/^([1-9][0-9]*(,[1-9][0-9]*)*)?$/.test(u.from_majors)) process.exit(1); process.stdout.write(u.from_majors)" > /tmp/worker-update-from
 COPY portal/package.json ./portal/package.json
 RUN npm ci --ignore-scripts --no-audit --no-fund
 COPY portal/index.html portal/tsconfig.json ./portal/
@@ -21,11 +22,12 @@ RUN go mod download \
     && cp "$(go list -m -f '{{.Dir}}' github.com/modelcontextprotocol/go-sdk)"/LICENSE /out/mcp-licenses/
 COPY cmd ./cmd
 COPY internal ./internal
+COPY --from=frontend /tmp/worker-update-from /tmp/worker-update-from
 ARG SOURCE_SHA=development
 ARG SOURCE_DIRTY=true
 ARG PRODUCT_VERSION=1.0.0-dev.0
 ARG WORKER_SHA256
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.revision=${SOURCE_SHA} -X main.dirty=${SOURCE_DIRTY} -X main.version=${PRODUCT_VERSION} -X main.workerSHA256=${WORKER_SHA256}" -o /out/service ./cmd/service
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.revision=${SOURCE_SHA} -X main.dirty=${SOURCE_DIRTY} -X main.version=${PRODUCT_VERSION} -X main.workerSHA256=${WORKER_SHA256} -X main.workerUpdateFrom=$(cat /tmp/worker-update-from)" -o /out/service ./cmd/service
 
 FROM alpine:3.24@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf AS runtime
 RUN apk add --no-cache ffmpeg && addgroup -g 10001 service && adduser -D -H -u 10001 -G service service \

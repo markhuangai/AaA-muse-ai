@@ -2,13 +2,14 @@
 set +x
 set -euo pipefail
 umask 077
-[[ $# == 6 ]] || { printf '%s\n' '{"level":"ERROR","msg":"setup.runtime_unsupported","cause":"installer_arguments_required","protected_capture_unavailable":true}' >&2; exit 1; }
+[[ $# == 6 || ($# == 7 && $7 == --adopt) ]] || { printf '%s\n' '{"level":"ERROR","msg":"setup.runtime_unsupported","cause":"installer_arguments_required","protected_capture_unavailable":true}' >&2; exit 1; }
 archive=$1
 version=$2
 expected=$3
 origin=$4
 setup_id=$5
 receipt=$6
+adopt=${7:-}
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-(rc|dev)\.[0-9]+)?$ && "$expected" =~ ^[0-9a-f]{64}$ && "$setup_id" =~ ^[0-9a-f]{32}$ ]] || exit 1
 [[ -f "$receipt" && ! -L "$receipt" && -O "$receipt" && $(stat -c '%a:%h' "$receipt") == 600:1 && $(stat -c '%s' "$receipt") -le 65536 ]] || { printf '%s\n' '{"level":"ERROR","msg":"setup.runtime_unsupported","cause":"bootstrap_evidence_unsafe","protected_capture_unavailable":true}' >&2; exit 1; }
 stage=installer
@@ -94,13 +95,9 @@ fi
 observed_state=supported_node
 event INFO setup.runtime_verified
 stage=extract
-while IFS= read -r entry; do
-  [[ "$entry" == package/* && "$entry" != /* && "$entry" != *'/../'* && "$entry" != *'/./'* && "$entry" != *'/..' && "$entry" != *$'\n'* ]]
-  case "$entry" in package/dist/*|package/setup/*|package/package.json|package/LICENSE|package/README.md) ;; *) event ERROR setup.package_mismatch; exit 1 ;; esac
-done < <(tar -tzf "$archive")
-while IFS= read -r entry; do [[ ${entry:0:1} == - || ${entry:0:1} == d ]]; done < <(tar -tvzf "$archive")
 bundle=$(mktemp -d "$root/releases/bundle.XXXXXXXX")
-tar -xzf "$archive" --no-same-owner --no-same-permissions -C "$bundle"
+archive_helper=$(tar -xOzf "$archive" package/setup/extract.sh)
+bash -c "$archive_helper" aaa-muse-extract "$archive" "$bundle"
 "$node" --input-type=module - "$bundle/package" "$version" <<'AAA_MUSE_METADATA'
 import { readFileSync } from 'node:fs';
 const [root,version]=process.argv.slice(2);
@@ -111,4 +108,8 @@ AAA_MUSE_METADATA
 stage=worker
 event INFO setup.package_verified
 execution_started=true
-"$node" "$bundle/package/dist/main.js" setup --origin "$origin" --code-stdin --install-dir "$root" --setup-id "$setup_id" --bootstrap "$receipt" --state-dir "$state"
+if [[ "$adopt" == --adopt ]]; then
+  "$node" "$bundle/package/dist/main.js" update-adopt --origin "$origin" --install-dir "$root" --worker-id "$setup_id" --archive-digest "$expected" --bootstrap "$receipt" --state-dir "$state"
+else
+  "$node" "$bundle/package/dist/main.js" setup --origin "$origin" --code-stdin --install-dir "$root" --setup-id "$setup_id" --archive-digest "$expected" --bootstrap "$receipt" --state-dir "$state"
+fi

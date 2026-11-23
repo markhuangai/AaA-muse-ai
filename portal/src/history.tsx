@@ -70,7 +70,7 @@ function RequestList({ controller, view, select }: { controller: HistoryControll
           <span className="row-note">Client {request.client_id ?? 'Not recorded'} · {request.kind}</span>
         </>}
       </td>
-      <td>{request.kind === 'media' ? mediaProgress(request.state, request.started_at) : request.state}{request.reason && <span className="row-note">{request.reason}</span>}</td><td><code className="worker-id">{request.worker_id || 'Unassigned'}</code><CurrentName id={request.worker_id} view={view} /></td><td className="num">{timestamp(request.created_at)}</td>
+      <td>{request.kind === 'media' ? mediaProgress(request.state, request.started_at) : request.state}{(request.reason_message || request.reason) && <span className="row-note">{request.reason_message || request.reason}</span>}</td><td><code className="worker-id">{request.worker_id || 'Unassigned'}</code><CurrentName id={request.worker_id} view={view} /></td><td className="num">{timestamp(request.created_at)}</td>
     </tr>)}</tbody></table>}
     <Paging read={read} label="Requests" next={() => void controller.page('list', 'next')} previous={() => void controller.page('list', 'previous')} first={() => void controller.page('list', 'first')} />
   </section>;
@@ -94,7 +94,7 @@ function MediaSnapshot({ detail, view }: { detail: RequestDetail & { kind: 'medi
       <h3 id="media-state">Media job</h3>
       <dl className="identity-list">
         <div><dt>State</dt><dd>{mediaProgress(execution.state, assignment.started_at)}</dd></div>
-        {execution.reason && <div><dt>Reason</dt><dd>{execution.reason}</dd></div>}
+        {(execution.reason_message || execution.reason) && <div><dt>Reason</dt><dd>{execution.reason_message || execution.reason}</dd></div>}
         <div><dt>Owner</dt><dd>{detail.owner}</dd></div>
         <div><dt>Profile</dt><dd>{detail.profile}</dd></div>
         <div><dt>Job ID</dt><dd><Identifier label="job ID" value={execution.current_job_id} /></dd></div>
@@ -124,7 +124,7 @@ function Snapshot({ detail, view }: { detail: RequestDetail; view: HistoryView }
   const delivery = detail.delivery, assignment = detail.assignment;
   return <>
     <section className="data-panel history-summary" aria-labelledby="request-state"><h3 id="request-state">Recorded outcome</h3><dl className="identity-list">
-      <div><dt>State</dt><dd>{execution.state}</dd></div><div><dt>Reason</dt><dd>{execution.reason || 'None recorded'}</dd></div><div><dt>Remote outcome</dt><dd>{execution.remote_outcome}</dd></div>
+      <div><dt>State</dt><dd>{execution.state}</dd></div><div><dt>Reason</dt><dd>{execution.reason_message || execution.reason || 'None recorded'}</dd></div><div><dt>Remote outcome</dt><dd>{execution.remote_outcome}</dd></div>
       <div><dt>Busy hold</dt><dd>{assignment ? assignment.held === true ? 'Retained; remote execution may continue' : 'No retained hold recorded' : 'No assignment recorded'}</dd></div>
       <div><dt>Worker ID</dt><dd><Identifier label="worker ID" value={execution.worker_id || ''} /><CurrentName id={execution.worker_id} view={view} /></dd></div>
       <div><dt>Session ID</dt><dd><Identifier label="session ID" value={text(request.session_id)} /></dd></div><div><dt>Conversation ID</dt><dd><Identifier label="conversation ID" value={request.conversation_id} /></dd></div>

@@ -4,17 +4,23 @@ import { State } from './state.js';
 import { Worker } from './worker.js';
 import { encode, identifier, object, parse, text, type ObjectValue } from './json.js';
 import { requireValue } from './errors.js';
+import { archiveDigest } from './update-archive.js';
 
 function quote(value: string): string { return "'" + value.replaceAll("'", "'\\''") + "'"; }
+
+export function launcherScript(node: string, entry: string, state: string): string {
+  return '#!/usr/bin/env bash\nset -euo pipefail\nexec ' + quote(node) + ' ' + quote(entry) + ' "$@" --state-dir ' + quote(state) + '\n';
+}
 
 export class CronSetup {
   constructor(readonly worker: Worker, readonly io: InstallationIO, readonly version: string) {}
 
   get state() { return this.worker.state; }
 
-  async install(origin: string, input: string, root: string, setupID: string): Promise<ObjectValue> {
+  async install(origin: string, input: string, root: string, setupID: string, digest?: string): Promise<ObjectValue> {
     requireValue(isAbsolute(root) && isAbsolute(this.io.node) && isAbsolute(this.io.entry), 'absolute_install_paths_required');
     identifier(setupID);
+    requireValue(digest === undefined || archiveDigest.test(digest), "invalid_archive_digest");
     return this.state.withLock('setup', async () => {
       const prior = await this.worker.readRecord(this.state, 'installation.json');
       requireValue(!prior || (prior.setup_id === setupID && prior.root === root && prior.origin === origin && prior.package_version === this.version), 'fresh_worker_state_required');
@@ -22,12 +28,12 @@ export class CronSetup {
       const bin = new State(join(root, 'bin'), this.state.io, this.state.sys);
       await this.io.prepareDirectory(bin.root, 'launcher_directory');
       const launcher = bin.path('aaa-muse-worker');
-      await bin.write('aaa-muse-worker', '#!/usr/bin/env bash\nset -euo pipefail\nexec ' + quote(this.io.node) + ' ' + quote(this.io.entry) + ' "$@" --state-dir ' + quote(this.state.root) + '\n', 0o700);
+      await bin.write('aaa-muse-worker', launcherScript(this.io.node, this.io.entry, this.state.root), 0o700);
       await this.worker.configure(origin);
       const enrolled = await this.worker.enroll(input.split('\n', 1)[0].trim());
       const workerID = identifier(enrolled.worker_id);
       requireValue(!prior || prior.worker_id === workerID, 'worker_identity_mismatch');
-      const installation = { setup_id: setupID, worker_id: workerID, origin, package_version: this.version, root, launcher, command: quote(launcher) };
+      const installation = { setup_id: setupID, worker_id: workerID, origin, package_version: this.version, root, launcher, command: quote(launcher), ...(digest ? { package_sha256: digest, node: this.io.node, entry: this.io.entry } : {}) };
       const skillRoot = join(this.io.home, 'workspace', 'skills');
       await this.io.prepareDirectory(skillRoot, 'skill_directory', workerID, true);
       const skillDir = new State(join(skillRoot, 'aaa-muse-worker-' + workerID), this.state.io, this.state.sys);

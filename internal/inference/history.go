@@ -83,6 +83,7 @@ type RequestView struct {
 	ResponseID     string            `json:"response_id"`
 	State          string            `json:"state"`
 	Reason         string            `json:"reason,omitempty"`
+	ReasonMessage  string            `json:"reason_message,omitempty"`
 	Output         *Item             `json:"output,omitempty"`
 	CreatedAt      time.Time         `json:"created_at"`
 	Response       *ResponseMetadata `json:"response_metadata,omitempty"`

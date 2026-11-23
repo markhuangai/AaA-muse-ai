@@ -23,10 +23,10 @@ type MediaHistoryKind = { kind: 'media'; owner: string; profile: string };
 type MediaAssignment = Record<string, unknown> & { held: boolean; started_at?: string | null };
 export type RequestSummary = (TextHistoryKind | (MediaHistoryKind & { started_at: string | null })) & {
   id: string; conversation_id: string; client_id: string | null; session_id: string | null;
-  worker_id: string | null; state: string; reason?: string | null; created_at: string; provenance: string; response_id?: string | null;
+  worker_id: string | null; state: string; reason?: string | null; reason_message?: string; created_at: string; provenance: string; response_id?: string | null;
 }
 export interface Execution {
-  id: string; worker_id: string | null; state: string; reason?: string | null; remote_outcome: string;
+  id: string; worker_id: string | null; state: string; reason?: string | null; reason_message?: string; remote_outcome: string;
   created_at: string; deadline_at: string; current_job_id: string;
 }
 export type RequestDetail = (TextHistoryKind & { assignment: Record<string, unknown> | null } | MediaHistoryKind & { assignment: MediaAssignment }) & {
@@ -48,12 +48,12 @@ export function isSummary(value: unknown): value is RequestSummary {
     (isMedia(value) && (value.started_at === null || date(value.started_at)))) && historyID(value.id) && historyID(value.conversation_id) &&
     (value.client_id === null || typeof value.client_id === 'string') && nullableID(value.session_id) && nullableID(value.worker_id) &&
     typeof value.state === 'string' && date(value.created_at) && typeof value.provenance === 'string' &&
-    (value.reason == null || typeof value.reason === 'string') && (value.response_id == null || historyID(value.response_id));
+    (value.reason == null || typeof value.reason === 'string') && (value.reason_message === undefined || typeof value.reason_message === 'string') && (value.response_id == null || historyID(value.response_id));
 }
 
 export function isExecution(value: unknown): value is Execution {
   return object(value) && historyID(value.id) && nullableID(value.worker_id) && typeof value.state === 'string' &&
-    (value.reason == null || typeof value.reason === 'string') && typeof value.remote_outcome === 'string' &&
+    (value.reason == null || typeof value.reason === 'string') && (value.reason_message === undefined || typeof value.reason_message === 'string') && typeof value.remote_outcome === 'string' &&
     date(value.created_at) && date(value.deadline_at) && (value.current_job_id === '' || historyID(value.current_job_id));
 }
 

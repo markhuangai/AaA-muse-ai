@@ -4,6 +4,16 @@ interface ModelReport {
   reported_at: string;
 }
 
+export interface WorkerUpdate {
+  version?: string;
+  contract?: string;
+  state?: string;
+  target?: { version: string };
+  reason?: string;
+  retry_at?: string;
+  id?: string;
+}
+
 export interface Worker {
   id: string;
   name: string;
@@ -23,6 +33,7 @@ export interface Worker {
   busy_reason?: string;
   claim_started_at?: string;
   model_report?: ModelReport;
+  worker_update?: WorkerUpdate;
 }
 
 export interface Enrollment {
@@ -47,6 +58,12 @@ function modelReport(value: unknown): value is ModelReport {
     (value.context_window_tokens === undefined || integer(value.context_window_tokens) && Number(value.context_window_tokens) > 0);
 }
 
+function isWorkerUpdate(value: unknown): value is WorkerUpdate {
+  return object(value) && [value.version, value.contract, value.state, value.reason, value.id].every(field => field === undefined || typeof field === 'string') &&
+    (value.retry_at === undefined || date(value.retry_at)) &&
+    (value.target === undefined || (object(value.target) && typeof value.target.version === 'string'));
+}
+
 export function isWorker(value: unknown): value is Worker {
   return object(value) && typeof value.id === 'string' && /^[a-f0-9]{32}$/.test(value.id) && typeof value.name === 'string' &&
     date(value.registered_at) && optionalDate(value.revoked_at) && optionalDate(value.last_contact_at) &&
@@ -60,7 +77,8 @@ export function isWorker(value: unknown): value is Worker {
     (value.claim_age_ms === undefined || integer(value.claim_age_ms)) && (value.claim_stage === undefined || typeof value.claim_stage === 'string') &&
     (value.busy_reason === undefined || typeof value.busy_reason === 'string') &&
     (value.claim_started_at === undefined || date(value.claim_started_at)) &&
-    (value.model_report === undefined || modelReport(value.model_report));
+    (value.model_report === undefined || modelReport(value.model_report)) &&
+    (value.worker_update === undefined || isWorkerUpdate(value.worker_update));
 }
 
 export function isEnrollment(value: unknown, kind: EnrollmentKind): value is Enrollment {

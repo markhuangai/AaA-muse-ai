@@ -140,7 +140,7 @@ class TLSFixture:
                                "Accept", "MCP-Protocol-Version", "MCP-Method", "MCP-Name", "Mcp-Session-Id",
                                "Forwarded", "X-Forwarded-Host",
                                "X-Request-Id", "X-Portal-Operation-Id",
-                               "X-Muse-Worker-Version", "X-Muse-Worker-Model-Report", "X-Muse-Media-Jobs", "X-Muse-Prompt-Wav",
+                               "X-Muse-Worker-Version", "X-Muse-Worker-Updater", "X-Muse-Worker-SHA256", "X-Muse-Interruption", "X-Muse-Worker-Model-Report", "X-Muse-Media-Jobs", "X-Muse-Prompt-Wav",
                                "X-Muse-Artifact-Sha256", "X-Muse-Artifact-Size", "X-Muse-Connection-Id", "X-Muse-Connection-Generation",
                                "X-Muse-Generation", "X-Muse-Lease-Id") if key in self.headers}
                     if self.command == "PUT" and path.endswith("/artifact"):

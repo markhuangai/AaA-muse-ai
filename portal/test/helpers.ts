@@ -88,6 +88,8 @@ export class TestAPI implements API {
   async report(value: BrowserReport) { this.reports.push(value); return this.reportWork(value); }
   async workers() { this.workersCalls++; return this.workersWork(); }
   async renameWorker(id: string, name: string) { return this.renameWork(id, name); }
+  updatePromptWork = async (_id: string) => ({ value: 'Attach the existing worker', requestID: 'update-prompt-request' });
+  async workerUpdatePrompt(id: string) { return this.updatePromptWork(id); }
   async revokeWorker(id: string) { return this.revokeWork(id); }
   async enrollment(kind: EnrollmentKind) { return this.enrollmentWork(kind); }
   async requests(conversation: string, cursor: string) { this.historyCalls.list++; return this.requestsWork(conversation, cursor); }

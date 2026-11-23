@@ -28,7 +28,7 @@ func routeFor(path string) (string, string) {
 	switch path {
 	case "/api/v1/portal/login", "/api/v1/portal/logout", "/api/v1/portal/session", "/api/v1/portal/settings", "/api/v1/portal/events", "/api/v1/portal/client-keys":
 		return path, ""
-	case mcpRoute, "/v1/models", "/v1/chat/completions", "/v1/responses", "/healthz", "/readyz", "/api/v1/admin/status", "/api/v1/admin/diagnostics/export", "/api/v1/admin/enrollments", "/api/v1/admin/setup-prompts", "/api/v1/worker/enroll", "/api/v1/admin/workers", "/api/v1/worker/status":
+	case mcpRoute, "/v1/models", "/v1/chat/completions", "/v1/responses", "/healthz", "/readyz", "/api/v1/admin/status", "/api/v1/admin/diagnostics/export", "/api/v1/admin/enrollments", "/api/v1/admin/setup-prompts", "/api/v1/worker/enroll", "/api/v1/admin/workers", "/api/v1/worker/status", workerUpdateRoute:
 		return path, ""
 	}
 	if strings.HasPrefix(path, "/api/v1/admin/workers/") {
@@ -39,6 +39,9 @@ func routeFor(path string) (string, string) {
 			}
 			if len(parts) == 2 && parts[1] == "qualifications" {
 				return "/api/v1/admin/workers/{id}/qualifications", parts[0]
+			}
+			if len(parts) == 2 && parts[1] == "update-prompt" {
+				return adoptionPromptRoute, parts[0]
 			}
 			if len(parts) == 2 && parts[1] == "revoke" {
 				return "/api/v1/admin/workers/{id}/revoke", parts[0]
@@ -63,7 +66,7 @@ func routeMethod(route string) string {
 		return http.MethodPost
 	case "/api/v1/admin/workers/{id}":
 		return http.MethodPatch
-	case "/api/v1/requests", "/api/v1/requests/{id}/cancel", "/api/v1/admin/experiments", "/api/v1/admin/experiments/{id}/cancel", "/api/v1/admin/experiments/{id}/tool-results", "/api/v1/worker/jobs/{id}/decisions", "/api/v1/worker/pull", "/api/v1/worker/jobs/{id}/start", "/api/v1/worker/jobs/{id}/interrupt", workerPresenceRoute:
+	case "/api/v1/requests", "/api/v1/requests/{id}/cancel", "/api/v1/admin/experiments", "/api/v1/admin/experiments/{id}/cancel", "/api/v1/admin/experiments/{id}/tool-results", "/api/v1/worker/jobs/{id}/decisions", "/api/v1/worker/pull", "/api/v1/worker/jobs/{id}/start", "/api/v1/worker/jobs/{id}/interrupt", workerPresenceRoute, workerUpdateRoute, adoptionPromptRoute:
 		return http.MethodPost
 	default:
 		return http.MethodGet
@@ -255,8 +258,9 @@ func (h *Handler) workerRequest(w *response, r *http.Request, logger *slog.Logge
 		}
 		writeJSON(w, 200, struct {
 			workerView
-			WorkerPackage service.PackagePin `json:"worker_package"`
-		}{v, h.Service.Build().WorkerPackage})
+			WorkerPackage service.PackagePin   `json:"worker_package"`
+			UpdateTarget  *worker.UpdateTarget `json:"update_target,omitempty"`
+		}{v, h.Service.Build().WorkerPackage, h.Service.Build().UpdateTarget()})
 	case "/api/v1/admin/workers/{id}":
 		record, err := h.Workers.Rename(r.Context(), logger, id, input[field].(string))
 		w.workerID = id

@@ -166,6 +166,9 @@ func Run(ctx context.Context, args []string, build service.Build, d Dependencies
 			return 1
 		}
 	}
+	if err = broker.EnableUpdates(ctx, startup, instance, build.UpdateTarget()); err != nil {
+		return 1
+	}
 	if err = broker.Recover(ctx, startup); err != nil {
 		return 1
 	}

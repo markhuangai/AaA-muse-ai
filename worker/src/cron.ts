@@ -5,6 +5,7 @@ import { decision, encode, identifier, integer, object, text, type ObjectValue, 
 import { prepareMedia, finishMedia } from './media.js';
 import { job as validateJob } from './protocol.js';
 import { Worker } from './worker.js';
+import type { CronUpdate } from './cron-update.js';
 import { presenceTimeoutMs } from './transport.js';
 
 const interval = 60_000;
@@ -76,7 +77,7 @@ export async function processIdentity(pid: number): Promise<ProcessIdentity | un
 }
 
 export class Cron {
-  constructor(readonly worker: Worker, readonly inspectProcess = processIdentity) {}
+  constructor(readonly worker: Worker, readonly inspectProcess = processIdentity, readonly updater?: CronUpdate) {}
 
   get state() { return this.worker.state; }
   private async read(name: string): Promise<ObjectValue | undefined> { return this.worker.readRecord(this.state, name); }
@@ -175,6 +176,8 @@ export class Cron {
     const tick = { checker_job_id: input.checker_job_id, checker_run_id: occurrence, scheduled_at: iso(scheduled), entered_at: iso(entered) };
     const planned = await this.state.withLock('cron', async () => {
       requireValue(scheduled <= entered, 'checker_time_not_yet_due');
+      const recovered = await this.updater?.recover();
+      if (recovered) return { outcome: 'update', recovered } as const;
       const previous = await this.read(occurrenceFile);
       if (entered - scheduled >= interval || (previous && (previous.checker_run_id === occurrence || scheduled <= time(previous.scheduled_at)))) return { outcome: 'coalesced' } as const;
       await this.save(occurrenceFile, tick);
@@ -207,6 +210,7 @@ export class Cron {
       await this.save(tickFile, { sequence, scheduled_at: pending.scheduled_at, attempt, attempt_started_at: tick.entered_at, pending });
       return { outcome: 'pull', pending } as const;
     });
+    if (planned.outcome === 'update') return { ...tick, ...planned.recovered };
     if (planned.outcome === 'settle') return { ...tick, ...await this.settle(planned.active, object(planned.active.failure), occurrence) };
     if (planned.outcome === 'active') {
       const { active } = planned;
@@ -232,12 +236,13 @@ export class Cron {
       const transport = await this.worker.load();
       const { pending } = planned;
       const pull = { ...tick, sequence: pending.sequence, pull_run_id: pending.checker_run_id, pull_scheduled_at: pending.scheduled_at, pull_entered_at: pending.entered_at };
-      const reply = await transport.request('/api/v1/worker/pull', 'POST', encode(pending), pull, 1);
+      const reply = await transport.request('/api/v1/worker/pull', 'POST', encode(pending), pull, 1, undefined, await this.updater?.contactHeaders());
       return await this.state.withLock('cron', async () => {
         const stored = await this.read(tickFile);
         requireValue(stored?.attempt === attempt, 'poll_owner_changed');
         let result: ObjectValue = { ...pull, outcome: 'idle' };
         if (reply.data.job !== null) {
+          requireValue(reply.data.update === undefined, 'invalid_update_offer');
           const grant = object(reply.data.job);
           identifier(grant.job_id); identifier(grant.claim_id); identifier(grant.operation_id);
           requireValue(integer(grant.generation) > 0 && time(grant.deadline_at) >= time(grant.claimed_at), 'invalid_work_grant');
@@ -248,6 +253,7 @@ export class Cron {
           result = { ...pull, ...this.correlation(claim), outcome: claim.due_at ? 'recovery_pending' : 'prepare', lookup: claim.due_at ? this.definition(claim, installation) : null };
         }
         await this.save(tickFile, { sequence: stored.sequence, scheduled_at: stored.scheduled_at });
+        if (this.updater && reply.data.update) return { ...result, ...await this.updater.offer(reply.data.update, transport, reply.requestId) };
         await this.worker.logger.log(result.outcome === 'idle' ? 'DEBUG' : 'INFO', 'cron.pull_observed', { ...result, lookup: undefined, request_id: reply.requestId });
         return result;
       });
@@ -268,7 +274,7 @@ export class Cron {
     const route = `/api/v1/worker/jobs/${identifier(claim.job_id)}/presence`;
     try {
       const transport = await this.worker.load();
-      const reply = await transport.request(route, 'POST', encode(input), details, 1, presenceTimeoutMs);
+      const reply = await transport.request(route, 'POST', encode(input), details, 1, presenceTimeoutMs, await this.updater?.contactHeaders());
       requireValue(typeof reply.data.recorded === 'boolean', 'invalid_presence_reply', { request_id: reply.requestId });
       time(reply.data.received_at);
       await this.worker.logger.log('DEBUG', 'cron.presence_observed', { ...details, request_id: reply.requestId, recorded: reply.data.recorded, received_at: reply.data.received_at });
@@ -407,7 +413,8 @@ export class Cron {
   private async settle(active: ObjectValue, settlement: ObjectValue, occurrence?: string): Promise<ObjectValue> {
     const details: ObjectValue = { ...this.correlation(active), settling_checker_run_id: occurrence ?? active.observing_checker_run_id ?? null };
     const transport = await this.worker.load();
-    const { data: receipt, requestId } = await transport.request(`/api/v1/worker/jobs/${identifier(details.job_id)}/interrupt`, 'POST', encode(settlement), details, 1);
+    const { data: receipt, requestId } = await transport.request(`/api/v1/worker/jobs/${identifier(details.job_id)}/interrupt`, 'POST', encode(settlement), details, 1, undefined,
+      typeof active.interruption_evidence === 'string' ? { 'X-Muse-Interruption': active.interruption_evidence } : {});
     requireValue(receipt.job_id === details.job_id && receipt.claim_id === details.claim_id && ['accepted', 'interrupted', 'cancelled'].includes(text(receipt.state)), 'terminal_receipt_unverified');
     await this.state.withLock('cron', async () => {
       const current = await this.read(claimFile);
@@ -553,6 +560,7 @@ export class Cron {
     });
     if (initialBlock) return blocked(initialBlock);
     if (current.failure) return this.settle(current, object(current.failure), occurrence);
+    let resultFailure = '';
     if (!current.receipt && (current.pending_result || (current.brief && object(current.brief).media))) {
       const jobID = identifier(current.job_id);
       try {
@@ -560,6 +568,11 @@ export class Cron {
         if (replay.outcome !== 'accepted') return blocked({ cause: replay.cause });
       } catch (error) {
         if (!fencedResult(error) && !absentMediaResult(error) && !invalidDecision(error)) throw error;
+        if (invalidDecision(error)) resultFailure = 'decision_rejected';
+        if (absentMediaResult(error)) {
+          resultFailure = ['media_output_missing', 'media_temporary_directory_missing', 'media_generation_not_started'].includes(cause(error)) ?
+            'media_output_missing' : 'media_output_invalid';
+        }
         await this.worker.logger.log('WARN', 'cron.saved_result_unavailable', { ...details, cause: cause(error), ...(error instanceof Failure ? error.fields : {}) });
       }
     }
@@ -571,13 +584,14 @@ export class Cron {
         saved.failure = { protocol_version: 1, submission_id: this.state.sys.uuid(), claim_id: saved.claim_id, generation: saved.generation,
           launch_id: saved.launch_id, native_job_id: saved.native_job_id, native_run_id: saved.native_run_id ?? '',
           reason: saved.native_never_started ? 'native_cancelled_before_start' : 'execution_confirmed_stopped' };
+        if (!saved.native_never_started) saved.interruption_evidence = text(saved.native_status) + (resultFailure ? '/' + resultFailure : '');
         await this.save(claimFile, saved);
         const unused = (Array.isArray(saved.producers) ? saved.producers : []).map(object).filter(producer => !producer.pid);
         if (unused.length) await this.worker.logger.log('INFO', 'cron.unused_producers_retired', { ...details, producer_ids: unused.map(producer => producer.producer_id) });
       }
-      return { settlement: object(saved.failure) };
+      return { settlement: object(saved.failure), saved };
     });
     if (plan.reason) return blocked(plan.reason);
-    return this.settle(proof, plan.settlement, occurrence);
+    return this.settle(plan.saved, plan.settlement, occurrence);
   }
 }

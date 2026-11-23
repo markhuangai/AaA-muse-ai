@@ -21,6 +21,9 @@ func (h *Handler) workerCompatibility(w *response, r *http.Request, logger *slog
 		return false
 	}
 	if !build.Compatible(version) {
+		if route == "/api/v1/worker/pull" && r.Header.Get(service.WorkerUpdaterHeader) != "" {
+			return true
+		}
 		logger.Warn("worker.update_required", "service_version", build.Version, "worker_version", version, "legacy_handshake", len(values) == 0, "recommended_worker", build.WorkerPackage, "outcome", "new_authority_rejected", "automatic_update", false)
 		writeJSON(w, http.StatusUpgradeRequired, map[string]any{"error": "update_required", "service_version": build.Version, "worker_version": version, "worker_package": build.WorkerPackage, "automatic_update": false})
 		return false

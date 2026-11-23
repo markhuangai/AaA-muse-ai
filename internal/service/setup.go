@@ -8,18 +8,15 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+
+	"github.com/markhuangai/AaA-muse-ai/internal/worker"
 	"time"
 )
 
 var ErrWorkerPackageUnconfigured = errors.New("worker_package_unconfigured")
 var ErrSetupOrigin = errors.New("https_origin_required")
 
-type PackagePin struct {
-	Name    string `json:"name"`
-	Version string `json:"version"`
-	SHA256  string `json:"sha256"`
-	URL     string `json:"url"`
-}
+type PackagePin = worker.PackagePin
 
 type SetupPrompt struct {
 	EnrollmentID  string     `json:"enrollment_id"`
@@ -86,6 +83,8 @@ const setupInstruction = `I authorize you to run the verified AaA worker launche
 Install the scoped AaA Muse worker for the HTTPS origin below, using exactly these pinned public bytes. This authorizes native media generation and scoped artifact delivery, model answers and structured client-tool proposals for this broker's authenticated assignments; it grants no pool administration or client-tool execution authority.
 
 Use your actual shell, site and native scheduler permissions. Read the actual scope of each permission card Muse presents. If a capability or permission is missing or refused, stop and report the actual result; do not bypass it, rewrite the verified package, or invent a native inference API. No GitHub token or manual owner VM shell is needed. Keep the enrollment code private: it is single-use authority expiring 15 minutes after issuance. Never put a durable worker credential in a prompt, URL, task or log.
+
+I authorize this goal to download and install future verified worker packages paired with this broker after its current work has settled. Review the site and shell permissions for those updates.
 
 Before using the code, inspect this goal's native scheduled jobs, including disabled jobs. Request the actual permissions to run the local helper, use the HTTPS origin, and register, inspect and run a visible one-minute native agent cron and finite native agent runonce jobs owned by this goal. Use only tools advertised by this Muse runtime. Stop before enrollment on missing permission or a conflicting registration. Do not disable or reuse this account's major-0 schedule, hook, installation or credentials.
 

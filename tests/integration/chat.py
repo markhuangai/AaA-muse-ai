@@ -411,7 +411,9 @@ class Chat(History):
                 expired = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
                 self.expire_job(job, expired)
                 status, headers, raw = pending.result(timeout=12)
-            require(status == 504 and json.loads(raw)["error"]["code"] == "deadline_exceeded", "deadline did not produce explicit OpenAI error")
+            failure = json.loads(raw)["error"]
+            require(status == 504 and failure["code"] == "deadline_exceeded" and "native run started" in failure["message"],
+                    "deadline did not produce explicit OpenAI error and execution reason")
             self.diagnose_chat(headers["X-Request-Id"], "chat.stream_terminated" if stream else "chat.request_terminated", "deadline_exceeded")
             require(self.detail_id(job["experiment_id"])["assignment"]["held"], "deadline dropped uncertain busy hold")
             bot.settle(job)

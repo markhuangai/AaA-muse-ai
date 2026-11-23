@@ -14,15 +14,16 @@ import (
 )
 
 type MediaStatus struct {
-	ID          string                     `json:"job_id"`
-	State       string                     `json:"status"`
-	Profile     string                     `json:"profile"`
-	CreatedAt   time.Time                  `json:"created_at"`
-	DeadlineAt  time.Time                  `json:"deadline_at"`
-	CommittedAt *time.Time                 `json:"committed_at,omitempty"`
-	ExpiresAt   *time.Time                 `json:"expires_at,omitempty"`
-	Artifact    *inference.MediaProperties `json:"artifact,omitempty"`
-	Reason      string                     `json:"reason,omitempty"`
+	ID            string                     `json:"job_id"`
+	State         string                     `json:"status"`
+	Profile       string                     `json:"profile"`
+	CreatedAt     time.Time                  `json:"created_at"`
+	DeadlineAt    time.Time                  `json:"deadline_at"`
+	CommittedAt   *time.Time                 `json:"committed_at,omitempty"`
+	ExpiresAt     *time.Time                 `json:"expires_at,omitempty"`
+	Artifact      *inference.MediaProperties `json:"artifact,omitempty"`
+	Reason        string                     `json:"reason,omitempty"`
+	ReasonMessage string                     `json:"reason_message,omitempty"`
 }
 
 const (
@@ -42,7 +43,7 @@ func mediaTimeoutSeconds(input json.RawMessage) (int, error) {
 }
 
 func mediaStatus(e *inference.Experiment, j *inference.Job) MediaStatus {
-	return MediaStatus{ID: j.ID, State: e.State, Profile: j.Media.Profile, CreatedAt: e.CreatedAt, DeadlineAt: e.DeadlineAt, CommittedAt: j.Media.CommittedAt, ExpiresAt: j.Media.ExpiresAt, Artifact: j.Media.Artifact, Reason: e.Reason}
+	return MediaStatus{ID: j.ID, State: e.State, Profile: j.Media.Profile, CreatedAt: e.CreatedAt, DeadlineAt: e.DeadlineAt, CommittedAt: j.Media.CommittedAt, ExpiresAt: j.Media.ExpiresAt, Artifact: j.Media.Artifact, Reason: e.Reason, ReasonMessage: e.ReasonMessage()}
 }
 
 func mediaCapability(profile string) string {

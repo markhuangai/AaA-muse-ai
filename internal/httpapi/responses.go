@@ -26,7 +26,7 @@ func writeResponseError(w *response, err error) {
 			param = "input"
 		}
 	}
-	writeJSON(w, status, chatErrorValue(status, reason, param))
+	writeJSON(w, status, chatErrorValue(status, reason, param, failureMessage(err)))
 }
 
 func (h *Handler) responsesRequest(w *response, r *http.Request, logger *slog.Logger, client string, body []byte) {

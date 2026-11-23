@@ -129,6 +129,19 @@ func (s *Workers) Authenticate(ctx context.Context, logger *slog.Logger, credent
 	return w, nil
 }
 
+func (s *Workers) Registered(ctx context.Context, logger *slog.Logger, id string) (worker.Record, error) {
+	workers, err := s.List(ctx, logger)
+	if err != nil {
+		return worker.Record{}, err
+	}
+	for _, record := range workers {
+		if record.ID == id && record.RevokedAt == nil {
+			return record, nil
+		}
+	}
+	return worker.Record{}, &worker.Rejection{Reason: "worker_not_found"}
+}
+
 func (s *Workers) List(ctx context.Context, logger *slog.Logger) ([]worker.Record, error) {
 	logger, started := workerLogger(logger, "worker.list"), s.now()
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)

@@ -10,19 +10,20 @@ import (
 	"github.com/markhuangai/AaA-muse-ai/internal/auth"
 	"github.com/markhuangai/AaA-muse-ai/internal/inference"
 	"github.com/markhuangai/AaA-muse-ai/internal/sqlite"
+	"github.com/markhuangai/AaA-muse-ai/internal/worker"
 )
 
 type pullRepository interface {
-	WithinPull(context.Context, [32]byte, inference.Pull, string, int, func(*inference.State) (*inference.Grant, error)) (inference.PullResult, string, bool, inference.PullTiming, error)
+	WithinPull(context.Context, [32]byte, inference.Pull, string, int, worker.Contact, worker.UpdateBroker, func(*inference.State) (*inference.Grant, error)) (inference.PullResult, string, bool, inference.PullTiming, error)
 }
 
 type presenceRepository interface {
-	RecordBusyPresence(context.Context, [32]byte, string, func(*inference.Job, time.Time) (inference.PresenceReceipt, error)) (inference.PresenceReceipt, string, string, error)
+	RecordBusyPresence(context.Context, [32]byte, string, inference.BusyCheck, worker.Contact, func(*inference.Job, time.Time) (inference.PresenceReceipt, error)) (inference.PresenceReceipt, string, string, error)
 }
 
 const nativeOfflineAfter = 10 * time.Minute
 
-func (b *Broker) BusyCheck(ctx context.Context, logger *slog.Logger, credential, jobID string, input inference.BusyCheck) (inference.PresenceReceipt, string, error) {
+func (b *Broker) BusyCheck(ctx context.Context, logger *slog.Logger, credential, jobID string, input inference.BusyCheck, reports ...worker.Contact) (inference.PresenceReceipt, string, error) {
 	logger = logger.With("job_id", jobID, "claim_id", input.ClaimID, "generation", input.Generation, "checker_job_id", input.Checker,
 		"checker_run_id", input.Occurrence, "scheduled_at", input.ScheduledAt)
 	if !auth.ValidToken(credential, auth.WorkerPrefix) {
@@ -42,7 +43,7 @@ func (b *Broker) BusyCheck(ctx context.Context, logger *slog.Logger, credential,
 	started := b.now()
 	bounded, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
-	receipt, workerID, operationID, err := repo.RecordBusyPresence(bounded, auth.Digest(credential), jobID,
+	receipt, workerID, operationID, err := repo.RecordBusyPresence(bounded, auth.Digest(credential), jobID, input, workerContact(reports),
 		func(job *inference.Job, now time.Time) (inference.PresenceReceipt, error) {
 			if !claimMatches(job, input.ClaimID, input.Generation) || !job.Held {
 				return inference.PresenceReceipt{}, inference.Reject("stale_assignment", 409)
@@ -78,7 +79,7 @@ func validBusyReason(reason string) bool {
 	}
 }
 
-func (b *Broker) PullWork(ctx context.Context, logger *slog.Logger, credential string, input inference.Pull) (inference.PullResult, string, error) {
+func (b *Broker) PullWork(ctx context.Context, logger *slog.Logger, credential string, input inference.Pull, reports ...worker.Contact) (inference.PullResult, string, error) {
 	if !auth.ValidToken(credential, auth.WorkerPrefix) {
 		return inference.PullResult{}, "", inference.Reject("invalid_worker_credential", 401)
 	}
@@ -103,7 +104,7 @@ func (b *Broker) PullWork(ctx context.Context, logger *slog.Logger, credential s
 	started := b.now()
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	result, workerID, replayed, timing, err := repo.WithinPull(ctx, auth.Digest(credential), input, hash, capability, b.claimPulledJob)
+	result, workerID, replayed, timing, err := repo.WithinPull(ctx, auth.Digest(credential), input, hash, capability, workerContact(reports), b.updateBroker, b.claimPulledJob)
 	logger = logger.With("worker_id", workerID, "sequence", input.Sequence, "checker_job_id", input.Checker, "checker_run_id", input.Occurrence)
 	logger.Debug("worker.pull_timing", "scheduled_at", input.ScheduledAt, "entered_at", input.EnteredAt, "duration_ms", b.now().Sub(started).Milliseconds(),
 		"transaction_acquire_us", timing.Acquire.Microseconds(), "queue_lookup_us", timing.Select.Microseconds(), "replayed", replayed)
@@ -119,6 +120,9 @@ func (b *Broker) PullWork(ctx context.Context, logger *slog.Logger, credential s
 			logger.Error("worker.pull_failed", "reason", failure.Reason, "phase", failure.Phase, "sqlite_code", failure.Code, "transaction_outcome", failure.Outcome)
 		}
 		return inference.PullResult{}, workerID, err
+	}
+	if !replayed {
+		logUpdateDecision(ctx, logger, timing.Update, b.now().Sub(started))
 	}
 	if grant := result.Job; grant != nil {
 		logger = logger.With("operation_id", grant.OperationID, "job_id", grant.JobID, "claim_id", grant.ClaimID, "generation", grant.Generation)
@@ -278,7 +282,7 @@ func (b *Broker) StartWork(ctx context.Context, logger *slog.Logger, workerID, i
 	})
 }
 
-func (b *Broker) InterruptWork(ctx context.Context, logger *slog.Logger, workerID, id string, input inference.Interruption) (json.RawMessage, error) {
+func (b *Broker) InterruptWork(ctx context.Context, logger *slog.Logger, workerID, id string, input inference.Interruption, evidence ...inference.InterruptionEvidence) (json.RawMessage, error) {
 	ref := workerRef(workerID, id, input.SubmissionID, false)
 	ref.Single = true
 	return b.run(ctx, logger, ref, "work_interrupted", input, func(s *inference.State, events *[]inferenceEvent) (any, error) {
@@ -289,6 +293,9 @@ func (b *Broker) InterruptWork(ctx context.Context, logger *slog.Logger, workerI
 		cancelledBeforeStart := input.Reason == "native_cancelled_before_start" && inference.Identifier.MatchString(input.NativeJob) && input.NativeRun == ""
 		stopped := input.Reason == "execution_confirmed_stopped" && input.NativeJob != input.NativeRun &&
 			inference.Identifier.MatchString(input.NativeJob) && inference.Identifier.MatchString(input.NativeRun)
+		if len(evidence) != 0 && (!stopped || !evidence[0].ValidNative()) {
+			return nil, inference.Reject("invalid_interruption_evidence", 400)
+		}
 		if !inference.Identifier.MatchString(input.LaunchID) || (!unlaunched && !cancelledBeforeStart && !stopped) {
 			return nil, inference.Reject("invalid_work_interruption", 400)
 		}
@@ -311,7 +318,7 @@ func (b *Broker) InterruptWork(ctx context.Context, logger *slog.Logger, workerI
 		if cancelledBeforeStart && job.StartedAt != nil {
 			return nil, inference.Reject("work_already_started", 409)
 		}
-		finish(s, experiment, "interrupted", input.Reason, events)
+		finish(s, experiment, "interrupted", input.Reason, events, evidence...)
 		job.Held = false
 		experiment.RemoteOutcome = input.Reason
 		event(events, slog.LevelInfo, "job.work_settled", s, job, "claim_id", job.LeaseID, "launch_id", input.LaunchID, "native_job_id", input.NativeJob, "native_run_id", input.NativeRun, "reason", input.Reason, "busy_hold", false)

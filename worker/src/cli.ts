@@ -11,10 +11,11 @@ import { presenceTimeoutMs, type Network } from './transport.js';
 import { captureBootstrap, installationIO, type InstallationIO } from './install-io.js';
 import { Cron } from './cron.js';
 import { CronSetup } from './cron-setup.js';
+import { CronUpdate } from './cron-update.js';
 
 import { VERSION } from './version.js';
 export { VERSION } from './version.js';
-const help = 'aaa-muse-worker setup --origin HTTPS_ORIGIN --code-stdin --install-dir ABSOLUTE_PATH --setup-id ID | cron-describe --goal-id ID | cron-authorize-registration --input FILE|- | cron-confirm --input FILE|- | cron-check --input FILE|- | cron-prepare --input FILE|- | cron-observe --input FILE|- | cron-start --launch-id ID --native-job-id ID | cron-producer-intent --launch-id ID | cron-producer --launch-id ID --producer-id ID --pid PID | status | doctor | media-finish --job-id ID | decision-submit --job-id ID --input FILE|- | diagnostics-export [--operation-id ID] [--request-id ID] [--since RFC3339] [--until RFC3339] [--decode]\nCommon: --state-dir ABSOLUTE_PATH, --help, --version\n';
+const help = 'aaa-muse-worker setup --origin HTTPS_ORIGIN --code-stdin --install-dir ABSOLUTE_PATH --setup-id ID | update-adopt --origin HTTPS_ORIGIN --install-dir ABSOLUTE_PATH --worker-id ID --archive-digest SHA256 | cron-describe --goal-id ID | cron-authorize-registration --input FILE|- | cron-confirm --input FILE|- | cron-check --input FILE|- | cron-prepare --input FILE|- | cron-observe --input FILE|- | cron-start --launch-id ID --native-job-id ID | cron-producer-intent --launch-id ID | cron-producer --launch-id ID --producer-id ID --pid PID | status | doctor | media-finish --job-id ID | decision-submit --job-id ID --input FILE|- | diagnostics-export [--operation-id ID] [--request-id ID] [--since RFC3339] [--until RFC3339] [--decode]\nCommon: --state-dir ABSOLUTE_PATH, --help, --version\n';
 export interface Adapters {
   files: Files;
   system: System;
@@ -35,7 +36,8 @@ export function argumentsFor(args: string[]): { command: string; flags: Record<s
   const flags: Record<string, string | boolean> = Object.create(null);
   const allowed: Record<string, string[]> = {
     configure: ['origin'], enroll: ['code-stdin'], status: [], doctor: [], 'media-finish': ['job-id'],
-    setup: ['origin', 'code-stdin', 'install-dir', 'setup-id', 'bootstrap'],
+    setup: ['origin', 'code-stdin', 'install-dir', 'setup-id', 'bootstrap', 'archive-digest'],
+    'update-adopt': ['origin', 'install-dir', 'worker-id', 'archive-digest', 'bootstrap'],
     'decision-submit': ['job-id', 'input'], 'diagnostics-export': ['operation-id', 'request-id', 'since', 'until', 'decode'],
     'cron-describe': ['goal-id'], 'cron-authorize-registration': ['input'], 'cron-confirm': ['input'], 'cron-check': ['input'], 'cron-observe': ['input'], 'cron-prepare': ['input'],
     'cron-start': ['launch-id', 'native-job-id'], 'cron-producer-intent': ['launch-id'], 'cron-producer': ['launch-id', 'producer-id', 'pid'],
@@ -83,14 +85,24 @@ export async function execute(args: string[], io: Adapters): Promise<number> {
     const credential = await state.read('credential.key');
     if (credential) logger.redactor.add(credential.trim());
     const worker = new Worker(state, logger, io.network);
-    const cron = new Cron(worker);
+    const setup = io.setup ?? installationIO(io.home());
+    const updater = new CronUpdate(worker, setup);
+    const cron = new Cron(worker, undefined, updater);
     const finiteCheck = ['cron-check', 'cron-observe', 'cron-prepare'].includes(command);
     if (!finiteCheck) await logger.log('INFO', 'worker.command_started');
     let result: ObjectValue;
     switch (command) {
       case 'setup': {
         requireValue(flags['code-stdin'] && typeof flags.origin === 'string' && typeof flags['install-dir'] === 'string' && typeof flags['setup-id'] === 'string', 'setup_options_required');
-        result = await new CronSetup(worker, io.setup ?? installationIO(io.home()), VERSION).install(flags.origin, (await io.input('-')).trim(), flags['install-dir'], flags['setup-id']);
+        result = await new CronSetup(worker, io.setup ?? installationIO(io.home()), VERSION).install(flags.origin, (await io.input('-')).trim(), flags['install-dir'], flags['setup-id'], flags['archive-digest'] as string | undefined);
+        break;
+      }
+      case 'update-adopt': {
+        requireValue(typeof flags.origin === 'string' && typeof flags['install-dir'] === 'string' &&
+          typeof flags['archive-digest'] === 'string', 'update_adoption_options_required');
+        const selected = identifier(flags['worker-id'] as string);
+        if (typeof flags.bootstrap === 'string') await captureBootstrap(logger, selected, await io.input(flags.bootstrap));
+        result = await updater.adopt(flags.origin, selected, flags['archive-digest'], flags['install-dir']);
         break;
       }
       case 'cron-describe':

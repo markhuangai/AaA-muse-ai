@@ -62,6 +62,7 @@ export interface API {
   createClientKey(name: string, key: string, operation: string, signal: AbortSignal): Promise<{ value: string; requestID: string }>;
   workers(operation: string, signal: AbortSignal): Promise<{ value: Worker[]; requestID: string }>;
   renameWorker(id: string, name: string, operation: string, signal: AbortSignal): Promise<{ value: Worker; requestID: string }>;
+  workerUpdatePrompt(id: string, operation: string, signal: AbortSignal): Promise<{ value: string; requestID: string }>;
   revokeWorker(id: string, operation: string, signal: AbortSignal): Promise<{ value: Worker; requestID: string }>;
   enrollment(kind: EnrollmentKind, operation: string, signal: AbortSignal): Promise<{ value: Enrollment; requestID: string }>;
   requests(conversation: string, cursor: string, operation: string, signal: AbortSignal): Promise<{ value: HistoryPage<RequestSummary>; requestID: string }>;
@@ -176,6 +177,16 @@ export class BrowserAPI implements API {
 
   async revokeWorker(id: string, operation: string, signal: AbortSignal) {
     return this.workerAction(id, 'POST', '/revoke', operation, signal);
+  }
+
+  async workerUpdatePrompt(id: string, operation: string, signal: AbortSignal) {
+    if (!/^[a-f0-9]{32}$/.test(id)) throw new APIError('invalid_worker_id');
+    const origin = this.origin();
+    if (!origin.startsWith('https://')) throw new APIError('https_origin_required');
+    const result = await this.request(`/api/v1/admin/workers/${id}/update-prompt`, 'POST', operation, signal, { origin });
+    if (!object(result.data) || typeof result.data.update_prompt !== 'string' || !result.data.update_prompt)
+      throw new APIError('invalid_response', 200, result.requestID);
+    return { value: result.data.update_prompt, requestID: result.requestID };
   }
 
   async enrollment(kind: EnrollmentKind, operation: string, signal: AbortSignal) {

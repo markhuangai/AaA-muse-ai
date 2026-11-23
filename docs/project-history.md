@@ -2,6 +2,62 @@
 
 These entries record decisions and evidence at the dates shown. See the release guide for the current publication and qualification rules. [Paired product releases](releases.md)
 
+## Worker version matching
+
+On November 23, 2026 the owner approved automatic installation of the exact
+service-paired version at base `b22490f8073c0b218131c70ae0b9fda4dfebc767`, including
+prereleases and rollbacks between updater-enabled releases. Existing major-1
+workers adopt the updater in place. Major transitions require declared
+compatibility for local state, enrolled authority and the native checker. A
+verified compatible fallback can serve during transient retry backoff.
+
+The same delivery makes the first recorded interruption reason available in
+clients and portal history. Acceptance uses controlled archives, HTTPS,
+SQLite and the packaged worker. Require independent audit, full CI, CodeQL,
+Codex and complete configured AI review. The owner exempted CodeRabbit.
+Publication, deployment, live Muse verification and merge remain owner
+decisions.
+
+After PR #73 merged at `883f4cc7b6f66d970a8ef258121761963b431850`, the delivery
+preserved its scoped same-turn launcher authorization and both-broker media
+diagnostics. The initial independent audit passed before testing at tracked
+diff SHA-256 `0fd55292e1fb215abb1e2b9c94d69b9f05945bcb70556f74d6795d0a0dfd8794`.
+The first acceptance run adopted stock `1.0.0`, then failed when the container
+fixture exposed a read-only `/tmp` to media generation. The revised fixture
+provides a private writable mount for that path.
+
+By `2026-11-23T14:17:33Z`, `make test-worker-updates` passed at working-source
+digest `749bbb4bb8148030fe74e1a3e53a2149fb9b6405aa14dc236da9efa89d31e2af`.
+It exercised stock adoption, broker disagreement, held work, compatible
+fallback, crash recovery, rollback, and supported and unsupported major
+transitions. Chromium verified update progress and interruption reasons at
+1440, 768, and 390 pixels. Protected logs correlated the missing archive
+across both brokers and identified the observed digest on corrupt download.
+The test verified removal of eleven containers, ten volumes, one network,
+and five fixture images. These observations used controlled native scheduler
+reports.
+
+The follow-up audit was conformant at tracked diff SHA-256
+`63a5c7dcc49052c6dbc4197125298534623b04efcf93d565e662e0e60abdbea0`.
+The audited working-source digest was
+`1c32bbc20bae318596c4fc2af0c1a917ae250cf14ebebb097f1bc5b107c32b95`
+before this evidence note. The controlled updater suite passed again at that
+digest. Worker setup and recovery, inference, Chat, Responses, Media, Workers
+and History passed. SQLite fault injection verified that a failed pin or
+attempt write leaves the original pickup or update available for retry.
+All six unit components exceeded 90% statement coverage. The service
+covered 6,368 of 7,068 statements, the worker covered 3,173 of 3,412,
+and the portal covered 1,159 of 1,275. File limits, CI policy and workflow lint
+passed. By `2026-11-23T14:53:36Z`, controlled release verification also passed
+at the audited digest, including final-version packaging and fixture cleanup.
+
+On PR #74 head `3cc849c361d243cba5032363304bfb9706838fbd`, hosted CI passed
+both product E2E shards, all coverage gates and the new updater suite. Codex
+completed its review. CodeQL traced the diagnostic event to the HTTP
+interruption header. Parsing now produces fixed allowlisted codes before
+diagnostics or persistence. The configured AI review reached its 40-minute
+limit at `2026-11-23T15:41:53Z` on that head. [CI](https://github.com/markhuangai/AaA-muse-ai/actions/runs/45199423922) · [CodeQL alert](https://github.com/markhuangai/AaA-muse-ai/security/code-scanning/11) · [AI review](https://github.com/markhuangai/AaA-muse-ai/actions/runs/45199424011)
+
 ## Native Muse Cron
 
 On November 23, 2026 the owner reported that Muse stopped after package verification and worker enrollment. Muse attributed the pause before launcher execution and native cron registration to an execution-risk check. The owner approved putting scoped launcher and checker authorization before the bootstrap, then directing Muse to finish registration with the same enrolled worker. Muse must surface any required permission request and verify the exact saved checker before reporting success. Whether the revised prompt avoids a second chat confirmation requires a separate live observation.

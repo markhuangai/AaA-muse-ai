@@ -13,6 +13,26 @@ const busyReasons = new Map([
   ['producer_still_active_or_unobservable', 'Waiting for the background process to stop'],
 ]);
 
+const updateLabels = new Map([
+  ['adoption_required', 'Setup required'], ['offered', 'Update available'], ['downloading', 'Updating'],
+  ['switching', 'Updating'], ['awaiting_confirmation', 'Awaiting confirmation'], ['confirmed', 'Update confirmed'],
+  ['failed', 'Update failed'], ['deferred', 'Update deferred'], ['migration_required', 'Migration required'],
+]);
+const updateReasons = new Map([
+  ['archive_unavailable', 'The paired archive is unavailable.'], ['download_failed', 'The archive download failed.'],
+  ['archive_digest_mismatch', 'The downloaded archive did not match the expected digest.'],
+  ['archive_invalid', 'The archive contents could not be verified.'],
+  ['staging_failed', 'The worker could not stage the new release.'], ['activation_failed', 'The worker could not switch the launcher.'],
+  ['candidate_incompatible', 'The package is incompatible with this worker.'], ['target_changed', 'The broker target changed.'],
+  ['mixed_broker_releases', 'The brokers are serving different releases.'],
+  ['release_digest_conflict', 'The same version has conflicting archive digests.'],
+  ['unsupported_worker_migration', 'The target requires an operator-guided migration.'],
+]);
+
+function updateLabel(worker: Worker) {
+  return updateLabels.get(worker.worker_update?.state ?? '');
+}
+
 function formatOfflineDuration(milliseconds: number) {
   const seconds = Math.floor(milliseconds / 1000);
   return `${Math.floor(seconds / 3600)}h ${Math.floor(seconds % 3600 / 60)}m ${seconds % 60}s`;
@@ -40,6 +60,7 @@ function WorkerDetail({ worker, controller, view }: { worker: Worker; controller
   const [name, setName] = useState(worker.name);
   const [confirming, setConfirming] = useState(false);
   const dialog = useRef<HTMLDialogElement>(null);
+  const update = worker.worker_update;
   const disabled = view.stale || !!view.pending;
   const refreshDisabled = view.loading || !!view.pending;
   useEffect(() => { setName(worker.name); }, [worker.id, worker.name]);
@@ -73,8 +94,20 @@ function WorkerDetail({ worker, controller, view }: { worker: Worker; controller
         <div><dt>Contact status</dt><dd>{stateName(worker.connection_status)}</dd></div>
         <div><dt>Last contact</dt><dd>{timestamp(worker.last_contact_at)}</dd></div>
         <div><dt>Last work poll</dt><dd>{timestamp(worker.last_poll_at ?? null)}</dd></div>
-        <div><dt>Installed version</dt><dd>Not reported</dd></div>
+        <div><dt>Installed version</dt><dd>{update?.version ?? 'Not reported'}</dd></div>
+        {update?.target && <div><dt>Paired version</dt><dd>{update.target.version}</dd></div>}
+        {updateLabel(worker) && <div><dt>Automatic updates</dt><dd>{updateLabel(worker)}</dd></div>}
+        {update?.reason && updateReasons.has(update.reason) && <div><dt>Reason</dt><dd>{updateReasons.get(update.reason)}</dd></div>}
+        {update?.retry_at && <div><dt>Retry after</dt><dd>{timestamp(update.retry_at)}</dd></div>}
+        {update?.id && <div><dt>Update operation</dt><dd><code>{update.id}</code></dd></div>}
       </dl><p className="field-note">Contact becomes Quiet after one minute and Offline after ten. A scheduled tick can run late.</p>
+      {!update?.contract && <button type="button" disabled={disabled || !!worker.current_claim}
+        onClick={() => void controller.createUpdatePrompt(worker.id)}>{view.pending === 'update' ? 'Generating…' : 'Enable automatic updates'}</button>}
+      {view.updatePrompt && <div className="enrollment-result">
+        <button type="button" onClick={() => void controller.copyUpdatePrompt()}>Copy update prompt</button>
+        <label htmlFor="worker-update-prompt">Paste into this worker’s Muse goal</label>
+        <textarea id="worker-update-prompt" readOnly spellCheck={false} value={view.updatePrompt} rows={8} />
+      </div>}
       <h4>Reported by Muse during setup</h4>
       <dl className="identity-list">
         <div><dt>Model</dt><dd>{worker.model_report?.model_name ?? 'Not reported'}</dd></div>
@@ -172,6 +205,13 @@ export function Workers({ controller }: { controller: WorkersController }) {
               formatOfflineDuration(worker.offline_for_ms + (view.stale ? 0 : Math.max(0, view.offlineClock - worker.receivedAt)))}</span>
           </td>
           <td>{stateName(worker.work_status)}
+            {updateLabel(worker) && <span className="row-note">{updateLabel(worker)}</span>}
+            <span className="row-note">Version {worker.worker_update?.version ?? 'Not reported'}
+              {worker.worker_update?.target && worker.worker_update.target.version !== worker.worker_update.version ? ' → ' + worker.worker_update.target.version : ''}</span>
+            {worker.worker_update?.state === 'failed' && worker.worker_update.reason &&
+              <span className="row-note">{updateReasons.get(worker.worker_update.reason)}</span>}
+            {worker.worker_update?.state === 'failed' && worker.worker_update.retry_at &&
+              <span className="row-note">Retry after {timestamp(worker.worker_update.retry_at)}</span>}
             {worker.current_claim && worker.busy_reason && busyReasons.has(worker.busy_reason) &&
               <span className="row-note">{busyReasons.get(worker.busy_reason)}</span>}
             <span className="row-note">{worker.waiting_for_client_tool} client-tool waits</span>

@@ -64,6 +64,7 @@ type mcpMediaResult struct {
 	State             string `json:"status"`
 	RetryAfterSeconds int    `json:"retry_after_seconds,omitempty"`
 	Reason            string `json:"reason,omitempty"`
+	ReasonMessage     string `json:"reason_message,omitempty"`
 	DownloadURL       string `json:"download_url,omitempty"`
 	ExpiresAt         string `json:"expires_at,omitempty"`
 	DeadlineAt        string `json:"deadline_at"`
@@ -152,6 +153,9 @@ func mcpFailure(l *slog.Logger, err error) error {
 		}
 		l.Log(context.Background(), level, "mcp.tool_rejected", "cause", rejected.Reason, "status", rejected.Code,
 			"evidence", rejected.Fields, "outcome", "rejected")
+		if message := failureMessage(err); message != "" {
+			return errors.New(rejected.Reason + ": " + message)
+		}
 		return errors.New(rejected.Reason)
 	}
 	l.Error("mcp.tool_failed", "cause", err.Error(), "outcome", "failed")
@@ -282,7 +286,7 @@ func (h *Handler) downloadMCPMedia(kind string) mcp.ToolHandlerFor[mcpJob, mcpMe
 		if err != nil {
 			return nil, mcpMediaResult{}, mcpFailure(l, err)
 		}
-		result := mcpMediaResult{ID: status.ID, State: status.State, Reason: status.Reason,
+		result := mcpMediaResult{ID: status.ID, State: status.State, Reason: status.Reason, ReasonMessage: status.ReasonMessage,
 			RetryAfterSeconds: status.RetryAfterSeconds, DownloadURL: status.DownloadURL, DeadlineAt: status.DeadlineAt.Format(time.RFC3339Nano)}
 		if status.Expired {
 			result.State, result.Reason = "expired", "artifact_expired"

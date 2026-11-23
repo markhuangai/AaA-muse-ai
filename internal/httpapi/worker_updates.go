@@ -1,0 +1,77 @@
+package httpapi
+
+import (
+	"log/slog"
+	"net/http"
+	"regexp"
+	"strings"
+
+	"github.com/markhuangai/AaA-muse-ai/internal/inference"
+	"github.com/markhuangai/AaA-muse-ai/internal/service"
+	"github.com/markhuangai/AaA-muse-ai/internal/worker"
+)
+
+const workerUpdateRoute = "/api/v1/worker/update"
+const adoptionPromptRoute = "/api/v1/admin/workers/{id}/update-prompt"
+
+var updaterContract = regexp.MustCompile(`^[a-z0-9-]{1,40}$`)
+
+func readWorkerContact(r *http.Request) (worker.Contact, error) {
+	version := r.Header.Get(service.WorkerVersionHeader)
+	contract := r.Header.Get(service.WorkerUpdaterHeader)
+	digest := r.Header.Get(service.WorkerDigestHeader)
+	_, valid := service.ReleaseMajor(version)
+	if len(r.Header.Values(service.WorkerVersionHeader)) > 1 || (version != "" && (!valid || len(version) > 100)) ||
+		len(r.Header.Values(service.WorkerUpdaterHeader)) > 1 || len(r.Header.Values(service.WorkerDigestHeader)) > 1 ||
+		((contract != "" || digest != "") && (!valid || !updaterContract.MatchString(contract) || !service.ValidWorkerDigest(digest))) {
+		return worker.Contact{}, inference.Reject("invalid_worker_update_headers", 400)
+	}
+	return worker.Contact{Version: version, Contract: contract, Digest: digest}, nil
+}
+
+func (h *Handler) workerUpdateRequest(w *response, r *http.Request, logger *slog.Logger, body []byte) {
+	if h.Broker == nil {
+		inferenceError(w, nil)
+		return
+	}
+	contact, err := readWorkerContact(r)
+	var input worker.UpdateRequest
+	if err == nil {
+		err = decodeInferenceInput(body, &input, "id", "action", "target")
+	}
+	if err != nil {
+		logger.Warn("worker.update_rejected", "cause", err.Error())
+		inferenceError(w, err)
+		return
+	}
+	status, id, err := h.Broker.ApplyWorkerUpdate(r.Context(), logger, strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "), contact, input)
+	w.workerID = id
+	if err != nil {
+		inferenceError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, status)
+}
+
+func (h *Handler) adoptionPrompt(w *response, r *http.Request, logger *slog.Logger, id string, body []byte) {
+	if h.Workers == nil || h.Service == nil {
+		inferenceError(w, nil)
+		return
+	}
+	input, err := decodeWorkerInput(body, "origin")
+	if err != nil {
+		inferenceError(w, inference.Reject("invalid_setup_origin", 400))
+		return
+	}
+	if _, err = h.Workers.Registered(r.Context(), logger, id); err != nil {
+		workerError(w, err)
+		return
+	}
+	w.workerID = id
+	prompt, err := service.AdoptionPrompt(logger, input["origin"].(string), id, h.Service.Build().UpdateTarget())
+	if err != nil {
+		inferenceError(w, service.AdoptionError(err))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"update_prompt": prompt})
+}

@@ -119,6 +119,14 @@ Use the protected export route with `?request_id=HTTP_REQUEST_ID`, then `?operat
 
 `make test-routing` exercises competing HTTP, SQLite and SSE paths through two broker processes, queue limits, owner and session isolation, pinning, and offline boundaries with controlled peers.
 
+An interrupted native request or media task includes `reason_message` alongside
+its original `reason` when an explanation is available. OpenAI errors use that
+explanation in `error.message`, including a streamed Responses `response.failed`
+event. Chat preserves its buffered-stream error behavior. MCP media results use
+the same reason fields. The explanation records the first terminal decision.
+Later stop proof can settle the worker's slot while preserving the earlier
+deadline, accepted result and reason.
+
 ## OpenAI Chat Completions
 
 The November 12, 2026 issue #13 engineering approval permits this adapter and controlled software validation. Live Muse qualification remains inconclusive. The implementation follows the [official Chat Completions contract](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create) and the OpenAI JS SDK 7.53.0 types inspected on November 12, 2026; it supports the subset below.

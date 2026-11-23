@@ -138,8 +138,8 @@ class WorkerSetup(NativeCronFixture, Inference):
         self.assert_private(result.stdout + result.stderr)
         return result
 
-    def report_evidence(self, filter_name, identity):
-        status, _, body = self.api("/api/v1/admin/diagnostics/export?" + filter_name + "=" + identity, self.admin)
+    def report_evidence(self, filter_name, identity, origin=None):
+        status, _, body = self.api("/api/v1/admin/diagnostics/export?" + filter_name + "=" + identity, self.admin, origin=origin)
         require(status == 200, "model report broker export unavailable")
         saved = self.private("setup-report-" + identity + "-" + filter_name + ".ndjson", body.decode())
         decoder = ("import {readFileSync} from 'node:fs'; import {decodeExport} from './tools/qualification-evidence.mjs';"

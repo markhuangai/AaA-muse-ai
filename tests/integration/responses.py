@@ -474,7 +474,8 @@ class Responses(Chat):
             expired = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
             self.expire_job(job, expired)
             result = pending.result(timeout=12)
-        require(self.value(result, failed=True)["error"]["code"] == "deadline_exceeded", "admitted deadline lacked failure lifecycle")
+        failure = self.value(result, failed=True)["error"]
+        require(failure["code"] == "deadline_exceeded" and "native run started" in failure["message"], "admitted deadline lacked failure explanation")
         self.diagnose_response(result[1]["X-Request-Id"], "responses.stream_terminated", "deadline_exceeded")
         require(self.detail_id(job["experiment_id"])["assignment"]["held"], "deadline freed uncertain remote inference")
         bot.settle(job)

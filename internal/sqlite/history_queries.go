@@ -41,15 +41,24 @@ func projectMedia(result map[string]any, raw []byte) error {
 }
 
 type executionMetadata struct {
-	ID             string    `json:"id"`
-	ConversationID string    `json:"conversation_id"`
-	WorkerID       *string   `json:"worker_id"`
-	State          string    `json:"state"`
-	Reason         *string   `json:"reason"`
-	RemoteOutcome  *string   `json:"remote_outcome"`
-	CreatedAt      time.Time `json:"created_at"`
-	DeadlineAt     time.Time `json:"deadline_at"`
-	CurrentJobID   string    `json:"current_job_id"`
+	ID             string                          `json:"id"`
+	ConversationID string                          `json:"conversation_id"`
+	WorkerID       *string                         `json:"worker_id"`
+	State          string                          `json:"state"`
+	Reason         *string                         `json:"reason"`
+	RemoteOutcome  *string                         `json:"remote_outcome"`
+	CreatedAt      time.Time                       `json:"created_at"`
+	DeadlineAt     time.Time                       `json:"deadline_at"`
+	CurrentJobID   string                          `json:"current_job_id"`
+	Interruption   *inference.InterruptionEvidence `json:"interruption"`
+}
+
+func (e executionMetadata) reasonMessage() string {
+	reason := ""
+	if e.Reason != nil {
+		reason = *e.Reason
+	}
+	return inference.ExplainInterruption(e.State, reason, e.Interruption)
 }
 
 func (r *Repository) QueryHistory(ctx context.Context, q inference.HistoryQuery) (json.RawMessage, error) {
@@ -124,6 +133,9 @@ func scanRequest(row scanner) (string, int64, json.RawMessage, error) {
 	result := map[string]any{"kind": kind, "id": id, "conversation_id": conversation, "client_id": client,
 		"session_id": session, "response_id": response, "worker_id": worker, "state": state, "reason": e.Reason,
 		"created_at": e.CreatedAt, "provenance": "unavailable"}
+	if message := e.reasonMessage(); message != "" {
+		result["reason_message"] = message
+	}
 	switch kind {
 	case "native":
 		result["provenance"] = "recorded"
@@ -152,6 +164,9 @@ func historyRequest(ctx context.Context, tx *sql.Tx, id string) (json.RawMessage
 	result := map[string]any{"kind": "native", "request": json.RawMessage(native), "assignment": json.RawMessage(job), "delivery": json.RawMessage(delivery),
 		"execution": map[string]any{"id": execution.ID, "worker_id": worker, "state": execution.State, "reason": execution.Reason,
 			"remote_outcome": execution.RemoteOutcome, "created_at": execution.CreatedAt, "deadline_at": execution.DeadlineAt, "current_job_id": execution.CurrentJobID}}
+	if message := execution.reasonMessage(); message != "" {
+		result["execution"].(map[string]any)["reason_message"] = message
+	}
 	if native == nil {
 		result["kind"], result["request"], result["provenance"] = "legacy", json.RawMessage(legacy), "unavailable"
 		if media {

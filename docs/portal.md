@@ -71,6 +71,11 @@ Current views poll every thirty seconds while visible. Timeline pages with a con
 
 **Cancel request** opens a native confirmation naming the immutable request ID. Confirming sends one fresh submission ID to the existing management cancellation endpoint, including for unassigned requests. The portal displays the returned state and remote outcome. A claimed request can remain remotely uncertain with a retained busy hold; the worker's exact idle acknowledgement releases capacity without inventing a stopped outcome. Accepted decisions, client tool IDs/results and history remain durable. Cancellation never executes a tool or grants inference replay authority. A lost response is explicitly unconfirmed; refresh reconciles current state before another deliberate action. No mutation is retried automatically.
 
+Rows and request details explain interrupted tasks using the first recorded
+terminal reason. The explanation can distinguish a queued deadline, an authorized
+native run that failed, and a missing media file. The original reason code remains
+in the API. Historical detail is limited to the evidence recorded at the time.
+
 ## History diagnostics
 
 `portal.history_load_failed` WARN records rejected queries, missing records and dependency failures; authenticated browser reports add bounded cursor/filter identifiers, query/selection/session generations, requested/accepted/latest sequences and last-good time for deadlines, staleness and discarded responses. Protected `history.query_input` and `history.query_exchange` retain relevant queries and full responses; existing storage ERROR events and protected causal detail identify SQLite failures.
@@ -79,6 +84,13 @@ Current views poll every thirty seconds while visible. Timeline pages with a con
 
 Collect complete protected exports using each displayed portal operation ID and HTTP request ID, then the native request operation ID, using the commands below with `operation_id=ID` or `request_id=HTTP_ID`. Verify chunks, digests and absence of omissions. Invalid cursors require the matching filter's first page; missing records require a recorded identifier; a storage failure requires restoring the dependency before refreshing. A completion race requires inspecting the accepted output. An unconfirmed cancellation requires a fresh read while preserving uncertainty. A discarded response requires retaining the newer selection. These conclusions come from logs without business-table queries or process attachment.
 
+The Workers list and drawer show the last authenticated version, the paired
+target and the last update state. **Update available** means the broker offered
+the package. **Updating** means the worker acquired an update reservation.
+**Awaiting confirmation** means the worker reported a switch and the broker has
+yet to see a fresh pickup from the target package. The drawer shows the failure
+reason, retry time when available and the operation ID used for exports.
+
 ## Worker diagnostics
 
 `portal.worker_action` INFO records authenticated portal enrollment/setup, rename and revocation requests with action/resource IDs, portal session, backend request/operation IDs, actual HTTP status, timing and HTTP completion outcome. Existing domain events retain transaction outcomes; HTTP completion alone does not mean a mutation committed. `portal.worker_state_stale` WARN is an authenticated client report with request/accepted sequences, generation, last-good time, safe cause and related backend request ID where a response was received. The endpoint does not accept client assertions of successful actions. Enrollment text/codes and arbitrary exceptions are excluded from browser telemetry.
@@ -86,6 +98,15 @@ Collect complete protected exports using each displayed portal operation ID and 
 Collect the protected export by the operation ID and associated request IDs shown in the UI. Use the decoder and completeness checks below to join client ordering evidence with server request exchanges, worker rejections and storage causes. Invalid names require correcting the submitted name; an unreadable SQLite database requires restoring the database and refreshing; obsolete responses require retaining the newer accepted state. Unconfirmed mutations require reading the actual state before another deliberate action. These conclusions require no business-table queries or process attachment.
 
 For an unexpected offline duration, compare the last contact and last poll in the protected worker-list exchange with the checker’s scheduled and actual entry times in the private worker export. Use the worker’s pull request ID to inspect `worker.pull_timing`, including database acquisition and queue lookup. For busy work, join `cron.presence_observed` or `cron.presence_unavailable` to the broker exchange by request ID. Join `cron.native_observation`, `cron.recovery_pending` and `job.work_settled` by operation, claim and native run. A producer hold names the unresolved reservation or process. Preserve the accepted result and the private log export when a hold remains. For a stale snapshot, use `portal.worker_state_stale` and the related failed read before refreshing.
+
+For an update problem, export the operation from the worker with
+`diagnostics-export --operation-id ID --decode` and from each participating
+broker using the command below. Join `worker.update_started`,
+`worker.update_verification_failed` and `worker.update_fallback` by operation
+and request ID. A missing archive calls for checking the exact paired release
+asset. A digest mismatch calls for comparing the observed digest to the image's
+trusted pin. For an interrupted task, use its request operation to retrieve
+`job.interrupted` or `job.deadline_exceeded` and the original stage and evidence.
 
 ## Diagnostics
 

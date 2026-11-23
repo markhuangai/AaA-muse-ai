@@ -255,19 +255,19 @@ class Harness:
             require("db.connected" not in self.logs(first) + self.logs(second), "bootstrap crossed the held writer barrier")
         self.ready(first, origin)
         self.ready(second, sibling_origin)
-        require(self.sql("SELECT count(*) FROM aaa_schema_migrations;") == "3", "concurrent bootstrap did not apply all migrations")
+        require(self.sql("SELECT count(*) FROM aaa_schema_migrations;") == "4", "concurrent bootstrap did not apply all migrations")
         require(self.sql("PRAGMA journal_mode;") == "wal", "SQLite WAL was not enabled")
         for file in (SQLITE_FILE, SQLITE_FILE + "-wal", SQLITE_FILE + "-shm"):
             require(self.docker("exec", self.db, "stat", "-c", "%a:%u", file).stdout.strip() == "600:10001", "SQLite state file permissions are open")
         require(self.docker("exec", self.db, "stat", "-c", "%a:%u", SQLITE_STATE).stdout.strip() == "700:10001", "SQLite state directory permissions are open")
-        self.receipt("migration.concurrent_bootstrap", broker_processes=2, schema_versions=3)
+        self.receipt("migration.concurrent_bootstrap", broker_processes=2, schema_versions=4)
         info = self.inspect(first)
         config_mount = next(mount for mount in info["Mounts"] if mount["Destination"] == "/etc/aaa-muse-ai/config.yaml")
         require(config_mount["RW"] is False, "configuration mount is writable")
         code, headers, body = self.request(origin, "/api/v1/admin/status", self.admin)
         require(code == 200 and not any(name.lower().startswith("access-control-") for name in headers), "status or proxy boundary failed")
         status = json.loads(body)
-        require(status["schema_version"] == 3 and status["ready"], "wrong status schema/readiness")
+        require(status["schema_version"] == 4 and status["ready"], "wrong status schema/readiness")
         require(status["build"]["revision"] == self.args.source_sha, "HTTP source identity mismatch")
         package_receipt = json.loads(Path(".artifacts/worker-package/latest.json").read_text())
         require(status["build"]["version"] == package_receipt["version"] and status["build"]["worker_package"]["version"] == package_receipt["version"] and status["build"]["worker_package"]["sha256"] == package_receipt["sha256"], "paired image metadata differs from the tested worker bytes")
@@ -316,7 +316,7 @@ class Harness:
             probes = [event for event in events if event["msg"] == "db.probe"]
             outcomes = [event for event in events if event["msg"] == "request.completed"]
             require(metadata["complete"] and len(changes) == 1 and changes[0]["ready"] is expected_ready and changes[0]["previous_ready"] is not expected_ready, "logs do not explain readiness transition")
-            require(changes[0]["schema_version"] == 3 and changes[0]["database_file"] == "broker.sqlite3" and bool(changes[0]["cause"]), "readiness evidence lacks expected state, target or cause")
+            require(changes[0]["schema_version"] == 4 and changes[0]["database_file"] == "broker.sqlite3" and bool(changes[0]["cause"]), "readiness evidence lacks expected state, target or cause")
             require(len(probes) == 1 and probes[0]["duration_ms"] >= 0 and len(outcomes) == 1 and outcomes[0]["status"] == expected_status, "readiness diagnosis lacks timing or final outcome")
             self.assert_private(json.dumps(events))
         with self.writer_lock():
@@ -336,7 +336,7 @@ class Harness:
         self.receipt("readiness.log_only_diagnosis", degradation_request=down_headers["X-Request-Id"], recovery_request=recovery_id, corrective_action="restore the SQLite schema ledger")
         require(self.sql("SELECT value FROM test_persistence;") == "retained", "SQLite fault or recovery changed persisted state")
         self.assert_private(self.logs(first))
-        self.receipt("service.state_and_boundaries", schema_versions=3, database_recovery=True, readonly_config=True, http_ports=1)
+        self.receipt("service.state_and_boundaries", schema_versions=4, database_recovery=True, readonly_config=True, http_ports=1)
         return first, origin, volume
 
     def generated_key(self):
@@ -462,9 +462,9 @@ class Harness:
         result, _ = self.startup_failure("migration.checksum_rejected", expected="db.migration_failed")
         require(result["cause"] == "migration_checksum_mismatch" and len(result["expected"]) == 64 and result["observed"] == "deliberately-invalid-test-checksum", "migration diagnosis lacks expected/observed checksum")
         checksum = hashlib.sha256(Path("internal/sqlite/migrations/001_schema.sql").read_bytes()).hexdigest()
-        self.sql("UPDATE aaa_schema_migrations SET checksum='" + checksum + "' WHERE version=1; UPDATE aaa_schema_migrations SET version=4 WHERE version=3;")
+        self.sql("UPDATE aaa_schema_migrations SET checksum='" + checksum + "' WHERE version=1; UPDATE aaa_schema_migrations SET version=5 WHERE version=4;")
         result, _ = self.startup_failure("migration.newer_schema_rejected", expected="db.migration_failed")
-        require(result["cause"] == "schema_version_incompatible" and result["expected"] == "3" and result["observed"] == "4" and result["attempt"] == 1, "migration version diagnosis is incomplete or retried")
+        require(result["cause"] == "schema_version_incompatible" and result["expected"] == "4" and result["observed"] == "5" and result["attempt"] == 1, "migration version diagnosis is incomplete or retried")
         require(self.sql("SELECT value FROM test_persistence;") == "retained", "rejected migration removed existing data")
 
     def capture_failure_stops(self, container, origin):

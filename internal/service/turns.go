@@ -100,7 +100,10 @@ func (b *Broker) Read(ctx context.Context, logger *slog.Logger, id string) (json
 		if e == nil {
 			return nil, inference.Reject("inference_not_found", 404)
 		}
-		return e, nil
+		return struct {
+			*inference.Experiment
+			ReasonMessage string `json:"reason_message,omitempty"`
+		}{e, e.ReasonMessage()}, nil
 	})
 }
 
