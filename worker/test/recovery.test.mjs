@@ -72,7 +72,7 @@ test('major-one background recovery survives headerless authentication and subsc
     assert.equal(await f.state.read('credential.key'), key); assert.equal(await f.state.read('config.json'), config);
     assert.equal(await journals.read('operation-' + pointer.submission_id + '.json'), receipt);
     assert.equal(encode(f.broker.jobs.get(JOB)), assignment); assert.equal(f.broker.jobs.get(JOB).held, true);
-    assert.equal(f.broker.calls.filter(call => call.path.endsWith('/enroll')).length, 1);
+    assert.equal(f.broker.calls.filter(call => call.path.endsWith('/enroll') && call.input?.phase !== 'prepare').length, 1);
     assert.equal(f.broker.calls.filter(call => call.path.endsWith('/claim')).length, 1);
     assert(!f.broker.calls.some(call => call.path.endsWith('/decisions') || call.input?.idle_ack));
     const log = await events(f);

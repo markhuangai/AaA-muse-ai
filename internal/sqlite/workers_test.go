@@ -82,6 +82,44 @@ func TestWorkerEnrollmentAndRevocation(t *testing.T) {
 	workerReason(t, err, "invalid_worker_credential")
 }
 
+func TestStagedEnrollmentKeepsExpiryAndRollsBackWithSQLiteWriteFailures(t *testing.T) {
+	repo := newRepo(t)
+	now := time.Now().UTC()
+	repo.now = func() time.Time { return now }
+	ctx := t.Context()
+	code, credential, grant := [32]byte{91}, [32]byte{92}, [32]byte{93}
+	if _, err := repo.IssueEnrollment(ctx, "short", code, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.PrepareEnrollment(ctx, code, grant, credential); err != nil {
+		t.Fatal(err)
+	}
+	execute(t, repo, "CREATE TRIGGER reject_grant_removal BEFORE DELETE ON aaa_worker_enrollments BEGIN SELECT RAISE(ABORT,'fixture refusal'); END")
+	_, _, _, err := repo.ActivateEnrollment(ctx, code, "first", credential, "First", grant)
+	failReason(t, err, "sqlite_error")
+	_, err = repo.AuthenticateWorker(ctx, credential)
+	workerReason(t, err, "invalid_worker_credential")
+	execute(t, repo, "DROP TRIGGER reject_grant_removal")
+	_, _, replay, err := repo.ActivateEnrollment(ctx, code, "second", credential, "Second", grant)
+	if err != nil || replay {
+		t.Fatal("original activation was not available after rollback", err)
+	}
+	other := [32]byte{94}
+	if _, err := repo.IssueEnrollment(ctx, "other", other, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.PrepareEnrollment(ctx, other, grant, credential); err == nil {
+		t.Fatal("prepare returned a credential with active authority")
+	}
+	_, err = repo.PrepareEnrollment(ctx, [32]byte{99}, grant, credential)
+	workerReason(t, err, "enrollment_invalid")
+	now = now.Add(time.Minute)
+	_, err = repo.PrepareEnrollment(ctx, other, grant, [32]byte{95})
+	workerReason(t, err, "enrollment_expired")
+	_, _, _, err = repo.ActivateEnrollment(ctx, other, "third", [32]byte{95}, "Third", grant)
+	workerReason(t, err, "enrollment_expired")
+}
+
 func TestWorkerEnrollmentAndRenameRollBackWithRealTriggers(t *testing.T) {
 	repo := newRepo(t)
 	key := enroll(t, repo, "one")

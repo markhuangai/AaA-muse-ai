@@ -384,6 +384,17 @@ class WorkerTransport(NativeCronFixture, Inference):
         finally:
             self.args.image = original_image
         try:
+            enrollment = self.issue()
+            payload = {"enrollment_code": enrollment["enrollment_code"]}
+            route = "/api/v1/worker/enroll"
+            staged, _ = self.checked(route, None, "POST", {**payload, "phase": "prepare"}, want=201)
+            self.secrets.append(staged["credential"])
+            legacy_enrollment, _ = self.checked(route, None, "POST", payload, want=201, origin=origin)
+            self.secrets.append(legacy_enrollment["credential"])
+            self.checked(route, staged["credential"], "POST", {**payload, "phase": "activate"}, want=409)
+            require(self.checked("/api/v1/worker/status", legacy_enrollment["credential"])[0]["id"] == legacy_enrollment["worker"]["id"],
+                    "an archived consume did not fence the inactive grant across brokers")
+            self.receipt("worker.archived_broker_consumes_prepared_enrollment", shared_schema=5, same_store=True)
             self.proxy.target = urlsplit(origin)
             worker = self.cli_worker("native-start-mixed")
             legacy = self.create(worker, "fixed helper on rc.2", tools=False)

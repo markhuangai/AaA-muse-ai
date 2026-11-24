@@ -18,6 +18,7 @@ import (
 )
 
 type workerMemory struct {
+	WorkerRepository
 	mu          sync.Mutex
 	now         time.Time
 	enrollments map[[32]byte]worker.Enrollment

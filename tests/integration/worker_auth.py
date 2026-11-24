@@ -103,6 +103,73 @@ class WorkerAuth(Harness):
         self.receipt("enrollment.single_use_expiry_and_race", attempts=8, issued=1, rejected_reuse=7, expiry_after_lock=True)
         return winner
 
+    def staged_enrollment(self, other_origin):
+        route = "/api/v1/worker/enroll"
+
+        def phase(enrollment, name, key=None, origin=None):
+            status, _, body = self.api(route, key, "POST", {"enrollment_code": enrollment["enrollment_code"], "phase": name}, origin=origin)
+            value = json.loads(body)
+            if name == "prepare" and status == 201:
+                self.secrets.append(value["credential"])
+            else:
+                require("credential" not in value, "activation or denial exposed a credential")
+            return status, value
+
+        def prepared(enrollment, origin=None):
+            status, value = phase(enrollment, "prepare", origin=origin)
+            require(status == 201 and value.get("enrollment_id") == enrollment["enrollment_id"], "preparation did not bind the original code")
+            key = value["credential"]
+            require(self.api("/api/v1/worker/status", key)[0] == 401, "preparation authenticated before activation")
+            return key
+
+        def expire(enrollment, at):
+            self.sql("UPDATE aaa_worker_enrollments SET created_at=" + str(int((at - 60) * 1000000))
+                     + ", expires_at=" + str(int(at * 1000000)) + " WHERE id='" + enrollment["enrollment_id"] + "';")
+
+        same = self.issue()
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first, second = list(pool.map(lambda origin: prepared(same, origin), (self.origin_url, other_origin)))
+        require(first != second and self.sql("SELECT count(*) FROM aaa_worker_enrollments WHERE id='prepare/" +
+                same["enrollment_id"] + "';") == "1", "parallel preparations created multiple grants")
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            two = list(pool.map(lambda pair: phase(same, "activate", *pair), ((first, self.origin_url), (second, other_origin))))
+        require(sorted(status for status, _ in two) == [201, 409], "candidate race did not create exactly one identity")
+        winner = first if two[0][0] == 201 else second
+        loser = second if winner == first else first
+        worker_id = next(value["worker"]["id"] for status, value in two if status == 201)
+        require(self.api("/api/v1/worker/status", winner)[0] == 200 and self.api("/api/v1/worker/status", loser)[0] == 401,
+                "worker authentication was not confined to the winner")
+        require(phase(same, "activate", loser)[0] == 409 and phase(same, "prepare")[0] == 409, "copied prompt recovered a spent code")
+        require(self.sql("SELECT count(*) FROM aaa_worker_enrollments WHERE id='prepare/" + same["enrollment_id"] + "';") == "0",
+                "activation left the internal grant in the store")
+        expire(same, time.time() - 60)
+        status, value = phase(same, "activate", winner, origin=other_origin)
+        require(status == 201 and value["worker"]["id"] == worker_id, "expiry prevented exact replay on a sibling")
+        require(self.api("/api/v1/admin/workers/" + worker_id + "/revoke", self.admin, "POST")[0] == 200, "fixture revoke failed")
+        require(phase(same, "activate", winner)[0] == 401, "revoked authority replayed")
+
+        mixed = self.issue()
+        staged = prepared(mixed)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            legacy = pool.submit(self.enroll, mixed)
+            activation = pool.submit(phase, mixed, "activate", staged, other_origin)
+            require(sorted([legacy.result()[0], activation.result()[0]]) == [201, 409], "legacy and staged clients both consumed the code")
+
+        waiting = self.issue()
+        waiting_key = prepared(waiting)
+        deadline = time.time() + 1
+        expire(waiting, deadline)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            with self.writer_lock():
+                activation = pool.submit(phase, waiting, "activate", waiting_key)
+                preparation = pool.submit(phase, waiting, "prepare", None, other_origin)
+                require(deadline - time.time() > 0.3, "fixture elapsed before requests reached the writer")
+                time.sleep(0.2)
+                require(activation.running() and preparation.running(), "enrollment phases did not wait for the writer")
+                time.sleep(max(0, deadline - time.time()) + 0.05)
+        require(activation.result()[0] == 410 and preparation.result()[0] == 410, "a phase checked expiry before acquiring the writer")
+        self.receipt("enrollment.staged_race_expiry_and_replay", same_store=True, legacy_race=True, expiry_after_lock=True, revocation_preserved=True)
+
     def functional_workers(self, first):
         enrolled = [first]
         for _ in range(3):
@@ -267,6 +334,7 @@ def main():
         h.names_and_boundaries(a, b)
         h.restart_and_revoke([first, second], a, b)
         h.overlapping_secret_diagnosis()
+        h.staged_enrollment(other)
         h.private("results.json", json.dumps({"suite": args.suite, "source_sha": args.source_sha, "receipts": h.receipts}))
     finally:
         h.cleanup()

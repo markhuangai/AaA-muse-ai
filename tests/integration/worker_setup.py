@@ -280,6 +280,90 @@ class WorkerSetup(NativeCronFixture, Inference):
                 "protected setup export did not explain the skill refusal")
         self.receipt("setup.asset_directory_recovery", identity_preserved=True, failure_held_before_native_registration=True)
 
+    def enrollment_disconnects(self):
+        second, second_origin, _ = self.launch(self.configuration())
+        self.ready(second, second_origin)
+        first_target = self.proxy.target
+        self.proxy.observe_staged_credential = self.secrets.append
+        scenarios = (("prepare", False, 1), ("prepare", True, 1), ("activate", False, 1), ("activate", True, 1), ("activate", True, 3))
+        for phase, committed, count in scenarios:
+            outcome = "reply" if committed else "request"
+            worker = self.environment(f"enrollment-{phase}-{outcome}-{count}")
+            prompt = self.prompt()
+            operation = prompt["enrollment_id"]
+            faults = self.proxy.drop_enrollment_replies if committed else self.proxy.drop_enrollment_requests
+            before, _ = self.checked("/api/v1/admin/workers", self.admin)
+            faults[phase] = count
+            if count == 1:
+                first = self.install(worker, prompt)
+                require("worker.http_retrying" in first.stderr and "UND_ERR_SOCKET" in first.stderr, "the installer did not retry the dropped connection")
+            else:
+                failed = self.install(worker, prompt, want=1)
+                require("UND_ERR_SOCKET" in failed.stderr and faults[phase] == 0, "activation retry exhaustion was not visible")
+                require(not (worker["state"] / "credential.key").exists() and not (worker["state"] / "installation.json").exists(),
+                        "unverified activation promoted credentials or authorized a checker")
+                journal = worker["state"] / "enrollment.json"
+                require(journal.stat().st_mode & 0o777 == 0o600, "staged key journal is not private")
+                saved = json.loads(journal.read_text())["credential"]
+                # A new installer process uses a sibling broker after the original process used its retry budget.
+                self.proxy.target = urllib.parse.urlsplit(second_origin)
+                try:
+                    self.install(worker, prompt)
+                finally:
+                    self.proxy.target = first_target
+                require(worker["credential"] == saved, "restart changed the staged key")
+            require(faults[phase] == 0, "configured socket fault was never exercised")
+            self.checker(worker)
+            require(self.tick(worker)["outcome"] == "idle", "recovered checker did not make an authenticated idle poll")
+            after, _ = self.checked("/api/v1/admin/workers", self.admin)
+            created = set(record["id"] for record in after["workers"]) - set(record["id"] for record in before["workers"])
+            require(created == {worker["worker"]["id"]}, "recovery created more than one worker")
+            evidence = self.report_evidence("operation_id", operation)
+            if count > 1:
+                evidence += self.report_evidence("operation_id", operation, origin=second_origin)
+            fixture_events = [e for e in self.proxy.events if e.get("operation_id") == operation and e.get("phase") == phase]
+            require(len(fixture_events) == count, "fault fixture lost its causal records")
+            if committed:
+                event_name = "enrollment.prepared" if phase == "prepare" else "worker.enrolled"
+                require(any(e["msg"] == event_name and e["transaction_outcome"] == "committed" and
+                            e["request_id"] == fixture_events[0]["request_id"] for e in evidence),
+                        "protected broker evidence did not identify the dropped committed reply")
+            require(sum(e["msg"] == "worker.enrolled" for e in evidence) == 1 and
+                    (phase != "activate" or not committed or any(e["msg"] == "enrollment.activation_replayed" for e in evidence)),
+                    "broker evidence did not establish exactly one enrollment with replay")
+            raw = self.native_cli(worker, "diagnostics-export", "--operation-id", operation, "--decode")
+            records = [json.loads(line) for line in raw.splitlines()]
+            self.assert_private(raw)
+            require(records[0]["complete"] and not records[0]["omissions"] and
+                    any(e.get("msg") == "worker.http_retrying" and e.get("enrollment_phase") == phase and e.get("attempt") == 1 and
+                        e.get("transport_cause") == "UND_ERR_SOCKET" for e in records) and
+                    any(e.get("msg") == "setup.native_checker_verified" and e.get("checker_job_id") == worker["checker"] for e in records),
+                    "worker capture did not explain retry or verify the recovered checker")
+            self.receipt("setup.enrollment_connection_recovery", phase=phase, lost=outcome, drops=count,
+                         sibling_after_restart=count > 1, worker_count=1, checker_verified=True, idle_poll=True)
+
+        worker = self.environment("enrollment-key-write")
+        prompt = self.prompt()
+        key = worker["state"] / "credential.key"
+        committed = []
+
+        def block_key(worker_id):
+            committed.append(worker_id)
+            key.mkdir(mode=0o700, exist_ok=True)
+
+        self.proxy.enrollment_accepted = block_key
+        try:
+            self.install(worker, prompt, want=1)
+        finally:
+            self.proxy.enrollment_accepted = None
+        require(committed and not (worker["state"] / "installation.json").exists(), "key-write failure was not exercised after activation")
+        original = json.loads((worker["state"] / "enrollment.json").read_text())["credential"]
+        key.rmdir()
+        self.install(worker, prompt)
+        require(worker["credential"] == original and committed == [worker["worker"]["id"]], "disk-write recovery changed the committed identity")
+        self.receipt("setup.enrollment_key_write_recovery", same_worker=True, committed_before_write_failure=True)
+        self.proxy.observe_staged_credential = None
+
     def exercise(self):
         status, _, _ = self.api("/api/v1/admin/setup-prompts", self.client, "POST", {})
         require(status == 401, "client authority generated setup prompt")
@@ -353,6 +437,7 @@ class WorkerSetup(NativeCronFixture, Inference):
                 "invalid runtime bytes were not rejected before enrollment")
         self.receipt("setup.corruption_and_pinned_node", node_sha256=NODE_SHA, fallback_executed=True, corrupted_node_rejected=True)
         self.asset_directory_recovery()
+        self.enrollment_disconnects()
 
 
 def run(harness_type=WorkerSetup, suite="worker-setup"):

@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"regexp"
+	"slices"
 	"strings"
 	"unicode/utf8"
 
@@ -132,7 +133,7 @@ func workerError(w http.ResponseWriter, err error) {
 		switch reason {
 		case "worker_not_found":
 			code = 404
-		case "enrollment_used":
+		case "enrollment_used", "enrollment_not_prepared", "enrollment_superseded":
 			code = 409
 		case "enrollment_expired":
 			code = 410
@@ -146,7 +147,7 @@ func workerError(w http.ResponseWriter, err error) {
 	writeJSON(w, code, map[string]any{"error": reason})
 }
 
-func decodeWorkerInput(body []byte, field string) (map[string]any, error) {
+func decodeWorkerInput(body []byte, field string, optional ...string) (map[string]any, error) {
 	result := map[string]any{}
 	if len(body) == 0 && field == "" {
 		return result, nil
@@ -160,14 +161,15 @@ func decodeWorkerInput(body []byte, field string) (map[string]any, error) {
 		return nil, errors.New("json_object_required")
 	}
 	for d.More() {
-		key, err := d.Token()
+		token, err := d.Token()
 		if err != nil {
 			return nil, errors.New("invalid_json")
 		}
-		if key != field || field == "" {
+		key, _ := token.(string)
+		if key == "" || (key != field && !slices.Contains(optional, key)) {
 			return nil, errors.New("unsupported_field")
 		}
-		if _, exists := result[field]; exists {
+		if _, exists := result[key]; exists {
 			return nil, errors.New("duplicate_field")
 		}
 		var value any
@@ -178,7 +180,7 @@ func decodeWorkerInput(body []byte, field string) (map[string]any, error) {
 		if !ok {
 			return nil, errors.New("string_required")
 		}
-		result[field] = text
+		result[key] = text
 	}
 	if _, err = d.Token(); err != nil {
 		return nil, errors.New("invalid_json")
@@ -193,6 +195,43 @@ func decodeWorkerInput(body []byte, field string) (map[string]any, error) {
 	return result, nil
 }
 
+func (h *Handler) enrollRequest(w *response, r *http.Request, logger *slog.Logger, input map[string]any) {
+	code := input["enrollment_code"].(string)
+	switch input["phase"] {
+	case nil:
+		record, e, credential, err := h.Workers.Enroll(r.Context(), logger, code)
+		w.workerID, w.enrollmentID = record.ID, e.ID
+		if err != nil {
+			workerError(w, err)
+			return
+		}
+		writeJSON(w, 201, map[string]any{"worker": viewWorker(record), "credential": credential})
+	case "prepare":
+		e, credential, err := h.Workers.PrepareEnrollment(r.Context(), logger.With("enrollment_phase", "prepare"), code)
+		w.enrollmentID = e.ID
+		if err != nil {
+			workerError(w, err)
+			return
+		}
+		writeJSON(w, 201, map[string]any{"enrollment_id": e.ID, "credential": credential})
+	case "activate":
+		credential := ""
+		if values := r.Header.Values("Authorization"); len(values) == 1 {
+			credential, _ = strings.CutPrefix(values[0], "Bearer ")
+		}
+		record, e, err := h.Workers.ActivateEnrollment(r.Context(), logger.With("enrollment_phase", "activate"), code, credential)
+		w.workerID, w.enrollmentID = record.ID, e.ID
+		if err != nil {
+			workerError(w, err)
+			return
+		}
+		writeJSON(w, 201, map[string]any{"worker": viewWorker(record)})
+	default:
+		logger.Warn("request.rejected", "reason", "invalid_enrollment_phase")
+		writeJSON(w, 400, map[string]any{"error": "invalid_enrollment_phase"})
+	}
+}
+
 func (h *Handler) workerRequest(w *response, r *http.Request, logger *slog.Logger, route, id string, identity workerView, body []byte) {
 	if h.Workers == nil {
 		writeJSON(w, 503, map[string]any{"error": "service_unavailable"})
@@ -205,12 +244,13 @@ func (h *Handler) workerRequest(w *response, r *http.Request, logger *slog.Logge
 		return
 	}
 	field := ""
+	var optional []string
 	if route == "/api/v1/worker/enroll" {
-		field = "enrollment_code"
+		field, optional = "enrollment_code", []string{"phase"}
 	} else if route == "/api/v1/admin/workers/{id}" {
 		field = "name"
 	}
-	input, err := decodeWorkerInput(body, field)
+	input, err := decodeWorkerInput(body, field, optional...)
 	if err != nil {
 		logger.Warn("request.rejected", "reason", err.Error(), "omitted_body_bytes", len(body))
 		writeJSON(w, 400, map[string]any{"error": err.Error()})
@@ -227,13 +267,7 @@ func (h *Handler) workerRequest(w *response, r *http.Request, logger *slog.Logge
 		}
 		writeJSON(w, 201, map[string]any{"enrollment_id": e.ID, "enrollment_code": code, "created_at": e.CreatedAt, "expires_at": e.ExpiresAt})
 	case "/api/v1/worker/enroll":
-		record, e, credential, err := h.Workers.Enroll(r.Context(), logger, input[field].(string))
-		w.workerID, w.enrollmentID = record.ID, e.ID
-		if err != nil {
-			workerError(w, err)
-			return
-		}
-		writeJSON(w, 201, map[string]any{"worker": viewWorker(record), "credential": credential})
+		h.enrollRequest(w, r, logger, input)
 	case "/api/v1/admin/workers":
 		records, err := h.Workers.List(r.Context(), logger)
 		if err != nil {

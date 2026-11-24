@@ -88,7 +88,7 @@ I authorize this goal to download and install future verified worker packages pa
 
 Before using the code, inspect this goal's native scheduled jobs, including disabled jobs. Request the actual permissions to run the local helper, use the HTTPS origin, and register, inspect and run a visible one-minute native agent cron and finite native agent runonce jobs owned by this goal. Use only tools advertised by this Muse runtime. Stop before enrollment on missing permission or a conflicting registration. Do not disable or reuse this account's major-0 schedule, hook, installation or credentials.
 
-Run as the same user throughout. The verified installer uses separate major-1 paths and private state. On a directory refusal, preserve the private receipt and report its stage and directory role. Resume a registration-only failure with the same authenticated worker and saved installation. An uncertain identity needs owner inspection.
+Run as the same user throughout. The verified installer uses separate major-1 paths and private state. On a directory refusal, preserve the private receipt and report its stage and directory role. Resume a registration-only failure with the same authenticated worker and saved installation. If setup still stops after a network interruption, retry this exact prompt with the same private state directory. If the worker reports enrollment_uncertain for older state without a staged credential, preserve it for owner inspection.
 
 Run this Bash bootstrap with tracing disabled. Retain its private evidence directory on failure:
 

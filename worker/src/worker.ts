@@ -1,11 +1,15 @@
 import { prepareMedia } from './media.js';
 import { State } from './state.js';
-import { Logger } from './diagnostics.js';
+import { digest, Logger } from './diagnostics.js';
 import { Transport, origin, validateBody, type Network } from './transport.js';
 import { cause, Failure, requireValue } from './errors.js';
 import { decision, encode, identifier, integer, object, parse, text, type ObjectValue, type Value } from './json.js';
 import { correlation, job, version } from './protocol.js';
 import { VERSION } from './version.js';
+
+const enrollmentRoute = '/api/v1/worker/enroll';
+const workerCredential = /^muse_worker_[A-Za-z0-9_-]{43}$/;
+const operationPattern = /^[0-9a-f]{32}$/;
 
 export class Worker {
   config: ObjectValue = {};
@@ -33,7 +37,7 @@ export class Worker {
     const endpoint = origin(text(config.origin));
     this.credential = (await this.state.read('credential.key'))?.trim() ?? '';
     this.logger.redactor.add(this.credential);
-    if (enrolled) requireValue(/^muse_worker_[A-Za-z0-9_-]{43}$/.test(this.credential), 'worker_not_enrolled');
+    if (enrolled) requireValue(workerCredential.test(this.credential), 'worker_not_enrolled');
     return new Transport(endpoint, this.credential, this.logger, this.state.sys, this.net, this.productVersion);
   }
   async configure(endpoint: string): Promise<ObjectValue> {
@@ -42,6 +46,10 @@ export class Worker {
       const raw = await this.state.read('config.json');
       const saved = raw ? object(parse(raw)) : undefined;
       requireValue(!saved || saved.origin === normalized || !(await this.state.read('credential.key')), 'enrolled_origin_immutable');
+      if (saved?.origin !== normalized) {
+        const enrollment = await this.readRecord(this.state, 'enrollment.json');
+        requireValue(!enrollment || enrollment.state === 'rejected' || enrollment.state === 'accepted', 'enrollment_origin_immutable');
+      }
       if (saved?.origin !== normalized) await this.state.write('config.json', encode({ protocol_version: 1, origin: normalized }));
       await this.logger.log('INFO', 'worker.configured', { endpoint: normalized, identity_preserved: !!saved?.worker_id });
       return { configured: true, origin: normalized };
@@ -57,41 +65,122 @@ export class Worker {
     }
     return reply.data;
   }
-  async enroll(code: string): Promise<ObjectValue> {
+  async enroll(code: string, setupID?: string): Promise<ObjectValue> {
+    const setupOperationID = setupID && operationPattern.test(setupID) ? setupID : undefined;
     this.logger.redactor.add(code);
     requireValue(/^muse_enroll_[A-Za-z0-9_-]{43}$/.test(code), 'invalid_enrollment_code');
     return await this.state.withLock('config', async () => {
       const transport = await this.load(false);
+      const saved = await this.readRecord(this.state, 'enrollment.json');
+      if (setupOperationID) this.logger.base.operation_id = setupOperationID;
+      const codeDigest = digest(code);
+      const staged = saved?.state === 'staged' || saved?.state === 'preparing';
+      if (staged) {
+        requireValue(typeof saved.operation_id === 'string' && operationPattern.test(saved.operation_id), 'invalid_enrollment_journal');
+        this.logger.base.operation_id = saved.operation_id;
+        requireValue(saved.origin === transport.endpoint && saved.code_digest === codeDigest &&
+          (!setupOperationID || saved.operation_id === setupOperationID), 'enrollment_journal_mismatch');
+      }
+      const operationID = staged ? text(saved.operation_id) : setupOperationID ?? this.state.sys.uuid().replaceAll('-', '');
+      this.logger.base.operation_id = operationID;
+      const metadata = { 'X-Muse-Enrollment-Operation': operationID };
       if (this.credential) {
-        const record = (await transport.request('/api/v1/worker/status')).data;
-        const id = identifier(record.id);
+        const reply = await transport.request('/api/v1/worker/status', 'GET', undefined, { enrollment_phase: 'verify' }, 3, 10_000, metadata);
+        const id = identifier(reply.data.id);
         requireValue(!this.config.worker_id || this.config.worker_id === id, 'worker_identity_mismatch');
-        this.config.worker_id = id;
-        await this.state.write('config.json', encode(this.config));
-        await this.logger.log('INFO', 'worker.identity_preserved', { worker_id: id });
+        if (staged) {
+          requireValue(saved.state === 'staged' && saved.credential === this.credential, 'enrollment_journal_mismatch');
+          await this.finishEnrollment(this.credential, id, reply.requestId, true);
+        } else {
+          this.config.worker_id = id;
+          await this.state.write('config.json', encode(this.config));
+          await this.logger.log('INFO', 'worker.identity_preserved', { worker_id: id, request_id: reply.requestId });
+        }
         return { worker_id: id, identity_preserved: true };
       }
-      await transport.enrollmentCompatibility();
-      const saved = await this.state.read('enrollment.json');
-      requireValue(!saved || object(parse(saved)).state === 'rejected', 'enrollment_uncertain', { corrective_action: 'inspect management issuance records, revoke any orphaned identity, then use a separate clean state directory' });
-      await this.state.write('enrollment.json', encode({ state: 'pending', started_at: new Date(this.state.sys.now()).toISOString() }));
-      let response;
-      try { response = await transport.request('/api/v1/worker/enroll', 'POST', encode({ enrollment_code: code }), {}, 1); }
-      catch (error) {
-        if (error instanceof Failure && ['broker_rejected', 'update_required'].includes(error.code) && !error.retryable) await this.state.write('enrollment.json', encode({ state: 'rejected', ...error.fields }));
-        throw error;
+      const fresh = !saved || saved.state === 'rejected';
+      requireValue(fresh || staged, 'enrollment_uncertain', { corrective_action: 'inspect management issuance records, revoke any orphaned identity, then use a separate clean state directory' });
+      const journal = { origin: transport.endpoint, code_digest: codeDigest, operation_id: operationID };
+      if (fresh) await transport.enrollmentCompatibility();
+      if (fresh && this.productVersion.startsWith('0.')) return await this.enrollLegacy(transport, code, metadata);
+      let credential = '';
+      if (saved?.state === 'staged') {
+        credential = text(saved.credential);
+        requireValue(workerCredential.test(credential), 'invalid_enrollment_journal');
+        this.logger.redactor.add(credential);
+        await this.state.write('enrollment.json', encode(saved));
       }
-      const credential = text(response.data.credential);
-      this.logger.redactor.add(credential);
-      requireValue(/^muse_worker_[A-Za-z0-9_-]{43}$/.test(credential), 'invalid_enrollment_response');
-      const id = identifier(object(response.data.worker).id);
-      await this.state.write('credential.key', credential + '\n');
-      this.config.worker_id = id;
-      await this.state.write('config.json', encode(this.config));
-      await this.state.write('enrollment.json', encode({ state: 'accepted', worker_id: id, request_id: response.requestId }));
-      await this.logger.log('INFO', 'worker.enrolled', { worker_id: id, request_id: response.requestId });
-      return { worker_id: id, identity_preserved: false };
+      for (let round = 1; round <= 2; round++) {
+        if (!credential) {
+          await this.state.write('enrollment.json', encode({ ...journal, state: 'preparing' }));
+          let reply;
+          try {
+            reply = await transport.request(enrollmentRoute, 'POST', encode({ enrollment_code: code, phase: 'prepare' }), { enrollment_phase: 'prepare' }, 3, 10_000, metadata);
+          } catch (error) {
+            if (fresh && round === 1 && error instanceof Failure && error.code === 'broker_rejected' &&
+                error.fields.http_status === 400 && error.fields.reason === 'unsupported_field' && error.fields.attempt === 1) {
+              return await this.enrollLegacy(transport, code, metadata);
+            }
+            if (error instanceof Failure && error.code === 'broker_rejected' &&
+                ['enrollment_expired', 'enrollment_invalid'].includes(String(error.fields.reason))) {
+              await this.state.write('enrollment.json', encode({ state: 'rejected', ...error.fields }));
+            }
+            throw error;
+          }
+          credential = text(reply.data.credential);
+          this.logger.redactor.add(credential);
+          requireValue(reply.status === 201 && workerCredential.test(credential), 'invalid_enrollment_response');
+          const enrollmentID = identifier(reply.data.enrollment_id);
+          requireValue(!setupOperationID || setupOperationID === enrollmentID, 'enrollment_identity_mismatch');
+          await this.state.write('enrollment.json', encode({ ...journal, state: 'staged', credential }));
+          await this.logger.log('INFO', 'worker.enrollment_prepared', { enrollment_phase: 'prepare', enrollment_id: enrollmentID, request_id: reply.requestId, outcome: 'saved' });
+        }
+        const candidate = new Transport(transport.endpoint, credential, this.logger, this.state.sys, this.net, this.productVersion);
+        let reply;
+        try {
+          reply = await candidate.request(enrollmentRoute, 'POST', encode({ enrollment_code: code, phase: 'activate' }), { enrollment_phase: 'activate' }, 3, 10_000, metadata);
+        } catch (error) {
+          if (!(error instanceof Failure && error.code === 'broker_rejected' && error.fields.http_status === 409 &&
+                error.fields.reason === 'enrollment_superseded' && round === 1)) throw error;
+          await this.logger.log('WARN', 'worker.enrollment_superseded', { ...error.fields, outcome: 'retry_preparation', cause: 'enrollment_superseded' });
+          credential = '';
+          continue;
+        }
+        requireValue(reply.status === 201, 'invalid_enrollment_response');
+        const id = identifier(object(reply.data.worker).id);
+        const verified = await candidate.request('/api/v1/worker/status', 'GET', undefined, { enrollment_phase: 'verify' }, 3, 10_000, metadata);
+        requireValue(identifier(verified.data.id) === id, 'worker_identity_mismatch');
+        return await this.finishEnrollment(credential, id, reply.requestId);
+      }
+      throw new Failure('enrollment_superseded');
     });
+  }
+
+  private async enrollLegacy(transport: Transport, code: string, metadata: Record<string, string>): Promise<ObjectValue> {
+    await this.state.write('enrollment.json', encode({ state: 'pending', started_at: new Date(this.state.sys.now()).toISOString() }));
+    let response;
+    try {
+      response = await transport.request(enrollmentRoute, 'POST', encode({ enrollment_code: code }), { enrollment_phase: 'legacy' }, 1, 10_000, metadata);
+    } catch (error) {
+      if (error instanceof Failure && ['broker_rejected', 'update_required'].includes(error.code) && !error.retryable) {
+        await this.state.write('enrollment.json', encode({ state: 'rejected', ...error.fields }));
+      }
+      throw error;
+    }
+    const credential = text(response.data.credential);
+    this.logger.redactor.add(credential);
+    requireValue(workerCredential.test(credential), 'invalid_enrollment_response');
+    return await this.finishEnrollment(credential, identifier(object(response.data.worker).id), response.requestId);
+  }
+
+  private async finishEnrollment(credential: string, id: string, requestId: string, preserved = false): Promise<ObjectValue> {
+    requireValue(!this.config.worker_id || this.config.worker_id === id, 'worker_identity_mismatch');
+    this.config.worker_id = id;
+    await this.state.write('config.json', encode(this.config));
+    await this.state.write('credential.key', credential + '\n');
+    await this.state.write('enrollment.json', encode({ state: 'accepted', worker_id: id, request_id: requestId }));
+    await this.logger.log('INFO', preserved ? 'worker.identity_preserved' : 'worker.enrolled', { worker_id: id, request_id: requestId, outcome: 'saved' });
+    return { worker_id: id, identity_preserved: preserved };
   }
   async getJob(transport: Transport, id: string): Promise<ObjectValue> {
     identifier(id);

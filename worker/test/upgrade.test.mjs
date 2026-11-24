@@ -84,7 +84,7 @@ test('enrolled upgrade reserves before shutdown, resumes, and preserves the old 
   assert.deepEqual(f.counts(), { stops: 1, stages: 1 });
   assert.equal(await f.state.read('credential.key'), key);
   assert.equal((await f.state.read('installation.json')).includes('Stored'), true);
-  assert.equal(f.broker.calls.filter(call => call.path.endsWith('/enroll')).length, 1);
+  assert.equal(f.broker.calls.filter(call => call.path.endsWith('/enroll') && call.input?.phase !== 'prepare').length, 1);
 });
 
 test('cancelled or rejected upgrade keeps the running owner and permits a fresh attempt', async t => {
@@ -161,5 +161,5 @@ test('revocation, unproven markers and work journals continue to block unsafe up
   const noKey = new Setup(f.worker, f.setup.io, version);
   await f.state.remove('credential.key');
   await assert.rejects(noKey.install(f.local.origin, CODE, f.local.root, setupID, undefined, true), /worker_not_enrolled/);
-  assert.equal(f.broker.calls.filter(call => call.path.endsWith('/enroll')).length, 1);
+  assert.equal(f.broker.calls.filter(call => call.path.endsWith('/enroll') && call.input?.phase !== 'prepare').length, 1);
 });
