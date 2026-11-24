@@ -31,16 +31,12 @@ const (
 )
 
 type Store struct {
-	Dir     string
-	Inspect func(context.Context, string, string) (inference.MediaProperties, error)
-	files   fileOps
-	run     func(context.Context, string, []string, io.Writer) error
+	Dir   string
+	files fileOps
 }
 
 func New(dir string) *Store {
-	s := &Store{Dir: dir, files: localFiles(), run: runProcess}
-	s.Inspect = s.inspect
-	return s
+	return &Store{Dir: dir, files: localFiles()}
 }
 
 const namespaceMarker = ".aaa-muse-media-v1"
@@ -178,7 +174,7 @@ func (s *Store) Image(ctx context.Context, p *Stage, input io.Reader, kind strin
 	if err != nil {
 		return err
 	}
-	if _, err = s.Inspect(ctx, name, kind); err != nil {
+	if err = s.checkHeader(ctx, name, kind); err != nil {
 		return err
 	}
 	p.Record.InputType = kind
@@ -273,11 +269,11 @@ func (s *Store) Receive(ctx context.Context, id, profile, hash string, size int6
 		return nil, inference.Reject("artifact_digest_mismatch", 422)
 	}
 	stage = "inspect"
-	props, err := s.Inspect(ctx, f.Name(), OutputType(profile))
-	if err != nil {
+	kind := OutputType(profile)
+	if err = s.checkHeader(ctx, f.Name(), kind); err != nil {
 		return nil, err
 	}
-	props.Size, props.SHA256, props.MediaType = n, actual, OutputType(profile)
+	props := inference.MediaProperties{Size: n, SHA256: actual, MediaType: kind}
 	return &Upload{Path: f.Name(), directory: directory, Properties: props, files: &s.files}, nil
 }
 

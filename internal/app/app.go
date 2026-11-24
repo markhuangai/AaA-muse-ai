@@ -75,7 +75,7 @@ func Run(ctx context.Context, args []string, build service.Build, d Dependencies
 	build = build.Normalized()
 	operation := fmt.Sprintf("startup-%d", d.Now().UnixNano())
 	fatal := func(event, cause string, attrs []any) {
-		emergency(d.Stderr, event, cause, append([]any{"operation_id", operation, "revision", build.Revision}, attrs...))
+		emergency(d.Stderr, event, cause, append([]any{"operation_id", operation, "revision", build.Revision, "version", build.Version}, attrs...))
 	}
 	flags := flag.NewFlagSet("aaa-muse-ai", flag.ContinueOnError)
 	if !build.Valid() {
@@ -85,6 +85,34 @@ func Run(ctx context.Context, args []string, build service.Build, d Dependencies
 	if len(args) > 0 && args[0] == "prepare-mounts" {
 		paths := []string{filepath.Dir(d.DatabasePath), d.MediaDir, config.Defaults().Diagnostics.Directory}
 		return runMountPreparation(args[1:], build.Revision, config.DefaultPath, paths, d)
+	}
+	if len(args) > 0 && args[0] == "serve" {
+		if len(args) != 1 {
+			fatal("config.rejected", "invalid_arguments", nil)
+			return 1
+		}
+		if os.Geteuid() != 0 {
+			fatal("mounts.prepare_failed", "root_bootstrap_required", []any{"stage", "check_identity", "target", filepath.Dir(config.DefaultPath),
+				"reason", "root_bootstrap_required", "expected", 0, "observed", os.Geteuid(), "corrective_action", mountCorrection("root_bootstrap_required")})
+			return 1
+		}
+		mounts := composeMounts{
+			roots: [4]mountTarget{
+				{path: filepath.Dir(config.DefaultPath), mode: 0700},
+				{path: filepath.Dir(d.DatabasePath), mode: 0700},
+				{path: d.MediaDir, mode: 0700},
+				{path: config.Defaults().Diagnostics.Directory, mode: 0700},
+			},
+			configFile: filepath.Base(config.DefaultPath),
+			database:   filepath.Base(d.DatabasePath),
+		}
+		bootstrap := slog.New(slog.NewJSONHandler(d.Stdout, nil)).With("operation_id", operation, "revision", build.Revision, "version", build.Version)
+		lock, ok := mounts.prepare(ctx, bootstrap, fatal, dropComposeRoot)
+		if !ok {
+			return 1
+		}
+		defer lock.Close()
+		args = args[1:]
 	}
 	flags.SetOutput(io.Discard)
 	path := flags.String("config", config.DefaultPath, "Configuration path")

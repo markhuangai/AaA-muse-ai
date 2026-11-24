@@ -1,42 +1,32 @@
 name: muse-ai-proxy
-x-service-mounts: &service-mounts
-  - type: bind
-    source: ./config
-    target: /etc/aaa-muse-ai
-    bind:
-      create_host_path: false
-  - type: bind
-    source: ./sqlite
-    target: /var/lib/aaa-muse-ai/state
-    bind:
-      create_host_path: false
-  - type: bind
-    source: ./media
-    target: /var/lib/aaa-muse-ai/media
-    bind:
-      create_host_path: false
-  - diagnostics:/var/lib/aaa-muse-ai/diagnostics
 services:
-  prepare-mounts:
-    image: ghcr.io/markhuangai/aaa-muse-ai:latest
-    user: '0:0'
-    command: [prepare-mounts, '1000:1000']
-    read_only: true
-    network_mode: none
-    cap_drop: [ALL]
-    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER]
-    security_opt: [no-new-privileges:true]
-    volumes: *service-mounts
   service:
     image: ghcr.io/markhuangai/aaa-muse-ai:latest
-    user: '1000:1000'
-    depends_on:
-      prepare-mounts:
-        condition: service_completed_successfully
+    user: '0:0'
+    command: [serve]
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID]
+    security_opt: [no-new-privileges:true]
     restart: unless-stopped
     ports:
       - '8080:8080'
-    volumes: *service-mounts
+    volumes:
+      - type: bind
+        source: ./config
+        target: /etc/aaa-muse-ai
+        bind:
+          create_host_path: true
+      - type: bind
+        source: ./sqlite
+        target: /var/lib/aaa-muse-ai/state
+        bind:
+          create_host_path: true
+      - type: bind
+        source: ./media
+        target: /var/lib/aaa-muse-ai/media
+        bind:
+          create_host_path: true
+      - diagnostics:/var/lib/aaa-muse-ai/diagnostics
     logging:
       driver: json-file
       options:

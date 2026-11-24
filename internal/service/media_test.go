@@ -3,6 +3,8 @@ package service
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"os"
@@ -69,22 +71,19 @@ func TestMediaReceiptAndOwnership(t *testing.T) {
 	requireInferenceReason(t, err, "stale_assignment")
 	_, err = b.Decide(ctx, logger, wid, j.ID, inference.Submit{Claim: inference.Claim{Version: 1, SubmissionID: "text-on-media"}})
 	requireInferenceReason(t, err, "media_upload_required")
-	b.Media.Inspect = func(_ context.Context, path, kind string) (inference.MediaProperties, error) {
-		if v, err := os.ReadFile(path); err != nil || string(v) != "bytes" {
-			t.Fatal(path, err)
-		}
-		return inference.MediaProperties{MediaType: kind, Duration: 1, VideoFrames: 1}, nil
-	}
-	const hash = "277089d91c0bdf4f2e6862ba7e4a07605119431f5d13f726dd352b06f1b206a9"
-	_, check, err := b.MediaUpload(ctx, logger, wid, j.ID, f, hash, 5, nil)
+	payload := []byte("\x00\x00\x00\x18ftypisom000000000000")
+	sum := sha256.Sum256(payload)
+	hash := hex.EncodeToString(sum[:])
+	size := int64(len(payload))
+	_, check, err := b.MediaUpload(ctx, logger, wid, j.ID, f, hash, size, nil)
 	if err != nil || check.Accepted {
 		t.Fatal(check, err)
 	}
-	u, err := b.Media.Receive(ctx, j.ID, "prompt_video", hash, 5, bytes.NewReader([]byte("bytes")))
+	u, err := b.Media.Receive(ctx, j.ID, "prompt_video", hash, size, bytes.NewReader(payload))
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, a, err := b.MediaUpload(ctx, logger, wid, j.ID, f, hash, 5, u)
+	_, a, err := b.MediaUpload(ctx, logger, wid, j.ID, f, hash, size, u)
 	if err != nil || !a.Accepted {
 		t.Fatal(a, err)
 	}
@@ -110,17 +109,17 @@ func TestMediaReceiptAndOwnership(t *testing.T) {
 	}
 	original, err := io.ReadAll(file)
 	file.Close()
-	if err != nil || string(original) != "bytes" {
+	if err != nil || !bytes.Equal(original, payload) {
 		t.Fatal("anonymous read did not return the original", err)
 	}
 	_, _, err = b.ReadSharedMedia(ctx, logger, j.ID, "wrong")
 	requireInferenceReason(t, err, "download_link_invalid")
 	m.now = m.now.Add(time.Minute)
-	_, a, err = b.MediaUpload(ctx, logger, wid, j.ID, f, hash, 5, nil)
+	_, a, err = b.MediaUpload(ctx, logger, wid, j.ID, f, hash, size, nil)
 	if err != nil || !a.ExpiresAt.Equal(before) {
 		t.Fatal("receipt replay", err)
 	}
-	_, _, err = b.MediaUpload(ctx, logger, wid, j.ID, f, "other", 5, nil)
+	_, _, err = b.MediaUpload(ctx, logger, wid, j.ID, f, "other", size, nil)
 	requireInferenceReason(t, err, "artifact_conflict")
 	_, file, err = b.ReadMedia(ctx, logger, "alice", j.ID, true)
 	if err != nil {
@@ -128,7 +127,7 @@ func TestMediaReceiptAndOwnership(t *testing.T) {
 	}
 	body, _ := io.ReadAll(file)
 	file.Close()
-	if string(body) != "bytes" {
+	if !bytes.Equal(body, payload) {
 		t.Fatal("incorrect artifact")
 	}
 	m.now = before

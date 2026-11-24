@@ -2,10 +2,11 @@ package httpapi
 
 import (
 	"bytes"
-	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"image"
+	"image/png"
 	"io"
 	"mime/multipart"
 	"net/http/httptest"
@@ -18,17 +19,12 @@ import (
 	"time"
 
 	"github.com/markhuangai/AaA-muse-ai/internal/auth"
-	"github.com/markhuangai/AaA-muse-ai/internal/inference"
 	"github.com/markhuangai/AaA-muse-ai/internal/media"
 )
 
 func TestMediaHTTP(t *testing.T) {
 	h, db, w, key := inferenceHTTPFixture(t)
 	h.Broker.Media = media.New(t.TempDir())
-	h.Broker.Media.Inspect = func(_ context.Context, path, kind string) (inference.MediaProperties, error) {
-		_, err := os.Stat(path)
-		return inference.MediaProperties{MediaType: kind, Width: 64, Height: 48, Duration: 1, VideoFrames: 24}, err
-	}
 	const client = "client-private-sentinel"
 	const admin = "admin-private-sentinel"
 	req := func(method, path, principal, kind string, body []byte, headers map[string]string, status int) *httptest.ResponseRecorder {
@@ -88,7 +84,7 @@ func TestMediaHTTP(t *testing.T) {
 		t.Fatal("wrong prompt")
 	}
 	req("GET", workerRoute+"/media/image", key, "", nil, headers, 404)
-	payload := []byte("private-byte-sentinel")
+	payload := []byte("\x00\x00\x00\x18ftypisom000000000000private-byte-sentinel")
 	digest := sha256.Sum256(payload)
 	req("PUT", workerRoute+"/artifact", key, "video/mp4", payload, headers, 400)
 	headers["X-Muse-Artifact-Sha256"] = hex.EncodeToString(digest[:])
@@ -104,6 +100,14 @@ func TestMediaHTTP(t *testing.T) {
 	var link mediaPollResult
 	if err := json.Unmarshal(owned.Body.Bytes(), &link); err != nil {
 		t.Fatal(err)
+	}
+	var status struct {
+		Artifact map[string]any `json:"artifact"`
+	}
+	if err := json.Unmarshal(owned.Body.Bytes(), &status); err != nil ||
+		len(status.Artifact) != 3 || status.Artifact["media_type"] != "video/mp4" || status.Artifact["sha256"] != headers["X-Muse-Artifact-Sha256"] ||
+		status.Artifact["size"] != float64(len(payload)) {
+		t.Fatal("new receipt did not describe relayed bytes", status, err)
 	}
 	publicLink, err := neturl.Parse(link.DownloadURL)
 	if err != nil || publicLink.Scheme != "https" || publicLink.Host != "broker.example:8443" {
@@ -153,9 +157,6 @@ func TestMediaHTTP(t *testing.T) {
 
 func TestMediaMultipartBoundary(t *testing.T) {
 	store := media.New(t.TempDir())
-	store.Inspect = func(context.Context, string, string) (inference.MediaProperties, error) {
-		return inference.MediaProperties{}, nil
-	}
 	for _, kind := range []string{"valid", "duplicate", "missing", "unsupported", "unknown"} {
 		var b bytes.Buffer
 		w := multipart.NewWriter(&b)
@@ -173,11 +174,11 @@ func TestMediaMultipartBoundary(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			data := "\x89PNG\r\n\x1a\nimage"
 			if kind == "unsupported" {
-				data = "gif"
+				io.WriteString(p, "gif")
+			} else if err = png.Encode(p, image.NewGray(image.Rect(0, 0, 8, 8))); err != nil {
+				t.Fatal(err)
 			}
-			io.WriteString(p, data)
 		}
 		w.Close()
 		r := httptest.NewRequest("POST", mediaJobs, &b)
