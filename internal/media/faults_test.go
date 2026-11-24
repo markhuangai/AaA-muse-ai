@@ -6,42 +6,20 @@ import (
 	"errors"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"slices"
 	"strings"
 	"syscall"
 	"testing"
-	"time"
 
 	"github.com/markhuangai/AaA-muse-ai/internal/inference"
 )
 
-func measuredProcess(_ context.Context, program string, args []string, out io.Writer) error {
-	if program == "ffmpeg" {
-		return nil
-	}
-	if program != "ffprobe" {
-		return errors.New("unexpected program")
-	}
-	var report string
-	switch {
-	case slices.Contains(args, "mov"):
-		report = `{"streams":[{"codec_type":"video","codec_name":"h264","width":64,"height":48,"avg_frame_rate":"8/1","nb_read_frames":"8"}],"format":{"duration":"1"}}`
-	case slices.Contains(args, "mp3"), slices.Contains(args, "wav"):
-		report = `{"streams":[{"codec_type":"audio","codec_name":"pcm_s16le"}],"format":{"duration":"1"}}`
-	default:
-		report = `{"streams":[{"codec_type":"video","codec_name":"png","width":8,"height":8,"nb_read_frames":"1"}]}`
-	}
-	_, err := io.WriteString(out, report)
-	return err
-}
-
-func TestDecoderFailuresRemoveUnverifiedUploads(t *testing.T) {
-	for _, tc := range []struct{ failure, reason, ioCause string }{
-		{"missing", "artifact_io_failed", "media_decoder_unavailable"},
-		{"deadline", "media_inspection_timeout", ""},
-		{"interrupted", "media_decode_failed", ""},
+func TestHeaderFailuresRemoveUnverifiedUploads(t *testing.T) {
+	for _, tc := range []struct{ failure, block, reason string }{
+		{"bad_header", "media that has no MP4 signature", "invalid_media_format"},
+		{"wrong_format", "RIFF\x00\x00\x00\x00WAVEtrailing", "invalid_media_format"},
+		{"interrupted", "\x00\x00\x00\x18ftypisom000000000000", "artifact_transfer_interrupted"},
+		{"read", "\x00\x00\x00\x18ftypisom000000000000", "artifact_io_failed"},
 	} {
 		t.Run(tc.failure, func(t *testing.T) {
 			s := New(t.TempDir())
@@ -49,34 +27,21 @@ func TestDecoderFailuresRemoveUnverifiedUploads(t *testing.T) {
 			if err := os.Mkdir(filepath.Join(s.Dir, id), 0700); err != nil {
 				t.Fatal(err)
 			}
-			ctx := context.Background()
-			if tc.failure == "deadline" {
-				var cancel context.CancelFunc
-				ctx, cancel = context.WithDeadline(ctx, time.Time{})
-				defer cancel()
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			if tc.failure == "interrupted" {
+				cancel()
 			}
-			s.run = func(ctx context.Context, program string, args []string, out io.Writer) error {
-				if tc.failure == "missing" {
-					return &exec.Error{Name: program, Err: exec.ErrNotFound}
-				}
-				if ctx.Err() != nil {
-					return ctx.Err()
-				}
-				if program == "ffmpeg" {
-					return syscall.EINTR
-				}
-				return measuredProcess(ctx, program, args, out)
+			if tc.failure == "read" {
+				s.files.open = func(string) (io.ReadSeekCloser, error) { return nil, syscall.EIO }
 			}
-			data := []byte("\x00\x00\x00\x18ftypisom000000000000")
+			data := []byte(tc.block)
 			u, err := s.Receive(ctx, id, "prompt_video", hash(data), int64(len(data)), bytes.NewReader(data))
 			var reject *inference.Rejection
 			if u != nil || !errors.As(err, &reject) || reject.Reason != tc.reason {
 				t.Fatalf("received %v, %v", u, err)
 			}
 			if reject.Fields["stage"] != "inspect" || reject.Fields["partial_cleanup"] != "removed" || reject.Fields["observed_sha256"] != hash(data) {
-				t.Fatal(reject.Fields)
-			}
-			if tc.ioCause != "" && reject.Fields["io_cause"] != tc.ioCause {
 				t.Fatal(reject.Fields)
 			}
 			entries, err := os.ReadDir(s.Dir)
@@ -89,10 +54,8 @@ func TestDecoderFailuresRemoveUnverifiedUploads(t *testing.T) {
 		})
 	}
 }
-
 func TestUploadCommitFailuresCanBeRetried(t *testing.T) {
 	s := New(t.TempDir())
-	s.run = measuredProcess
 	id := strings.Repeat("2", 32)
 	if err := os.Mkdir(filepath.Join(s.Dir, id), 0700); err != nil {
 		t.Fatal(err)

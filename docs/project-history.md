@@ -2,6 +2,45 @@
 
 These entries record decisions and evidence at the dates shown. See the release guide for the current publication and qualification rules. [Paired product releases](releases.md)
 
+## Lean broker image and Compose startup
+
+The owner approved the lean runtime and single-service Compose delivery from
+`3f31b4f06cb7e177067275bc9b31133499c72abf`. The published
+`1.0.1-rc.2` amd64 manifest
+`sha256:59afbc0a6d8d917c435e74410ca517cfd47ff3c1171a64f8c23f12f2113bf858`
+contains 62,530,764 compressed layer bytes. Its FFmpeg installation accounts for
+51,775,971 bytes. The approved runtime ships one broker executable with a 12 MiB
+compressed exported rootfs limit. The owner chose media header and integrity
+checks with byte-preserving relay. Stored measured receipts remain readable.
+The owner also chose operator-supplied YAML, YAML ownership on conflicts and
+a privileged startup that drops to a non-root identity before serving.
+Delivery requires independent audit, full CI, CodeQL, Codex and configured AI
+review. The owner exempted CodeRabbit for this PR.
+[Deployment](deployment.md) · [Media validation and receipts](media-api.md)
+
+The independent audit was conformant in round two. The implementation now
+reports the exact nested mount target and exercises a complete upload with a
+wrong digest. Follow-up smoke testing found that an existing SQLite listener
+blocked initialization of another broker’s private diagnostics volume. Startup
+now locks that volume separately when shared storage needs no repair. The same
+owner can start a sibling, while an active broker fences an ownership handoff.
+The smoke harness excludes Docker’s exported mount stubs from its executable
+inventory. Using the direct Docker test network avoided intermittent Desktop
+published-port failures during browser validation.
+
+By `2026-11-24T13:44:02Z`, the local checks passed on working-source digest
+`dbbe61f1da6aba9f9dcf2603082715af9684a7759a56b561ec359f769cf15ecb` before this record. The amd64 image
+`sha256:fc46ce2e2f36c02c6903aa60621e0207bba384c7547a388133f5e676ea6605ca` exported at 6,988,744 bytes
+with `docker export` and `gzip -n -6`. The pinned base exported at 60,732,365
+bytes with the same procedure and rejected `serve` before startup. The packaged
+checks covered repaired binds, mixed-owner named volumes, actual serving
+credentials, an atomic portal key save, exact media downloads, historical
+receipts and expiry across restart. The protected upload export identified the
+digest mismatch and cleanup. The mounted read-only config error was diagnosed
+from Compose logs. All six unit coverage gates passed, including 6,736 of 7,481
+Go statements. Image smoke, service integration, media, Chromium, controlled
+release verification, file limits, CI policy and workflow lint passed.
+
 ## Weekly account allowance routing
 
 The owner approved weekly usage reporting and pre-claim routing at base

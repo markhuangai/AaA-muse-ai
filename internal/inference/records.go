@@ -228,12 +228,12 @@ type MediaProperties struct {
 	MediaType   string        `json:"media_type"`
 	Size        int64         `json:"size"`
 	SHA256      string        `json:"sha256"`
-	Duration    float64       `json:"duration"`
+	Duration    float64       `json:"duration,omitempty"`
 	Width       int           `json:"width,omitempty"`
 	Height      int           `json:"height,omitempty"`
 	FPS         float64       `json:"fps,omitempty"`
 	VideoFrames int           `json:"video_frames,omitempty"`
-	Streams     []MediaStream `json:"streams"`
+	Streams     []MediaStream `json:"streams,omitempty"`
 }
 
 // Media contains the durable receipt. Customer prompts and file bytes live only in the private spool.

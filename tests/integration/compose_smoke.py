@@ -8,24 +8,20 @@ import secrets
 import stat
 import subprocess
 
-from service import SQLITE_STATE, require
+from service import DIAGNOSTICS, LABEL, SQLITE_STATE, require
 
 
 CONFIG = "/etc/aaa-muse-ai"
 MEDIA = "/var/lib/aaa-muse-ai/media"
-DIAGNOSTICS = "/var/lib/aaa-muse-ai/diagnostics"
 STATE_BIND = "sqlite"
 MEDIA_BIND = "media"
 BASE = Path("compose.yaml").resolve()
 NAMED = Path("compose.named-volumes.yaml").resolve()
 
 TEST_OVERRIDE = """services:
-  prepare-mounts:
-    image: ${MUSE_TEST_IMAGE}
-    command: [prepare-mounts, '${MUSE_TEST_SERVICE_USER}']
   service:
     image: ${MUSE_TEST_IMAGE}
-    user: '${MUSE_TEST_SERVICE_USER}'
+    restart: "no"
     ports: !override ["127.0.0.1:0:8080"]
 """
 
@@ -46,7 +42,7 @@ volumes:
 
 
 class ComposeProject:
-    def __init__(self, harness, label, user):
+    def __init__(self, harness, label):
         self.h = harness
         self.name = harness.owner + "-" + label
         self.dir = harness.root.resolve() / label
@@ -57,7 +53,7 @@ class ComposeProject:
             key: value for key, value in os.environ.items()
             if not key.startswith(("COMPOSE_", "MUSE_"))
         }
-        self.env.update(MUSE_TEST_IMAGE=harness.args.image, MUSE_TEST_SERVICE_USER=user)
+        self.env.update(MUSE_TEST_IMAGE=harness.args.image)
         override = self.dir / "test-override.yaml"
         override.write_text(TEST_OVERRIDE)
         self.files = (BASE, override)
@@ -87,13 +83,13 @@ class ComposeProject:
         self.h.ready(identity, origin)
         return identity, origin
 
-    def logs(self, service, reason, extra=()):
-        result = self.compose("logs", "--no-log-prefix", service)
+    def logs(self, event, reason=None, files=None):
+        result = self.compose("logs", "--no-log-prefix", "service", files=files)
         output = result.stdout + result.stderr
-        self.h.assert_private(output, extra)
+        self.h.assert_private(output)
         records = [json.loads(line) for line in output.splitlines() if line.startswith("{")]
-        matches = [e for e in records if e.get("reason") == reason]
-        require(matches, "expected startup reason is absent from Compose logs: " + reason)
+        matches = [e for e in records if e.get("msg") == event and (reason is None or e.get("reason") == reason)]
+        require(matches, "expected startup event is absent from Compose logs: " + str((event, reason)))
         result = matches[-1]
         require(result["revision"] == self.h.args.source_sha and result.get("operation_id"), "startup diagnosis lacks provenance")
         return result
@@ -106,8 +102,8 @@ class ComposeProject:
 
 
 @contextmanager
-def project(h, label, user):
-    p = ComposeProject(h, label, user)
+def project(h, label):
+    p = ComposeProject(h, label)
     require(p.unused(), "fixture Compose project already exists")
     try:
         yield p
@@ -134,8 +130,10 @@ def config_read_failures(h, config):
     ):
         source = directory if name == "directory" else config
         uid = 10001 if os.getuid() != 10001 else 10002
-        result = h.docker("run", "--rm", "--user", f"{uid}:10001", "--mount",
-                          f"type=bind,source={source},target={target},readonly", h.args.image, *arguments, success=False)
+        identity = h.remember("containers", h.docker(
+            "create", "--label", LABEL + "=" + h.owner, "--user", f"{uid}:10001", "--mount",
+            f"type=bind,source={source},target={target},readonly", h.args.image, *arguments).stdout.strip())
+        result = h.docker("start", "--attach", identity, success=False, timeout=15)
         output = result.stdout + result.stderr
         h.assert_private(output, (private_selector,))
         require(result.returncode == 1, "config read did not stop in the broker")
@@ -146,115 +144,119 @@ def config_read_failures(h, config):
         h.receipt("compose.direct_config_" + name, reason=reason)
 
 
-def check_missing_bind_sources(p):
-    project = json.loads(p.compose("config", "--format", "json", files=(BASE,)).stdout)
-    services = project["services"]
-    helper, broker = services["prepare-mounts"], services["service"]
-    require(helper["image"] == broker["image"] == "ghcr.io/markhuangai/aaa-muse-ai:latest",
-            "Compose does not default both services to the stable image")
-    require(helper["user"] == "0:0" and helper["command"] == ["prepare-mounts", "1000:1000"]
-            and broker["user"] == "1000:1000"
-            and broker["depends_on"]["prepare-mounts"]["condition"] == "service_completed_successfully",
-            "Compose does not prepare private mounts before starting the non-root broker")
+def check_compose_defaults(p):
+    spec = json.loads(p.compose("config", "--format", "json", files=(BASE,)).stdout)
+    require(set(spec["services"]) == {"service"}, "Compose must contain one service")
+    broker = spec["services"]["service"]
+    require(broker["image"] == "ghcr.io/markhuangai/aaa-muse-ai:latest" and broker["command"] == ["serve"]
+            and broker["user"] == "0:0" and not broker.get("depends_on"), "unexpected startup invocation")
+    require(set(broker["cap_drop"]) == {"ALL"} and set(broker["cap_add"]) ==
+            {"CHOWN", "DAC_OVERRIDE", "FOWNER", "SETUID", "SETGID"}
+            and broker["security_opt"] == ["no-new-privileges:true"], "Compose bootstrap has the wrong capabilities")
     ports = [(port.get("host_ip"), str(port["published"]), port["target"]) for port in broker["ports"]]
     require(ports == [(None, "8080", 8080)] and not broker.get("environment"), "unexpected default ports or environment")
-    require("diagnostics" in project["volumes"], "diagnostics volume is not declared")
     sources = {CONFIG: "config", SQLITE_STATE: STATE_BIND, MEDIA: MEDIA_BIND}
-    for name in ("prepare-mounts", "service"):
-        binds = [m for m in services[name]["volumes"] if m["type"] == "bind"]
-        require({m["target"]: m["source"] for m in binds} == {target: str(p.dir / source) for target, source in sources.items()}
-                and all(m["bind"]["create_host_path"] is False for m in binds), "unexpected Compose bind sources or creation policy")
-        require(any(m["type"] == "volume" and m["source"] == "diagnostics" and m["target"] == DIAGNOSTICS
-                    for m in services[name]["volumes"]), "Compose does not share the diagnostics volume")
-    platform = p.h.docker("info", "--format", "{{.OperatingSystem}}").stdout.strip()
-    if platform == "Docker Desktop":
-        # The Desktop file-sharing layer can create sources before the engine applies the bind flags.
-        p.h.receipt("compose.bind_declarations", engine=platform, missing_source_runtime="not_exercised")
-        return
-    p.compose("up", "-d", "service", success=False)
-    require(not (p.dir / STATE_BIND).exists() and not (p.dir / MEDIA_BIND).exists(), "Compose created missing host sources")
-    p.h.receipt("compose.bind_declarations", missing_source_runtime="rejected")
+    binds = [m for m in broker["volumes"] if m["type"] == "bind"]
+    require({m["target"]: m["source"] for m in binds} == {t: str(p.dir / source) for t, source in sources.items()}
+            and all(m.get("bind", {}).get("create_host_path", True) for m in binds), "Compose must create missing host bind sources")
+    require("diagnostics" in spec["volumes"] and
+            any(m["type"] == "volume" and m["source"] == "diagnostics" and m["target"] == DIAGNOSTICS
+                for m in broker["volumes"]), "Compose lost the diagnostics volume")
+
+
+def rejected_start(p, reason, files=None):
+    p.compose("up", "-d", "--force-recreate", "service", files=files)
+    identity = p.compose("ps", "--all", "--quiet", "service", files=files).stdout.strip()
+    require(identity and p.h.docker("wait", identity, timeout=15).stdout.strip() == "1",
+            "mount failure did not stop the broker")
+    require('"msg":"db.connected"' not in p.h.logs(identity), "broker opened SQLite after a mount failure")
+    record = p.logs("mounts.prepare_failed", reason, files=files)
+    require(record["level"] == "ERROR" and record["outcome"] == "stopped" and record.get("corrective_action")
+            and record.get("cause") == reason and "expected" in record and "observed" in record,
+            "mount rejection lacks a diagnostic cause or corrective action")
+    return record
+
+
+def missing_config(h):
+    with project(h, "missing") as p:
+        p.config.parent.rmdir()
+        check_compose_defaults(p)
+        record = rejected_start(p, "not_found")
+        require(record["stage"] == "open_config" and record["target"] == CONFIG + "/config.yaml",
+                "missing YAML diagnosis must identify the required path")
+        for name in ("config", STATE_BIND, MEDIA_BIND):
+            require(stat.S_IMODE((p.dir / name).stat().st_mode) == 0o700, "empty source was not created privately")
+        stopped = p.compose("ps", "--all", "--quiet", "service").stdout.strip()
+        h.run_tools("sh", "-ec", 'test ! -e "$1/config.yaml" && test ! -e "$2/broker.sqlite3" && test "$(stat -c %a "$3")" = 700',
+                    "fixture", CONFIG, SQLITE_STATE, DIAGNOSTICS, options=("--volumes-from", stopped))
+        h.receipt("compose.missing_config", automatic_sources=True, database_initialized=False)
+
+
+def unsafe_mounts(p):
+    h = p.h
+    (p.dir / MEDIA_BIND).mkdir()
+    wrong = p.config.with_suffix(".yml")
+    p.config.rename(wrong)
+    try:
+        for link, reason in ((os.symlink, "symlink"), (os.link, "multiple_links")):
+            link(wrong, p.config)
+            failure = rejected_start(p, reason)
+            require(failure["target"] == CONFIG + "/config.yaml", "unsafe config lacks the required path")
+            p.config.unlink()
+    finally:
+        wrong.rename(p.config)
+
+    nested = p.dir / MEDIA_BIND / "nested"
+    nested.mkdir(parents=True)
+    link = nested / "alias"
+    link.symlink_to(p.config)
+    record = rejected_start(p, "symlink")
+    require(record["target"] == MEDIA + "/nested/alias", "nested rejection did not identify the failing entry")
+    link.unlink()
+    nested.rmdir()
+    config_mode = stat.S_IMODE(p.config.stat().st_mode)
+    source = p.dir / "fixture-source"
+    source.mkdir()
+    outside = source / "outside"
+    outside.write_text("untouched")
+    os.chmod(outside, 0o644)
+    override = p.dir / "unsafe.yaml"
+    override.write_text(json.dumps({"services": {"service": {"volumes": [
+        {"type": "bind", "source": str(source), "target": MEDIA + "/nested"}]}}}))
+    rejected_start(p, "nested_mount", (*p.files, override))
+    require(outside.read_text() == "untouched" and stat.S_IMODE(outside.stat().st_mode) == 0o644,
+            "a nested mount changed another source's data or mode")
+    if nested.exists():
+        nested.rmdir()
+    override.write_text(json.dumps({"services": {"service": {"volumes": [
+        {"type": "bind", "source": str(p.config.parent), "target": CONFIG, "read_only": True}]}}}))
+    failure = rejected_start(p, "read_only", (*p.files, override))
+    require(failure["target"] == CONFIG and failure["stage"] == "inspect_filesystem"
+            and failure["observed"]["mode"] == "0700", "read-only mount cannot be diagnosed from Compose logs")
+    require(stat.S_IMODE(p.config.stat().st_mode) == config_mode, "failed validation changed config metadata")
+    h.receipt("compose.fail_before_database", unsafe_yaml=True, nested_mount=True, read_only=True)
 
 
 def fresh_install(h):
     owner = f"{os.getuid()}:{os.getgid()}"
     require(os.getuid() > 0 and os.getgid() > 0, "the Compose host-edit check requires an unprivileged account")
-    with project(h, "host", owner) as p:
+    with project(h, "host") as p:
         sample = Path("config.example.yaml").read_text()
         p.config.write_text(sample.replace('key: ""', f"key: {json.dumps(h.admin)}")
                             .replace('password: ""', f"password: {json.dumps(h.portal)}")
                             .replace("client-keys: {}", "client-keys:\n  fixture-client: " + h.client))
-        check_missing_bind_sources(p)
-        for name in (STATE_BIND, MEDIA_BIND):
-            (p.dir / name).mkdir(mode=0o755)
-            (p.dir / name).chmod(0o755)
-
         config_read_failures(h, p.config)
-        denied_uid = 10001 if os.getuid() == 1000 else 1000
-        denied = p.dir / "non-root-helper.yaml"
-        denied.write_text(f"services:\n  prepare-mounts:\n    user: '{denied_uid}:{denied_uid}'\n")
-        p.compose("up", "-d", "service", files=(*p.files, denied), success=False)
-        event = p.logs("prepare-mounts", "permission_denied")
-        require(event["msg"] == "mounts.prepare_failed" and event["level"] == "ERROR"
-                and event["outcome"] == "stopped" and event["stage"] == "open_directory"
-                and event["target"] == CONFIG and event["observed"] is None
-                and event["expected"] == {"uid": os.getuid(), "gid": os.getgid(), "mode": "0700"},
-                "non-root helper failure does not identify inaccessible config directory and expected ownership")
-        h.receipt("compose.helper_permission_denied", stage=event["stage"], target=event["target"])
-
-        wrong = p.config.with_suffix(".yml")
-        p.config.rename(wrong)
-        p.compose("up", "-d", "service", success=False)
-        event = p.logs("prepare-mounts", "not_found")
-        require(event["msg"] == "mounts.prepare_failed" and event["target"] == CONFIG + "/config.yaml"
-                and event["level"] == "ERROR" and event["outcome"] == "stopped", "wrong YAML failure lacks a corrective path")
-
-        for link, reason in ((os.symlink, "symlink"), (os.link, "multiple_links")):
-            link(wrong, p.config)
-            p.compose("up", "-d", "service", success=False)
-            event = p.logs("prepare-mounts", reason)
-            require(event["target"] == CONFIG + "/config.yaml" and event["observed"]["uid"] == os.getuid(),
-                    "unsafe YAML reason or observed owner missing")
-            p.config.unlink()
-        wrong.rename(p.config)
-        nested = p.dir / MEDIA_BIND / "nested"
-        nested.mkdir()
-        link = nested / "link"
-        link.symlink_to(p.config)
-        p.compose("up", "-d", "service", success=False)
-        event = p.logs("prepare-mounts", "symlink")
-        require(event["target"] == MEDIA and event["stage"] == "validate_entries"
-                and stat.S_IMODE((p.dir / STATE_BIND).stat().st_mode) == 0o755,
-                "nested symlink did not stop preparation before mode changes")
-        link.unlink()
-        nested.rmdir()
-        p.compose("up", "-d", "service", overrides={"MUSE_TEST_SERVICE_USER": "0:10001"}, success=False)
-        p.logs("prepare-mounts", "invalid_service_user")
-        mount = f"type=bind,source={p.dir / STATE_BIND},target=/fixture"
-        h.docker("run", "--rm", "--user", "0:0", "--mount", mount, "--entrypoint", "/bin/sh", h.args.image,
-                 "-ec", 'touch /fixture/retained; chown 0:0 /fixture')
-        try:
-            p.compose("up", "-d", "service", success=False)
-            event = p.logs("prepare-mounts", "populated_directory_owner_mismatch")
-            require(event["target"] == SQLITE_STATE and event["observed"]["uid"] == 0
-                    and event["expected"]["uid"] == os.getuid(), "incompatible data ownership is not diagnosable")
-            require((p.dir / STATE_BIND / "retained").exists() and (p.dir / STATE_BIND).stat().st_uid == 0,
-                    "failed preparation changed populated storage")
-        finally:
-            h.docker("run", "--rm", "--user", "0:0", "--mount", mount, "--entrypoint", "/bin/sh", h.args.image,
-                     "-ec", 'chown "$1" /fixture; unlink /fixture/retained', "restore-fixture", owner)
-        require(not (p.dir / STATE_BIND / "broker.sqlite3").exists(), "broker started before mount validation")
-        h.receipt("compose.fail_before_database", unsafe_yaml=True, invalid_identity=True)
-
         p.config.chmod(0o644)
-        p.compose("up", "-d", "service")
+        unsafe_mounts(p)
+        for path in (p.dir / STATE_BIND, p.dir / MEDIA_BIND):
+            if path.exists():
+                path.rmdir()
+        p.compose("up", "-d", "--force-recreate", "service")
         identity, origin = p.running_service()
-        event = p.logs("prepare-mounts", "ready")
-        require(event["msg"] == "mounts.prepared" and event["level"] == "INFO"
-                and event["expected"] == {"uid": os.getuid(), "gid": os.getgid(), "mode": "0600"}
-                and event["observed"]["mode"] == "0644", "preparation receipt lost observed permissions")
-        require(h.docker("exec", identity, "sh", "-ec", 'printf "%s:%s" "$(id -u)" "$(id -g)"').stdout == owner,
-                "broker does not run as the host creator")
+        h.assert_serving_identity(identity, owner, no_new_privileges=True)
+        event = p.logs("mounts.prepared")
+        require(event["level"] == "INFO" and event["owner_source"] == "config_file" and event["metadata_repairs"] > 0,
+                "successful setup lacks its owner selection and repairs")
         require(h.request(origin, "/api/v1/admin/status", h.admin)[0] == 200, "supplied management key failed")
         require(h.request(origin, "/v1/models", h.client)[0] == 200, "supplied model-client key failed")
         prompt = "controlled media storage"
@@ -285,8 +287,15 @@ def fresh_install(h):
             f.truncate()
         require(h.request(origin, "/v1/models", host_key)[0] == 200, "broker did not accept the host creator's edit")
         h.assert_private(h.logs(identity), (session, key, host_key))
+        p.compose("stop", "service")
+        db = p.dir / STATE_BIND / "broker.sqlite3"
+        db.chmod(0o644)
+        prompt_file = p.dir / MEDIA_BIND / job["job_id"] / "prompt"
+        prompt_file.chmod(0o644)
         p.compose("up", "-d", "--force-recreate", "service")
         replacement, new_origin = p.running_service()
+        require(stat.S_IMODE(db.stat().st_mode) == stat.S_IMODE(prompt_file.stat().st_mode) == 0o600,
+                "restart did not repair populated bind storage")
         require(replacement != identity, "recreate reused the old broker")
         for credential in (h.client, key, host_key):
             require(h.request(new_origin, "/v1/models", credential)[0] == 200, "configuration was lost on recreation")
@@ -298,18 +307,69 @@ def fresh_install(h):
         h.receipt("compose.host_creator", uid=os.getuid(), gid=os.getgid(), atomic_save=True, recreated=True, database=True, media=True)
 
 
+def simultaneous_brokers(h):
+    with project(h, "concurrent") as first, project(h, "sibling") as sibling:
+        first.config.write_text(json.dumps(h.configuration()))
+        shared = {CONFIG: first.config.parent, SQLITE_STATE: first.dir / STATE_BIND, MEDIA: first.dir / MEDIA_BIND}
+        overlay = sibling.dir / "sharing.yaml"
+
+        def share_config(include_config):
+            overlay.write_text(json.dumps({"services": {"service": {"volumes": [
+                {"type": "bind", "source": str(path), "target": target, "bind": {"create_host_path": True}}
+                for target, path in shared.items() if include_config or target != CONFIG]}}}))
+
+        share_config(True)
+        files = (*sibling.files, overlay)
+        first.compose("up", "-d", "service")
+        sibling.compose("up", "-d", "service", files=files)
+        _, origin = first.running_service()
+        _, sibling_origin = sibling.running_service(files=files)
+        require(h.request(origin, "/v1/models", h.client)[0] == h.request(sibling_origin, "/v1/models", h.client)[0] == 200,
+                "brokers with an identical owner did not share state")
+        sibling.compose("stop", "service", files=files)
+        share_config(False)
+        sibling.config.write_text(json.dumps(h.configuration()))
+        other = 10001 if os.getuid() != 10001 else 10002
+        mount = "type=bind,source=" + str(sibling.config.parent) + ",target=/fixture"
+        h.run_tools("chown", f"{other}:{other}", "/fixture/config.yaml", options=("--mount", mount))
+        try:
+            failure = rejected_start(sibling, "mounts_in_use", files)
+            require(failure["stage"] == "lock_state" and failure["target"] == SQLITE_STATE,
+                    "active broker did not block an ownership handoff")
+            require((first.dir / STATE_BIND).stat().st_uid == os.getuid()
+                    and h.request(origin, "/v1/models", h.client)[0] == 200, "handoff disrupted a running sibling")
+        finally:
+            h.run_tools("chown", f"{os.getuid()}:{os.getgid()}", "/fixture/config.yaml", options=("--mount", mount))
+        h.receipt("compose.concurrent_boot", siblings=2, active_handoff_rejected=True)
+
+
 def named_upgrade(h):
-    with project(h, "named", "10001:10001") as p:
+    with project(h, "named") as p:
         legacy = p.dir / "legacy.yaml"
-        legacy.write_text(LEGACY)
+        helper = """
+  prepare-mounts:
+    image: ${MUSE_TEST_IMAGE}
+    user: "0:0"
+    command: [prepare-mounts, '10001:10001']
+    volumes:
+      - ./config:/etc/aaa-muse-ai
+      - sqlite:/var/lib/aaa-muse-ai/state
+      - diagnostics:/var/lib/aaa-muse-ai/diagnostics
+      - media:/var/lib/aaa-muse-ai/media
+"""
+        legacy.write_text(LEGACY.replace("services:\n", "services:" + helper, 1).replace(
+            '    ports: ["127.0.0.1:0:8080"]', '''    ports: ["127.0.0.1:0:8080"]
+    depends_on:
+      prepare-mounts:
+        condition: service_completed_successfully'''))
         p.cleanup_files = (legacy,)
         p.config.write_text(json.dumps(h.configuration()))
         mount = f"type=bind,source={p.config.parent},target=/fixture"
 
         def config_owner(user):
-            h.docker("run", "--rm", "--user", "0:0", "--mount", mount, "--entrypoint", "/bin/sh", h.args.image,
-                     "-ec", 'chown "$1" /fixture /fixture/config.yaml', "legacy-config", user)
+            h.run_tools("chown", user, "/fixture", "/fixture/config.yaml", options=("--mount", mount))
 
+        owner = f"{os.getuid()}:{os.getgid()}"
         try:
             config_owner("10001:10001")
             p.compose("up", "-d", "service", files=p.cleanup_files)
@@ -317,15 +377,22 @@ def named_upgrade(h):
             old_mounts = {m["Destination"]: m for m in h.inspect(old)["Mounts"]}
             p.env.update(MUSE_SQLITE_VOLUME=old_mounts[SQLITE_STATE]["Name"], MUSE_MEDIA_VOLUME=old_mounts[MEDIA]["Name"])
             code, headers, reply = json_request(h, origin, "/api/v1/admin/enrollments", h.admin)
-            require(code == 201, "legacy database did not issue an enrollment")
+            require(code == 201, "old Compose broker did not issue an enrollment")
             enrollment = json.loads(reply)["enrollment_code"]
             worker_version = {"X-Muse-Worker-Version": headers["X-Muse-Service-Version"]}
             code, event_headers, reply = json_request(h, origin, "/api/v1/worker/enroll",
                                                       data={"enrollment_code": enrollment}, headers=worker_version)
-            require(code == 201, f"legacy database did not store the worker (HTTP {code})")
+            require(code == 201, f"old Compose broker did not store the worker (HTTP {code})")
             worker_key = json.loads(reply)["credential"]
-            h.docker("exec", old, "sh", "-ec", "umask 077\nprintf retained > /var/lib/aaa-muse-ai/media/upgrade-fixture")
+            prompt = "retained named volume input"
+            code, _, body = json_request(h, origin, "/api/v1/media/jobs", h.client,
+                                         {"submission_id": secrets.token_hex(16), "prompt": prompt})
+            require(code == 202, "old Compose broker did not store the job")
+            job = json.loads(body)["job_id"]
             p.compose("stop", "service", files=p.cleanup_files)
+            newer = owner if owner != "10001:10001" else "10002:10002"
+            config_owner(newer)
+            h.run_tools("chmod", "0644", SQLITE_STATE + "/broker.sqlite3", options=("--volumes-from", old))
 
             files = (*p.files, NAMED)
             result = p.compose("up", "-d", "service", files=files,
@@ -334,24 +401,30 @@ def named_upgrade(h):
             p.compose("up", "-d", "service", files=files)
             new, new_origin = p.running_service(files=files)
             require(new != old, "upgrade did not recreate the service")
-            for service in ("prepare-mounts", "service"):
-                identity = p.compose("ps", "--all", "--quiet", service, files=files).stdout.strip()
-                mounts = {m["Destination"]: m for m in h.inspect(identity)["Mounts"]}
-                for path in (SQLITE_STATE, MEDIA, DIAGNOSTICS):
-                    require(mounts[path]["Name"] == old_mounts[path]["Name"], "upgrade opened a different volume")
+            h.assert_serving_identity(new, newer, no_new_privileges=True)
+            mounts = {m["Destination"]: m for m in h.inspect(new)["Mounts"]}
+            for path in (SQLITE_STATE, MEDIA, DIAGNOSTICS):
+                require(mounts[path]["Name"] == old_mounts[path]["Name"], "upgrade opened a different volume")
             require(h.request(new_origin, "/api/v1/worker/status", worker_key)[0] == 200, "worker identity was lost")
-            require(h.docker("exec", new, "cat", MEDIA + "/upgrade-fixture").stdout == "retained", "media did not survive upgrade")
+            require(h.request(new_origin, "/api/v1/media/jobs/" + job, h.client)[0] == 200, "stored media job was lost")
+            require(h.run_tools("cat", MEDIA + "/" + job + "/prompt", options=("--volumes-from", new)).stdout == prompt,
+                    "media did not survive upgrade")
+            expected_uid, expected_gid = newer.split(":")
+            require(h.run_tools("stat", "-c", "%a:%u:%g", SQLITE_STATE + "/broker.sqlite3", options=("--volumes-from", new)).stdout.strip()
+                    == f"600:{expected_uid}:{expected_gid}", "populated SQLite file was not repaired to its YAML owner")
             route = "/api/v1/admin/diagnostics/export?request_id=" + event_headers["X-Request-Id"]
             code, _, reply = h.request(new_origin, route, h.admin)
             require(code == 200, "old diagnostic evidence could not be read")
             metadata, records = h.decode_export(reply)
             require(metadata["complete"] and records, "enrollment diagnostic evidence was lost")
             h.assert_private(json.dumps(records), (enrollment, worker_key))
-            h.receipt("compose.named_upgrade", database=True, media=True, diagnostics=True)
+            h.receipt("compose.named_upgrade", database=True, media=True, diagnostics=True, mixed_owners=True, old_compose=True)
         finally:
-            config_owner(f"{os.getuid()}:{os.getgid()}")
+            config_owner(owner)
 
 
 def smoke_compose(h):
+    missing_config(h)
     fresh_install(h)
+    simultaneous_brokers(h)
     named_upgrade(h)

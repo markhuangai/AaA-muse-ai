@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"time"
 
+	"golang.org/x/sys/unix"
 	driver "modernc.org/sqlite"
 	sqlite3 "modernc.org/sqlite/lib"
 )
@@ -48,8 +49,9 @@ var migrationChecksums = func() (result [SchemaVersion]string) {
 }()
 
 type Repository struct {
-	db  *sql.DB
-	now func() time.Time
+	db    *sql.DB
+	now   func() time.Time
+	state *os.File
 }
 
 type Failure struct {
@@ -97,7 +99,19 @@ func Open(ctx context.Context, path string) (*Repository, error) {
 }
 
 func OpenWithClock(_ context.Context, path string, now func() time.Time) (*Repository, error) {
-	if err := secureFile(path); err != nil {
+	if !filepath.IsAbs(path) {
+		return nil, &Failure{Reason: "database_file_unavailable", Phase: "open", cause: errors.New("absolute database file path required")}
+	}
+	state, err := os.OpenFile(filepath.Dir(path), os.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, &Failure{Reason: "database_file_unavailable", Phase: "open", cause: err}
+	}
+	if err = unix.Flock(int(state.Fd()), unix.LOCK_SH|unix.LOCK_NB); err != nil {
+		_ = state.Close()
+		return nil, &Failure{Reason: "database_busy", Phase: "mount_lock", cause: err}
+	}
+	if err = secureFile(path); err != nil {
+		_ = state.Close()
 		return nil, &Failure{Reason: "database_file_unavailable", Phase: "open", cause: err}
 	}
 	query := url.Values{
@@ -107,15 +121,13 @@ func OpenWithClock(_ context.Context, path string, now func() time.Time) (*Repos
 	uri := url.URL{Scheme: "file", Path: path, RawQuery: query.Encode()}
 	db, err := sql.Open("sqlite", uri.String())
 	if err != nil {
+		_ = state.Close()
 		return nil, err
 	}
-	return &Repository{db: db, now: now}, nil
+	return &Repository{db: db, now: now, state: state}, nil
 }
 
 func secureFile(path string) error {
-	if !filepath.IsAbs(path) {
-		return errors.New("absolute database file path required")
-	}
 	dir, err := os.Lstat(filepath.Dir(path))
 	if err != nil {
 		return err
@@ -142,7 +154,10 @@ func secureFile(path string) error {
 	return file.Close()
 }
 
-func (r *Repository) Close() { _ = r.db.Close() }
+func (r *Repository) Close() {
+	_ = r.db.Close()
+	_ = r.state.Close()
+}
 
 func (r *Repository) databaseTime() time.Time { return r.now().UTC().Truncate(time.Microsecond) }
 

@@ -4,9 +4,13 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"hash/crc32"
 	"image"
+	"image/jpeg"
 	"image/png"
 	"io"
 	"log/slog"
@@ -99,7 +103,6 @@ func TestVerifiedStorageAndLifecycle(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
 	store := New(root)
-	store.run = measuredProcess
 	p, err := store.Begin()
 	if err != nil {
 		t.Fatal(err)
@@ -130,44 +133,26 @@ func TestVerifiedStorageAndLifecycle(t *testing.T) {
 	if err != nil || hash(body) != p.Record.InputHash {
 		t.Fatal("source identity changed")
 	}
-	for _, entry := range []struct{ kind, header string }{
-		{"video/mp4", "\x00\x00\x00\x18ftypisom"}, {"audio/mpeg", "ID3"},
-		{"audio/wav", "RIFF\x00\x00\x00\x00WAVE"}, {"image/webp", "RIFF\x00\x00\x00\x00WEBPVP8 "},
-		{"image/jpeg", "\xff\xd8\xff"},
-	} {
-		name := filepath.Join(t.TempDir(), "input")
-		data := make([]byte, 24)
-		copy(data, entry.header)
-		if err := os.WriteFile(name, data, 0600); err != nil {
-			t.Fatal(err)
-		}
-		properties, err := store.Inspect(ctx, name, entry.kind)
-		if err != nil || len(properties.Streams) != 1 {
-			t.Fatal(entry.kind, err, properties)
-		}
-		if entry.kind == "video/mp4" {
-			if properties.Width != 64 || properties.Height != 48 || properties.VideoFrames != 8 || properties.Duration != 1 || properties.FPS != 8 {
-				t.Fatal(properties)
-			}
-			u, err := store.Receive(ctx, id, "image_video", hash(data), int64(len(data)), bytes.NewReader(data))
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err = u.Commit(); err != nil {
-				t.Fatal(err)
-			}
-			stored, _ := os.ReadFile(filepath.Join(root, id, "artifact"))
-			if !bytes.Equal(stored, data) {
-				t.Fatal("bytes modified")
-			}
-			for _, bad := range []struct {
-				n    int64
-				hash string
-			}{{int64(len(data)), strings.Repeat("0", 64)}, {0, ""}, {ArtifactLimit + 1, ""}, {1, hash(data)}} {
-				if _, err = store.Receive(ctx, id, "image_video", bad.hash, bad.n, bytes.NewReader(data)); err == nil {
-					t.Fatal("accepted mismatched upload")
-				}
-			}
+	data := []byte("\x00\x00\x00\x18ftypisom\x00\x00\x02\x00isommp41damaged-coding")
+	u, err := store.Receive(ctx, id, "image_video", hash(data), int64(len(data)), bytes.NewReader(data))
+	if err != nil || u.Properties.MediaType != "video/mp4" || u.Properties.Size != int64(len(data)) || u.Properties.SHA256 != hash(data) {
+		t.Fatal("header-only upload did not retain its identity", u, err)
+	}
+	if props, err := json.Marshal(u.Properties); err != nil || bytes.Contains(props, []byte("duration")) || bytes.Contains(props, []byte("streams")) {
+		t.Fatal("header-only receipt contains measurements", string(props), err)
+	}
+	if err = u.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if stored, err := os.ReadFile(filepath.Join(root, id, "artifact")); err != nil || !bytes.Equal(stored, data) {
+		t.Fatal("upload bytes modified", err)
+	}
+	for _, bad := range []struct {
+		n    int64
+		hash string
+	}{{int64(len(data)), strings.Repeat("0", 64)}, {0, ""}, {ArtifactLimit + 1, ""}, {1, hash(data)}} {
+		if _, err = store.Receive(ctx, id, "image_video", bad.hash, bad.n, bytes.NewReader(data)); err == nil {
+			t.Fatal("accepted mismatched upload")
 		}
 	}
 	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
@@ -196,7 +181,6 @@ func TestVerifiedStorageAndLifecycle(t *testing.T) {
 func TestRejectedInputsAndOrphans(t *testing.T) {
 	ctx := context.Background()
 	s := New(t.TempDir())
-	s.run = func(context.Context, string, []string, io.Writer) error { return errors.New("invalid fixture") }
 	p, err := s.Begin()
 	if err != nil {
 		t.Fatal(err)
@@ -212,7 +196,7 @@ func TestRejectedInputsAndOrphans(t *testing.T) {
 	for _, kind := range []string{"image/jpeg", "image/png", "image/webp", "video/mp4", "audio/wav", "unknown"} {
 		name := filepath.Join(t.TempDir(), "bad")
 		os.WriteFile(name, bytes.Repeat([]byte{3}, 56), 0600)
-		if _, err := s.Inspect(ctx, name, kind); err == nil {
+		if err := s.checkHeader(ctx, name, kind); err == nil {
 			t.Fatal(kind)
 		}
 	}
@@ -230,13 +214,6 @@ func TestRejectedInputsAndOrphans(t *testing.T) {
 	if _, err := s.Receive(ctx, "absent", "prompt_video", "", 1, strings.NewReader("x")); err == nil {
 		t.Fatal("unknown stage")
 	}
-	buf := &cappedOutput{}
-	if _, err = buf.Write(make([]byte, 1<<17)); err == nil {
-		t.Fatal("unbounded output")
-	}
-	if rate("5") != 5 || rate("a") != 0 || rate("3/0") != 0 {
-		t.Fatal("invalid rate")
-	}
 	now := time.Now()
 	get := func(context.Context, []string) (map[string]string, error) { return nil, nil }
 	l := slog.Default()
@@ -251,5 +228,96 @@ func TestRejectedInputsAndOrphans(t *testing.T) {
 	}
 	if _, err = os.Stat(p.Path); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("orphan persisted")
+	}
+}
+
+func TestReferenceHeaderBudgets(t *testing.T) {
+	var encoded bytes.Buffer
+	if err := jpeg.Encode(&encoded, image.NewGray(image.Rect(0, 0, 32, 24)), nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := checkReferenceHeader(bytes.NewReader(encoded.Bytes()), "image/jpeg"); err != nil {
+		t.Fatal("valid JPEG header rejected", err)
+	}
+	encoded.Reset()
+	if err := png.Encode(&encoded, image.NewGray(image.Rect(0, 0, 4001, 4000))); err != nil {
+		t.Fatal(err)
+	}
+	if err := checkReferenceHeader(bytes.NewReader(encoded.Bytes()), "image/png"); err == nil || err.Error() != "invalid_media_dimensions" {
+		t.Fatal("oversized PNG header accepted", err)
+	}
+	encoded.Reset()
+	if err := png.Encode(&encoded, image.NewGray(image.Rect(0, 0, 8, 8))); err != nil {
+		t.Fatal(err)
+	}
+	control := []byte("\x00\x00\x00\x08acTL\x00\x00\x00\x02\x00\x00\x00\x00")
+	control = binary.BigEndian.AppendUint32(control, crc32.ChecksumIEEE(control[4:]))
+	apng := append(append(bytes.Clone(encoded.Bytes()[:33]), control...), encoded.Bytes()[33:]...)
+	webp := []byte("RIFF\x16\x00\x00\x00WEBPVP8X\x0a\x00\x00\x00\x02\x00\x00\x00\x07\x00\x00\x07\x00\x00")
+	for kind, body := range map[string][]byte{"image/png": apng, "image/webp": webp} {
+		if err := checkReferenceHeader(bytes.NewReader(body), kind); err == nil || err.Error() != "animated_reference" {
+			t.Fatal("animated reference was admitted", kind, err)
+		}
+	}
+	webp[20] = 0
+	if err := checkReferenceHeader(bytes.NewReader(webp), "image/webp"); err != nil {
+		t.Fatal("valid WebP canvas header rejected", err)
+	}
+}
+
+func TestArtifactSignatures(t *testing.T) {
+	frames := make([]byte, 834)
+	for _, offset := range []int{0, 417} {
+		copy(frames[offset:], []byte{0xff, 0xfb, 0x90, 0x64})
+	}
+	tagged := append([]byte("ID3\x04\x00\x00\x00\x00\x00\x01\x00"), frames...)
+	for _, sample := range []struct {
+		kind string
+		body []byte
+	}{
+		{"audio/mpeg", frames},
+		{"audio/mpeg", tagged},
+		{"audio/wav", []byte("RIFF\x20\x00\x00\x00WAVE")},
+	} {
+		if err := checkArtifactHeader(bytes.NewReader(sample.body), sample.kind); err != nil {
+			t.Fatal(sample.kind, err)
+		}
+		if err := checkArtifactHeader(bytes.NewReader(sample.body[:11]), sample.kind); err == nil {
+			t.Fatal("truncated header matched", sample.kind)
+		}
+	}
+	if err := checkArtifactHeader(bytes.NewReader([]byte("RIFF\x20\x00\x00\x00WAVE")), "audio/mpeg"); err == nil {
+		t.Fatal("WAV header passed as MP3")
+	}
+}
+
+func TestHeaderReadFailuresAreRejected(t *testing.T) {
+	if err := checkReferenceHeader(bytes.NewReader([]byte("RIFF")), "image/webp"); err == nil || err.Error() != "invalid_media_format" {
+		t.Fatal("truncated WebP header matched", err)
+	}
+	if err := checkPNGAnimation(bytes.NewReader([]byte("\x89PNG\r\n\x1a\n"))); err == nil || err.Error() != "invalid_media_format" {
+		t.Fatal("missing PNG chunk data passed", err)
+	}
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	if _, err := w.Write(make([]byte, 24)); err != nil {
+		w.Close()
+		t.Fatal(err)
+	}
+	w.Close()
+	if err := checkReferenceHeader(r, "image/webp"); err == nil {
+		t.Fatal("unseekable header parsed successfully")
+	}
+	if err := checkPNGAnimation(r); err == nil {
+		t.Fatal("PNG scan accepted an unseekable header")
+	}
+	if err := r.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := checkArtifactHeader(r, "video/mp4"); !errors.Is(err, os.ErrClosed) {
+		t.Fatal("read failure was treated as a format check", err)
 	}
 }
