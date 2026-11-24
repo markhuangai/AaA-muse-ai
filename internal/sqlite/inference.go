@@ -141,6 +141,13 @@ func (r *Repository) WithinInference(ctx context.Context, ref inference.Ref, app
 		if err = loadInference(ctx, tx, ref, s); err != nil {
 			return err
 		}
+		if ref.NativeWork {
+			s.NativeWork, err = readNativeWork(ctx, tx, s.Jobs[ref.JobID])
+			if err != nil {
+				return err
+			}
+		}
+		nativeStartPending := s.NativeWork != nil && s.NativeWork.Start == nil
 		if err = loadRouting(ctx, tx, s); err != nil {
 			return err
 		}
@@ -180,6 +187,11 @@ func (r *Repository) WithinInference(ctx context.Context, ref inference.Ref, app
 		}
 		if err = saveInference(ctx, tx, ref, s, before); err != nil {
 			return err
+		}
+		if nativeStartPending && s.NativeWork.Start != nil {
+			if err = recordNativeStart(ctx, tx, s.Jobs[ref.JobID], s.NativeWork); err != nil {
+				return err
+			}
 		}
 		return saveHistory(ctx, tx, s, history)
 	})

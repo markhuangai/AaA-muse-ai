@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/markhuangai/AaA-muse-ai/internal/auth"
@@ -399,7 +400,8 @@ func (b *Broker) run(ctx context.Context, logger *slog.Logger, ref inference.Ref
 				name = "lease.fenced"
 			}
 			evidence := rejection.Fields
-			if ref.Responses || name == "history.conflict" || (observed != nil && observed["client_id"] != nil && name != "history.owner_denied") {
+			nativeProofRejection := ref.NativeWork && (strings.HasPrefix(rejection.Reason, "native_start_") || strings.HasPrefix(rejection.Reason, "native_settlement_"))
+			if ref.Responses || name == "history.conflict" || (observed != nil && observed["client_id"] != nil && name != "history.owner_denied" && !nativeProofRejection) {
 				logger.Debug("history.conflict_detail", "reason", rejection.Reason, "evidence", evidence, "observed", observed)
 				evidence = safeHistoryConflict(evidence)
 			}

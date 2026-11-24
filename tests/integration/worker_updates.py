@@ -225,6 +225,8 @@ printf '%s\n' 'Usage: 33% of free weekly limit.' 'Weekly limit resets Nov 29 at 
         body = {"protocol_version": 1, "submission_id": saved["settlement_id"], "claim_id": saved["claim_id"],
                 "generation": saved["generation"], "launch_id": saved["launch_id"], "native_job_id": saved["native_job_id"],
                 "native_run_id": saved["native_run_id"], "reason": "execution_confirmed_stopped"}
+        if saved["claim_id"].startswith("verified-"):
+            body["verified_start"] = True
         path = "/api/v1/worker/jobs/" + saved["job_id"] + "/interrupt"
         for metadata in (first, changed):
             status, _, raw = self.api(path, worker["credential"], "POST", body, headers={"X-Muse-Interruption": metadata})

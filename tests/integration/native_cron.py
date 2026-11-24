@@ -47,13 +47,15 @@ class NativeCronFixture:
         worker["last_tick"] = tick
         return self.cron_json(worker, "cron-check", tick, want)
 
-    def work_definition(self, worker, grant, *, delay_seconds=5):
+    def work_definition(self, worker, grant, *, delay_seconds=5, job_id_is_launch=False):
         bound = {"claim_id": grant["claim_id"], "launch_id": grant["launch_id"]}
         due = datetime.now(timezone.utc) + timedelta(seconds=delay_seconds)
         registration = self.cron_json(worker, "cron-prepare", {**bound, "due_at": utc_stamp(due)})
-        require(registration["outcome"] == "register" and registration["work"]["reference"] == bound["launch_id"],
+        reference = bound["claim_id"] if bound["claim_id"].startswith("verified-") else bound["launch_id"]
+        require(registration["outcome"] == "register" and registration["work"]["reference"] == reference,
                 "native launch was not authorized for this claim")
-        work = {**registration["work"], "native_job_id": "controlled-once-" + grant["job_id"]}
+        native_job_id = grant["launch_id"] if job_id_is_launch else "controlled-once-" + grant["job_id"]
+        work = {**registration["work"], "native_job_id": native_job_id}
         worker["work"] = {"definition": work, "due": due, "grant": grant}
         return work
 
@@ -72,11 +74,17 @@ class NativeCronFixture:
             "checker_job_id": tick["checker_job_id"], "checker_run_id": tick["checker_run_id"],
             "observed_at": utc_stamp(), "matches": [match] if matches is None else matches, **evidence}, want)
 
-    def start_work(self, worker, *, want=0):
+    def start_work(self, worker, *, want=0, matches=None, self_report=None):
         work = worker["work"]
         self.until(lambda: datetime.now(timezone.utc) >= work["due"], "controlled one-shot did not reach its due time", timeout=10)
-        result = self.native_cli(worker, "cron-start", "--launch-id", work["grant"]["launch_id"],
-                                 "--native-job-id", work["definition"]["native_job_id"], want=want)
+        args = ("cron-start", "--launch-id", work["grant"]["launch_id"])
+        if self_report is not None or "--native-job-id" in work["definition"]["prompt"]:
+            result = self.native_cli(worker, *args, "--native-job-id", self_report or work["definition"]["native_job_id"], want=want)
+        else:
+            definition = work["definition"]
+            verification = {"native_job_id": definition["native_job_id"], "native_run_id": "controlled-execution-" + work["grant"]["job_id"], "status": "running"}
+            evidence = [{**definition, "status": "running", "execution": verification}] if matches is None else matches
+            result = self.native_cli(worker, *args, "--input", "-", input_text=json.dumps({"matches": evidence}), want=want)
         if want != 0:
             require(not result, "rejected work handler exposed an executable brief")
             return None
@@ -84,8 +92,8 @@ class NativeCronFixture:
         require(brief["outcome"] == "authorized" and brief["job_id"] == work["grant"]["job_id"], "finite work brief was not authorized")
         return brief
 
-    def claim_work(self, worker, job_id):
+    def claim_work(self, worker, job_id, *, job_id_is_launch=False):
         grant = self.tick(worker)
         require(grant["outcome"] == "prepare" and grant["job_id"] == job_id, "controlled tick did not pull the expected job")
-        self.work_definition(worker, grant)
+        self.work_definition(worker, grant, job_id_is_launch=job_id_is_launch)
         return grant

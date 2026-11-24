@@ -95,6 +95,7 @@ class MediaFlow(MCPMedia, Product):
         stills, video, audios = self.inputs()
         prompt = "private-motion-" + secrets.token_hex(20)
         jobs, links = [], {}
+        verified_video = None
         for case, image in [*stills.items(), ("prompt_video", None), *audios.items()]:
             motion = "\ufeff" + prompt if case == "prompt_video" else prompt
             fields = {"prompt": motion, "submission_id": secrets.token_hex(16)}
@@ -124,10 +125,21 @@ class MediaFlow(MCPMedia, Product):
                 identity = submit()
             require(submit() == identity, "exact retry created a second job")
             url = "/api/v1/media/jobs/" + identity
-            self.claim_work(worker, identity)
-            shown = self.start_work(worker)
+            grant = self.claim_work(worker, identity, job_id_is_launch=case == "prompt_video")
+            if verified_video is not None:
+                require(grant["claim_id"] != verified_video and self.status(worker)["current_claim"]["job_id"] == identity,
+                        "the worker never pulled another job after the verified video")
+                self.add("media.pickup_after_verified_video")
+                verified_video = None
             if case == "prompt_video":
-                require(self.observe(worker, "running")["outcome"] == "running", "foreground video run was not bound")
+                bad_id = "checker-coalesced-run-21a1f1d3"
+                wrong = {**worker["work"]["definition"], "native_job_id": bad_id, "status": "unobservable"}
+                require(self.observe(worker, "unobservable", matches=[wrong])["native_job_id"] is None,
+                        "unobservable occurrence became the native job")
+                self.start_work(worker, self_report=bad_id, want=1)
+                require(self.status(worker)["claim_stage"] == "pending_native_start",
+                        "misreported checker occurrence disclosed a brief")
+            shown = self.start_work(worker)
             spool, progress = self.worker_media_directory(worker, identity, shown)
             output = spool / Path(shown["output_path"]).name
             expected = audios.get(case, video)
@@ -179,10 +191,15 @@ class MediaFlow(MCPMedia, Product):
             if case == "prompt_video":
                 execution = {"native_job_id": worker["work"]["definition"]["native_job_id"],
                              "native_run_id": "controlled-execution-" + identity, "status": "succeeded"}
+                lookup = self.tick(worker)["history_lookup"]
+                require(all(lookup[key] == execution[key] for key in ("native_job_id", "native_run_id")),
+                        "early start did not preserve identity when the schedule disappeared")
                 settled = self.observe(worker, "completed", matches=[], execution=execution)
                 require(self.proxy.media_puts["/api/v1/worker/jobs/" + identity + "/artifact"] == 1,
                         "foreground media was uploaded again during recovery from run history")
                 self.add("media.foreground_video_settled_from_bound_run_history", uploads=1)
+                self.verified_video_diagnosis(worker, grant, bad_id, execution)
+                verified_video = grant["claim_id"]
             elif settled is None:
                 settled = self.observe(worker, "completed")
             require(settled["outcome"] == "settled" and not progress.exists(), "worker did not reconcile the confirmed upload")
@@ -386,6 +403,30 @@ class MediaFlow(MCPMedia, Product):
             self.docker("exec", self.broker, "test", "!", "-e", "/var/lib/aaa-muse-ai/media/" + identity)
         self.add("media.expiry_across_restart", window_seconds=600)
         self.add("mcp.expiry_before_cleanup", brokers=2)
+
+    def verified_video_diagnosis(self, worker, grant, bad_id, execution):
+        operation = grant["operation_id"]
+        worker_raw = self.native_cli(worker, "diagnostics-export", "--operation-id", operation, "--decode")
+        self.assert_private(worker_raw)
+        metadata, *local = [json.loads(line) for line in worker_raw.splitlines()]
+        require(metadata["complete"] and not metadata["omissions"], "worker verification evidence is incomplete")
+        rejected = next(event for event in local if event.get("msg") == "cron.start_evidence_rejected")
+        details = next(event for event in local if event.get("msg") == "cron.start_evidence" and event.get("input") == bad_id)
+        started = [event for event in local if event.get("msg") == "cron.work_started"]
+        settled = [event for event in local if event.get("msg") == "cron.work_settled"]
+        require(rejected["level"] == "WARN" and rejected["cause"] == "native_start_definition_required" and
+                rejected["observed_native_job_id"] == bad_id and rejected["expected_reference"] == grant["claim_id"] and
+                details["level"] == "DEBUG" and details["expected_definition"]["reference"] == grant["claim_id"] and
+                len(started) == len(settled) == 1 and started[0]["level"] == settled[0]["level"] == "INFO",
+                "logs did not identify the refused execution and single accepted start")
+        for name, event in (("job.work_started", started[0]), ("job.work_settled", settled[0])):
+            status, _, body = self.api("/api/v1/admin/diagnostics/export?request_id=" + event["request_id"], self.admin)
+            envelope, events = self.decode_export(body)
+            require(status == 200 and envelope["complete"] and not envelope["omissions"], "broker verification evidence is incomplete")
+            remote = next(value for value in events if value.get("msg") == name)
+            require(all(remote[key] == event[key] for key in ("claim_id", "launch_id", "native_job_id", "native_run_id")) and
+                    remote["native_run_id"] == execution["native_run_id"], "protected exports could not join verified start to settlement")
+        self.add("media.native_start_identity_verified", rejected_without_brief=True, protected_evidence=True)
 
 
 if __name__ == "__main__":
