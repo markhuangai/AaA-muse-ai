@@ -334,7 +334,7 @@ def main():
         h.names_and_boundaries(a, b)
         h.restart_and_revoke([first, second], a, b)
         h.overlapping_secret_diagnosis()
-        h.staged_enrollment(other)
+        h.staged_enrollment(h.origin(second))
         h.private("results.json", json.dumps({"suite": args.suite, "source_sha": args.source_sha, "receipts": h.receipts}))
     finally:
         h.cleanup()

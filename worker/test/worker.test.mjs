@@ -115,6 +115,28 @@ test('resuming a staged rename re-establishes directory durability before activa
   assert.deepEqual(f.broker.calls.filter(call => call.path.endsWith('/enroll')).map(call => call.input.phase), ['prepare', 'activate']);
 });
 
+test('definitive expiry or consumption releases the directory for a fresh code', async t => {
+  for (const [status, reason] of [[410, 'enrollment_expired'], [409, 'enrollment_used']]) {
+    for (const phase of ['prepare', 'activate']) {
+      const f = await fixture(t);
+      await f.worker.configure('https://broker.example.test');
+      f.broker.override = async call => {
+        if (call.input?.phase === phase) return new Response(JSON.stringify({ error: reason }), { status });
+      };
+      await assert.rejects(f.worker.enroll(CODE), error => error.code === 'broker_rejected' &&
+        error.fields.reason === reason && error.fields.corrective_action.includes('fresh'));
+      const record = object(parse(await f.state.read('enrollment.json')));
+      assert.equal(record.state, 'rejected');
+      assert.equal(record.credential, undefined);
+      assert.equal(await f.state.read('credential.key'), undefined);
+      f.broker.override = undefined;
+      const fresh = 'muse_enroll_' + Buffer.alloc(32, 31).toString('base64url');
+      assert.equal((await new Worker(f.state, f.logger, f.net).enroll(fresh)).worker_id, ID);
+      assert(f.broker.calls.filter(call => call.path.endsWith('/enroll')).every(call => call.input.phase));
+    }
+  }
+});
+
 test('an unsupported phase received after an uncertain prepare does not allow legacy consumption', async t => {
   const f = await fixture(t);
   await f.worker.configure('https://broker.example.test');

@@ -11,6 +11,13 @@ const enrollmentRoute = '/api/v1/worker/enroll';
 const workerCredential = /^muse_worker_[A-Za-z0-9_-]{43}$/;
 const operationPattern = /^[0-9a-f]{32}$/;
 
+function spentEnrollment(error: Failure): boolean {
+  return error.code === 'broker_rejected' && (
+    (error.fields.http_status === 410 && error.fields.reason === 'enrollment_expired') ||
+    (error.fields.http_status === 409 && error.fields.reason === 'enrollment_used')
+  );
+}
+
 export class Worker {
   config: ObjectValue = {};
   credential = '';
@@ -121,9 +128,9 @@ export class Worker {
                 error.fields.http_status === 400 && error.fields.reason === 'unsupported_field' && error.fields.attempt === 1) {
               return await this.enrollLegacy(transport, code, metadata);
             }
-            if (error instanceof Failure && error.code === 'broker_rejected' &&
-                ['enrollment_expired', 'enrollment_invalid'].includes(String(error.fields.reason))) {
-              await this.state.write('enrollment.json', encode({ state: 'rejected', ...error.fields }));
+            if (error instanceof Failure && (spentEnrollment(error) ||
+                (error.code === 'broker_rejected' && error.fields.http_status === 400 && error.fields.reason === 'enrollment_invalid'))) {
+              await this.rejectEnrollment(error);
             }
             throw error;
           }
@@ -140,6 +147,8 @@ export class Worker {
         try {
           reply = await candidate.request(enrollmentRoute, 'POST', encode({ enrollment_code: code, phase: 'activate' }), { enrollment_phase: 'activate' }, 3, 10_000, metadata);
         } catch (error) {
+          // The broker checks exact committed replay before it returns either outcome.
+          if (error instanceof Failure && spentEnrollment(error)) await this.rejectEnrollment(error);
           if (!(error instanceof Failure && error.code === 'broker_rejected' && error.fields.http_status === 409 &&
                 error.fields.reason === 'enrollment_superseded' && round === 1)) throw error;
           await this.logger.log('WARN', 'worker.enrollment_superseded', { ...error.fields, outcome: 'retry_preparation', cause: 'enrollment_superseded' });
@@ -154,6 +163,11 @@ export class Worker {
       }
       throw new Failure('enrollment_superseded');
     });
+  }
+
+  private async rejectEnrollment(error: Failure): Promise<void> {
+    error.fields.corrective_action = 'generate a fresh setup prompt or enrollment code';
+    await this.state.write('enrollment.json', encode({ state: 'rejected', ...error.fields }));
   }
 
   private async enrollLegacy(transport: Transport, code: string, metadata: Record<string, string>): Promise<ObjectValue> {
