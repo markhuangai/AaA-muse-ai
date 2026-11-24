@@ -94,6 +94,13 @@ func (h *Handler) inferenceRequest(w *response, r *http.Request, logger *slog.Lo
 			}
 			contact.Incompatible = !h.Service.Build().Compatible(contact.Version)
 			input.WeeklyUsage = readWeeklyUsage(r.Header, logger)
+			if values := r.Header.Values("X-Muse-Worker-Start-Proof"); len(values) != 0 {
+				if len(values) != 1 || values[0] != "1" {
+					err = inference.Reject("invalid_native_start_capability", 400)
+					break
+				}
+				input.VerifyStart = true
+			}
 			pulled, w.workerID, err = h.Broker.PullWork(r.Context(), logger, strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "), input, contact)
 			if err == nil {
 				writeJSON(w, code, pulled)

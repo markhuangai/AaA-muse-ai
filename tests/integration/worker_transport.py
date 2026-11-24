@@ -18,6 +18,7 @@ from service import LABEL, require
 from worker_tls import TLSFixture
 
 NODE_IMAGE = "node:24.22.2-bookworm-slim@sha256:c0a93797ee78814ae6d32fcca2561fdbbe423149c3f5389aad32d86e9fd85bd4"
+RC2_BROKER = "ghcr.io/markhuangai/aaa-muse-ai@sha256:59afbc0a6d8d917c435e74410ca517cfd47ff3c1171a64f8c23f12f2113bf858"
 
 
 class WorkerTransport(NativeCronFixture, Inference):
@@ -372,6 +373,83 @@ class WorkerTransport(NativeCronFixture, Inference):
         require(diagnostic["replayed"] and diagnostic["sequence"] == 1 and diagnostic["queue_lookup_us"] == 0, "broker processed a replay like new work")
         self.receipt("worker.exact_empty_poll_replay", sequence=outcome["sequence"], protected_evidence=True)
 
+    def native_start_version_orders(self):
+        # rc.2 shares the current schema but decodes the original strict JSON bodies.
+        self.docker("pull", RC2_BROKER, timeout=120)
+        original_image, original_target = self.args.image, self.proxy.target
+        self.args.image = RC2_BROKER
+        try:
+            archived, origin, _ = self.launch(self.configuration())
+            self.ready(archived, origin)
+        finally:
+            self.args.image = original_image
+        try:
+            self.proxy.target = urlsplit(origin)
+            worker = self.cli_worker("native-start-mixed")
+            legacy = self.create(worker, "fixed helper on rc.2", tools=False)
+            grant = self.claim_work(worker, legacy["current_job_id"])
+            require(not grant["claim_id"].startswith("verified-"), "old broker unexpectedly opted into proof")
+            self.start_work(worker, self_report="unrelated-checker-occurrence", want=1)
+            self.start_work(worker)
+            self.submit_cli(worker, grant["job_id"], {"type": "final", "text": "same major legacy wire"})
+            require(self.observe(worker, "completed")["outcome"] == "settled", "old broker could not settle verified local work")
+
+            self.proxy.target = original_target
+            experiment = self.create(worker, "verified pickup with an archived replay", tools=False)
+            self.proxy.lose_worker_replies["/api/v1/worker/pull"] = 1
+            self.tick(worker, want=1)
+            original_tick = worker["last_tick"]
+            self.proxy.target = urlsplit(origin)
+            grant = self.tick(worker)
+            require(grant["outcome"] == "prepare" and grant["job_id"] == experiment["current_job_id"] and
+                    grant["claim_id"].startswith("verified-") and grant["pull_run_id"] == original_tick["checker_run_id"],
+                    "old broker replay lost the granted contract")
+            work = self.work_definition(worker, grant)
+            job = grant["job_id"]
+            run = "controlled-execution-" + job
+            route = "/api/v1/worker/jobs/" + job
+            start = {"protocol_version": 1, "claim_id": grant["claim_id"], "generation": grant["generation"],
+                     "launch_id": grant["launch_id"], "native_job_id": work["native_job_id"]}
+            proof = {"reference": grant["claim_id"], "native_job_id": work["native_job_id"], "native_run_id": run, "status": "running"}
+            self.checked(route + "/start", worker["credential"], "POST", {**start, "verification": proof}, want=400, origin=origin)
+            _, rejected_headers = self.checked(route + "/start", worker["credential"], "POST", {**start, "verification": {**proof, "native_run_id": original_tick["checker_run_id"]}},
+                                               want=409)
+            event = next(event for event in self.broker_evidence(self.origin_url, "request_id", rejected_headers["X-Request-Id"])
+                         if event.get("reason") == "native_start_proof_mismatch" and event.get("msg") == "lease.rejected")
+            require(event["level"] == "WARN" and event["job_id"] == job and
+                    event["evidence"]["expected_reference"] == grant["claim_id"] and
+                    event["evidence"]["observed_native_run_id"] == original_tick["checker_run_id"],
+                    "broker refusal logs did not identify the unexpected checker occurrence")
+            self.proxy.target = original_target
+            self.start_work(worker)
+            self.submit_cli(worker, job, {"type": "final", "text": "same pickup after archive replay"})
+            self.proxy.target = urlsplit(origin)
+            busy = self.tick(worker)
+            require(busy["outcome"] == "recovery_pending" and busy["history_lookup"]["native_run_id"] == run,
+                    "the verified run was missing from the busy checker's history lookup")
+            legacy_presence = self.broker_evidence(origin, "operation_id", grant["operation_id"])
+            require(any(event["msg"] == "worker.presence_observed" and event["claim_id"] == grant["claim_id"] for event in legacy_presence),
+                    "archived broker never recorded the busy presence")
+            settlement = {**start, "submission_id": "marked-legacy-stop", "native_run_id": run,
+                          "reason": "execution_confirmed_stopped", "verified_start": True}
+            self.checked(route + "/interrupt", worker["credential"], "POST", settlement, want=400, origin=origin)
+            self.proxy.target = original_target
+            for changed in ({"native_job_id": "unrelated-job"}, {"native_run_id": "unrelated-run"}):
+                wrong = {**settlement, **changed}
+                _, headers = self.checked(route + "/interrupt", worker["credential"], "POST", wrong, want=409)
+                record = next(event for event in self.broker_evidence(self.origin_url, "request_id", headers["X-Request-Id"])
+                              if event.get("reason") == "native_settlement_proof_mismatch" and event.get("msg") == "lease.rejected")
+                evidence = record["evidence"]
+                require(record["level"] == "WARN" and evidence["expected_native_job_id"] == work["native_job_id"] and
+                        evidence["expected_native_run_id"] == run and evidence["observed_native_job_id"] == wrong["native_job_id"] and
+                        evidence["observed_native_run_id"] == wrong["native_run_id"] and self.status(worker)["work_status"] == "busy",
+                        "settlement refusal lost the identity diagnostics or cleared a live hold")
+            require(self.observe(worker, "completed")["outcome"] == "settled" and self.status(worker)["work_status"] == "idle",
+                    "old broker presence erased the recorded run")
+            self.receipt("worker.native_start_after_archived_grant_replay", image=RC2_BROKER, wire_compatible=True, identity_preserved=True)
+        finally:
+            self.proxy.target = original_target
+
     def finite_tool_loop(self, worker):
         fixture = self.private("client-only-fixture.txt", "client-only exact bytes\nsecond line\n")
         experiment = self.create(worker, "Read the private client fixture")
@@ -546,6 +624,7 @@ def main():
         harness.cancel_before_start(worker)
         harness.expire_before_start(worker)
         harness.weekly_usage_check(sibling_origin)
+        harness.native_start_version_orders()
         harness.private("results.json", json.dumps({"suite": "worker-transport", "native_scheduler": "controlled", "transport": "loopback_https", "source_sha": args.source_sha, "package_sha256": harness.package_receipt["sha256"], "receipts": harness.receipts}))
     finally:
         if proxy:

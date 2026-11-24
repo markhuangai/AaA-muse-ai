@@ -107,7 +107,8 @@ func (b *Broker) PullWork(ctx context.Context, logger *slog.Logger, credential s
 	started := b.now()
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	result, workerID, replayed, timing, err := repo.WithinPull(ctx, auth.Digest(credential), input, hash, capability, workerContact(reports), b.updateBroker, b.claimPulledJob)
+	result, workerID, replayed, timing, err := repo.WithinPull(ctx, auth.Digest(credential), input, hash, capability, workerContact(reports), b.updateBroker,
+		func(s *inference.State) (*inference.Grant, error) { return b.claimPulledJob(s, input.VerifyStart) })
 	logger = logger.With("worker_id", workerID, "sequence", input.Sequence, "checker_job_id", input.Checker, "checker_run_id", input.Occurrence)
 	logger.Debug("worker.pull_timing", "scheduled_at", input.ScheduledAt, "entered_at", input.EnteredAt, "duration_ms", b.now().Sub(started).Milliseconds(),
 		"transaction_acquire_us", timing.Acquire.Microseconds(), "queue_lookup_us", timing.Select.Microseconds(), "replayed", replayed)
@@ -165,7 +166,7 @@ func logWeeklyUsage(logger *slog.Logger, sample *worker.WeeklyUsage, received ti
 		"reason", result, "received_at", received, "freshness_ms", worker.WeeklyUsageFreshness.Milliseconds())
 }
 
-func (b *Broker) claimPulledJob(s *inference.State) (*inference.Grant, error) {
+func (b *Broker) claimPulledJob(s *inference.State, verifyStart bool) (*inference.Grant, error) {
 	for _, job := range s.Jobs {
 		experiment := s.Experiments[job.ExperimentID]
 		if experiment == nil || experiment.State != "queued" || experiment.CurrentJobID != job.ID ||
@@ -184,6 +185,9 @@ func (b *Broker) claimPulledJob(s *inference.State) (*inference.Grant, error) {
 		claim, err := auth.ID(b.random)
 		if err != nil {
 			return nil, err
+		}
+		if verifyStart {
+			claim = inference.VerifiedClaimPrefix + claim
 		}
 		job.WorkerID, job.State, job.Held = s.WorkerID, "claimed", true
 		job.Generation++
@@ -310,7 +314,7 @@ func applyPullProjection(projection *inference.Projection, state *inference.Stat
 
 func (b *Broker) StartWork(ctx context.Context, logger *slog.Logger, workerID, id string, input inference.WorkStart) (json.RawMessage, error) {
 	ref := workerRef(workerID, id, "", true)
-	ref.Single = true
+	ref.Single, ref.NativeWork = true, true
 	return b.run(ctx, logger, ref, "work_start", input, func(s *inference.State, events *[]inferenceEvent) (any, error) {
 		if input.Version != inference.Version || !inference.Identifier.MatchString(input.LaunchID) || !inference.Identifier.MatchString(input.NativeJob) {
 			return nil, inference.Reject("invalid_work_start", 400)
@@ -322,17 +326,44 @@ func (b *Broker) StartWork(ctx context.Context, logger *slog.Logger, workerID, i
 		if job.StartedAt != nil {
 			return nil, inference.Reject("work_already_started", 409)
 		}
+		if err := verifyNativeStart(s.NativeWork, job, input); err != nil {
+			return nil, err
+		}
 		job.StartedAt, job.LaunchID, job.NativeJob = &s.Now, input.LaunchID, input.NativeJob
 		startContextDelivery(s, job, events)
-		event(events, slog.LevelInfo, "job.work_started", s, job, "claim_id", job.LeaseID, "launch_id", job.LaunchID, "native_job_id", job.NativeJob, "started_at", job.StartedAt)
+		fields := []any{"claim_id", job.LeaseID, "launch_id", job.LaunchID, "native_job_id", job.NativeJob, "started_at", job.StartedAt}
+		if input.Verification != nil {
+			fields = append(fields, "native_run_id", input.Verification.NativeRun, "native_reference", input.Verification.Reference)
+		}
+		event(events, slog.LevelInfo, "job.work_started", s, job, fields...)
 		event(events, slog.LevelDebug, "inference.context", s, job, "claim_id", job.LeaseID, "context", job.Context)
 		return job, nil
 	})
 }
 
+func verifyNativeStart(receipt *inference.NativeWorkReceipt, job *inference.Job, input inference.WorkStart) error {
+	proof := input.Verification
+	if proof == nil && !inference.VerifiedClaim(job.LeaseID) {
+		return nil
+	}
+	if proof == nil || receipt == nil {
+		return inference.Reject("native_start_proof_required", 409, "claim_id", job.LeaseID, "launch_id", input.LaunchID, "observed_native_job_id", input.NativeJob)
+	}
+	if proof.Reference != job.LeaseID || proof.NativeJob != input.NativeJob || !inference.Identifier.MatchString(proof.NativeRun) ||
+		proof.NativeRun == proof.NativeJob || proof.Status != "running" || receipt.IsChecker(proof.NativeJob, job.BusyPresence) ||
+		receipt.IsChecker(proof.NativeRun, job.BusyPresence) {
+		return inference.Reject("native_start_proof_mismatch", 409, "claim_id", job.LeaseID, "launch_id", input.LaunchID,
+			"expected_reference", job.LeaseID, "observed_reference", proof.Reference, "expected_native_job_id", input.NativeJob,
+			"checker_job_id", receipt.Checker, "checker_run_id", receipt.Occurrence,
+			"observed_native_job_id", proof.NativeJob, "observed_native_run_id", proof.NativeRun)
+	}
+	receipt.Start = proof
+	return nil
+}
+
 func (b *Broker) InterruptWork(ctx context.Context, logger *slog.Logger, workerID, id string, input inference.Interruption, evidence ...inference.InterruptionEvidence) (json.RawMessage, error) {
 	ref := workerRef(workerID, id, input.SubmissionID, false)
-	ref.Single = true
+	ref.Single, ref.NativeWork = true, true
 	return b.run(ctx, logger, ref, "work_interrupted", input, func(s *inference.State, events *[]inferenceEvent) (any, error) {
 		if err := inference.VersionAndID(input.Version, input.SubmissionID); err != nil {
 			return nil, err
@@ -348,7 +379,17 @@ func (b *Broker) InterruptWork(ctx context.Context, logger *slog.Logger, workerI
 			return nil, inference.Reject("invalid_work_interruption", 400)
 		}
 		job := s.Jobs[id]
-		if !claimMatches(job, input.ClaimID, input.Generation) || (job.StartedAt != nil && (job.LaunchID != input.LaunchID || job.NativeJob != input.NativeJob)) {
+		if !claimMatches(job, input.ClaimID, input.Generation) {
+			return nil, inference.Reject("stale_assignment", 409)
+		}
+		if input.VerifiedStart != inference.VerifiedClaim(job.LeaseID) {
+			return nil, inference.Reject("native_settlement_proof_required", 409, "claim_id", job.LeaseID, "launch_id", input.LaunchID)
+		}
+		if input.VerifiedStart {
+			if err := verifyNativeSettlement(s.NativeWork, job, input); err != nil {
+				return nil, err
+			}
+		} else if job.StartedAt != nil && (job.LaunchID != input.LaunchID || job.NativeJob != input.NativeJob) {
 			return nil, inference.Reject("stale_assignment", 409)
 		}
 		if job.State == "accepted" {
@@ -372,4 +413,28 @@ func (b *Broker) InterruptWork(ctx context.Context, logger *slog.Logger, workerI
 		event(events, slog.LevelInfo, "job.work_settled", s, job, "claim_id", job.LeaseID, "launch_id", input.LaunchID, "native_job_id", input.NativeJob, "native_run_id", input.NativeRun, "reason", input.Reason, "busy_hold", false)
 		return inference.WorkOutcome{JobID: id, ClaimID: job.LeaseID, State: job.State, Reason: job.Reason}, nil
 	})
+}
+
+func verifyNativeSettlement(receipt *inference.NativeWorkReceipt, job *inference.Job, input inference.Interruption) error {
+	if receipt == nil || !job.Held {
+		return inference.Reject("stale_assignment", 409)
+	}
+	if job.StartedAt == nil {
+		if receipt.IsChecker(input.NativeJob, job.BusyPresence) || receipt.IsChecker(input.NativeRun, job.BusyPresence) {
+			return inference.Reject("native_settlement_checker_id", 409, "claim_id", job.LeaseID, "launch_id", input.LaunchID,
+				"checker_job_id", receipt.Checker, "checker_run_id", receipt.Occurrence,
+				"observed_native_job_id", input.NativeJob, "observed_native_run_id", input.NativeRun)
+		}
+		return nil
+	}
+	if receipt.Start == nil {
+		return inference.Reject("native_settlement_proof_required", 409, "claim_id", job.LeaseID, "launch_id", input.LaunchID)
+	}
+	if input.LaunchID != job.LaunchID || input.NativeJob != receipt.Start.NativeJob || input.NativeRun != receipt.Start.NativeRun {
+		return inference.Reject("native_settlement_proof_mismatch", 409, "claim_id", job.LeaseID,
+			"expected_launch_id", job.LaunchID, "observed_launch_id", input.LaunchID,
+			"expected_native_job_id", receipt.Start.NativeJob, "expected_native_run_id", receipt.Start.NativeRun,
+			"observed_native_job_id", input.NativeJob, "observed_native_run_id", input.NativeRun)
+	}
+	return nil
 }

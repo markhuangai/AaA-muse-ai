@@ -146,6 +146,7 @@ test('a legacy producer holds the claim until its exact process stops and settle
   assert.equal(initial.outcome, 'prepare');
   const legacy = JSON.parse(await f.state.read('cron-claim.json'));
   delete legacy.producer_mode;
+  delete legacy.start_proof;
   await f.state.write('cron-claim.json', encode(legacy));
   const request = { claim_id: claimID, launch_id: initial.launch_id, due_at: iso(stamp + 5_000) };
   const registered = await f.cron.prepare(request);
@@ -205,33 +206,90 @@ test('a legacy producer holds the claim until its exact process stops and settle
   assert.equal((await f.cron.check(f.tick(5))).outcome, 'idle');
 });
 
+for (const [scenario, cause] of [
+  ['missing execution', 'native_execution_unobservable'],
+  ['conflicting execution', 'native_execution_record_mismatch'],
+  ['ambiguous list', 'native_registration_ambiguous'],
+  ['conflicting rejection', 'native_registration_ambiguous'],
+]) {
+  test(`an exact definition remains registered after ${scenario}`, async t => {
+    const f = await installed(t);
+    const stamp = f.state.sys.now();
+    const grant = { job_id: JOB, operation_id: EXP, claim_id: claimID, generation: 1, claimed_at: iso(stamp), deadline_at: iso(stamp + 300_000) };
+    f.broker.override = ({ path, input }) => path.endsWith('/pull') ? reply({ job: grant }) : reply(claimed({
+      connection_id: '', connection_generation: 0, native_job_id: workJob, launch_id: input.launch_id,
+      lease_id: claimID, started_at: iso(stamp), deadline_at: grant.deadline_at,
+    }));
+    const check = await f.cron.check(f.tick(1));
+    const scope = { claim_id: claimID, launch_id: check.launch_id };
+    const definition = (await f.cron.prepare({ ...scope, due_at: iso(stamp + 5000) })).work;
+    const execution = { native_job_id: workJob, native_run_id: run, status: 'running' };
+    const match = { ...definition, native_job_id: workJob, status: 'running' };
+    const observation = { ...scope, observed_at: iso(f.state.sys.now()) };
+    const registrationRejection = { ...definition, outcome: 'not_created', native_operation_id: 'false-rejection' };
+    const evidence = {
+      'missing execution': { matches: [match] },
+      'conflicting execution': { matches: [{ ...match, execution }], execution: { ...execution, native_run_id: 'other-run' } },
+      'ambiguous list': { matches: [match, { ...match, native_job_id: 'other-job' }] },
+      'conflicting rejection': { matches: [match], registration_rejection: registrationRejection },
+    };
+    const pending = await f.observe({ ...observation, ...evidence[scenario] });
+    assert.equal(pending.cause, cause);
+    assert.equal(pending.native_job_id, null);
+    assert.equal(pending.native_run_id, null);
+    await assert.rejects(f.observe({ ...observation, matches: [], registration_rejection: registrationRejection }), /native_registration_already_delivered/);
+    assert.equal((await f.cron.start(check.launch_id, { matches: [{ ...match, execution }] })).outcome, 'authorized');
+  });
+}
+
 test('settles only normalized execution evidence bound to the same native job and run', async t => {
   const f = await installed(t);
   const stamp = f.state.sys.now();
-  const grant = { job_id: JOB, operation_id: EXP, claim_id: claimID, generation: 1, claimed_at: iso(stamp), deadline_at: iso(stamp + 300_000) };
+  const claim = 'verified-' + claimID;
+  const grant = { job_id: JOB, operation_id: EXP, claim_id: claim, generation: 1, claimed_at: iso(stamp), deadline_at: iso(stamp + 300_000) };
   f.broker.override = ({ path, input }) => {
     if (path.endsWith('/pull')) return reply({ job: grant });
     if (path.endsWith('/presence')) return reply({ recorded: true, received_at: iso(f.state.sys.now()) });
-    if (path.endsWith('/start')) return reply(claimed({ native_job_id: workJob, launch_id: input.launch_id,
-      lease_id: claimID, started_at: iso(stamp), deadline_at: grant.deadline_at }));
+    if (path.endsWith('/start')) {
+      assert.deepEqual(JSON.parse(encode(input.verification)), { reference: claim, ...record('running') });
+      return reply(claimed({ native_job_id: workJob, launch_id: input.launch_id,
+        lease_id: claim, started_at: iso(stamp), deadline_at: grant.deadline_at }));
+    }
     assert.ok(path.endsWith('/interrupt'));
+    assert.equal(input.verified_start, true);
     assert.equal(input.native_job_id, workJob);
     assert.equal(input.native_run_id, run);
-    return reply({ job_id: JOB, claim_id: claimID, state: 'interrupted' });
+    return reply({ job_id: JOB, claim_id: claim, state: 'interrupted' });
   };
   const check = await f.cron.check(f.tick(1));
-  const scope = { claim_id: claimID, launch_id: check.launch_id };
+  const scope = { claim_id: claim, launch_id: check.launch_id };
   const definition = (await f.cron.prepare({ ...scope, due_at: iso(stamp + 5000) })).work;
+  assert.equal(definition.reference, claim);
   const match = { ...definition, native_job_id: workJob };
   const record = (status, parent = workJob, id = run) => ({ native_job_id: parent, native_run_id: id, status });
   const observe = (matches, execution) => f.observe({ ...scope, observed_at: iso(f.state.sys.now()), matches, execution });
   assert.equal((await observe([], record('succeeded'))).cause, 'native_registration_unobservable');
-  assert.equal((await f.cron.start(check.launch_id, workJob)).outcome, 'authorized');
-  assert.equal((await observe([], record('succeeded'))).cause, 'native_registration_unobservable');
+  const running = { ...match, status: 'running', execution: record('running') };
+  const start = matches => f.cron.start(check.launch_id, { matches });
+  await assert.rejects(f.cron.start(check.launch_id, 'unrelated-occurrence'), /native_start_definition_required/);
+  await assert.rejects(start([running, running]), /native_start_definition_required/);
+  await assert.rejects(start([{ ...running, prompt: 'old one-shot' }]), /native_start_definition_mismatch/);
+  await assert.rejects(start([{ ...running, execution: record('running', 'foreign-parent') }]), /native_start_execution_mismatch/);
+  await assert.rejects(f.cron.start(check.launch_id, { matches: [running], execution: record('running', 'foreign-parent') }),
+    /unsupported_or_missing_fields/);
+  for (const foreign of [workJob, checker, 'tick-1']) {
+    await assert.rejects(start([{ ...running, execution: record('running', workJob, foreign) }]), /native_start_(execution_mismatch|checker_id)/);
+  }
+  assert.equal((await observe([{ ...match, native_job_id: 'unrelated-occurrence', status: 'unobservable' }])).native_job_id, null);
+  await assert.rejects(f.observe({ ...scope, observed_at: iso(f.state.sys.now()), matches: [],
+    registration_rejection: { ...definition, outcome: 'not_created', native_operation_id: 'late-rejection' } }), /native_registration_already_delivered/);
+  assert.equal((await observe([{ ...match, native_job_id: 'unrelated-occurrence', status: 'queued' }])).native_job_id, null);
+  assert.equal(f.broker.calls.filter(call => call.path.endsWith('/start')).length, 0);
+  assert.equal((await start([running])).outcome, 'authorized');
+  assert.equal((await observe([{ ...match, status: 'unobservable' }])).native_run_id, run);
   const reserved = await f.cron.producerIntent(check.launch_id);
   assert.equal(reserved.mode, 'guarded');
   await assert.rejects(f.cron.producer(check.launch_id, reserved.producer_id, process.pid), /producer_guard_required/);
-  assert.equal((await observe([{ ...match, status: 'running' }], record('running'))).outcome, 'running');
   assert.equal((await observe([{ ...match, status: 'completed', execution: record('failed') }], record('succeeded'))).cause,
     'native_execution_record_mismatch');
   assert.equal((await observe([], record('succeeded', 'foreign-job'))).cause, 'native_registration_unobservable');

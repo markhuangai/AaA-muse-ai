@@ -183,6 +183,11 @@ func (r *Repository) WithinPull(ctx context.Context, credential [32]byte, input 
 					if err != nil {
 						return err
 					}
+					if inference.VerifiedClaim(result.Job.ClaimID) {
+						if err = recordNativeGrant(ctx, tx, workerID, result.Job.ClaimID, input); err != nil {
+							return err
+						}
+					}
 					timing.PreviousPin = state.Jobs[candidate.job].ReroutedFrom
 					timing.PreviousPinReason = inference.OfflinePinReason
 					if transferFrom != "" {

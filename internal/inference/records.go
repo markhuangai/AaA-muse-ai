@@ -59,6 +59,7 @@ type Pull struct {
 	MediaJobs   bool                `json:"media_jobs"`
 	PromptWAV   bool                `json:"prompt_wav"`
 	WeeklyUsage *worker.WeeklyUsage `json:"-"`
+	VerifyStart bool                `json:"-"`
 }
 
 type Grant struct {
@@ -124,22 +125,24 @@ type PresenceReceipt struct {
 }
 
 type WorkStart struct {
-	Version    int    `json:"protocol_version"`
-	ClaimID    string `json:"claim_id"`
-	Generation int64  `json:"generation"`
-	LaunchID   string `json:"launch_id"`
-	NativeJob  string `json:"native_job_id"`
+	Version      int               `json:"protocol_version"`
+	ClaimID      string            `json:"claim_id"`
+	Generation   int64             `json:"generation"`
+	LaunchID     string            `json:"launch_id"`
+	NativeJob    string            `json:"native_job_id"`
+	Verification *NativeStartProof `json:"verification,omitempty"`
 }
 
 type Interruption struct {
-	Version      int    `json:"protocol_version"`
-	SubmissionID string `json:"submission_id"`
-	ClaimID      string `json:"claim_id"`
-	Generation   int64  `json:"generation"`
-	LaunchID     string `json:"launch_id"`
-	NativeJob    string `json:"native_job_id"`
-	NativeRun    string `json:"native_run_id"`
-	Reason       string `json:"reason"`
+	Version       int    `json:"protocol_version"`
+	SubmissionID  string `json:"submission_id"`
+	ClaimID       string `json:"claim_id"`
+	Generation    int64  `json:"generation"`
+	LaunchID      string `json:"launch_id"`
+	NativeJob     string `json:"native_job_id"`
+	NativeRun     string `json:"native_run_id"`
+	Reason        string `json:"reason"`
+	VerifiedStart bool   `json:"verified_start,omitempty"`
 }
 
 type WorkOutcome struct {
@@ -370,6 +373,7 @@ type Ref struct {
 	Responses                                bool
 	Single                                   bool
 	PollProjection                           bool
+	NativeWork                               bool
 }
 
 type State struct {
@@ -386,6 +390,7 @@ type State struct {
 	Experiments           map[string]*Experiment
 	Jobs                  map[string]*Job
 	Receipt               *Receipt
+	NativeWork            *NativeWorkReceipt
 	Conversations         map[string]*Conversation
 	Requests              map[string]*Request
 	PendingTools          int

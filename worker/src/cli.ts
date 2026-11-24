@@ -15,7 +15,7 @@ import { CronUpdate } from './cron-update.js';
 
 import { VERSION } from './version.js';
 export { VERSION } from './version.js';
-const help = 'aaa-muse-worker setup --origin HTTPS_ORIGIN --code-stdin --install-dir ABSOLUTE_PATH --setup-id ID | update-adopt --origin HTTPS_ORIGIN --install-dir ABSOLUTE_PATH --worker-id ID --archive-digest SHA256 | cron-describe --goal-id ID | cron-authorize-registration --input FILE|- | cron-confirm --input FILE|- | cron-check --input FILE|- | cron-prepare --input FILE|- | cron-observe --input FILE|- | cron-start --launch-id ID --native-job-id ID | cron-producer-intent --launch-id ID | cron-producer --launch-id ID --producer-id ID --pid PID | status | doctor | media-finish --job-id ID | decision-submit --job-id ID --input FILE|- | diagnostics-export [--operation-id ID] [--request-id ID] [--since RFC3339] [--until RFC3339] [--decode]\nCommon: --state-dir ABSOLUTE_PATH, --help, --version\n';
+const help = 'aaa-muse-worker setup --origin HTTPS_ORIGIN --code-stdin --install-dir ABSOLUTE_PATH --setup-id ID | update-adopt --origin HTTPS_ORIGIN --install-dir ABSOLUTE_PATH --worker-id ID --archive-digest SHA256 | cron-describe --goal-id ID | cron-authorize-registration --input FILE|- | cron-confirm --input FILE|- | cron-check --input FILE|- | cron-prepare --input FILE|- | cron-observe --input FILE|- | cron-start --launch-id ID --input FILE|- | cron-producer-intent --launch-id ID | cron-producer --launch-id ID --producer-id ID --pid PID | status | doctor | media-finish --job-id ID | decision-submit --job-id ID --input FILE|- | diagnostics-export [--operation-id ID] [--request-id ID] [--since RFC3339] [--until RFC3339] [--decode]\nCommon: --state-dir ABSOLUTE_PATH, --help, --version\n';
 export interface Adapters {
   files: Files;
   system: System;
@@ -40,7 +40,7 @@ export function argumentsFor(args: string[]): { command: string; flags: Record<s
     'update-adopt': ['origin', 'install-dir', 'worker-id', 'archive-digest', 'bootstrap'],
     'decision-submit': ['job-id', 'input'], 'diagnostics-export': ['operation-id', 'request-id', 'since', 'until', 'decode'],
     'cron-describe': ['goal-id'], 'cron-authorize-registration': ['input'], 'cron-confirm': ['input'], 'cron-check': ['input'], 'cron-observe': ['input'], 'cron-prepare': ['input'],
-    'cron-start': ['launch-id', 'native-job-id'], 'cron-producer-intent': ['launch-id'], 'cron-producer': ['launch-id', 'producer-id', 'pid'],
+    'cron-start': ['launch-id', 'native-job-id', 'input'], 'cron-producer-intent': ['launch-id'], 'cron-producer': ['launch-id', 'producer-id', 'pid'],
     'cron-producer-bind': ['launch-id', 'producer-id'],
   };
   requireValue(Object.hasOwn(allowed, command) || ['--help', '--version'].includes(command), 'unknown_command');
@@ -123,7 +123,9 @@ export async function execute(args: string[], io: Adapters): Promise<number> {
         break;
       }
       case 'cron-start':
-        result = await cron.start(identifier(flags['launch-id'] as string), identifier(flags['native-job-id'] as string));
+        requireValue(!(flags.input && flags['native-job-id']), 'conflicting_native_start_input');
+        result = await cron.start(identifier(flags['launch-id'] as string),
+          typeof flags.input === 'string' ? parse(await io.input(flags.input)) : flags['native-job-id'] as string | undefined);
         break;
       case 'cron-producer-intent':
         result = await cron.producerIntent(identifier(flags['launch-id'] as string));

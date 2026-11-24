@@ -138,7 +138,7 @@ func startFixtureJob(t *testing.T, b *Broker, m *inferenceMemory, worker, operat
 		candidate := *pool
 		candidate.Jobs = map[string]*inference.Job{job.ID: job}
 		var err error
-		grant, err = b.claimPulledJob(&candidate)
+		grant, err = b.claimPulledJob(&candidate, false)
 		return err
 	})
 	if err != nil {
