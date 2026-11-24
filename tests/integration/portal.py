@@ -258,8 +258,8 @@ class Portal(WorkerAuth):
         (directory / "config.yaml").write_text("".join(("# shared broker configuration\n", json.dumps(super().configuration()))))
         mount = "type=bind,source=" + str(directory) + ",target=/fixture"
         def set_owner(owner):
-            self.docker("run", "--rm", "--user", "0:0", "--entrypoint", "/bin/sh", "--mount", mount, self.args.image,
-                        "-ec", "chmod 700 /fixture; chmod 600 /fixture/config.yaml; chown " + owner + " /fixture /fixture/config.yaml")
+            self.run_tools("sh", "-ec", 'chmod 700 /fixture; chmod 600 /fixture/config.yaml; chown "$1" /fixture /fixture/config.yaml',
+                           "fixture", owner, options=("--mount", mount))
         proxies = []
         set_owner("10001:10001")
         try:
@@ -276,9 +276,9 @@ class Portal(WorkerAuth):
             origin = self.origin(first)
             brokers[0] = (first, origin, brokers[0][2])
             self.ready(first, origin)
-            raw = self.docker("exec", "--user", "0:0", first, "cat", "/etc/aaa-muse-ai/config.yaml").stdout
+            raw = self.run_tools("cat", "/fixture/config.yaml", options=("--mount", mount)).stdout
             require(raw.startswith("# shared broker configuration"), "YAML comment was lost")
-            require(self.docker("exec", first, "stat", "-c", "%a", "/etc/aaa-muse-ai/config.yaml").stdout.strip() == "600", "file mode changed")
+            require(self.run_tools("stat", "-c", "%a", "/fixture/config.yaml", options=("--mount", mount)).stdout.strip() == "600", "file mode changed")
             for item in keys:
                 require(item["name"] in raw and item["key"] in raw, "persisted config lacks the authored entry")
                 require(self.api("/v1/models", item["key"], origin=origin)[0] == 200, "created key was lost after restart")
@@ -317,8 +317,7 @@ def main():
     try:
         h.baseline()
         image_id = h.inspect(args.image)["Id"]
-        h.docker("run", "--rm", "--entrypoint", "/bin/sh", args.image, "-ec",
-                 '. /etc/os-release; test "$ID" = alpine; test -s /usr/share/aaa-muse-ai/portal/index.html; test -s /usr/share/aaa-muse-ai/licenses/geist-OFL.txt; test -s /usr/share/aaa-muse-ai/licenses/geist-mono-OFL.txt; test ! -e /usr/bin/node')
+        h.assert_runtime_files()
         h.setup()
         if os.environ.get("MUSE_TEST_DIRECT_NETWORK") == "true":
             h.main_service, h.origin_url, _ = h.launch()

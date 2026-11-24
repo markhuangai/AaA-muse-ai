@@ -9,11 +9,14 @@ from pathlib import Path
 import secrets
 import select
 import subprocess
+import tarfile
 import time
 import urllib.error
 import urllib.request
 import urllib.parse
 
+RUNTIME_EXECUTABLE = "usr/local/bin/service"
+DIAGNOSTICS = "/var/lib/aaa-muse-ai/diagnostics"
 SQLITE_STATE = "/var/lib/aaa-muse-ai/state"
 SQLITE_FILE = SQLITE_STATE + "/broker.sqlite3"
 SQLITE_SCHEMA = 5
@@ -38,6 +41,7 @@ class Harness:
         self.portal = "test-portal-" + secrets.token_hex(24)
         self.client = "test-client-" + secrets.token_hex(24)
         self.network = None
+        self.tools = None
         self.db = None
 
     def private(self, name, data):
@@ -92,14 +96,74 @@ class Harness:
         self.receipts.append(value)
         print(json.dumps(value), flush=True)
 
+    def prepare_tools(self):
+        if self.tools is None:
+            self.tools = os.environ.get("SERVICE_TOOLS_IMAGE", "aaa-muse-sqlite-tools:" + self.args.source_sha)
+            self.docker("build", "--target", "tools", "-t", self.tools, ".", timeout=240)
+
+    def run_tools(self, *args, options=()):
+        self.prepare_tools()
+        return self.docker("run", "--rm", *options, self.tools, *args)
+
+    def assert_serving_identity(self, container, owner, *, no_new_privileges=False):
+        output = self.run_tools("cat", "/proc/1/status", options=("--pid", "container:" + container)).stdout
+        fields = dict(line.split(":", 1) for line in output.splitlines() if ":" in line)
+        uid, gid = owner.split(":")
+        require(fields.get("Name", "").strip() == "service" and fields["Uid"].split() == [uid] * 4
+                and fields["Gid"].split() == [gid] * 4, "broker PID 1 has the wrong real, effective or saved credentials")
+        require(all(int(fields[name], 16) == 0 for name in ("CapPrm", "CapEff", "CapAmb")),
+                "serving broker retained capabilities")
+        if no_new_privileges:
+            require(not fields["Groups"].strip() and fields["NoNewPrivs"].strip() == "1",
+                    "broker retained supplementary groups or can acquire new privileges")
+
+    def export_runtime(self, image):
+        container = self.remember("containers", self.docker("create", "--label", LABEL + "=" + self.owner,
+                                                          "--network", "none", image).stdout.strip())
+        archive = self.root / (container[:12] + "-rootfs.tar")
+        self.docker("export", "-o", str(archive), container)
+        return archive
+
+    def assert_runtime_files(self):
+        info = self.inspect(self.args.image)
+        archive = self.export_runtime(self.args.image)
+        try:
+            with tarfile.open(archive, "r:") as fs:
+                files = {entry.name.removeprefix("./"): entry for entry in fs if not entry.isdir()}
+                # Docker adds empty mount stubs and the mtab link to an exported container.
+                for name in (".dockerenv", "dev/console", "etc/hostname", "etc/hosts", "etc/resolv.conf"):
+                    entry = files.get(name)
+                    if entry is not None and entry.isfile() and entry.size == 0:
+                        del files[name]
+                mtab = files.get("etc/mtab")
+                if mtab is not None and mtab.issym() and mtab.linkname == "/proc/mounts":
+                    del files["etc/mtab"]
+                executables = {name for name, entry in files.items() if entry.isfile() and entry.mode & 0o111}
+                require(executables == {RUNTIME_EXECUTABLE} and all(entry.isfile() for entry in files.values()),
+                        "runtime contains unexpected executables or links")
+                for name in ("etc/ssl/certs/ca-certificates.crt", "etc/alpine-release", "etc/os-release",
+                             "usr/share/aaa-muse-ai/portal/index.html",
+                             *("usr/share/aaa-muse-ai/licenses/" + name for name in
+                               ("geist-OFL.txt", "geist-mono-OFL.txt", "x-image/LICENSE", "mimetype/LICENSE",
+                                "mcp-go-sdk/LICENSE"))):
+                    require(name in files and files[name].size > 0, "missing runtime file " + name)
+                require(b"ID=alpine" in fs.extractfile(files["etc/os-release"]).read().splitlines(),
+                        "runtime metadata is not Alpine")
+            compressed = len(subprocess.check_output(["gzip", "-n", "-6", "-c", str(archive)], timeout=30))
+            require(info["Architecture"] != "amd64" or compressed <= 12 * 1024 * 1024,
+                    "compressed amd64 rootfs exceeds the 12 MiB budget")
+        finally:
+            archive.unlink()
+        self.receipt("runtime.rootfs", image_id=info["Id"], architecture=info["Architecture"],
+                     compressed_rootfs_bytes=compressed, executable=RUNTIME_EXECUTABLE)
+
     def setup(self):
         self.network = self.remember("networks", self.docker("network", "create", "--label", LABEL + "=" + self.owner, self.owner).stdout.strip())
         self.state_volume = self.volume("sqlite")
-        tools = os.environ.get("SERVICE_TOOLS_IMAGE", "aaa-muse-sqlite-tools:" + self.args.source_sha)
-        self.docker("build", "--target", "tools", "-t", tools, ".", timeout=240)
+        self.prepare_tools()
         self.db = self.remember("containers", self.docker(
             "run", "-d", "--label", LABEL + "=" + self.owner, "-v", self.state_volume + ":" + SQLITE_STATE,
-            "--entrypoint", "sh", tools, "-ec",
+            "--entrypoint", "sh", self.tools, "-ec",
             'chmod 700 "$1"; chown 10001:10001 "$1"; install -m 600 -o 10001 -g 10001 /dev/null "$2"; exec sleep 86400',
             "sqlite-fixture", SQLITE_STATE, SQLITE_FILE).stdout.strip())
         version = self.sql("SELECT sqlite_version();")
@@ -243,8 +307,7 @@ class Harness:
         labels = info["Config"]["Labels"]
         require(labels["org.opencontainers.image.revision"] == self.args.source_sha, "image source SHA mismatch")
         require(labels["io.aaa-muse.source-dirty"] == self.args.source_dirty, "image source state mismatch")
-        self.docker("run", "--rm", "--entrypoint", "/bin/sh", self.args.image,
-                    "-ec", 'test "$(id -u)" = 10001; test -s /etc/ssl/certs/ca-certificates.crt')
+        require(info["Config"]["Entrypoint"] == ["/" + RUNTIME_EXECUTABLE], "wrong runtime entrypoint")
         self.receipt("runtime.identity", source_sha=self.args.source_sha, source_dirty=self.args.source_dirty, image_id=info["Id"])
 
     def functional(self):
@@ -256,6 +319,7 @@ class Harness:
             require("db.connected" not in self.logs(first) + self.logs(second), "bootstrap crossed the held writer barrier")
         self.ready(first, origin)
         self.ready(second, sibling_origin)
+        self.assert_serving_identity(first, "10001:10001")
         require(self.sql("SELECT count(*) FROM aaa_schema_migrations;") == str(SQLITE_SCHEMA), "concurrent bootstrap did not apply all migrations")
         require(self.sql("PRAGMA journal_mode;") == "wal", "SQLite WAL was not enabled")
         for file in (SQLITE_FILE, SQLITE_FILE + "-wal", SQLITE_FILE + "-shm"):
@@ -471,7 +535,7 @@ class Harness:
         require(self.sql("SELECT value FROM test_persistence;") == "retained", "rejected migration removed existing data")
 
     def capture_failure_stops(self, container, origin):
-        self.docker("exec", container, "chmod", "0500", "/var/lib/aaa-muse-ai/diagnostics")
+        self.run_tools("chmod", "0500", DIAGNOSTICS, options=("--volumes-from", container))
         try:
             self.request(origin, "/healthz")
         except (OSError, urllib.error.URLError):
@@ -522,6 +586,7 @@ def main():
         harness.baseline()
         if args.suite == "image":
             from compose_smoke import smoke_compose
+            harness.assert_runtime_files()
             smoke_compose(harness)
         harness.setup()
         service, origin, _ = harness.functional()

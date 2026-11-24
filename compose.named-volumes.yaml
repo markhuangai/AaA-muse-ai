@@ -1,11 +1,8 @@
-x-existing-storage: &existing-storage
-  - sqlite:/var/lib/aaa-muse-ai/state
-  - media:/var/lib/aaa-muse-ai/media
 services:
-  prepare-mounts:
-    volumes: *existing-storage
   service:
-    volumes: *existing-storage
+    volumes:
+      - sqlite:/var/lib/aaa-muse-ai/state
+      - media:/var/lib/aaa-muse-ai/media
 volumes:
   sqlite:
     external: true

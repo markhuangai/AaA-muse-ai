@@ -14,6 +14,7 @@ import (
 
 	"github.com/markhuangai/AaA-muse-ai/internal/inference"
 	"github.com/markhuangai/AaA-muse-ai/internal/worker"
+	"golang.org/x/sys/unix"
 )
 
 func privatePath(t *testing.T) string {
@@ -455,4 +456,38 @@ func enroll(t *testing.T, repo *Repository, id string) [32]byte {
 		t.Fatal(record, entry, err, Classify(err).Detail())
 	}
 	return key
+}
+
+func TestDatabaseOpenHonorsDirectoryOwnershipHandoff(t *testing.T) {
+	path := privatePath(t)
+	dir, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dir.Close()
+	fd := int(dir.Fd())
+	if err := unix.Flock(fd, unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		t.Fatal(err)
+	}
+	if repo, err := Open(t.Context(), path); repo != nil || err == nil || Classify(err).Phase != "mount_lock" {
+		t.Fatalf("direct broker disturbed a directory ownership handoff: %v, %v", repo, err)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("blocked broker initialized the database", err)
+	}
+	if err = unix.Flock(fd, unix.LOCK_UN); err != nil {
+		t.Fatal(err)
+	}
+	repo, err := Open(t.Context(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Flock(fd, unix.LOCK_EX|unix.LOCK_NB); !errors.Is(err, unix.EWOULDBLOCK) {
+		repo.Close()
+		t.Fatal("open direct broker failed to retain the shared lock", err)
+	}
+	repo.Close()
+	if err := unix.Flock(fd, unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		t.Fatal("closed broker retained its shared lock", err)
+	}
 }

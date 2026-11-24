@@ -8,20 +8,20 @@ AaA-muse-ai is a self-hosted broker for using Muse from model clients. In major 
 
 ## Quick start
 
-Use Docker Compose on Linux. The default image follows the latest stable paired release. If you already run the broker, check its installed major version, mounts, and owner before replacing its Compose file. [Deployment and upgrades](docs/deployment.md) · [Paired releases](docs/releases.md)
+Use Docker Compose on Linux with the Compose file for your paired release. If you already run the broker, check its installed major version, mounts, and owner before switching Compose files. [Deployment and upgrades](docs/deployment.md) · [Paired releases](docs/releases.md)
 
-From the directory containing `compose.yaml` and `config.example.yaml`, create the host directories and supply your configuration.
+From the directory containing `compose.yaml` and `config.example.yaml`, put your configuration in `config/config.yaml`.
 
 ```sh
 umask 077
-mkdir -p config sqlite media
+mkdir -p config
 cp -n config.example.yaml config/config.yaml
 ```
 
-Set distinct values for `management.key` and `control-portal.password` in `config/config.yaml`. The broker defaults to UID and GID 1000. To use a different owner, set the same numeric `UID:GID` in the helper command and the broker’s `user` field. [Configuration and readiness](docs/deployment.md#fresh-install)
+Set distinct values for `management.key` and `control-portal.password` in `config/config.yaml`. Compose creates the SQLite and media directories. The broker fixes permissions and serves as the non-root owner of your YAML. [Configuration and readiness](docs/deployment.md#fresh-install)
 
 ```sh
-docker compose up -d service
+docker compose up -d
 curl -fsS http://127.0.0.1:8080/readyz
 ```
 
