@@ -262,14 +262,24 @@ func (r *Repository) RenameWorker(ctx context.Context, id, name string) (before,
 	return
 }
 
-func (r *Repository) RevokeWorker(ctx context.Context, id string) (before, after worker.Record, err error) {
+func (r *Repository) RevokeWorker(ctx context.Context, id string) (worker.Record, worker.Record, error) {
+	before, after, _, err := r.RevokeWorkerWithControl(ctx, id)
+	return before, after, err
+}
+
+func (r *Repository) RevokeWorkerWithControl(ctx context.Context, id string) (before, after worker.Record, interrupted []worker.ControlItem, err error) {
 	err = r.write(ctx, func(tx *sql.Tx) error {
 		var err error
 		before, err = scanWorker(tx.QueryRowContext(ctx, "SELECT "+workerColumns+" FROM aaa_workers WHERE id=?1", id))
 		if err != nil {
 			return err
 		}
-		after, err = scanWorker(tx.QueryRowContext(ctx, "UPDATE aaa_workers SET revoked_at=COALESCE(revoked_at, ?2) WHERE id=?1 RETURNING "+workerColumns, id, r.databaseTime().UnixMicro()))
+		now := r.databaseTime()
+		after, err = scanWorker(tx.QueryRowContext(ctx, "UPDATE aaa_workers SET revoked_at=COALESCE(revoked_at, ?2) WHERE id=?1 RETURNING "+workerColumns, id, now.UnixMicro()))
+		if err != nil {
+			return err
+		}
+		interrupted, err = interruptControlWork(ctx, tx, id, now)
 		return err
 	})
 	return

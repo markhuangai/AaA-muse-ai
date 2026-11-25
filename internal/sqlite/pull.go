@@ -12,7 +12,7 @@ import (
 	"github.com/markhuangai/AaA-muse-ai/internal/worker"
 )
 
-const heldPullJob = `SELECT EXISTS (SELECT 1 FROM aaa_inference_jobs WHERE worker_id=?1 AND held)`
+const heldPullJob = `SELECT EXISTS (SELECT 1 FROM aaa_worker_slots WHERE worker_id=?1)`
 
 const duePullExperiments = `SELECT id FROM aaa_experiments
 	WHERE state NOT IN ('completed','cancelled','interrupted') AND deadline_at<=?1 ORDER BY deadline_at,id LIMIT 32`
@@ -158,6 +158,18 @@ func (r *Repository) WithinPull(ctx context.Context, credential [32]byte, input 
 						return err
 					}
 				}
+				for lane, grant := range map[string]*worker.ControlGrant{worker.WorkerOp: result.WorkerOp, worker.AgentTask: result.AgentTask} {
+					if grant == nil {
+						continue
+					}
+					record, err := scopedControl(ctx, tx, lane, grant.ID, workerID, false)
+					if err != nil {
+						return err
+					}
+					if err := checkControlPair(ctx, record); err != nil {
+						return err
+					}
+				}
 				if result.Update != nil && (broker.Target == nil || result.Update.Target != *broker.Target) {
 					result.Update = nil
 				}
@@ -178,9 +190,28 @@ func (r *Repository) WithinPull(ctx context.Context, credential [32]byte, input 
 				return err
 			}
 			var work bool
-			result.Update, timing.Update, work, err = decideUpdate(ctx, tx, now, workerID, input, contact, broker, held)
+			result.Update, work, err = decideControlUpdate(ctx, tx, now, workerID, input, contact, broker, held, &timing)
 			if err != nil {
 				return err
+			}
+			if pairedHook && !contact.Incompatible {
+				timing.Capability, timing.CapabilityChanged, err = recordWorkerCapability(ctx, tx, workerID, input.AgentTasks, input.ScheduledAt, now)
+				if err != nil {
+					return err
+				}
+				if work && result.Update == nil {
+					result.WorkerOp, err = grantControl(ctx, tx, worker.WorkerOp, workerID, input, pair, now)
+					if err != nil {
+						return err
+					}
+					if result.WorkerOp == nil && input.AgentTasks {
+						result.AgentTask, err = grantControl(ctx, tx, worker.AgentTask, workerID, input, pair, now)
+						if err != nil {
+							return err
+						}
+					}
+					work = result.WorkerOp == nil && result.AgentTask == nil
+				}
 			}
 			var availableCapability *int
 			major, _, _ := strings.Cut(contact.Version, ".")

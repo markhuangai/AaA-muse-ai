@@ -3,7 +3,9 @@ import { promisify } from 'node:util';
 import { Cron, iso, processIdentity, time } from './cron.js';
 import type { CronUpdate } from './cron-update.js';
 import { Failure, cause, requireValue } from './errors.js';
-import { hookInstallation } from './hook-setup.js';
+import { agentTasksHeader, hookInstallation, hookTaskCapability } from './hook-setup.js';
+import { HookOps, hookOpFile } from './hook-ops.js';
+import { HookTasks, hookTaskFile } from './hook-task.js';
 import { encode, identifier, integer, object, text, type ObjectValue } from './json.js';
 import { prepareMedia } from './media.js';
 import { job as validateJob } from './protocol.js';
@@ -16,8 +18,8 @@ export const tickHealthFile = 'hook-tick-health.json';
 const usageIntervalMs = 45_000;
 const run = promisify(execFile);
 
-type Action = { kind: 'silent' | 'wake'; reason: string; payload?: ObjectValue };
-type Tick = { checker_job_id: string; checker_run_id: string; scheduled_at: string; entered_at: string };
+export type Action = { kind: 'silent' | 'wake'; reason: string; payload?: ObjectValue };
+export type Tick = { checker_job_id: string; checker_run_id: string; scheduled_at: string; entered_at: string };
 export type EmitHook = (runtime: string, action: Action) => Promise<string>;
 
 export const emitHook: EmitHook = async (runtime, action) => {
@@ -49,7 +51,8 @@ export async function bootIdentity(pid: number): Promise<string> {
 }
 
 export class HookRunner {
-  constructor(readonly claims: Cron, readonly updater: CronUpdate, readonly emit: EmitHook = emitHook, readonly boot = bootIdentity) {}
+  constructor(readonly claims: Cron, readonly updater: CronUpdate, readonly emit: EmitHook = emitHook, readonly boot = bootIdentity,
+    readonly ops = new HookOps(claims.worker), readonly tasks = new HookTasks(claims.worker)) {}
 
   get worker() { return this.claims.worker; }
   get state() { return this.worker.state; }
@@ -106,14 +109,43 @@ export class HookRunner {
   private async tick(tick: Tick, boot: string): Promise<Action> {
     const recovered = await this.updater.recover();
     if (recovered) return silent(text(recovered.outcome));
+    const op = await this.read(hookOpFile);
+    if (op) {
+      await this.clearControlPull(op);
+      return silent(await this.ops.recover(op));
+    }
     const active = await this.read(claimFile);
     if (active) return this.active(active, tick);
+    const capability = await hookTaskCapability(this.worker);
+    const task = await this.read(hookTaskFile);
+    if (task) {
+      await this.clearControlPull(task);
+      const saved = await this.read(tickFile) ?? {};
+      const usage = await this.usage(saved, tick);
+      if (usage) await this.save(tickFile, { ...saved, last_usage_at: usage.observed_at });
+      return this.tasks.active(tick, capability, usage);
+    }
     const saved = await this.read(tickFile) ?? {};
     const { pending, usage } = await this.pendingPull(saved, tick);
     const transport = await this.worker.load();
     const reply = await transport.request('/api/v1/worker/pull', 'POST', encode(pending), { ...pending, ...tick, pull_run_id: pending.checker_run_id,
       ...(usage ? { weekly_usage: usage } : {}) }, 1, 10_000,
-    { ...await this.updater.contactHeaders(), ...weeklyUsageHeaders(usage), 'X-Muse-Worker-Hook-Proof': '1' });
+    { ...await this.updater.contactHeaders(), ...weeklyUsageHeaders(usage), ...capability, 'X-Muse-Worker-Hook-Proof': '1' });
+    const offers = [reply.data.job ?? undefined, reply.data.update, reply.data.worker_op, reply.data.agent_task];
+    requireValue(offers.filter(offer => offer !== undefined).length <= 1, 'invalid_hook_pull_offer');
+    if (reply.data.worker_op !== undefined) {
+      await this.ops.saveGrant(reply.data.worker_op, pending);
+      await this.clearPull(pending);
+      const op = await this.read(hookOpFile);
+      requireValue(op, 'invalid_hook_control_grant');
+      return silent(await this.ops.recover(op));
+    }
+    if (reply.data.agent_task !== undefined) {
+      requireValue(capability[agentTasksHeader] === '1', 'hook_prompt_unverified');
+      await this.tasks.saveGrant(reply.data.agent_task, pending);
+      await this.clearPull(pending);
+      return this.tasks.active(tick, capability);
+    }
     if (reply.data.job !== null) {
       requireValue(reply.data.update === undefined, 'invalid_update_offer');
       const grant = object(reply.data.job);
@@ -155,6 +187,15 @@ export class HookRunner {
         !(settled && time(settled.settled_at) >= lastUsage)) return;
     const usage = await this.claims.weeklyUsage(tick);
     if (usage && time(usage.observed_at) >= time(tick.scheduled_at)) return usage;
+  }
+
+  private async clearControlPull(entry: ObjectValue): Promise<void> {
+    const saved = await this.read(tickFile);
+    if (saved?.pending && integer(saved.sequence) === integer(entry.pull_sequence)) {
+      const pending = object(saved.pending);
+      requireValue(pending.checker_run_id === entry.pull_occurrence, 'poll_grant_conflict');
+      await this.clearPull(pending);
+    }
   }
 
   private async clearPull(pending: ObjectValue): Promise<void> {
@@ -206,7 +247,7 @@ export class HookRunner {
     if (this.state.sys.now() >= time(claim.deadline_at)) return this.expiredBeforeWake(claim, tick);
     claim = await this.reviseBeforeWake(claim, { wake_attempted_at: iso(this.state.sys.now()) });
     await this.worker.logger.log('INFO', 'hook.wake_intent', { ...this.claims.correlation(claim), emitted: 'unconfirmed', wake_attempted_at: claim.wake_attempted_at });
-    return { kind: 'wake', reason: 'work_claimed', payload: { claim_id: claim.claim_id, launch_id: claim.launch_id, job_id: work,
+    return { kind: 'wake', reason: 'work_claimed', payload: { kind: 'inference', claim_id: claim.claim_id, launch_id: claim.launch_id, job_id: work,
       expected_run_id: 'event-hook:' + identifier(claim.wake_invocation_id) } };
   }
 

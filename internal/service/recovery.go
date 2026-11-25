@@ -48,6 +48,9 @@ func uncertain(events *[]inferenceEvent, s *inference.State, j *inference.Job, b
 
 func (b *Broker) Recover(ctx context.Context, logger *slog.Logger) error {
 	logger.Info("recovery.started", "protocol_version", inference.Version, "health_window_seconds", 30)
+	if err := b.sweepWorkerControl(ctx, logger, true); err != nil {
+		return err
+	}
 	_, err := b.run(ctx, logger, inference.Ref{Routing: true, Full: true, Recovery: true}, "recovery", nil, func(s *inference.State, events *[]inferenceEvent) (any, error) {
 		previous := map[string]string{}
 		ids := make([]string, 0, len(s.Experiments))

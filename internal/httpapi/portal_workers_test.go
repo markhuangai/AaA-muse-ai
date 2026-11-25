@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"net/http"
 	"strings"
 	"testing"
 
@@ -110,7 +111,7 @@ func TestPortalWorkerReportsValidateOrderingWithoutAcceptingActionAssertions(t *
 	if !found {
 		t.Fatal("worker ordering cannot be reconstructed from logs")
 	}
-	if action, resource := portalWorkerAction("/api/v1/admin/workers"); action != "" || resource != "" {
+	if action, resource := portalWorkerAction(http.MethodGet, "/api/v1/admin/workers"); action != "" || resource != "" {
 		t.Fatal("read invented an action")
 	}
 }

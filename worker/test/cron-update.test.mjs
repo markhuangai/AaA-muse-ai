@@ -8,7 +8,7 @@ import { launcherScript } from '../dist/cron-setup.js';
 import { Failure } from '../dist/errors.js';
 import { State } from '../dist/state.js';
 import { Worker } from '../dist/worker.js';
-import { supportsSource, updateContract, updateTarget, verifyCandidate, verifyInstallEntry } from '../dist/update-archive.js';
+import { supportsSource, updateContract, updateTarget, preflightLegacyUpdate, verifyCandidate, verifyInstallEntry } from '../dist/update-archive.js';
 
 const from = '1.0.1-rc.1', to = '1.0.1', firstSHA = 'a'.repeat(64), nextSHA = 'b'.repeat(64);
 const origin = 'https://worker.example.test';
@@ -41,7 +41,11 @@ async function setup(t, { legacy = false, stage, override } = {}) {
     }
   };
   const archive = { stage: stage ?? (async () => ({ entry: after, observed_digest: nextSHA, http_status: '200' })), verify: async () => {} };
-  const updater = (version, entry) => new CronUpdate(new Worker(f.state, f.logger, f.net, version), { node: process.execPath, entry }, archive);
+  const updater = (version, entry) => new CronUpdate(new Worker(f.state, f.logger, f.net, version), {
+    home: join(f.state.root, 'home'), node: process.execPath, entry,
+    asset: name => fs.readFile(new URL('../setup/' + name, import.meta.url), 'utf8'),
+    prepareDirectory: path => fs.mkdir(path, { recursive: true, mode: 0o700 }),
+  }, archive);
   return { ...f, updater, actions, bin, before, after, original };
 }
 
@@ -65,10 +69,23 @@ test('declared update target and candidate metadata restrict the version, proven
   verifyInstallEntry(f.state.root, f.after);
   const root = join(f.state.root, 'releases/update.two/package');
   await fs.mkdir(join(root, 'dist'), { recursive: true });
+  const assets = join(root, 'setup');
+  await fs.mkdir(assets);
+  await Promise.all(['hook.sh', 'SKILL.md'].map(name => fs.copyFile(new URL('../setup/' + name, import.meta.url), join(assets, name))));
   await fs.writeFile(f.after, "process.stdout.write('1.0.1\\n')");
   await fs.writeFile(join(root, 'dist/build.json'), JSON.stringify({ package_version: to, source_sha: target.source_sha }));
   await fs.writeFile(join(root, 'package.json'), JSON.stringify({ name: target.name, version: to, aaa_muse_update: { contract: target.contract, from_majors: '' } }));
   await verifyCandidate({ node: process.execPath }, f.after, target);
+  await fs.appendFile(join(assets, 'hook.sh'), 'if invalid then\n');
+  await assert.rejects(() => verifyCandidate({ node: process.execPath }, f.after, target), /candidate_incompatible/);
+  await fs.copyFile(new URL('../setup/hook.sh', import.meta.url), join(assets, 'hook.sh'));
+  const next = f.updater(to, f.after);
+  await f.state.write('cron-update.json', JSON.stringify({ stage: 'downloading', target }));
+  await assert.rejects(preflightLegacyUpdate(next.io, f.state, to, 'foreign-hook'), /worker_identity_mismatch/);
+  await preflightLegacyUpdate(next.io, f.state, to, 'aaa-muse-worker-' + ID);
+  await fs.appendFile(join(assets, 'hook.sh'), 'if invalid then\n');
+  await assert.rejects(preflightLegacyUpdate(next.io, f.state, to, 'aaa-muse-worker-' + ID), /candidate_incompatible/);
+  assert.equal(await f.bin.read('aaa-muse-worker', 0o700), f.original);
   await assert.rejects(() => verifyCandidate({ node: process.execPath }, f.after, { ...target, source_sha: '1'.repeat(40) }), /candidate_incompatible/);
 });
 
@@ -91,6 +108,12 @@ test('a journal and the actual launcher reconcile a switched package after a los
   assert.equal(await f.state.read('cron-update.json'), undefined);
   assert.equal((await current.contactHeaders())['X-Muse-Worker-SHA256'], nextSHA);
   assert.deepEqual(f.actions, ['begin', 'activate', 'applied', 'applied']);
+  const installation = JSON.parse(await f.state.read('installation.json'));
+  assert(installation.skill_path.endsWith('/SKILL.md'));
+  const details = await Promise.all([fs.readFile(installation.skill_path, 'utf8'), fs.stat(installation.detector), fs.stat(installation.skill_path)]);
+  assert(details[0].includes('Background tasks'));
+  assert.equal(details[1].mode & 0o777, 0o700);
+  assert.equal(details[2].mode & 0o777, 0o600);
 });
 
 test('failed checksum keeps the previous launcher and records evidence for the watchdog', async t => {

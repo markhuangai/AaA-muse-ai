@@ -6,6 +6,9 @@ Managed hooks use the full broker release, including its RC suffix, and the dige
 
 ## Automatic worker updates
 
+Each verified 1.x candidate validates the detector template and the on-disk worker skill before activation. The new binary refreshes both assets from its archive and records their SHA-256 while confirming the update. For the first hop from `v1.1.1-rc.1`, the candidate performs the asset preflight when the installed updater requests its version.
+
+
 First enroll the managed-hook worker with the pinned prompt in **Workers**. A native-cron worker displays **Migration required**. To switch, drain work and outstanding receipts on the old pair, update the broker, verify the new registration, then remove the identified old cron and revoke its credential. The schema-5 store, client keys and request history stay with the broker.
 
 After that cutover, an idle managed worker can discover a strictly newer 1.x archive when the running brokers agree on its release pin. It downloads the canonical public artifact over HTTPS, checks its version, source and SHA-256, and swaps the launcher atomically. A fresh matching pickup confirms the update. Rollback is unsupported.

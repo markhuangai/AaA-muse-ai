@@ -431,7 +431,7 @@ func (b *Broker) run(ctx context.Context, logger *slog.Logger, ref inference.Ref
 	return result, nil
 }
 
-func (b *Broker) Projection(ctx context.Context, logger *slog.Logger, id string, workerAuth bool) (inference.Projection, error) {
+func (b *Broker) Projection(ctx context.Context, logger *slog.Logger, id string, workerAuth bool, builds ...Build) (inference.Projection, error) {
 	ref := inference.Ref{WorkerID: id, Principal: "management", CountPendingTools: true, PollProjection: true}
 	if workerAuth {
 		ref.WorkerAuth = id
@@ -446,6 +446,15 @@ func (b *Broker) Projection(ctx context.Context, logger *slog.Logger, id string,
 		}
 		applyPullProjection(&p, s)
 		p.Update = s.WorkerUpdate
+		p.ControlProjection = s.ControlProjection
+		if p.ActiveSlotLane != "" {
+			p.WorkStatus = "busy"
+		}
+		if !workerAuth && !s.Revoked {
+			paired := len(builds) > 0 && p.Update != nil && builds[0].Paired(p.Update.Contact)
+			p.WorkerOpsReady = p.Update == nil || (p.Update.Version == "" && p.Update.Contract == "") || paired
+			p.AgentTasksReady = paired && s.WorkerCapability != nil && s.WorkerCapability.AgentTasks
+		}
 		return p, nil
 	})
 	return p, err
@@ -481,7 +490,7 @@ func (b *Broker) Sweep(ctx context.Context, logger *slog.Logger) error {
 				return err
 			}
 		}
-		return nil
+		return b.sweepWorkerControl(bounded, logger, false)
 	}
 	ids, err := b.repo.InferenceWorkers(bounded)
 	if err != nil {
@@ -496,7 +505,7 @@ func (b *Broker) Sweep(ctx context.Context, logger *slog.Logger) error {
 			return err
 		}
 	}
-	return nil
+	return b.sweepWorkerControl(bounded, logger, false)
 }
 
 func (b *Broker) Run(ctx context.Context, logger *slog.Logger) {

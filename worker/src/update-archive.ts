@@ -5,7 +5,8 @@ import { basename, dirname, join, relative, resolve } from 'node:path';
 import { promisify } from 'node:util';
 import { Failure, cause, requireValue } from './errors.js';
 import { object, parse, text, type ObjectValue, type Value } from './json.js';
-import type { InstallationIO } from './install-io.js';
+import { prepareManagedAssets, renderManagedAssets, type InstallationIO } from './install-io.js';
+import type { State } from './state.js';
 
 export const updateContract = 'managed-hook-v1';
 const packageName = '@markhuangai/aaa-muse-worker';
@@ -39,6 +40,33 @@ export function supportsSource(target: ObjectValue, version: string): boolean {
   return firstDifference >= 0 && to[firstDifference] > from[firstDifference];
 }
 
+async function verifyAssetTemplates(entry: string): Promise<void> {
+  const setup = join(dirname(dirname(entry)), 'setup');
+  try {
+    await renderManagedAssets(file => readFile(join(setup, file), 'utf8'),
+      { launcher: '/launcher', worker_id: 'worker', origin: 'https://example.invalid' }, '/state');
+    await command('bash', ['-n', join(setup, 'hook.sh')], { timeout: 2_000, maxBuffer: 4096 });
+  } catch (error) {
+    throw new Failure('candidate_incompatible', { stage: 'managed_asset_verification', asset_error: cause(error) });
+  }
+}
+
+export async function preflightLegacyUpdate(io: InstallationIO, state: State, version: string, hookID: string): Promise<void> {
+  if (!/^update\.[A-Za-z0-9]+$/.test(basename(dirname(dirname(dirname(io.entry)))))) return;
+  const raw = await state.read('cron-update.json');
+  if (!raw) return;
+  const attempt = object(parse(raw));
+  if (attempt.stage !== 'downloading' || object(attempt.target).version !== version) return;
+  const installed = await state.read('installation.json');
+  requireValue(installed, 'worker_setup_required');
+  const installation = object(parse(installed));
+  if (installation.skill_path !== undefined) return;
+  requireValue(hookID === 'aaa-muse-worker-' + installation.worker_id && installation.entry !== io.entry, 'worker_identity_mismatch');
+  verifyInstallEntry(text(installation.root), io.entry);
+  await verifyAssetTemplates(io.entry);
+  await prepareManagedAssets(io, state, installation, true);
+}
+
 export async function verifyCandidate(io: InstallationIO, entry: string, target: ObjectValue): Promise<void> {
   const root = dirname(dirname(entry));
   const build = object(parse(await readFile(join(root, 'dist/build.json'), 'utf8')));
@@ -49,6 +77,7 @@ export async function verifyCandidate(io: InstallationIO, entry: string, target:
     expected_source: target.source_sha, observed_source: build.source_sha, expected_version: target.version, observed_version: metadata.version,
     expected_contract: target.contract, observed_contract: supported.contract, expected_from_majors: target.from_majors, observed_from_majors: supported.from_majors,
   });
+  await verifyAssetTemplates(entry);
   const { stdout } = await command(io.node, [entry, '--version'], { timeout: 5_000, maxBuffer: 4096 });
   requireValue(stdout.trim() === target.version, 'candidate_incompatible', { expected_version: target.version, observed_version: stdout.trim() });
 }

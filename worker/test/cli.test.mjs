@@ -115,3 +115,37 @@ test('overlapping CLI decision commands reuse one journal and reject conflicting
   assert.equal(saved.state, 'accepted'); assert.equal(saved.body, posts[0].options.body);
   assert.equal((await f.state.read('credential.key')).trim(), KEY);
 });
+
+test('CLI delivers authorized background task text and records a pre-start abort', async t => {
+  const f = await fixture(t); f.stdout = [];
+  const workerID = 'a'.repeat(32);
+  const hookID = 'aaa-muse-worker-' + workerID;
+  const io = adapters(f);
+  const run = (...args) => execute([args[0], '--state-dir', f.state.root, ...args.slice(1)], io);
+  const lease = { id: JOB, operation_id: JOB, claim_id: 'task-claim', generation: 1, checker_job_id: hookID,
+    launch_id: 'launch', wake_invocation_id: 'task-invocation', wake_attempted_at: new Date().toISOString() };
+  const due = new Date(Date.now() + 90_000).toISOString();
+  await f.state.write('config.json', JSON.stringify({ protocol_version: 1, origin: 'https://broker.example.test', worker_id: workerID }));
+  await f.state.write('credential.key', KEY);
+  await f.state.write('installation.json', JSON.stringify({ worker_id: workerID, package_sha256: archivePin, launcher: '/fixture/worker', detector: '/fixture/detector.sh' }));
+  await f.state.write('hook-installation.json', JSON.stringify({ worker_id: workerID, hook_id: hookID, watchdog_job_id: 'watchdog' }));
+  await f.state.write('hook-task.json', JSON.stringify(lease));
+  f.broker.override = call => {
+    if (call.path.endsWith('/start')) return Response.json({ id: JOB, worker_id: workerID, state: 'running',
+      claim: { claim_id: lease.claim_id, generation: lease.generation }, prompt: 'Use the scoped fixture', started_at: new Date().toISOString(), deadline_at: due });
+    if (call.path.endsWith('/result')) return Response.json({ id: JOB, held: true, state: 'completed' });
+  };
+  assert.equal(await run('hook-upgrade-describe', '--worker-id', workerID, '--goal-id', 'goal'), 0);
+  assert(JSON.parse(f.stdout.at(-1)).hook.prompt.includes('hook-task-start'));
+  assert.equal(await run('hook-task-start', '--launch-id', 'launch', '--run-id', 'event-hook:task-invocation'), 0);
+  assert.equal(JSON.parse(f.stdout.at(-1)).prompt, 'Use the scoped fixture');
+  io.input = async () => '{"result_text":"finished from the controlled brief","summary":"done"}';
+  assert.equal(await run('hook-task-finish', '--task-id', JOB, '--input', '-'), 0);
+  const delivered = JSON.parse(await f.state.read('hook-task.json'));
+  assert.equal(delivered.pending_result.result_text, 'finished from the controlled brief');
+  assert.equal(delivered.failure.reason, 'execution_confirmed_stopped');
+  await f.state.write('hook-task.json', JSON.stringify(lease));
+  assert.equal(await run('hook-task-abort', '--launch-id', 'launch', '--run-id', 'event-hook:task-invocation',
+    '--reason', 'execution_failed', '--summary', 'controlled abort'), 0);
+  assert.equal(JSON.parse(await f.state.read('hook-task.json')).failure.reason, 'execution_confirmed_stopped');
+});

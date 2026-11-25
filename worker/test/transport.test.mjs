@@ -138,3 +138,17 @@ test('SSE rejects bad protocol, bounded frames, TLS failures and incomplete stre
   const client = new Transport('https://example.test', KEY, f.logger, f.state.sys, { ...f.net, fetch: async () => { throw new Error(); } });
   for await (const _ of client.events(stopped.signal)) assert.fail('aborted stream emitted an event');
 });
+
+test('skewed update-only pull refuses all new non-update grants', async t => {
+  const f = await fixture(t);
+  let result = { job: null };
+  const pin = 'a'.repeat(64);
+  const client = new Transport('https://broker.example.test', KEY, f.logger, f.state.sys, { ...f.net, fetch: async () =>
+    Response.json(result, { headers: { 'X-Muse-Service-Version': '1.7.0', 'X-Muse-Paired-Worker-SHA256': 'b'.repeat(64) } }) },
+  '1.6.0', pin);
+  assert.equal((await client.request('/api/v1/worker/pull', 'POST', '{}')).data.job, null);
+  for (const lane of ['worker_op', 'agent_task']) {
+    result = { job: null, [lane]: { id: 'controlled-grant' } };
+    await assert.rejects(client.request('/api/v1/worker/pull', 'POST', '{}'), /update_required/);
+  }
+});

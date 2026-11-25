@@ -16,3 +16,9 @@ The 15-second managed shell hook polls while idle and reports presence while a c
 5. Export private evidence with `diagnostics-export --since RFC3339 --until RFC3339 --decode`. A hard crash can leave work held. Inspect its original run and producer evidence before taking any action on the claim.
 
 Keep credentials, request contents and local paths out of chat summaries. Use the worker's granted native and VM permissions.
+
+## Background tasks
+
+For a wake with kind `background_task`, run `hook-task-start --launch-id ID --run-id RUN` with this wake's launch ID and actual `event-hook:` run. Use the returned task prompt within the permissions granted to this run. Hook and cron changes, sending a chat message, and permission approval require the main chat.
+
+Finish all activity and submit `{"result_text":"...","summary":"..."}` through `hook-task-finish --task-id ID --input -`. For a clean failure or refusal, use `hook-task-abort --launch-id ID --run-id RUN --reason execution_failed` or `execution_refused`. An optional `--summary` records the reason. End after delivering the result or saving the abort.

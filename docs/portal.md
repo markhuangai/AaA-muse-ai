@@ -153,3 +153,13 @@ Initial #17 checks found an unsupported Go regexp quantifier, ambiguous test que
 `npm run test:unit --workspace portal` exercises the real React rendering, state, API adapter and report queue with replaceable I/O boundaries. Raw statement coverage for every portal production module is recorded under `.artifacts/unit/portal/coverage-final.json`; the existing unit runner binds it to source identity and requires strictly greater than 90% coverage independently of other components. Integration receipts never contribute to that threshold.
 
 `CI / portal` depends on successful unit shards, then requires the shell, worker and history browser/image suites. Their safe receipts and credential-free screenshots are retained for seven days; private fixtures, raw session responses, traces and HAR files are not uploaded. All controlled results are software evidence. The live Muse verdict remains inconclusive and a passing live receipt still gates release.
+
+## Remote worker actions
+
+The **Worker operations** panel runs a local health check, exports filtered worker diagnostics, or requests a retry for a failed or deferred update. Doctor and diagnostics need the exact broker and worker pair. Retry update asks the idle worker to pick up a verified newer release once sibling brokers agree. Diagnostic previews show completeness and omissions. Use **Export next page** to continue a truncated snapshot.
+
+The **Background agent tasks** panel queues a prompt for the selected worker and shows the worker ID in its confirmation. Enter up to 32,768 UTF-8 bytes, an optional title of up to 120 characters, and a timeout between 30 and 3,600 seconds. Use **Show hook upgrade prompt** in an unready worker's drawer and apply it in the owning main Muse chat. The worker advertises readiness on an authenticated paired tick after exact prompt readback. A background run can use tools granted to that run. Hook and cron configuration, chat sending, and permission approvals use the main chat.
+
+The worker holds one slot shared by inference, media, operations, and tasks. A cancelled or overdue claim can remain held until the broker receives correlated settlement evidence. If a write reply is lost, refresh remote activity and inspect the recent entries before starting another action.
+
+Automation uses the management key with the same `/api/v1/admin/workers/{id}/ops` and `/api/v1/admin/workers/{id}/agent-tasks` resources. Create and cancel with JSON carrying `protocol_version: 1` and a unique `submission_id`. Use GET on a collection for summaries or on an item for its details. The item's ID correlates its protected broker export with the worker capture.

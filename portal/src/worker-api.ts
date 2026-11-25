@@ -1,3 +1,4 @@
+import { isControlItem, type ControlItem } from './worker-remote-api';
 interface ModelReport {
   model_name?: string;
   context_window_tokens?: number;
@@ -41,6 +42,13 @@ export interface Worker {
   claim_started_at?: string;
   model_report?: ModelReport;
   worker_update?: WorkerUpdate;
+  worker_ops_ready?: boolean;
+  agent_tasks_ready?: boolean;
+  prompt_contract?: string;
+  capabilities_observed_at?: string;
+  active_slot_lane?: string;
+  current_worker_op?: ControlItem;
+  current_agent_task?: ControlItem;
   weekly_usage?: WeeklyUsage;
 }
 
@@ -93,7 +101,12 @@ export function isWorker(value: unknown): value is Worker {
     (value.claim_started_at === undefined || date(value.claim_started_at)) &&
     (value.model_report === undefined || modelReport(value.model_report)) &&
     (value.worker_update === undefined || isWorkerUpdate(value.worker_update)) &&
-    (value.weekly_usage === undefined || isWeeklyUsage(value.weekly_usage));
+    (value.weekly_usage === undefined || isWeeklyUsage(value.weekly_usage)) &&
+    [value.worker_ops_ready, value.agent_tasks_ready].every(field => field === undefined || typeof field === 'boolean') &&
+    (value.prompt_contract === undefined || typeof value.prompt_contract === 'string') &&
+    (value.capabilities_observed_at === undefined || date(value.capabilities_observed_at)) &&
+    (value.active_slot_lane === undefined || ['inference', 'worker_op', 'agent_task'].includes(String(value.active_slot_lane))) &&
+    [value.current_worker_op, value.current_agent_task].every(item => item === undefined || (isControlItem(item) && item.worker_id === value.id));
 }
 
 export function isEnrollment(value: unknown, kind: EnrollmentKind): value is Enrollment {

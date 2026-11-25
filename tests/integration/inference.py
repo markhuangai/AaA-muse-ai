@@ -124,7 +124,15 @@ class PullPeer:
 
     def poll_input(self, *, media_jobs=False, prompt_wav=False):
         sequence = len(self.pulls) + 1
-        stamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        scheduled = datetime.now(timezone.utc)
+        if self.pulls:
+            previous = datetime.fromisoformat(self.pulls[-1]["scheduled_at"])
+            deadline = time.monotonic() + 5
+            while scheduled <= previous:
+                require(time.monotonic() < deadline, "controlled poll clock did not advance")
+                time.sleep(0.02)
+                scheduled = datetime.now(timezone.utc)
+        stamp = scheduled.isoformat().replace("+00:00", "Z")
         return {"protocol_version": 1, "sequence": sequence, "checker_job_id": self.checker,
                 "checker_run_id": f"tick-{sequence}", "scheduled_at": stamp, "entered_at": stamp,
                 "media_jobs": media_jobs, "prompt_wav": prompt_wav}
@@ -139,7 +147,7 @@ class PullPeer:
         with self.condition:
             observed = time.monotonic()
             self.pulls.append({"at": observed, "started": started, "origin": origin or self.h.origin_url,
-                               "sequence": sequence, "duration_ms": round((observed - started) * 1000, 3),
+                               "sequence": sequence, "scheduled_at": payload["scheduled_at"], "duration_ms": round((observed - started) * 1000, 3),
                                "claimed": grant is not None, "request_id": headers["X-Request-Id"]})
             if grant is not None:
                 self.active = grant["job_id"]

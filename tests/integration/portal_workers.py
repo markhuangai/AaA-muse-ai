@@ -122,6 +122,7 @@ class PortalWorkers(Portal, History):
                            "stale_data": "Refresh the stale worker snapshot before changing access.",
                            "request_failed": "Read current server values before another deliberate action; restore browser connectivity if needed.",
                            "request_timeout": "Restore browser connectivity and refresh the read; retain any unconfirmed mutation outcome.",
+                           "invalid_response": "Refresh the worker activity and correlate the request before submitting again.",
                            "service_unavailable": "Use the correlated backend dependency failure to restore the service, then refresh."}
                 diagnosis = {"cause": event["cause"], "corrective_action": actions[event["cause"]], "operation_id": event["operation_id"], "related_request_id": event["related_request_id"]}
                 backend = [item for item in events if item["msg"] == "worker.operation_failed"]
@@ -132,7 +133,7 @@ class PortalWorkers(Portal, History):
         safe = Path(".artifacts/ci/portal/screens")
         safe.mkdir(parents=True, exist_ok=True, mode=0o700)
         for name in browser["screenshots"]:
-            require(re.fullmatch(r"workers-(empty|list|detail(?:-dark)?|revoke|error)-(1440|768|390)\.png", name), "unsafe worker screenshot name")
+            require(re.fullmatch(r"workers-(empty|list|detail(?:-dark)?|revoke|error|remote)-(1440|768|390)\.png", name), "unsafe worker screenshot name")
             shutil.copyfile(self.root / name, safe / name)
         self.receipts.extend(browser["cases"])
 

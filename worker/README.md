@@ -13,6 +13,14 @@ The wake agent uses `hook-start` with its own `event-hook:<invocation-id>` and t
 
 If a wake, start, output delivery or producer remains uncertain, the slot stays held. A matching receipt and stopped local delivery/producer processes permit settlement. The watchdog reports stale ticks, overdue uncertain claims and update failures. For a missing hook, inspect the registered hook from the main Muse chat and verify its next authenticated tick.
 
+## Remote operations and background tasks
+
+Open the paired worker in the control portal to request a local doctor report or filtered diagnostics. The idle detector handles these operations without waking Muse. A failed update can receive a retry request and still requires the broker's verified newer paired archive.
+
+An idle paired update refreshes the detector and the on-disk skill using atomic file writes. The journal stays in place until these files and the installation record are updated and the broker acknowledges the new binary. During the first upgrade from `1.1.1-rc.1`, the candidate validates the detector and skill before the old updater switches the launcher.
+
+The owning main Muse chat applies the portal's hook upgrade prompt to the existing registration. Use the existing worker ID and goal in `hook-upgrade-describe`, verify the native readback with `hook-confirm`, and wait for an authenticated tick. A task wake carries the exact launch and run IDs used by `hook-task-start`. Deliver the result with `hook-task-finish`, or report a clean failure or refusal with `hook-task-abort`. A lost reply replays the saved submission. The worker keeps the slot until settlement. The watchdog reports overdue tasks and stalled operations.
+
 ## Updates
 
 The installed archive and the broker must match for enrollment and all work traffic. During version skew an idle managed worker can verify and install a newer 1.x archive pinned by the running brokers. The launcher switches atomically and the worker confirms the running version on its next authenticated pull. Drain work and update attempts before changing the broker version. [Release rules](../docs/releases.md#automatic-worker-updates)

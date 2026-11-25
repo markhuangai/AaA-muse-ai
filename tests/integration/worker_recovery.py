@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from datetime import datetime, timedelta, timezone
 import json
+import time
 
 from native_cron import utc_stamp
 from service import require
@@ -159,6 +160,62 @@ class WorkerRecovery(WorkerSetup):
                 "later tick emitted another wake after uncertainty")
         self.receipt("worker.uncertain_wake", busy_hold=True, duplicate_wakes=0)
 
+    def remote_replay(self, worker):
+        op = self.worker_control(worker, "ops", {"protocol_version": 1, "submission_id": "recovery-doctor", "kind": "doctor"})
+        op_result = "/api/v1/worker/ops/" + op["id"] + "/result"
+        self.proxy.lose_worker_replies[op_result] = 1
+        self.tick(worker, want=1)
+        pending = json.loads((worker["state"] / "hook-op.json").read_text())["pending_result"]
+        require(self.worker_control(worker, "ops/" + op["id"])["state"] == "succeeded", "lost doctor reply lost its accepted result")
+        require(self.tick(worker)["outcome"] == "worker_op_settled", "doctor result did not replay from the journal")
+        require(any(event["msg"] == "receipt.replayed" and event["submission_id"] == pending["submission_id"]
+                    for event in self.export_operation(op["id"])), "broker export did not prove exact doctor replay")
+
+        task = self.worker_control(worker, "agent-tasks", {"protocol_version": 1, "submission_id": "recovery-task", "prompt": "Check the scoped fixture"})
+        self.proxy.lose_worker_replies["/api/v1/worker/pull"] = 1
+        self.tick(worker, want=1)
+        self.proxy.lose_worker_replies["/api/v1/worker/agent-tasks/" + task["id"] + "/bind"] = 1
+        self.tick(worker, want=1)
+        wake, _ = self.start_agent_task(worker, task)
+        self.proxy.lose_worker_replies["/api/v1/worker/agent-tasks/" + task["id"] + "/result"] = 1
+        self.native_cli(worker, "hook-task-abort", "--launch-id", wake["launch_id"], "--run-id", wake["expected_run_id"],
+                        "--reason", "execution_refused", "--summary", "Approval is needed", want=1)
+        detail = self.worker_control(worker, "agent-tasks/" + task["id"])
+        require(detail["state"] == "refused" and detail["held"] and detail["result"]["summary"] == "Approval is needed",
+                "started refusal lost its result or released its hold")
+        require(self.tick(worker)["outcome"] == "background_task_settled", "started refusal failed to settle after replay")
+        events = self.export_operation(task["id"])
+        require(sum(event["msg"] == "agent_task.result_accepted" for event in events) == 1 and
+                any(event["msg"] == "receipt.replayed" for event in events) and
+                any(event["msg"] == "agent_task.hook_bound" for event in events), "broker export did not reconstruct task binding, replay and abort")
+        self.receipt("worker.remote_operations_replay", doctor_replayed=True, task_rebound=True, task_refusal_settled=True, capture_complete=True)
+
+    def expired_background_task(self, worker):
+        task = self.worker_control(worker, "agent-tasks", {"protocol_version": 1, "submission_id": "overdue-background",
+                                                          "prompt": "Retain the current slot", "timeout_seconds": 30})
+        wake, _ = self.start_agent_task(worker, task)
+        self.docker("restart", self.broker, timeout=35)
+        self.ready(self.broker, self.origin_url)
+        queued = self.worker_control(worker, "ops", {"protocol_version": 1, "submission_id": "wait-for-background", "kind": "doctor"})
+        require(self.tick(worker)["outcome"] == "background_task_active" and self.worker_control(worker, "ops/" + queued["id"])["state"] == "queued",
+                "broker restart admitted a second lane while the task held its slot")
+        deadline = datetime.fromisoformat(task["deadline_at"].replace("Z", "+00:00"))
+        time.sleep(max(0, (deadline - datetime.now(timezone.utc)).total_seconds()) + 1.25)
+        notice = json.loads(self.native_cli(worker, "watchdog-check"))
+        require(any(incident["kind"] == "task_deadline_exceeded" and incident["task_id"] == task["id"] for incident in notice["incidents"]),
+                "overdue task did not appear on the hourly watchdog")
+        detail = self.worker_control(worker, "agent-tasks/" + task["id"])
+        require(detail["state"] == "interrupted" and detail["held"], "deadline discarded the uncertain slot")
+        reply = self.native_cli(worker, "hook-task-abort", "--launch-id", wake["launch_id"], "--run-id", wake["expected_run_id"],
+                                "--reason", "execution_failed", "--summary", "Controlled stop after deadline")
+        require(json.loads(reply)["outcome"] == "settlement_saved", "late stop lacked a correlated settlement")
+        require(self.tick(worker)["outcome"] == "background_task_settled" and self.tick(worker)["outcome"] == "worker_op_settled",
+                "settlement did not permit the next lane")
+        records = self.export_operation(task["id"])
+        require(any(event["msg"] == "agent_task.deadline_exceeded" and event["busy_hold"] and event["level"] == "ERROR" for event in records),
+                "overdue hold was not diagnosable from the protected export")
+        self.receipt("worker.overdue_task_across_broker_restart", watchdog=True, busy_hold=True, capture_complete=True)
+
     def exercise(self):
         worker = self.environment("recovery")
         self.install(worker, self.prompt())
@@ -168,6 +225,8 @@ class WorkerRecovery(WorkerSetup):
         self.surviving_producer(worker)
         self.lost_pull(worker)
         self.watchdog_behaviors(worker)
+        self.remote_replay(worker)
+        self.expired_background_task(worker)
         self.uncertain_wake()
         require((worker["state"] / "credential.key").read_text().strip() == identity, "recovery replaced enrolled authority")
         self.checked("/api/v1/admin/workers/" + worker["worker"]["id"] + "/revoke", self.admin, "POST")

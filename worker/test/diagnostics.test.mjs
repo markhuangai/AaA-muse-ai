@@ -206,3 +206,34 @@ test('pruning failures preserve captures before watermark persistence and report
     }
   }
 });
+
+test('bounded export verifies chunks, redacts values and resumes a stable snapshot', async t => {
+  const f = await fixture(t);
+  const token = 'aaa_muse_ai_' + 'd'.repeat(64);
+  const bearer = 'Bearer controlled-token-0123456789';
+  const filter = { operation_id: 'controlled-bounded-export' };
+  const dense = ('"\\').repeat(3500);
+  for (const index of [1, 2, 3]) {
+    await f.logger.capture.write({ time: new Date(f.state.sys.now()).toISOString(), level: 'DEBUG',
+      msg: 'worker.fixture', operation_id: filter.operation_id, result: `${dense} ${token} ${bearer}`, index });
+    f.advance(10);
+  }
+  const limit = 31_000;
+  const first = await f.logger.capture.exportBounded(filter, true, limit, '', f.logger.redactor);
+  assert(first.truncated && !first.complete && first.next_cursor && first.output.length > 0);
+  assert(Buffer.byteLength(encode(first)) <= limit);
+  assert(!encode(first).includes(token) && !encode(first).includes(bearer));
+  const after = await f.logger.capture.exportBounded(filter, true, limit, first.next_cursor, f.logger.redactor);
+  assert(after.captures > 0 && after.output[0] !== first.output[0]);
+  await assert.rejects(f.logger.capture.exportBounded({ operation_id: 'other' }, true, limit, first.next_cursor, f.logger.redactor), /invalid_diagnostics_cursor/);
+  await assert.rejects(f.logger.capture.exportBounded(filter, true, 1, '', f.logger.redactor), /diagnostics_limit_too_small/);
+
+  const raw = await f.logger.capture.exportBounded(filter, false, 512 * 1024, '', f.logger.redactor);
+  assert(raw.complete && !raw.truncated && raw.captures === 3);
+  for (const entry of raw.output) {
+    const chunks = entry.trimEnd().split('\n').map(JSON.parse);
+    const payload = Buffer.concat(chunks.map(chunk => Buffer.from(chunk.data_base64, 'base64'))).toString();
+    assert(!payload.includes(token) && !payload.includes(bearer) && payload.includes('[REDACTED]'));
+    assert(entry.trimEnd().split('\n').every(line => Buffer.byteLength(line) + 1 <= 6144));
+  }
+});

@@ -33,14 +33,17 @@ var workerUpdateSchema string
 //go:embed migrations/005_weekly_usage.sql
 var weeklyUsageSchema string
 
+//go:embed migrations/006_worker_control_lanes.sql
+var workerControlSchema string
+
 const (
-	SchemaVersion = 5
+	SchemaVersion = 6
 	Path          = "/var/lib/aaa-muse-ai/state/broker.sqlite3"
 	BusyTimeoutMS = 2000
 	EngineVersion = "3.54.1"
 )
 
-var migrations = [SchemaVersion]string{schema, portalSchema, pullSchema, workerUpdateSchema, weeklyUsageSchema}
+var migrations = [SchemaVersion]string{schema, portalSchema, pullSchema, workerUpdateSchema, weeklyUsageSchema, workerControlSchema}
 var migrationChecksums = func() (result [SchemaVersion]string) {
 	for index, migration := range migrations {
 		result[index] = fmt.Sprintf("%x", sha256.Sum256([]byte(migration)))

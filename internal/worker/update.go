@@ -76,6 +76,7 @@ type UpdateStatus struct {
 	RetryAt     *time.Time    `json:"retry_at,omitempty"`
 	Attempt     int           `json:"attempt,omitempty"`
 	StartedAt   *time.Time    `json:"started_at,omitempty"`
+	ControlOp   *ControlItem  `json:"-"`
 	From        Contact       `json:"from,omitzero"`
 }
 

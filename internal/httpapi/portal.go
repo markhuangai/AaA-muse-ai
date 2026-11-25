@@ -69,8 +69,19 @@ func decodePortalLogin(body []byte) (password string, remember *bool, err error)
 	return password, remember, nil
 }
 
-func portalWorkerAction(route string) (string, string) {
+func portalWorkerAction(method, route string) (string, string) {
+	if method != http.MethodPost && method != http.MethodPatch {
+		return "", ""
+	}
 	switch route {
+	case opsRoute:
+		return "worker_op.submit", "worker"
+	case opCancelRoute:
+		return "worker_op.cancel", "worker"
+	case tasksRoute:
+		return "agent_task.submit", "worker"
+	case taskCancelRoute:
+		return "agent_task.cancel", "worker"
 	case "/api/v1/admin/enrollments":
 		return "enrollment.issue", "enrollment"
 	case "/api/v1/admin/setup-prompts":

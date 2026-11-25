@@ -351,3 +351,22 @@ html:has(.worker-drawer:modal) { overflow: hidden; }
 @media (prefers-reduced-motion: reduce) {
   .worker-drawer, .worker-drawer::backdrop { transition: none; }
 }
+
+.worker-remote-panel { min-width: 0; }
+.worker-remote-panel h4 { margin-top: 20px; }
+.worker-remote-actions, .worker-remote-item-heading { display: flex; align-items: baseline; flex-wrap: wrap; gap: 8px; }
+.worker-remote-form, .worker-remote-list, .worker-remote-output { display: grid; gap: 10px; margin-top: 12px; min-width: 0; }
+.worker-remote-form label { display: grid; gap: 6px; margin: 0; }
+.worker-remote-form textarea { width: 100%; min-height: 112px; resize: vertical; padding: 10px 12px; border: 1px solid var(--control-border); border-radius: 6px; color: var(--ink); background: var(--surface); }
+.worker-remote-form textarea:focus-visible { outline: 2px solid var(--focus); outline-offset: 3px; }
+.worker-remote-form .worker-export-decode { display: flex; align-items: center; gap: 8px; }
+.worker-export-decode input { width: 16px; min-height: 16px; accent-color: var(--focus); }
+.worker-export { margin-top: 16px; }
+.worker-export summary { cursor: pointer; }
+.worker-prompt-count { margin-top: -4px; }
+.worker-remote-list { margin-bottom: 0; padding-left: 0; list-style: none; }
+.worker-remote-list li { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.worker-remote-list li button:first-child { display: flex; flex: 1 1 230px; min-width: 0; text-align: left; flex-wrap: wrap; gap: 5px 12px; }
+.worker-remote-list li strong, .worker-remote-output { overflow-wrap: anywhere; }
+.worker-remote-list time { color: var(--muted); font-size: 12px; }
+.worker-remote-output pre { white-space: pre-wrap; overflow-wrap: anywhere; border: 1px solid var(--rule); border-radius: 6px; }

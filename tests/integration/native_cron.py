@@ -65,6 +65,12 @@ class ManagedHookFixture:
         emitted = json.loads(result.stdout)
         if emitted["action"] == "wake":
             payload = emitted["payload"]
+            if payload.get("kind") == "background_task":
+                record = json.loads((worker["state"] / "hook-task.json").read_text())
+                require(record["id"] == payload["task_id"] and record["claim_id"] == payload["claim_id"] and
+                        payload["expected_run_id"] == "event-hook:" + invocation,
+                        "packed task wake lost its exact invocation or claim")
+                return {"outcome": "background_task", **payload}
             current = json.loads((worker["state"] / "cron-claim.json").read_text())
             require(current["claim_id"] == payload["claim_id"] and current["wake_invocation_id"] == invocation and
                     payload["expected_run_id"] == "event-hook:" + invocation,
@@ -81,6 +87,20 @@ class ManagedHookFixture:
         if outcome == "claim_active":
             result["cause"] = self.status(worker).get("busy_reason")
         return result
+
+    def worker_control(self, worker, suffix, data=None, want=None):
+        worker_id = worker["worker"]["id"]
+        path = f"/api/v1/admin/workers/{worker_id}/{suffix}"
+        method = "POST" if data is not None else "GET"
+        return self.checked(path, self.admin, method, data, want=want or (202 if data is not None else 200))[0]
+
+    def start_agent_task(self, worker, task):
+        wake = self.tick(worker)
+        require(wake["outcome"] == "background_task" and wake["task_id"] == task["id"], "worker did not wake for the scoped task")
+        reply = self.native_cli(worker, "hook-task-start", "--launch-id", wake["launch_id"], "--run-id", wake["expected_run_id"])
+        brief = json.loads(reply)
+        require(brief["outcome"] == "authorized" and brief["task_id"] == task["id"], "worker did not receive the task brief")
+        return wake, brief
 
     def start_work(self, worker, *, want=0, self_report=None):
         work = worker["work"]

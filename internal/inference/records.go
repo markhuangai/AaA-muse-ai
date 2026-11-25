@@ -62,6 +62,7 @@ type Pull struct {
 	VerifyStart     bool                `json:"-"`
 	VerifyHookStart bool                `json:"-"`
 	ObserveLegacy   bool                `json:"-"`
+	AgentTasks      bool                `json:"-"`
 }
 
 type Grant struct {
@@ -74,20 +75,27 @@ type Grant struct {
 }
 
 type PullResult struct {
-	Job    *Grant              `json:"job"`
-	Update *worker.UpdateOffer `json:"update,omitempty"`
+	Job       *Grant               `json:"job"`
+	Update    *worker.UpdateOffer  `json:"update,omitempty"`
+	WorkerOp  *worker.ControlGrant `json:"worker_op,omitempty"`
+	AgentTask *worker.ControlGrant `json:"agent_task,omitempty"`
 }
 
 type PullTiming struct {
-	Acquire           time.Duration
-	Select            time.Duration
-	PreviousPin       string
-	PreviousPinReason string
-	Update            worker.UpdateStatus
-	UsageResult       string
-	UsageDecision     string
-	EffectiveUsage    *worker.WeeklyUsage
-	UsageDeferrals    []UsageDeferral
+	Acquire             time.Duration
+	Select              time.Duration
+	PreviousPin         string
+	PreviousPinReason   string
+	Update              worker.UpdateStatus
+	UpdateOp            *worker.ControlItem
+	ConfirmedUpdateOp   *worker.ControlItem
+	PreviousUpdateState string
+	Capability          *worker.Capability
+	CapabilityChanged   bool
+	UsageResult         string
+	UsageDecision       string
+	EffectiveUsage      *worker.WeeklyUsage
+	UsageDeferrals      []UsageDeferral
 }
 
 type UsageDeferral struct {
@@ -340,6 +348,7 @@ func (c Connection) Status(now time.Time) string {
 }
 
 type Projection struct {
+	worker.ControlProjection
 	ConnectionStatus     string                  `json:"connection_status"`
 	OfflineForMS         *int64                  `json:"offline_for_ms,omitempty"`
 	WorkStatus           string                  `json:"work_status"`
@@ -397,6 +406,8 @@ type State struct {
 	LastPollAt            *time.Time
 	LastContactAt         *time.Time
 	WorkerUpdate          *worker.UpdateStatus
+	ControlProjection     worker.ControlProjection
+	WorkerCapability      *worker.Capability
 	WeeklyUsage           *worker.WeeklyUsage
 	QuotaTransferFrom     string
 	Experiments           map[string]*Experiment

@@ -54,7 +54,7 @@ export class Transport {
     const pin = response.headers.get('x-muse-paired-worker-sha256');
     if (declared === null && pin === null && (response.status === 429 || response.status >= 500)) return;
     const updateOnly = pin !== null && archiveDigest.test(pin) && declared?.startsWith('1.') &&
-      (route === '/api/v1/worker/update' || (response.ok && route === '/api/v1/worker/pull' && data.job === null));
+      (route === '/api/v1/worker/update' || (response.ok && route === '/api/v1/worker/pull' && data.job === null && data.worker_op === undefined && data.agent_task === undefined));
     if (response.ok && route === '/api/v1/worker/pull' && data.update !== undefined) {
       const update = object(object(data.update).target);
       requireValue(update.version === declared && update.sha256 === pin && update.contract === updateContract, 'update_offer_pair_mismatch',
@@ -82,7 +82,7 @@ export class Transport {
       controlRouteUnavailable(response.status, route, data, this.credential);
     if (declared === null && retryable && data.error !== 'update_required') return;
     const checked = route.endsWith('/enroll') || (route.endsWith('/status') && !this.credential) || route.endsWith('/pull') || route.endsWith('/start') || route.endsWith('/events') || route.endsWith('/claim');
-    const updateOnly = updateCapable && route === '/api/v1/worker/pull' && response.ok && data.job === null;
+    const updateOnly = updateCapable && route === '/api/v1/worker/pull' && response.ok && data.job === null && data.worker_op === undefined && data.agent_task === undefined;
     if (data.error === 'update_required' || (checked && !updateOnly && major(this.productVersion) !== (declared === null ? '0' : major(declared)))) {
       const recommended = data.worker_package ?? (declared === null ? null : { version: declared, release_url: 'https://github.com/markhuangai/AaA-muse-ai/releases/tag/v' + declared });
       throw new Failure('update_required', { worker_version: this.productVersion, service_version: declared ?? 'legacy-major-zero', recommended_worker: recommended, automatic_update: false, corrective_action: 'Install the service-paired worker manually, or align the service major; preserve worker identity and journals.', http_status: response.status, request_id: response.headers.get('x-request-id') ?? '' });
@@ -110,7 +110,7 @@ export class Transport {
       return decoded(new TextDecoder('utf8', { fatal: true, ignoreBOM: preserveBOM }), Buffer.concat(buffers));
     } finally { await reader.cancel(); reader.releaseLock(); }
   }
-  async request(route: string, method = 'GET', input?: string, correlation: Record<string, Value> = {}, attempts = 3, timeoutMs = 10_000, metadata: Record<string, string> = {}): Promise<Reply> {
+  async request(route: string, method = 'GET', input?: string, correlation: Record<string, Value> = {}, attempts = 3, timeoutMs = 10_000, metadata: Record<string, string> = {}, { omitInputLog = false }: { omitInputLog?: boolean } = {}): Promise<Reply> {
     requireValue(/^\/api\/v1\/worker\/[a-z0-9/_-]+$/.test(route), 'invalid_worker_route');
     validateBody(input);
     for (let attempt = 1; ; attempt++) {
@@ -133,7 +133,8 @@ export class Transport {
         const validation = responseValidation ? { response_validation_cause: responseValidation } : {};
         await this.logger.log('DEBUG', 'worker.http_exchange', { ...correlation, ...validation, request_id: requestId, endpoint: this.endpoint, route: this.path(route), method, attempt, duration_ms: this.sys.now() - started, http_status: response.status,
           service_version: response.headers.get('x-muse-service-version'), service_worker_digest: response.headers.get('x-muse-paired-worker-sha256'),
-          input: input === undefined ? null : parse(input), output: responseValidation ? raw : data });
+          ...(omitInputLog ? { input_omitted: true, input_bytes: Buffer.byteLength(input ?? '') } : { input: input === undefined ? null : parse(input) }),
+          output: responseValidation ? raw : data });
         this.compatibility(response, route, data, !!metadata['X-Muse-Worker-Updater'], this.hookDigest === undefined ? undefined : metadata['X-Muse-Worker-SHA256'] ?? this.hookDigest);
         if (!response.ok) throw new Failure(response.status === 401 ? 'worker_unauthorized' : 'broker_rejected', { ...correlation, ...validation, request_id: requestId, route, method, attempt, http_status: response.status, reason: typeof data.error === 'string' ? data.error : 'invalid_error_response' }, response.status === 429 || response.status >= 500 || controlRouteUnavailable(response.status, route, data, this.credential));
         return { data, requestId, status: response.status };

@@ -324,3 +324,137 @@ test('the real Bash adapter emits exactly one native action with an inert payloa
     'work_claimed\n{"invocation":"actual"}\n');
   await assert.rejects(emitHook(f.state.path('missing'), { kind: 'silent', reason: 'idle' }), /hook_runtime_failed/);
 });
+
+test('v2 hook upgrade verifies the worker, goal and readback before advertising task support', async t => {
+  const f = await setup(t);
+  await f.state.write('installation.json', JSON.stringify({ worker_id: ID, launcher: '/installed/worker', detector: '/private/detector.sh', package_sha256: pin }));
+  const hs = new HookSetup(f.worker, {});
+  const v2 = await hs.describe('goal');
+  const original = { ...v2, hook: { ...v2.hook, prompt: 'old hook prompt' } };
+  await f.state.write('hook-expected.json', JSON.stringify(original));
+  await assert.rejects(hs.describeUpgrade(JOB, 'goal'), /worker_identity_mismatch/);
+  await assert.rejects(hs.describeUpgrade(ID, 'wrong'), /hook_goal_mismatch/);
+  const candidate = await hs.describeUpgrade(ID, 'goal');
+  assert.deepEqual(candidate, v2);
+  const readback = expected => JSON.stringify({ goal_id: expected.goal_id, complete: true, dry_run: 'silent',
+    hooks: [expected.hook], watchdogs: [{ ...expected.watchdog, native_job_id: 'watchdog' }] });
+  await assert.rejects(hs.confirm(readback(original)), /hook_readback_mismatch/);
+  f.broker.override = call => call.path.endsWith('/pull') ? hookReply({ job: null }) : undefined;
+  await f.runner.check(env('before-confirm'));
+  assert.equal(f.broker.calls.at(-1).options.headers['X-Muse-Worker-Agent-Tasks'], undefined);
+  await hs.confirm(readback(candidate));
+  const installed = JSON.parse(await f.state.read('hook-installation.json'));
+  assert.equal(installed.confirmed_at, new Date(startTime).toISOString());
+  assert.equal(installed.hook_prompt_sha256, digest(v2.hook.prompt));
+  assert.equal(await f.state.read('hook-upgrade-expected.json'), undefined);
+  f.advance(15000);
+  await f.runner.check(env('after-confirm'));
+  assert.equal(f.broker.calls.at(-1).options.headers['X-Muse-Worker-Agent-Tasks'], '1');
+});
+
+test('a doctor grant runs on the quiet hook and replays saved bytes after a lost result', async t => {
+  const f = await setup(t);
+  const payload = { id: JOB, operation_id: JOB, claim_id: 'operation-claim', generation: 1, kind: 'doctor',
+    claimed_at: new Date().toISOString(), deadline_at: new Date(Date.now() + 120_000).toISOString() };
+  const bodies = [];
+  f.broker.override = call => {
+    if (call.path.endsWith('/pull')) return hookReply({ job: null, worker_op: payload });
+    if (call.path.endsWith('/result')) {
+      bodies.push(call.options.body);
+      if (bodies.length === 1) throw new Error('controlled reply loss');
+      return hookReply({ id: JOB, held: false });
+    }
+  };
+  await assert.rejects(f.runner.check(env('doctor-grant')), /broker_unreachable/);
+  assert((await f.state.read('hook-op.json')).includes('pending_result'));
+  assert.equal(JSON.parse(bodies[0]).result.state_permissions, 'verified');
+  f.advance(15_000);
+  assert.equal(await f.runner.check(env('doctor-replay')), 'worker_op_settled');
+  assert.equal(bodies.length, 2);
+  assert.equal(bodies[0], bodies[1]);
+  assert.deepEqual(f.actions.map(action => action.kind), ['silent']);
+  assert.equal(await f.state.read('hook-op.json'), undefined);
+});
+
+test('task binding and started abort retain exact journals until their replies and settlement', async t => {
+  const f = await setup(t);
+  await f.state.write('installation.json', JSON.stringify({ worker_id: ID, launcher: '/installed/worker', detector: '/private/detector.sh', package_sha256: pin }));
+  const hs = new HookSetup(f.worker, {});
+  const definition = await hs.describe('goaltask');
+  await hs.confirm(JSON.stringify({ goal_id: definition.goal_id, complete: true, dry_run: 'silent', hooks: [definition.hook],
+    watchdogs: [{ ...definition.watchdog, native_job_id: 'watchdog' }] }));
+  const grant = { id: JOB, operation_id: JOB, claim_id: 'task-claim', generation: 1,
+    claimed_at: new Date().toISOString(), deadline_at: new Date(Date.now() + 120_000).toISOString() };
+  const attempts = {};
+  f.broker.override = call => {
+    const stage = call.path.split('/').at(-1);
+    (attempts[stage] ??= []).push(call.options.body);
+    if (['pull', 'bind', 'result'].includes(stage) && attempts[stage].length === 1) throw new Error('controlled reply loss');
+    switch (stage) {
+      case 'pull': return hookReply({ job: null, agent_task: grant });
+      case 'bind': return hookReply({ task_id: JOB, claim_id: grant.claim_id, invocation_id: call.input.invocation_id });
+      case 'start': return hookReply({ id: JOB, worker_id: ID, claim: grant, state: 'running',
+        prompt: 'Inspect the authorized fixture', started_at: new Date().toISOString(), deadline_at: grant.deadline_at });
+      case 'result': return hookReply({ id: JOB, held: true, state: 'refused' });
+      case 'interrupt': return hookReply({ id: JOB, held: false, state: 'refused' });
+      default: throw new Error('unexpected route ' + stage);
+    }
+  };
+  await assert.rejects(f.runner.check(env('first-pull')), /broker_unreachable/);
+  f.advance(15_000);
+  await assert.rejects(f.runner.check(env('first-bind')), /broker_unreachable/);
+  f.advance(15_000);
+  assert.equal(await f.runner.check(env('final-binding')), 'background_task');
+  assert.equal(attempts.pull[0], attempts.pull[1]);
+  assert.equal(attempts.bind[0], attempts.bind[1]);
+  assert.equal(attempts.bind.length, 3);
+  const wake = f.actions[0].payload;
+  await assert.rejects(f.runner.tasks.start(wake.launch_id, 'event-hook:wrong'), /hook_run_mismatch/);
+  assert.equal((await f.runner.tasks.start(wake.launch_id, wake.expected_run_id)).prompt, 'Inspect the authorized fixture');
+  await assert.rejects(f.runner.tasks.abort(wake.launch_id, wake.expected_run_id, 'execution_refused', 'Permission required'), /broker_unreachable/);
+  assert.equal(JSON.parse(attempts.result[0]).summary, 'Permission required');
+  f.advance(15_000);
+  assert.equal(await f.runner.check(env('finish-settlement')), 'background_task_settled');
+  assert.equal(attempts.result[0], attempts.result[1]);
+  assert.equal(attempts.interrupt.length, 1);
+  assert.equal(await f.state.read('hook-task.json'), undefined);
+});
+
+test('bounded diagnostics run quietly and exclude their raw result from HTTP capture', async t => {
+  const f = await setup(t);
+  await f.logger.log('DEBUG', 'worker.controlled_capture', { operation_id: 'filter-source', output: 'diagnostic payload' });
+  const grant = { id: JOB, operation_id: JOB, claim_id: 'export-claim', generation: 1, kind: 'diagnostics_export',
+    params: { operation_id: 'filter-source', decode: true, max_bytes: 8192 },
+    claimed_at: new Date().toISOString(), deadline_at: new Date(Date.now() + 120_000).toISOString() };
+  f.broker.override = call => call.path.endsWith('/pull') ? hookReply({ job: null, worker_op: grant }) : hookReply({ id: JOB, held: false });
+  assert.equal(await f.runner.check(env('export')), 'worker_op_settled');
+  const result = JSON.parse(f.broker.calls.at(-1).options.body).result;
+  assert.equal(result.captures, 1);
+  assert.match(result.output[0], /diagnostic payload/);
+  const trace = await f.logger.capture.export({ operation_id: JOB }, true);
+  assert(!trace.includes('diagnostic payload') && trace.includes('input_omitted'));
+  assert.deepEqual(f.actions.map(action => action.kind), ['silent']);
+});
+
+test('task presence and watchdog preserve overdue tasks and stalled operations', async t => {
+  const f = await setup(t);
+  const at = Date.now() - 360_000;
+  const task = { id: JOB, operation_id: JOB, claim_id: 'overdue-claim', generation: 1, checker_job_id: hookID, wake_invocation_id: 'wake',
+    launch_id: 'task-launch', wake_attempted_at: new Date(at).toISOString(), deadline_at: new Date(at + 10_000).toISOString() };
+  await f.state.write('hook-task.json', JSON.stringify(task));
+  await f.state.write('hook-op.json', JSON.stringify({ ...task, kind: 'doctor', claimed_at: new Date(at).toISOString() }));
+  const watchdog = new HookWatchdog(f.worker, async () => 'boot');
+  const first = await watchdog.check();
+  assert(first.incidents.some(item => item.kind === 'task_deadline_exceeded'));
+  assert(first.incidents.some(item => item.kind === 'worker_op_stalled'));
+  assert.equal((await watchdog.check()).notify, false);
+  await f.state.remove('hook-op.json');
+  f.broker.override = call => {
+    assert(call.path.endsWith('/agent-tasks/' + JOB + '/presence'));
+    return hookReply({ recorded: true });
+  };
+  assert.equal(await f.runner.check(env('busy-task')), 'background_task_active');
+  assert(await f.state.read('hook-task.json'));
+  assert.equal(f.broker.calls.length, 1);
+  assert.equal(JSON.parse(f.broker.calls[0].options.body).hold_reason, 'native_observation_pending');
+});
