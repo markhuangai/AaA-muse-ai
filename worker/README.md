@@ -8,6 +8,8 @@ The major-1 worker is a finite TypeScript helper for an enrolled Muse goal. One 
 2. Verify the installer receipt and read back the same goal ID, checker job ID, enabled state, one-minute interval, and exact action. If registration was uncertain, inspect the goal’s active and disabled native jobs. Adopt a single exact match; do not create another checker because a reply or listing is missing.
 3. Keep the same worker ID and private state across restarts. The default path is `$XDG_STATE_HOME/aaa-muse-worker-v1`, falling back to `$HOME/.local/state/aaa-muse-worker-v1`. The state directory is `0700` and `credential.key` is `0600`. Enrollment codes are private, single-use, and valid for fifteen minutes; the long-lived worker credential never goes in a prompt, URL, or argument. Do not reuse a major-0 installation, store, schedule, or key for this cutover.
 
+If the connection drops during enrollment, the installer retries in the same command. If retries run out, use the original prompt with the same private state directory. Setup saves a broker-generated inactive credential in a private journal before it activates the worker. If activation already committed, setup can recover the same worker even after the code expires. If the broker reports that the code expired unused or was consumed by another credential, generate a fresh prompt for the same state directory. An older `enrollment_uncertain` journal without a staged credential requires the owner to inspect issuance records before starting over.
+
 The installed launcher passes the correct state directory. Source builds can use `node worker/dist/main.js` with `--state-dir /absolute/path`.
 
 | Command | Use |

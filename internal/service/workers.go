@@ -20,6 +20,8 @@ const EnrollmentLifetime = 15 * time.Minute
 type WorkerRepository interface {
 	IssueEnrollment(context.Context, string, [32]byte, time.Duration) (worker.Enrollment, error)
 	ConsumeEnrollment(context.Context, [32]byte, string, [32]byte, string) (worker.Record, worker.Enrollment, error)
+	PrepareEnrollment(context.Context, [32]byte, [32]byte, [32]byte) (worker.Enrollment, error)
+	ActivateEnrollment(context.Context, [32]byte, string, [32]byte, string, [32]byte) (worker.Record, worker.Enrollment, bool, error)
 	AuthenticateWorker(context.Context, [32]byte) (worker.Record, error)
 	Workers(context.Context) ([]worker.Record, error)
 	RenameWorker(context.Context, string, string) (worker.Record, worker.Record, error)
@@ -112,6 +114,58 @@ func (s *Workers) Enroll(ctx context.Context, logger *slog.Logger, code string) 
 	}
 	logger.Info("worker.enrolled", "worker_id", w.ID, "enrollment", e, "worker", w, "transaction_outcome", "committed", "duration_ms", s.now().Sub(started).Milliseconds())
 	return w, e, credential, nil
+}
+
+func stagedCredentialDigest(credential string) [32]byte {
+	return auth.Digest("worker-enrollment-prepare/v1:" + credential)
+}
+
+func (s *Workers) PrepareEnrollment(ctx context.Context, logger *slog.Logger, code string) (worker.Enrollment, string, error) {
+	logger, started := workerLogger(logger, "enrollment.prepare"), s.now()
+	if !auth.ValidToken(code, auth.EnrollmentPrefix) {
+		return worker.Enrollment{}, "", s.failed(logger, &worker.Rejection{Reason: "enrollment_invalid"}, started)
+	}
+	credential, err := auth.Token(auth.WorkerPrefix, s.random)
+	if err == nil && s.authority.Reserved(credential) {
+		err = errors.New("generated_worker_authority_collision")
+	}
+	if err != nil {
+		return worker.Enrollment{}, "", s.failed(logger, err, started)
+	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	e, err := s.repo.PrepareEnrollment(ctx, auth.Digest(code), stagedCredentialDigest(credential), auth.Digest(credential))
+	if err != nil {
+		return e, "", s.failed(logger, err, started)
+	}
+	logger.Info("enrollment.prepared", "enrollment_id", e.ID, "enrollment", e, "transaction_outcome", "committed", "duration_ms", s.now().Sub(started).Milliseconds())
+	return e, credential, nil
+}
+
+func (s *Workers) ActivateEnrollment(ctx context.Context, logger *slog.Logger, code, credential string) (worker.Record, worker.Enrollment, error) {
+	logger, started := workerLogger(logger, "enrollment.activate"), s.now()
+	if !auth.ValidToken(code, auth.EnrollmentPrefix) {
+		return worker.Record{}, worker.Enrollment{}, s.failed(logger, &worker.Rejection{Reason: "enrollment_invalid"}, started)
+	}
+	if !auth.ValidToken(credential, auth.WorkerPrefix) || s.authority.Reserved(credential) {
+		return worker.Record{}, worker.Enrollment{}, s.failed(logger, &worker.Rejection{Reason: "invalid_worker_credential"}, started)
+	}
+	id, err := auth.ID(s.random)
+	if err != nil {
+		return worker.Record{}, worker.Enrollment{}, s.failed(logger, err, started)
+	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	w, e, replay, err := s.repo.ActivateEnrollment(ctx, auth.Digest(code), id, auth.Digest(credential), "Worker "+id[:8], stagedCredentialDigest(credential))
+	if err != nil {
+		return w, e, s.failed(logger, err, started)
+	}
+	event := "worker.enrolled"
+	if replay {
+		event = "enrollment.activation_replayed"
+	}
+	logger.Info(event, "worker_id", w.ID, "enrollment_id", e.ID, "enrollment", e, "worker", w, "transaction_outcome", "committed", "duration_ms", s.now().Sub(started).Milliseconds())
+	return w, e, nil
 }
 
 func (s *Workers) Authenticate(ctx context.Context, logger *slog.Logger, credential string) (worker.Record, error) {

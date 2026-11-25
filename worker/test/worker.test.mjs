@@ -15,7 +15,7 @@ test('enrollment preserves identity, rejects origin changes, and never silently 
   await f.worker.enroll(CODE);
   assert.equal((await f.state.read('credential.key')).trim(), KEY);
   assert.equal((await f.worker.enroll(CODE)).identity_preserved, true);
-  assert.equal(f.broker.calls.filter(c => c.path.endsWith('/enroll')).length, 1);
+  assert.equal(f.broker.calls.filter(c => c.path.endsWith('/enroll') && c.input?.phase === 'activate').length, 1);
   await f.worker.configure('https://broker.example.test');
   await assert.rejects(f.worker.configure('https://different.example.test'), /enrolled_origin_immutable/);
   assert(!f.output.join('').includes(KEY)); assert(!f.output.join('').includes(CODE));
@@ -27,8 +27,22 @@ test('enrollment preserves identity, rejects origin changes, and never silently 
   await lost.worker.configure('https://broker.example.test');
   lost.broker.override = async call => { if (call.path.endsWith('/enroll')) throw Object.assign(new Error(KEY), { code: 'ECONNRESET' }); };
   await assert.rejects(lost.worker.enroll(CODE), /broker_unreachable/);
-  await assert.rejects(lost.worker.enroll(CODE), /enrollment_uncertain/);
-  assert.equal(lost.broker.calls.filter(c => c.path.endsWith('/enroll')).length, 1);
+  const resume = new Worker(lost.state, lost.logger, lost.net);
+  await assert.rejects(resume.configure('https://other.example.test'), /enrollment_origin_immutable/);
+  await assert.rejects(resume.enroll('muse_enroll_' + 'A'.repeat(43)), /enrollment_journal_mismatch/);
+  assert.equal(lost.broker.calls.filter(c => c.path.endsWith('/enroll')).length, 3);
+  lost.broker.override = undefined;
+  assert.equal((await resume.enroll(CODE)).worker_id, ID);
+
+  const legacy = await fixture(t);
+  await legacy.worker.configure('https://broker.example.test');
+  legacy.broker.override = async call => {
+    if (call.input?.phase === 'prepare') return new Response('{"error":"unsupported_field"}', { status: 400 });
+    if (call.path.endsWith('/enroll')) throw Object.assign(new Error(), { code: 'ECONNRESET' });
+  };
+  await assert.rejects(legacy.worker.enroll(CODE), /broker_unreachable/);
+  await assert.rejects(legacy.worker.enroll(CODE), /enrollment_uncertain/);
+  assert.deepEqual(legacy.broker.calls.filter(c => c.path.endsWith('/enroll')).map(c => c.input.phase), ['prepare', undefined]);
   const rejected = await fixture(t); await rejected.worker.configure('https://broker.example.test');
   rejected.broker.override = async call => call.path.endsWith('/enroll') ? new Response('{"error":"enrollment_expired"}', { status: 410, headers: { 'X-Muse-Service-Version': call.options.headers['X-Muse-Worker-Version'] } }) : undefined;
   await assert.rejects(rejected.worker.enroll(CODE), /broker_rejected/);
@@ -49,8 +63,93 @@ test('identity recovery and all-or-explicit-failure enrollment storage execute r
   } }, bad.state.sys);
   const worker = new Worker(state, bad.logger, bad.net);
   await assert.rejects(worker.enroll(CODE)); assert.equal(await bad.state.read('credential.key'), undefined);
-  await assert.rejects(bad.worker.enroll(CODE), /enrollment_uncertain/);
-  assert.equal(bad.broker.calls.filter(c => c.path.endsWith('/enroll')).length, 1);
+  assert.equal((await bad.worker.enroll(CODE)).worker_id, ID);
+  assert.deepEqual(bad.broker.calls.filter(c => c.path.endsWith('/enroll')).map(c => c.input.phase), ['prepare', 'activate', 'activate']);
+  assert(!String(await bad.state.read('enrollment.json')).includes(KEY));
+});
+
+test('the staged journal is necessary for activation and can only be replaced after a definite supersession', async t => {
+  const f = await fixture(t);
+  await f.worker.configure('https://broker.example.test');
+  let activation = 0;
+  f.broker.override = async call => {
+    if (call.input?.phase !== 'activate') return;
+    const journal = object(parse(await f.state.read('enrollment.json')));
+    assert.equal(journal.state, 'staged');
+    assert.equal(call.options.headers.Authorization, 'Bearer ' + journal.credential);
+    assert.equal(call.options.headers['X-Muse-Enrollment-Operation'], journal.operation_id);
+    if (++activation === 1) return new Response('{"error":"enrollment_superseded"}', { status: 409 });
+  };
+  assert.equal((await f.worker.enroll(CODE)).worker_id, ID);
+  assert.deepEqual(f.broker.calls.filter(c => c.path.endsWith('/enroll')).map(c => c.input.phase), ['prepare', 'activate', 'prepare', 'activate']);
+  assert(!f.output.join('').includes(KEY));
+});
+
+test('resuming a staged rename re-establishes directory durability before activation', async t => {
+  const f = await fixture(t);
+  await f.worker.configure('https://broker.example.test');
+  const journalPath = f.state.path('enrollment.json');
+  let stagedSyncs = 0;
+  const state = new State(f.state.root, { ...fs, open: async (path, ...options) => {
+    const handle = await fs.open(path, ...options);
+    if (path === f.state.root) {
+      const sync = handle.sync.bind(handle);
+      handle.sync = async () => {
+        const journal = JSON.parse(await fs.readFile(journalPath, 'utf8'));
+        if (journal.state === 'staged') {
+          stagedSyncs++;
+          throw Object.assign(new Error(), { code: 'ENOSPC' });
+        }
+        await sync();
+      };
+    }
+    return handle;
+  } }, f.state.sys);
+  for (let attempt = 0; attempt < 2; attempt++) {
+    await assert.rejects(new Worker(state, f.logger, f.net).enroll(CODE), { code: 'ENOSPC' });
+    assert.equal(JSON.parse(await fs.readFile(journalPath, 'utf8')).state, 'staged');
+    assert(!f.broker.calls.some(call => call.input?.phase === 'activate'));
+  }
+  assert.equal(stagedSyncs, 2);
+  assert.equal((await f.worker.enroll(CODE)).worker_id, ID);
+  assert.deepEqual(f.broker.calls.filter(call => call.path.endsWith('/enroll')).map(call => call.input.phase), ['prepare', 'activate']);
+});
+
+test('definitive expiry or consumption releases the directory for a fresh code', async t => {
+  for (const [status, reason] of [[410, 'enrollment_expired'], [409, 'enrollment_used']]) {
+    for (const phase of ['prepare', 'activate']) {
+      const f = await fixture(t);
+      await f.worker.configure('https://broker.example.test');
+      f.broker.override = async call => {
+        if (call.input?.phase === phase) return new Response(JSON.stringify({ error: reason }), { status });
+      };
+      await assert.rejects(f.worker.enroll(CODE), error => error.code === 'broker_rejected' &&
+        error.fields.reason === reason && error.fields.corrective_action.includes('fresh'));
+      const record = object(parse(await f.state.read('enrollment.json')));
+      assert.equal(record.state, 'rejected');
+      assert.equal(record.credential, undefined);
+      assert.equal(await f.state.read('credential.key'), undefined);
+      f.broker.override = undefined;
+      const fresh = 'muse_enroll_' + Buffer.alloc(32, 31).toString('base64url');
+      assert.equal((await new Worker(f.state, f.logger, f.net).enroll(fresh)).worker_id, ID);
+      assert(f.broker.calls.filter(call => call.path.endsWith('/enroll')).every(call => call.input.phase));
+    }
+  }
+});
+
+test('an unsupported phase received after an uncertain prepare does not allow legacy consumption', async t => {
+  const f = await fixture(t);
+  await f.worker.configure('https://broker.example.test');
+  let prepares = 0;
+  f.broker.override = async call => {
+    if (call.input?.phase !== 'prepare') return;
+    if (++prepares === 1) throw Object.assign(new Error(), { code: 'ECONNRESET' });
+    return new Response('{"error":"unsupported_field"}', { status: 400 });
+  };
+  await assert.rejects(f.worker.enroll(CODE), /broker_rejected/);
+  await assert.rejects(new Worker(f.state, f.logger, f.net).enroll(CODE), /broker_rejected/);
+  assert.deepEqual(f.broker.calls.filter(c => c.path.endsWith('/enroll')).map(c => c.input.phase), ['prepare', 'prepare', 'prepare']);
+  assert.equal(await f.state.read('credential.key'), undefined);
 });
 
 test('claims and decisions retain identity and exact large-number payloads across lost responses and restart', async t => {

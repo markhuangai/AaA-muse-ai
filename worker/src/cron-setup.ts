@@ -30,7 +30,7 @@ export class CronSetup {
       const launcher = bin.path('aaa-muse-worker');
       await bin.write('aaa-muse-worker', launcherScript(this.io.node, this.io.entry, this.state.root), 0o700);
       await this.worker.configure(origin);
-      const enrolled = await this.worker.enroll(input.split('\n', 1)[0].trim());
+      const enrolled = await this.worker.enroll(input.split('\n', 1)[0].trim(), setupID);
       const workerID = identifier(enrolled.worker_id);
       requireValue(!prior || prior.worker_id === workerID, 'worker_identity_mismatch');
       const installation = { setup_id: setupID, worker_id: workerID, origin, package_version: this.version, root, launcher, command: quote(launcher), ...(digest ? { package_sha256: digest, node: this.io.node, entry: this.io.entry } : {}) };

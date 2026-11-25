@@ -35,7 +35,11 @@ export class Broker {
     }
     const response = (value, status = 200) => new Response(encode(value), { status, headers: { 'content-type': 'application/json', 'x-request-id': 'unit-request-' + this.calls.length, 'X-Muse-Service-Version': VERSION } });
     if (this.denied) return response({ error: 'unauthorized' }, 401);
-    if (path.endsWith('/enroll')) return response({ worker: { id: ID }, credential: KEY }, 201);
+    if (path.endsWith('/enroll')) {
+      if (input.phase === 'prepare') return response({ enrollment_id: options.headers['X-Muse-Enrollment-Operation'], credential: KEY }, 201);
+      if (input.phase === 'activate') return response({ worker: { id: ID } }, 201);
+      return response({ worker: { id: ID }, credential: KEY }, 201);
+    }
     if (path.endsWith('/status')) {
       const held = [...this.jobs.values()].find(j => j.held);
       return response({ id: ID, name: 'Test', inference_readiness: 'unverified', connection_status: 'online', work_status: held ? 'busy' : 'idle', current_job: held ? { job_id: held.id, generation: held.generation, lease_id: held.lease_id } : null });

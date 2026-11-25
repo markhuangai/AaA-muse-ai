@@ -8,6 +8,8 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -20,6 +22,7 @@ import (
 )
 
 type httpWorkerStore struct {
+	service.WorkerRepository
 	codes   map[[32]byte]worker.Enrollment
 	keys    map[[32]byte]string
 	records map[string]worker.Record
@@ -334,5 +337,99 @@ func TestIssuedSecretsCannotEscapeThroughWorkerNames(t *testing.T) {
 	encoded, _ := json.Marshal(capturedHTTP(t, capture))
 	if bytes.Contains(encoded, []byte(credential)) || bytes.Contains(encoded, []byte(code)) {
 		t.Fatal("worker name bypassed protected capture")
+	}
+}
+
+func TestStagedEnrollmentThroughHTTPAndSQLite(t *testing.T) {
+	h, _, stdout, capture := workerHTTPFixture(t)
+	directory := t.TempDir()
+	if err := os.Chmod(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	repo, err := sqlite.Open(t.Context(), filepath.Join(directory, "workers.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(repo.Close)
+	if err := repo.Bootstrap(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	h.Workers = service.NewWorkers(repo, h.Authority, rand.Reader, time.Now)
+	code := issueHTTP(t, h)
+	operation := strings.Repeat("c", 32)
+	enroll := func(body, key string, want int) map[string]json.RawMessage {
+		t.Helper()
+		request := httptest.NewRequest("POST", "/api/v1/worker/enroll", strings.NewReader(body))
+		request.Header.Set(service.WorkerVersionHeader, service.DevelopmentVersion)
+		request.Header.Set("X-Muse-Enrollment-Operation", operation)
+		request.Header.Set("X-Muse-Enrollment-Attempt", "1")
+		if key != "" {
+			request.Header.Set("Authorization", "Bearer "+key)
+		}
+		response := httptest.NewRecorder()
+		h.ServeHTTP(response, request)
+		var result map[string]json.RawMessage
+		if response.Code != want || json.Unmarshal(response.Body.Bytes(), &result) != nil {
+			t.Fatalf("enrollment expected HTTP %d, got %d", want, response.Code)
+		}
+		return result
+	}
+	body := func(phase string) string {
+		raw, _ := json.Marshal(map[string]string{"enrollment_code": code, "phase": phase})
+		return string(raw)
+	}
+	before := enroll(body("prepare"), "", 201)
+	var oldKey, key string
+	if json.Unmarshal(before["credential"], &oldKey) != nil || !auth.ValidToken(oldKey, auth.WorkerPrefix) {
+		t.Fatal("prepared credential invalid")
+	}
+	if call(h, "GET", "/api/v1/worker/status", "Bearer "+oldKey, nil).Code != 401 {
+		t.Fatal("prepared credential was already active")
+	}
+	after := enroll(body("prepare"), "", 201)
+	if json.Unmarshal(after["credential"], &key) != nil || key == oldKey {
+		t.Fatal("re-preparation did not replace the inactive grant")
+	}
+	enroll(body("activate"), "", 401)
+	enroll(body("activate"), oldKey, 409)
+	enroll(body("unknown"), "", 400)
+	enroll(`{"enrollment_code":"bad","phase":"prepare"}`, "", 400)
+	enroll(`{"enrollment_code":"bad","phase":"activate"}`, key, 400)
+	enroll(`{"enrollment_code":"bad","phase":"activate","phase":"prepare"}`, key, 400)
+	first := enroll(body("activate"), key, 201)
+	replay := enroll(body("activate"), key, 201)
+	workers, err := repo.Workers(t.Context())
+	if len(first["credential"]) != 0 || !bytes.Equal(first["worker"], replay["worker"]) || err != nil || len(workers) != 1 {
+		t.Fatal("exact activation replay did not preserve a single worker")
+	}
+	enroll(body("activate"), oldKey, 409)
+	enroll(body("prepare"), "", 409)
+	if _, _, err := repo.RevokeWorker(t.Context(), workers[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	enroll(body("activate"), key, 401)
+	fresh := issueHTTP(t, h)
+	code = fresh
+	enroll(body("activate"), key, 409)
+	code = issueHTTP(t, h)
+	h.Workers = service.NewWorkers(repo, h.Authority, bytes.NewReader(nil), time.Now)
+	enroll(body("prepare"), "", 503)
+	enroll(body("activate"), key, 503)
+	events := capturedHTTP(t, capture)
+	joined := map[string]bool{}
+	for _, event := range events {
+		if event["operation_id"] == operation && event["request_id"] != "" && event["enrollment_attempt"] == float64(1) {
+			eventName, _ := event["msg"].(string)
+			joined[eventName] = true
+		}
+	}
+	if !joined["enrollment.prepared"] || !joined["enrollment.activation_replayed"] || !joined["request.completed"] {
+		t.Fatal("capture could not reconstruct the activation operation")
+	}
+	encoded, _ := json.Marshal(events)
+	for _, secret := range []string{key, oldKey, fresh, code} {
+		if strings.Contains(stdout.String(), secret) || bytes.Contains(encoded, []byte(secret)) {
+			t.Fatal("enrollment credential escaped into diagnostics")
+		}
 	}
 }

@@ -90,32 +90,113 @@ func (r *Repository) IssueEnrollment(ctx context.Context, id string, hash [32]by
 	return
 }
 
-func (r *Repository) ConsumeEnrollment(ctx context.Context, hash [32]byte, id string, credential [32]byte, name string) (w worker.Record, e worker.Enrollment, err error) {
+func findEnrollment(ctx context.Context, tx *sql.Tx, hash [32]byte) (e worker.Enrollment, err error) {
+	var created, expires int64
+	var consumed *int64
+	err = tx.QueryRowContext(ctx, `SELECT id, created_at, expires_at, consumed_at, COALESCE(worker_id, '')
+		FROM aaa_worker_enrollments WHERE code_hash=?1 AND id NOT LIKE 'prepare/%'`, hash[:]).Scan(&e.ID, &created, &expires, &consumed, &e.WorkerID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return e, &worker.Rejection{Reason: "enrollment_invalid"}
+	}
+	if err == nil {
+		e.CreatedAt, e.ExpiresAt, e.ConsumedAt = time.UnixMicro(created).UTC(), time.UnixMicro(expires).UTC(), instant(consumed)
+	}
+	return
+}
+
+func enrollmentRejection(e worker.Enrollment, reason string) *worker.Rejection {
+	return &worker.Rejection{Reason: reason, Enrollment: e, WorkerID: e.WorkerID}
+}
+
+func (r *Repository) PrepareEnrollment(ctx context.Context, hash, grant, credential [32]byte) (e worker.Enrollment, err error) {
 	err = r.write(ctx, func(tx *sql.Tx) error {
-		var created, expires int64
-		var consumed *int64
-		err := tx.QueryRowContext(ctx, `SELECT id, created_at, expires_at, consumed_at, COALESCE(worker_id, '')
-			FROM aaa_worker_enrollments WHERE code_hash=?1`, hash[:]).Scan(&e.ID, &created, &expires, &consumed, &e.WorkerID)
-		if errors.Is(err, sql.ErrNoRows) {
-			return &worker.Rejection{Reason: "enrollment_invalid"}
-		}
+		e, err = findEnrollment(ctx, tx, hash)
 		if err != nil {
 			return err
 		}
-		e.CreatedAt, e.ExpiresAt, e.ConsumedAt = time.UnixMicro(created).UTC(), time.UnixMicro(expires).UTC(), instant(consumed)
-		now := r.databaseTime()
 		if e.ConsumedAt != nil {
-			return &worker.Rejection{Reason: "enrollment_used", Enrollment: e, WorkerID: e.WorkerID}
+			return enrollmentRejection(e, "enrollment_used")
 		}
+		now := r.databaseTime()
 		if !now.Before(e.ExpiresAt) {
-			return &worker.Rejection{Reason: "enrollment_expired", Enrollment: e}
+			return enrollmentRejection(e, "enrollment_expired")
+		}
+		var exists bool
+		err = tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM aaa_workers WHERE credential_hash=?1)", credential[:]).Scan(&exists)
+		if err != nil {
+			return err
+		}
+		if exists {
+			return errors.New("generated_worker_authority_collision")
+		}
+		_, err = tx.ExecContext(ctx, `INSERT INTO aaa_worker_enrollments (id, code_hash, created_at, expires_at)
+			VALUES (?1, ?2, ?3, ?4) ON CONFLICT (id) DO UPDATE SET code_hash=excluded.code_hash`,
+			"prepare/"+e.ID, grant[:], now.UnixMicro(), e.ExpiresAt.UnixMicro())
+		return err
+	})
+	return
+}
+
+func (r *Repository) ConsumeEnrollment(ctx context.Context, hash [32]byte, id string, credential [32]byte, name string) (worker.Record, worker.Enrollment, error) {
+	w, e, _, err := r.consumeEnrollment(ctx, hash, id, credential, name, nil)
+	return w, e, err
+}
+
+func (r *Repository) ActivateEnrollment(ctx context.Context, hash [32]byte, id string, credential [32]byte, name string, grant [32]byte) (worker.Record, worker.Enrollment, bool, error) {
+	return r.consumeEnrollment(ctx, hash, id, credential, name, &grant)
+}
+
+func (r *Repository) consumeEnrollment(ctx context.Context, hash [32]byte, id string, credential [32]byte, name string, grant *[32]byte) (w worker.Record, e worker.Enrollment, replay bool, err error) {
+	err = r.write(ctx, func(tx *sql.Tx) error {
+		e, err = findEnrollment(ctx, tx, hash)
+		if err != nil {
+			return err
+		}
+		if e.ConsumedAt != nil {
+			if grant == nil {
+				return enrollmentRejection(e, "enrollment_used")
+			}
+			w, err = scanWorker(tx.QueryRowContext(ctx, "SELECT "+workerColumns+" FROM aaa_workers WHERE id=?1 AND credential_hash=?2", e.WorkerID, credential[:]))
+			var rejected *worker.Rejection
+			if errors.As(err, &rejected) {
+				return enrollmentRejection(e, "enrollment_used")
+			}
+			if err != nil {
+				return err
+			}
+			if w.RevokedAt != nil {
+				return enrollmentRejection(e, "worker_revoked")
+			}
+			replay = true
+			return nil
+		}
+		now := r.databaseTime()
+		if !now.Before(e.ExpiresAt) {
+			return enrollmentRejection(e, "enrollment_expired")
+		}
+		childID := "prepare/" + e.ID
+		if grant != nil {
+			var matches bool
+			err := tx.QueryRowContext(ctx, "SELECT code_hash=?2 FROM aaa_worker_enrollments WHERE id=?1", childID, grant[:]).Scan(&matches)
+			if errors.Is(err, sql.ErrNoRows) {
+				return enrollmentRejection(e, "enrollment_not_prepared")
+			}
+			if err != nil {
+				return err
+			}
+			if !matches {
+				return enrollmentRejection(e, "enrollment_superseded")
+			}
 		}
 		w, err = scanWorker(tx.QueryRowContext(ctx, `INSERT INTO aaa_workers (id, name, credential_hash, registered_at, last_contact_at)
 			VALUES (?1, ?2, ?3, ?4, ?4) RETURNING `+workerColumns, id, name, credential[:], now.UnixMicro()))
 		if err != nil {
 			return err
 		}
-		if _, err = tx.ExecContext(ctx, "UPDATE aaa_worker_enrollments SET consumed_at=?2, worker_id=?3 WHERE id=?1", e.ID, now.UnixMicro(), id); err != nil {
+		if _, err := tx.ExecContext(ctx, "UPDATE aaa_worker_enrollments SET consumed_at=?2, worker_id=?3 WHERE id=?1", e.ID, now.UnixMicro(), id); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, "DELETE FROM aaa_worker_enrollments WHERE id=?1", childID); err != nil {
 			return err
 		}
 		e.ConsumedAt, e.WorkerID = &now, id

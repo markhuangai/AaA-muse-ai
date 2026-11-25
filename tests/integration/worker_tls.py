@@ -38,6 +38,9 @@ class TLSFixture:
         self.worker_route_failures = {}
         self.lose_worker_replies = {}
         self.enrollment_accepted = None
+        self.observe_staged_credential = None
+        self.drop_enrollment_requests = {}
+        self.drop_enrollment_replies = {}
         self.pause_decision = False
         self.decision_captured = threading.Event()
         self.release_decision = threading.Event()
@@ -87,7 +90,15 @@ class TLSFixture:
                     fixture.connections.append(connection)
                 try:
                     body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                    phase = json.loads(body).get("phase") if path == "/api/v1/worker/enroll" and body and (
+                        fixture.drop_enrollment_requests or fixture.drop_enrollment_replies or fixture.observe_staged_credential) else None
+                    operation = self.headers.get("X-Muse-Enrollment-Operation")
                     with fixture.lock:
+                        if phase and fixture.drop_enrollment_requests.get(phase, 0) > 0:
+                            fixture.drop_enrollment_requests[phase] -= 1
+                            fixture.events.append({"event": "fixture.enrollment_request_lost", "phase": phase, "operation_id": operation})
+                            self.connection.shutdown(socket.SHUT_RDWR)
+                            return
                         failures = fixture.worker_route_failures.get(path)
                         injected = failures.pop(0) if failures else None
                         reject = self.path.endswith("/claim") and fixture.fail_claims > 0
@@ -139,7 +150,7 @@ class TLSFixture:
                     headers = {key: self.headers[key] for key in ("Authorization", "Content-Type", "Cookie", "Host", "Origin", "Sec-Fetch-Site",
                                "Accept", "MCP-Protocol-Version", "MCP-Method", "MCP-Name", "Mcp-Session-Id",
                                "Forwarded", "X-Forwarded-Host",
-                               "X-Request-Id", "X-Portal-Operation-Id",
+                               "X-Request-Id", "X-Portal-Operation-Id", "X-Muse-Enrollment-Operation", "X-Muse-Enrollment-Attempt",
                                "X-Muse-Worker-Version", "X-Muse-Worker-Updater", "X-Muse-Worker-SHA256", "X-Muse-Interruption", "X-Muse-Worker-Start-Proof",
                                "X-Muse-Worker-Model-Report", "X-Muse-Worker-Weekly-Usage", "X-Muse-Media-Jobs", "X-Muse-Prompt-Wav",
                                "X-Muse-Artifact-Sha256", "X-Muse-Artifact-Size", "X-Muse-Connection-Id", "X-Muse-Connection-Generation",
@@ -176,6 +187,16 @@ class TLSFixture:
                     streaming = self.path == "/api/v1/worker/events" and response.status == 200
                     if not streaming:
                         payload = response.read()
+                        if phase and response.status == 201:
+                            with fixture.lock:
+                                if phase == "prepare" and fixture.observe_staged_credential:
+                                    fixture.observe_staged_credential(json.loads(payload)["credential"])
+                                if fixture.drop_enrollment_replies.get(phase, 0) > 0:
+                                    fixture.drop_enrollment_replies[phase] -= 1
+                                    fixture.events.append({"event": "fixture.enrollment_reply_lost", "phase": phase, "operation_id": operation,
+                                                           "request_id": response.getheader("X-Request-Id")})
+                                    self.connection.shutdown(socket.SHUT_RDWR)
+                                    return
                         if self.command == "POST" and path.startswith("/api/v1/worker/") and response.status == 200:
                             with fixture.lock:
                                 remaining = fixture.lose_worker_replies.get(path, 0)
@@ -222,7 +243,9 @@ class TLSFixture:
                             fixture.context_captured.set()
                             fixture.release_context.wait(timeout=8)
                         if self.path == "/api/v1/worker/enroll" and response.status == 201 and fixture.enrollment_accepted is not None:
-                            fixture.enrollment_accepted(json.loads(payload)["worker"]["id"])
+                            worker = json.loads(payload).get("worker")
+                            if worker:
+                                fixture.enrollment_accepted(worker["id"])
                         if paused_claim:
                             fixture.claim_captured.set()
                             fixture.release_claim.wait(timeout=8)

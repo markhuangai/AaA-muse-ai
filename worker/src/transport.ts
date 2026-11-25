@@ -82,7 +82,7 @@ export class Transport {
       const timer = this.net.setTimer(() => controller.abort(), timeoutMs);
       let requestId = this.sys.uuid();
       try {
-        const response = await this.net.fetch(this.endpoint + route, { method, body: input, redirect: 'manual', signal: controller.signal, headers: { ...(this.credential ? { Authorization: 'Bearer ' + this.credential } : {}), Accept: 'application/json', ...(input === undefined ? {} : { 'Content-Type': 'application/json' }), 'X-Request-Id': requestId, 'X-Muse-Worker-Version': this.productVersion, ...metadata } });
+        const response = await this.net.fetch(this.endpoint + route, { method, body: input, redirect: 'manual', signal: controller.signal, headers: { ...(this.credential ? { Authorization: 'Bearer ' + this.credential } : {}), Accept: 'application/json', ...(input === undefined ? {} : { 'Content-Type': 'application/json' }), 'X-Request-Id': requestId, 'X-Muse-Worker-Version': this.productVersion, ...metadata, ...(metadata['X-Muse-Enrollment-Operation'] ? { 'X-Muse-Enrollment-Attempt': String(attempt) } : {}) } });
         requestId = response.headers.get('x-request-id') || requestId;
         requireValue(response.status < 300 || response.status >= 400, 'redirect_forbidden');
         const raw = await this.body(response);
@@ -96,13 +96,18 @@ export class Transport {
         const validation = responseValidation ? { response_validation_cause: responseValidation } : {};
         await this.logger.log('DEBUG', 'worker.http_exchange', { ...correlation, ...validation, request_id: requestId, endpoint: this.endpoint, route, method, attempt, duration_ms: this.sys.now() - started, http_status: response.status, input: input === undefined ? null : parse(input), output: responseValidation ? raw : data });
         this.compatibility(response, route, data, !!metadata['X-Muse-Worker-Updater']);
-        if (!response.ok) throw new Failure(response.status === 401 ? 'worker_unauthorized' : 'broker_rejected', { ...correlation, ...validation, request_id: requestId, route, method, http_status: response.status, reason: typeof data.error === 'string' ? data.error : 'invalid_error_response' }, response.status === 429 || response.status >= 500 || controlRouteUnavailable(response.status, route, data, this.credential));
+        if (!response.ok) throw new Failure(response.status === 401 ? 'worker_unauthorized' : 'broker_rejected', { ...correlation, ...validation, request_id: requestId, route, method, attempt, http_status: response.status, reason: typeof data.error === 'string' ? data.error : 'invalid_error_response' }, response.status === 429 || response.status >= 500 || controlRouteUnavailable(response.status, route, data, this.credential));
         return { data, requestId, status: response.status };
       } catch (error) {
         const failure = error instanceof Failure ? error : new Failure('broker_unreachable', { ...correlation, cause: cause(error), request_id: requestId, route, method, attempt, duration_ms: this.sys.now() - started }, !/CERT|TLS|SSL/.test(cause(error)));
+        if (metadata['X-Muse-Enrollment-Operation']) {
+          failure.fields = { ...correlation, request_id: requestId, attempt, ...failure.fields };
+        }
         // An unstructured control-route 404 must return the subscriber to reconciliation.
         if (!failure.retryable || failure.fields.http_status === 404 || attempt >= attempts) throw failure;
-        await this.logger.log('WARN', 'worker.http_retrying', { ...correlation, ...failure.fields, endpoint: this.endpoint, route, method, attempt, delay_ms: attempt * 1000, cause: failure.code, duration_ms: this.sys.now() - started });
+        await this.logger.log('WARN', 'worker.http_retrying', { ...correlation, ...failure.fields, endpoint: this.endpoint, route, method, attempt, delay_ms: attempt * 1000, cause: failure.code,
+          ...(metadata['X-Muse-Enrollment-Operation'] && typeof failure.fields.cause === 'string' ? { transport_cause: failure.fields.cause } : {}),
+          duration_ms: this.sys.now() - started });
         await this.sys.wait(attempt * 1000);
       } finally { this.net.clearTimer(timer); }
     }

@@ -124,6 +124,18 @@ func (h *Handler) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 	}
 	route, requestedWorker := routeFor(r.URL.Path)
 	logger := h.Logger.With("request_id", id, "route", route)
+	if route == "/api/v1/worker/enroll" || route == "/api/v1/worker/status" {
+		if operation := r.Header.Get("X-Muse-Enrollment-Operation"); workerIDPattern.MatchString(operation) {
+			logger = logger.With("operation_id", operation)
+			if route == "/api/v1/worker/status" {
+				logger = logger.With("enrollment_phase", "verify")
+			}
+			switch attempt := r.Header.Get("X-Muse-Enrollment-Attempt"); attempt {
+			case "1", "2", "3":
+				logger = logger.With("enrollment_attempt", int(attempt[0]-'0'))
+			}
+		}
+	}
 	w := &response{ResponseWriter: out, capture: route != "/api/v1/admin/diagnostics/export" && route != "/api/v1/portal/login", openAI: chatRoute(route), mcp: route == mcpRoute, now: h.Now}
 	if isMediaRoute(route) {
 		w.capture = false
