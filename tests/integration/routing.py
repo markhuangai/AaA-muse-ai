@@ -207,6 +207,15 @@ class Routing(History):
             self.assert_private(operational)
         self.receipt("routing.storage_rollback_and_claim_capture", sqlite_code="1811", protected_debug=True, chunk_reconstruction=True)
 
+    def wait_for_pin_replacement(self, request, worker):
+        queued = [event for event in self.export_operation(request["id"]) if event["msg"] == "dispatch.queued"]
+        require(len(queued) == 1 and queued[0]["worker_id"] == worker["worker"]["id"] and queued[0]["job_id"],
+                "admission evidence did not identify the original pin")
+        original = queued[0]["job_id"]
+        self.until(lambda: self.experiment(request["id"])["current_job_id"] not in (None, "", original),
+                   "safe pin was not released", timeout=15)
+        return original
+
     def offline_boundaries(self):
         for boundary in ("safe", "revoked", "granted", "started", "tool-wait"):
             (worker, peer), (replacement, replacement_peer) = self.new_pair()
@@ -240,15 +249,18 @@ class Routing(History):
             if boundary == "safe":
                 self.silence(worker, 605)
             pending, _ = self.submit(next_input, request["session_id"])
-            old = self.experiment(pending["id"])
             if boundary == "safe":
-                self.until(lambda: self.experiment(pending["id"])["current_job_id"] != old["current_job_id"], "safe pin was not released", timeout=15)
+                original = self.wait_for_pin_replacement(pending, worker)
                 replacement_job = self.deliver(replacement, replacement_peer, pending, {"type": "final", "text": "full history replay"})
                 moved, _ = self.read_native(pending)
                 require(moved["worker_id"] == replacement["worker"]["id"] and moved["conversation_id"] == request["conversation_id"], "safe replacement lost the owned session")
-                require(replacement_job["id"] != old["current_job_id"] and replacement_job["context"]["messages"] == next_input["messages"], "safe movement did not fence the prior job or retain full history")
-                self.diagnose_operation(pending, "dispatch.pin_released", "the old queued pin was released before any grant")
+                require(replacement_job["id"] != original and replacement_job["context"]["messages"] == next_input["messages"], "safe movement did not fence the prior job or retain full history")
+                events = self.diagnose_operation(pending, "dispatch.pin_released", "the old queued pin was released before any grant")
+                require(any(event["msg"] == "dispatch.pin_released" and event["prior_job_id"] == original and
+                            event["job_id"] == replacement_job["id"] and event["previous_worker_id"] == worker["worker"]["id"]
+                            for event in events), "pin release did not link the original job to its replacement")
             else:
+                old = self.experiment(pending["id"])
                 if boundary == "granted":
                     require(peer.poll()["job_id"] == old["current_job_id"], "wrong protected grant")
                 elif boundary == "started":

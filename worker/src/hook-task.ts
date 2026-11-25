@@ -1,5 +1,5 @@
 import { iso, time } from './cron.js';
-import { requireValue } from './errors.js';
+import { Failure, requireValue } from './errors.js';
 import { controlContext, controlGrant, terminalControl } from './hook-ops.js';
 import type { Action, Tick } from './hook.js';
 import { encode, identifier, integer, object, parse, text, type ObjectValue, type Value } from './json.js';
@@ -150,9 +150,12 @@ export class HookTasks {
       reply = await transport.request(this.route(task, 'start'), 'POST', encode({
         ...this.claim(task), launch_id: task.launch_id, native_job_id: task.checker_job_id,
         verification: { reference: task.claim_id, native_job_id: task.checker_job_id, native_run_id: this.nativeRun(task), status: 'running' },
-      }), this.fields(task), 1);
+      }), this.fields(task), 2);
     } catch (error) {
-      if (terminalControl(error, 'hook_claim_terminal')) await this.state.withLock('cron', async () => this.markUnstarted(await this.current(launch, run)));
+      // A terminal refusal after a retry cannot rule out a first-attempt start.
+      if (error instanceof Failure && error.fields.attempt === 1 && terminalControl(error, 'hook_claim_terminal')) {
+        await this.state.withLock('cron', async () => this.markUnstarted(await this.current(launch, run)));
+      }
       throw error;
     }
     const { data } = reply;

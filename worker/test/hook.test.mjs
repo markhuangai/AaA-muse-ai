@@ -389,7 +389,7 @@ test('task binding and started abort retain exact journals until their replies a
   f.broker.override = call => {
     const stage = call.path.split('/').at(-1);
     (attempts[stage] ??= []).push(call.options.body);
-    if (['pull', 'bind', 'result'].includes(stage) && attempts[stage].length === 1) throw new Error('controlled reply loss');
+    if (['pull', 'bind', 'start', 'result'].includes(stage) && attempts[stage].length === 1) throw new Error('controlled reply loss');
     switch (stage) {
       case 'pull': return hookReply({ job: null, agent_task: grant });
       case 'bind': return hookReply({ task_id: JOB, claim_id: grant.claim_id, invocation_id: call.input.invocation_id });
@@ -411,6 +411,9 @@ test('task binding and started abort retain exact journals until their replies a
   const wake = f.actions[0].payload;
   await assert.rejects(f.runner.tasks.start(wake.launch_id, 'event-hook:wrong'), /hook_run_mismatch/);
   assert.equal((await f.runner.tasks.start(wake.launch_id, wake.expected_run_id)).prompt, 'Inspect the authorized fixture');
+  await assert.rejects(f.runner.tasks.start(wake.launch_id, wake.expected_run_id), /work_already_started/);
+  assert.equal(attempts.start.length, 2);
+  assert.equal(attempts.start[0], attempts.start[1]);
   await assert.rejects(f.runner.tasks.abort(wake.launch_id, wake.expected_run_id, 'execution_refused', 'Permission required'), /broker_unreachable/);
   assert.equal(JSON.parse(attempts.result[0]).summary, 'Permission required');
   f.advance(15_000);
@@ -418,6 +421,37 @@ test('task binding and started abort retain exact journals until their replies a
   assert.equal(attempts.result[0], attempts.result[1]);
   assert.equal(attempts.interrupt.length, 1);
   assert.equal(await f.state.read('hook-task.json'), undefined);
+});
+
+test('task start records an unstarted failure only on a first-attempt terminal refusal', async t => {
+  for (const loseFirstReply of [false, true]) {
+    const f = await setup(t);
+    const at = new Date(f.state.sys.now()).toISOString();
+    const tick = { checker_job_id: hookID, checker_run_id: 'wake', scheduled_at: at, entered_at: at };
+    const grant = { id: JOB, operation_id: JOB, claim_id: 'task-claim', generation: 1,
+      claimed_at: at, deadline_at: new Date(f.state.sys.now() + 30_000).toISOString() };
+    await f.runner.tasks.saveGrant(grant, { ...tick, sequence: 1 });
+    const { payload: wake } = await f.runner.tasks.active(tick, {});
+    const bodies = [];
+    f.broker.override = call => {
+      assert(call.path.endsWith('/start'));
+      bodies.push(call.options.body);
+      if (loseFirstReply && bodies.length === 1) throw new Error('controlled reply loss');
+      return hookReply({ error: 'hook_claim_terminal' }, 409);
+    };
+    await assert.rejects(f.runner.tasks.start(wake.launch_id, wake.expected_run_id), /broker_rejected/);
+    const saved = JSON.parse(await f.state.read('hook-task.json'));
+    assert(saved.start_requested_at);
+    assert.equal(saved.started_at, undefined);
+    if (loseFirstReply) {
+      assert.equal(saved.failure, undefined);
+      assert.deepEqual(bodies, [bodies[0], bodies[0]]);
+      await assert.rejects(f.runner.tasks.abort(wake.launch_id, wake.expected_run_id, 'execution_failed', ''), /hook_task_abort_uncertain/);
+    } else {
+      assert.equal(saved.failure.reason, 'launch_not_authorized');
+      assert.equal(bodies.length, 1);
+    }
+  }
 });
 
 test('a lost binding reply is reconciled before settling an expired task without a wake', async t => {

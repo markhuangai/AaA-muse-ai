@@ -172,24 +172,36 @@ class WorkerRecovery(WorkerSetup):
         require(any(event["msg"] == "receipt.replayed" and event["submission_id"] == pending["submission_id"]
                     for event in self.export_operation(op["id"])), "broker export did not prove exact doctor replay")
 
-        task = self.worker_control(worker, "agent-tasks", {"protocol_version": 1, "submission_id": "recovery-task", "prompt": "Check the scoped fixture"})
+        prompt = "Check the scoped fixture"
+        task = self.worker_control(worker, "agent-tasks", {"protocol_version": 1, "submission_id": "recovery-task", "prompt": prompt})
         self.proxy.lose_worker_replies["/api/v1/worker/pull"] = 1
         self.tick(worker, want=1)
         self.proxy.lose_worker_replies["/api/v1/worker/agent-tasks/" + task["id"] + "/bind"] = 1
         self.tick(worker, want=1)
-        wake, _ = self.start_agent_task(worker, task)
+        start_route = "/api/v1/worker/agent-tasks/" + task["id"] + "/start"
+        self.proxy.lose_worker_replies[start_route] = 1
+        wake, brief = self.start_agent_task(worker, task)
+        require(self.proxy.lose_worker_replies[start_route] == 0 and brief["prompt"] == prompt,
+                "lost start reply did not recover the authorized brief")
+        require(not self.native_cli(worker, "hook-task-start", "--launch-id", wake["launch_id"], "--run-id", wake["expected_run_id"], want=1),
+                "a second CLI invocation retrieved the background task brief")
         self.proxy.lose_worker_replies["/api/v1/worker/agent-tasks/" + task["id"] + "/result"] = 1
         self.native_cli(worker, "hook-task-abort", "--launch-id", wake["launch_id"], "--run-id", wake["expected_run_id"],
                         "--reason", "execution_refused", "--summary", "Approval is needed", want=1)
         detail = self.worker_control(worker, "agent-tasks/" + task["id"])
-        require(detail["state"] == "refused" and detail["held"] and detail["result"]["summary"] == "Approval is needed",
-                "started refusal lost its result or released its hold")
+        require(detail["state"] == "refused" and detail["held"] and detail["prompt"] == prompt and detail["result"]["summary"] == "Approval is needed",
+                "started refusal lost its prompt or result, or released its hold")
         require(self.tick(worker)["outcome"] == "background_task_settled", "started refusal failed to settle after replay")
         events = self.export_operation(task["id"])
+        starts = [event for event in events if event["msg"] == "agent_task.exchange" and event["stage"] == "started"]
+        require(len(starts) == 2 and starts[0]["input"] == starts[1]["input"] and
+                starts[0]["result"]["started_at"] == starts[1]["result"]["started_at"],
+                "broker export did not prove an exact same-launch retry")
         require(sum(event["msg"] == "agent_task.result_accepted" for event in events) == 1 and
                 any(event["msg"] == "receipt.replayed" for event in events) and
                 any(event["msg"] == "agent_task.hook_bound" for event in events), "broker export did not reconstruct task binding, replay and abort")
-        self.receipt("worker.remote_operations_replay", doctor_replayed=True, task_rebound=True, task_refusal_settled=True, capture_complete=True)
+        self.receipt("worker.remote_operations_replay", doctor_replayed=True, task_rebound=True, task_start_replayed=True,
+                     task_refusal_settled=True, capture_complete=True)
 
     def expired_background_task(self, worker):
         task = self.worker_control(worker, "agent-tasks", {"protocol_version": 1, "submission_id": "overdue-background",
