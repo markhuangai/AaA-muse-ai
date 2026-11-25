@@ -29,7 +29,7 @@ func TestMediaHTTP(t *testing.T) {
 	const admin = "admin-private-sentinel"
 	req := func(method, path, principal, kind string, body []byte, headers map[string]string, status int) *httptest.ResponseRecorder {
 		t.Helper()
-		r := httptest.NewRequest(method, path, bytes.NewReader(body))
+		r := pairedRequest(h, method, path, bytes.NewReader(body))
 		r.Header.Set("Authorization", "Bearer "+principal)
 		r.Header.Set("Content-Type", kind)
 		for k, v := range headers {

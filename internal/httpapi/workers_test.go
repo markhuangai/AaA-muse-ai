@@ -26,7 +26,35 @@ type httpWorkerStore struct {
 	codes   map[[32]byte]worker.Enrollment
 	keys    map[[32]byte]string
 	records map[string]worker.Record
+	staged  map[[32]byte][32]byte
 	fail    error
+}
+
+func (m *httpWorkerStore) PrepareEnrollment(_ context.Context, hash, _ [32]byte, credential [32]byte) (worker.Enrollment, error) {
+	if m.fail != nil {
+		return worker.Enrollment{}, m.fail
+	}
+	e, ok := m.codes[hash]
+	if !ok {
+		return e, &worker.Rejection{Reason: "enrollment_invalid"}
+	}
+	if e.ConsumedAt != nil {
+		return e, &worker.Rejection{Reason: "enrollment_used", Enrollment: e}
+	}
+	m.staged[hash] = credential
+	return e, nil
+}
+
+func (m *httpWorkerStore) ActivateEnrollment(ctx context.Context, hash [32]byte, id string, credential [32]byte, name string, _ [32]byte) (worker.Record, worker.Enrollment, bool, error) {
+	e := m.codes[hash]
+	if e.ConsumedAt != nil && m.keys[credential] == e.WorkerID {
+		return m.records[e.WorkerID], e, true, nil
+	}
+	if m.staged[hash] != credential {
+		return worker.Record{}, e, false, &worker.Rejection{Reason: "enrollment_not_prepared"}
+	}
+	record, enrolled, err := m.ConsumeEnrollment(ctx, hash, id, credential, name)
+	return record, enrolled, false, err
 }
 
 func (m *httpWorkerStore) IssueEnrollment(_ context.Context, id string, hash [32]byte, ttl time.Duration) (worker.Enrollment, error) {
@@ -112,7 +140,7 @@ func (m *httpWorkerStore) RevokeWorker(_ context.Context, id string) (worker.Rec
 
 func workerHTTPFixture(t *testing.T) (*Handler, *httpWorkerStore, *bytes.Buffer, *diagnostics.Store) {
 	h, _, out, capture := fixture(t)
-	m := &httpWorkerStore{codes: map[[32]byte]worker.Enrollment{}, keys: map[[32]byte]string{}, records: map[string]worker.Record{}}
+	m := &httpWorkerStore{codes: map[[32]byte]worker.Enrollment{}, keys: map[[32]byte]string{}, records: map[string]worker.Record{}, staged: map[[32]byte][32]byte{}}
 	h.Workers = service.NewWorkers(m, h.Authority, rand.Reader, time.Now)
 	return h, m, out, capture
 }
@@ -129,16 +157,27 @@ func issueHTTP(t *testing.T, h *Handler) string {
 }
 func enrollHTTP(t *testing.T, h *Handler, code string) (workerView, string) {
 	t.Helper()
-	body, _ := json.Marshal(map[string]string{"enrollment_code": code})
-	w := call(h, "POST", "/api/v1/worker/enroll", "", bytes.NewReader(body))
+	key := prepareHTTP(t, h, code)
+	body, _ := json.Marshal(map[string]string{"enrollment_code": code, "phase": "activate"})
+	w := call(h, "POST", workerEnrollRoute, "Bearer "+key, bytes.NewReader(body))
 	var value struct {
-		Worker     workerView `json:"worker"`
-		Credential string     `json:"credential"`
+		Worker workerView `json:"worker"`
 	}
-	if w.Code != 201 || json.Unmarshal(w.Body.Bytes(), &value) != nil || !auth.ValidToken(value.Credential, auth.WorkerPrefix) {
+	if w.Code != 201 || json.Unmarshal(w.Body.Bytes(), &value) != nil {
 		t.Fatal("enrollment route failed")
 	}
-	return value.Worker, value.Credential
+	return value.Worker, key
+}
+
+func prepareHTTP(t *testing.T, h *Handler, code string) string {
+	t.Helper()
+	body, _ := json.Marshal(map[string]string{"enrollment_code": code, "phase": "prepare"})
+	w := call(h, "POST", workerEnrollRoute, "", bytes.NewReader(body))
+	var value struct{ Credential string }
+	if w.Code != 201 || json.Unmarshal(w.Body.Bytes(), &value) != nil || !auth.ValidToken(value.Credential, auth.WorkerPrefix) {
+		t.Fatalf("enrollment preparation status %d", w.Code)
+	}
+	return value.Credential
 }
 func capturedHTTP(t *testing.T, store *diagnostics.Store) []map[string]any {
 	t.Helper()
@@ -257,7 +296,7 @@ func TestWorkerHTTPInputsAndFailures(t *testing.T) {
 	}
 	code := issueHTTP(t, h)
 	enrollHTTP(t, h, code)
-	body, _ := json.Marshal(map[string]string{"enrollment_code": code})
+	body, _ := json.Marshal(map[string]string{"enrollment_code": code, "phase": "prepare"})
 	if call(h, "POST", "/api/v1/worker/enroll", "", bytes.NewReader(body)).Code != 409 {
 		t.Fatal("reused enrollment accepted")
 	}
@@ -286,9 +325,10 @@ func TestWorkerHTTPInputsAndFailures(t *testing.T) {
 func TestIssuedCredentialWriteFailureIsDiagnosable(t *testing.T) {
 	h, repo, _, capture := workerHTTPFixture(t)
 	code := issueHTTP(t, h)
-	body, _ := json.Marshal(map[string]string{"enrollment_code": code})
-	r := httptest.NewRequest("POST", "/api/v1/worker/enroll", bytes.NewReader(body))
-	r.Header.Set(service.WorkerVersionHeader, service.DevelopmentVersion)
+	key := prepareHTTP(t, h, code)
+	body, _ := json.Marshal(map[string]string{"enrollment_code": code, "phase": "activate"})
+	r := pairedRequest(h, "POST", workerEnrollRoute, bytes.NewReader(body))
+	r.Header.Set("Authorization", "Bearer "+key)
 	writer := &failWriter{header: http.Header{}, after: 0}
 	h.ServeHTTP(writer, r)
 	if len(repo.records) != 1 {
@@ -306,8 +346,8 @@ func TestIssuedCredentialWriteFailureIsDiagnosable(t *testing.T) {
 	if !found {
 		t.Fatal("write failure missing")
 	}
-	if call(h, "POST", "/api/v1/worker/enroll", "", bytes.NewReader(body)).Code != 409 {
-		t.Fatal("lost response reissued authority")
+	if call(h, "POST", workerEnrollRoute, "Bearer "+key, bytes.NewReader(body)).Code != 201 || len(repo.records) != 1 {
+		t.Fatal("lost response did not reconcile the same authority")
 	}
 	h.Workers = service.NewWorkers(repo, h.Authority, bytes.NewReader(nil), time.Now)
 	if call(h, "POST", "/api/v1/admin/enrollments", "Bearer admin-private-sentinel", nil).Code != 503 {
@@ -359,8 +399,7 @@ func TestStagedEnrollmentThroughHTTPAndSQLite(t *testing.T) {
 	operation := strings.Repeat("c", 32)
 	enroll := func(body, key string, want int) map[string]json.RawMessage {
 		t.Helper()
-		request := httptest.NewRequest("POST", "/api/v1/worker/enroll", strings.NewReader(body))
-		request.Header.Set(service.WorkerVersionHeader, service.DevelopmentVersion)
+		request := pairedRequest(h, "POST", workerEnrollRoute, strings.NewReader(body))
 		request.Header.Set("X-Muse-Enrollment-Operation", operation)
 		request.Header.Set("X-Muse-Enrollment-Attempt", "1")
 		if key != "" {

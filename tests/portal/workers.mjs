@@ -19,14 +19,21 @@ async function control(path, { method = 'GET', key, body, cookie, workerVersion 
   const headers = { 'Content-Type': 'application/json' };
   if (cookie) Object.assign(headers, browserSessionHeaders(cookie, fixture.origin));
   if (key) headers.Authorization = `Bearer ${key}`;
-  if (workerVersion) headers['X-Muse-Worker-Version'] = workerVersion;
+  if (workerVersion) Object.assign(headers, { 'X-Muse-Worker-Version': workerVersion, 'X-Muse-Worker-Updater': 'managed-hook-v1',
+    'X-Muse-Worker-SHA256': fixture.pin.sha256 });
   const response = await fetch(fixture.origin + path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(10_000) });
   const data = response.status === 204 ? null : await response.json();
   return { response, data };
 }
 
-function enroll(code) {
-  return control('/api/v1/worker/enroll', { method: 'POST', workerVersion: fixture.pin.version, body: { enrollment_code: code } });
+async function enroll(code) {
+  const route = '/api/v1/worker/hook/enroll';
+  const request = { method: 'POST', workerVersion: fixture.pin.version };
+  const prepared = await control(route, { ...request, body: { enrollment_code: code, phase: 'prepare' } });
+  if (prepared.response.status !== 201) return prepared;
+  const credential = prepared.data.credential;
+  const activated = await control(route, { ...request, key: credential, body: { enrollment_code: code, phase: 'activate' } });
+  return { ...activated, data: { ...activated.data, credential } };
 }
 
 async function login(page) {
@@ -231,7 +238,9 @@ async function viewports() {
     const text = page.getByLabel('Complete setup prompt', { exact: true });
     expect((await text.inputValue()) === generated.data.setup_prompt).toBe(true);
     expect(generated.data.worker_package.version).toBe(fixture.pin.version); expect(generated.data.worker_package.sha256).toBe(fixture.pin.sha256);
-    expect(generated.data.setup_prompt.includes('1m') && generated.data.setup_prompt.includes('cron-confirm') && generated.data.setup_prompt.includes('sha256sum')).toBe(true);
+    for (const instruction of ['poll_interval_secs: 15', 'every: "1h"', 'hook-confirm', 'sha256sum']) {
+      expect(generated.data.setup_prompt.includes(instruction)).toBe(true);
+    }
     expect((Date.parse(generated.data.expires_at) - Date.parse(generated.data.created_at)) / 1000).toBe(900);
     await page.getByRole('button', { name: 'Copy complete prompt' }).click();
     await expect(page.getByText('Copied. Keep this single-use enrollment private.')).toBeVisible();

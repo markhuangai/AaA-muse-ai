@@ -4,7 +4,7 @@ import { Transport } from '../dist/transport.js';
 import { Worker } from '../dist/worker.js';
 import { State } from '../dist/state.js';
 import { execute } from '../dist/cli.js';
-import { CronSetup } from '../dist/cron-setup.js';
+import { VERSION } from '../dist/version.js';
 import { encode, parse } from '../dist/json.js';
 import { fixture, enrolled, CODE, KEY, ID, JOB, CONN } from './helpers.mjs';
 import * as fs from 'node:fs/promises';
@@ -94,31 +94,42 @@ test('transient status codes cannot hide declared version mismatches or explicit
   }
 });
 
-test('a mixed-major checker records a manual update requirement without replacing authority', async t => {
-  const f = await fixture(t); await f.worker.configure('https://broker.example.test'); await f.worker.enroll(CODE);
-  const pending = encode({ protocol_version: 1, worker_id: ID, jobs: [] });
-  await f.state.write('pending.json', pending);
-  const key = await f.state.read('credential.key'); const config = await f.state.read('config.json');
-  const body = { id: ID, worker_package: { version: '2.0.0', sha256: 'a'.repeat(64) } };
-  const net = { ...f.net, fetch: async url => new Response(JSON.stringify(url.endsWith('/pull') ? { ...body, error: 'update_required' } : body), { status: url.endsWith('/pull') ? 426 : 200, headers: { 'x-muse-service-version': '2.0.0', 'x-request-id': 'update-check' } }) };
-  const transport = new Transport('https://broker.example.test', KEY, f.logger, f.state.sys, net);
-  await assert.rejects(transport.request('/api/v1/worker/pull', 'POST', '{}'), error => error.fields.recommended_worker.version === '2.0.0');
-  await f.state.write('installation.json', encode({ command: "'/fixture/launcher'", worker_id: ID }));
-  const setup = new CronSetup(f.worker, {}, '1.0.0');
-  const definition = await setup.describe('owned-goal');
-  await setup.confirm(encode({ matches: [{ ...definition, native_job_id: 'checker-registration' }] }));
-  const tick = JSON.stringify({ checker_job_id: 'checker-registration', checker_run_id: 'occurrence-one', scheduled_at: new Date(f.state.sys.now()).toISOString() });
-  const stdout = [];
-  assert.equal(await execute(['cron-check', '--input', '-', '--state-dir', f.state.root], { files: fs, system: f.state.sys, network: net, env: {}, home: () => f.state.root, nodeVersion: process.version, input: async () => tick, stdout: line => stdout.push(line), stderr: line => f.output.push(line), signal: new AbortController().signal, metadata: async () => ({ source_sha: 'unit', source_dirty: true }) }), 1);
-  const event = f.output.map(JSON.parse).find(e => e.msg === 'worker.update_required');
-  assert.equal(event.automatic_update, false); assert.equal(event.service_version, '2.0.0'); assert.equal(event.recommended_worker.version, '2.0.0');
-  assert.equal(await f.state.read('credential.key'), key); assert.equal(await f.state.read('config.json'), config); assert.equal(await f.state.read('pending.json'), pending);
-  assert(!stdout.join('').includes(KEY));
-  const malformed = new Transport('https://broker.example.test', KEY, f.logger, f.state.sys, { ...net, fetch: async () => new Response('{}', { headers: { 'x-muse-service-version': 'invalid' } }) });
-  await assert.rejects(malformed.request('/api/v1/worker/status'), /invalid_service_version/);
+const pin = 'a'.repeat(64);
+
+test('hook transport reserves cross-pair replies for update discovery and reporting', async t => {
+  const f = await fixture(t);
+  let status = 200, version = '1.2.0', digest = '1'.repeat(64), body = {};
+  const transport = new Transport('https://broker.example.test', KEY, f.logger, f.state.sys, {
+    ...f.net, fetch: async (_url, options) => {
+      assert.equal(options.headers['X-Muse-Worker-Version'], VERSION);
+      assert.equal(options.headers['X-Muse-Worker-Updater'], 'managed-hook-v1');
+      assert.equal(options.headers['X-Muse-Worker-SHA256'], pin);
+      return Response.json(body, { status, headers: { 'x-muse-service-version': version,
+        ...(digest ? { 'x-muse-paired-worker-sha256': digest } : {}) } });
+    },
+  }, VERSION, pin);
+  body = { job: null, update: { target: { version, sha256: digest, contract: 'managed-hook-v1' } } };
+  assert.deepEqual((await transport.request('/api/v1/worker/pull', 'POST', '{}')).data, body);
+  body.update.target.sha256 = pin;
+  await assert.rejects(transport.request('/api/v1/worker/pull', 'POST', '{}'), { code: 'update_offer_pair_mismatch' });
+  delete body.update;
+  assert.equal((await transport.request('/api/v1/worker/update', 'POST', '{}')).status, 200);
+  body.job = { job_id: JOB };
+  await assert.rejects(transport.request('/api/v1/worker/pull', 'POST', '{}'), { code: 'update_required' });
+  const start = '/api/v1/worker/jobs/' + JOB + '/start';
+  status = 409;
+  body = { error: 'hook_claim_terminal' };
+  await assert.rejects(transport.request(start, 'POST', '{}'), { code: 'update_required' });
+  version = VERSION;
+  await assert.rejects(transport.request(start, 'POST', '{}'), { code: 'update_required' });
+  digest = pin;
+  await assert.rejects(transport.request(start, 'POST', '{}'), { code: 'broker_rejected' });
+  digest = '';
+  status = 404;
+  await assert.rejects(transport.request(start, 'POST', '{}'), { code: 'hook_broker_unavailable' });
 });
 
-test('decision-submit reconciles accepted and uncertain receipts across service major changes through the CLI', async t => {
+test('decision-submit holds the original receipt across broker changes and replays on its exact pair', async t => {
   for (const acknowledgement of ['accepted', 'uncertain']) {
     const f = await fixture(t), transport = await enrolled(f);
     await f.worker.claim(transport, JOB, { connection_id: CONN, connection_generation: 1 });
@@ -144,10 +155,25 @@ test('decision-submit reconciles accepted and uncertain receipts across service 
     const key = await f.state.read('credential.key'), config = await f.state.read('config.json'), names = (await journals.list()).sort();
     const fetch = f.net.fetch;
     f.net.fetch = async (...args) => { const response = await fetch(...args); response.headers.set('x-muse-service-version', '2.0.0'); return response; };
+    await f.state.write('installation.json', encode({ package_sha256: pin, worker_id: ID }));
     const before = f.broker.calls.length, stdout = [];
-    assert.equal(await execute(['decision-submit', '--job-id', JOB, '--input', '-', '--state-dir', f.state.root], { files: fs, system: f.state.sys, network: f.net, env: {}, home: () => f.state.root, nodeVersion: process.version, input: async () => input, stdout: line => stdout.push(line), stderr: line => f.output.push(line), signal: new AbortController().signal, metadata: async () => ({ source_sha: 'unit', source_dirty: true }) }), 0);
+    const run = () => execute(['decision-submit', '--job-id', JOB, '--input', '-', '--state-dir', f.state.root], { files: fs, system: f.state.sys, network: f.net, env: {}, home: () => f.state.root, nodeVersion: process.version, input: async () => input, stdout: line => stdout.push(line), stderr: line => f.output.push(line), signal: new AbortController().signal, metadata: async () => ({ source_sha: 'unit', source_dirty: true }) });
+    assert.equal(await run(), 1);
+    assert.equal(stdout.length, 0);
+    assert.equal(await f.state.read('cron-claim.json') !== undefined, true);
+    assert.deepEqual(f.broker.calls.slice(before).map(call => call.path), ['/api/v1/worker/hook/jobs/' + JOB + '/decisions']);
+    const rejected = f.output.map(JSON.parse).findLast(event => event.msg === 'worker.update_required');
+    assert.equal(rejected.expected_digest, pin);
+    assert.equal(rejected.service_version, '2.0.0');
+    f.net.fetch = async (...args) => {
+      const response = await fetch(...args);
+      response.headers.set('x-muse-paired-worker-sha256', pin);
+      return response;
+    };
+    assert.equal(await run(), 0);
     const replay = f.broker.calls.slice(before).filter(call => call.path.endsWith('/decisions'));
-    assert.equal(replay.length, 1); assert.equal(replay[0].options.body, saved.body); assert.equal(replay[0].input.submission_id, pointer.submission_id);
+    assert.equal(replay.length, 2);
+    assert(replay.every(call => call.options.body === saved.body && call.input.submission_id === pointer.submission_id));
     assert.equal(parse(stdout.join('')).claim_id, claimID);
     assert.equal(parse(stdout.join('')).outcome, 'accepted');
     assert.equal(parse(await journals.read(name)).state, 'accepted'); assert.deepEqual((await journals.list()).sort(), names);

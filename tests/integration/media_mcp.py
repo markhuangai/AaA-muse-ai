@@ -217,7 +217,7 @@ class MCPMedia:
             expected = self.render("wav", "-f", "lavfi", "-i", f"sine=frequency={frequency}:duration=0.25", "-c:a", "pcm_s16le")
             output.write_bytes(expected)
             self.cli(worker, "media-finish", "--job-id", identity)
-            require(self.observe(worker, "completed")["outcome"] == "settled" and not progress.exists(), "WAV acknowledgement did not settle the native claim")
+            require(self.tick(worker)["outcome"] == "settled" and not progress.exists(), "WAV acknowledgement did not settle the native claim")
             path = self.ready_link(identity, "wav", expected)
             view = self.checked("/api/v1/media/jobs/" + identity, self.client)[0]
             digest = hashlib.sha256(expected).hexdigest()
@@ -232,13 +232,13 @@ class MCPMedia:
         return jobs
 
     def reject_malformed_wav(self, worker, identity):
-        route = "/api/v1/worker/jobs/" + identity
+        route = "/api/v1/worker/hook/jobs/" + identity
         assigned = worker["work"]["grant"]
         require(assigned["job_id"] == identity, "malformed upload fixture lost its native claim")
         bad = b"controlled bytes without a WAV container"
         headers = {"X-Muse-Generation": str(assigned["generation"]), "X-Muse-Lease-Id": assigned["claim_id"],
                    "X-Muse-Artifact-Sha256": hashlib.sha256(bad).hexdigest(), "Content-Type": "audio/wav"}
-        status, reply, _ = self.proxy_exchange_bytes(route + "/artifact", worker["credential"], bad, headers)
+        status, reply, _ = self.proxy_exchange_bytes(route + "/artifact", worker["credential"], bad, {**self.worker_pair_headers(), **headers})
         require(status == 422, "non-WAV bytes published as WAV")
         events = self.mcp_diagnostic("request_id", reply["X-Request-Id"], self.origin_url)
         failure = next((e for e in events if e["msg"] == "media.rejected" and e.get("cause") == "invalid_media_format"), None)
@@ -313,7 +313,6 @@ class MCPMedia:
             self.until(pulled, "MCP text work did not reach the packed worker", timeout=15)
             grant, = grants
             identity = grant["job_id"]
-            self.work_definition(worker, grant)
             view = self.start_work(worker)
             request_id = view["operation_id"]
             require(view["context"]["messages"] == [{"type": "message", "role": "user", "text": fields["prompt"]}]
@@ -322,7 +321,7 @@ class MCPMedia:
                 time.sleep(max(0, 32 - (time.monotonic() - started)))
             self.cli(worker, "decision-submit", "--job-id", identity, "--input", "-",
                      input_text=json.dumps({"type": "final", "text": final_text}))
-            require(self.observe(worker, "completed")["outcome"] == "settled", "MCP text worker did not settle its native claim")
+            require(self.tick(worker)["outcome"] == "settled", "MCP text worker did not settle its native claim")
             first = pending.result()
         if secret_path:
             require(self.proxy.mcp_reply_lost.is_set(), "five-minute MCP route failed before the ordinary write timeout")

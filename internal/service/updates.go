@@ -105,12 +105,6 @@ func validateWorkerUpdate(input worker.UpdateRequest, contact worker.Contact) er
 		return inference.Reject("invalid_worker_update", 400)
 	}
 	switch input.Action {
-	case "adopt":
-		from, valid := ReleaseMajor(input.PreviousVersion)
-		to, _ := ReleaseMajor(input.Target.Version)
-		if !valid || from == 0 || from != to || !inference.Identifier.MatchString(input.WorkerID) || input.Reason != "" {
-			return inference.Reject("invalid_worker_update", 400)
-		}
 	case "begin", "activate", "applied", "failed":
 		if input.PreviousVersion != "" || input.WorkerID != "" ||
 			(input.Action == "failed" && !worker.ValidUpdateFailure(input.Reason)) ||
@@ -149,7 +143,7 @@ func updateCorrection(reason string) string {
 		return "Compare the deployed image pin against the verified release archive before changing versions."
 	case "staging_failed", "activation_failed":
 		return "Check the worker’s private installation directory, permissions and available disk space."
-	case "mixed_broker_releases", "target_changed", "update_target_changed":
+	case "mixed_broker_releases", "target_changed", "update_target_changed", "update_requires_newer_pair":
 		return "Bring the running brokers to the intended paired release and allow the next idle check."
 	case "unsupported_worker_migration":
 		return "Follow the target release’s operator-managed migration instructions."

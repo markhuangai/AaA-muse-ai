@@ -20,7 +20,7 @@ const busyReasons = new Map([
 ]);
 
 const updateLabels = new Map([
-  ['adoption_required', 'Setup required'], ['offered', 'Update available'], ['downloading', 'Updating'],
+  ['offered', 'Update available'], ['downloading', 'Updating'],
   ['switching', 'Updating'], ['awaiting_confirmation', 'Awaiting confirmation'], ['confirmed', 'Update confirmed'],
   ['failed', 'Update failed'], ['deferred', 'Update deferred'], ['migration_required', 'Migration required'],
 ]);
@@ -32,6 +32,7 @@ const updateReasons = new Map([
   ['candidate_incompatible', 'The package is incompatible with this worker.'], ['target_changed', 'The broker target changed.'],
   ['mixed_broker_releases', 'The brokers are serving different releases.'],
   ['release_digest_conflict', 'The same version has conflicting archive digests.'],
+  ['update_requires_newer_pair', 'The broker must run a newer paired release to update this worker.'],
   ['unsupported_worker_migration', 'The target requires an operator-guided migration.'],
 ]);
 
@@ -106,14 +107,7 @@ function WorkerDetail({ worker, controller, view }: { worker: Worker; controller
         {update?.reason && updateReasons.has(update.reason) && <div><dt>Reason</dt><dd>{updateReasons.get(update.reason)}</dd></div>}
         {update?.retry_at && <div><dt>Retry after</dt><dd>{timestamp(update.retry_at)}</dd></div>}
         {update?.id && <div><dt>Update operation</dt><dd><code>{update.id}</code></dd></div>}
-      </dl><p className="field-note">Contact becomes Quiet after one minute and Offline after ten. A scheduled tick can run late.</p>
-      {!update?.contract && <button type="button" disabled={disabled || !!worker.current_claim}
-        onClick={() => void controller.createUpdatePrompt(worker.id)}>{view.pending === 'update' ? 'Generating…' : 'Enable automatic updates'}</button>}
-      {view.updatePrompt && <div className="enrollment-result">
-        <button type="button" onClick={() => void controller.copyUpdatePrompt()}>Copy update prompt</button>
-        <label htmlFor="worker-update-prompt">Paste into this worker’s Muse goal</label>
-        <textarea id="worker-update-prompt" readOnly spellCheck={false} value={view.updatePrompt} rows={8} />
-      </div>}
+      </dl><p className="field-note">Contact becomes Quiet after one minute and Offline after ten.</p>
       <h4>Weekly account usage</h4>
       <dl className="identity-list">
         <div><dt>Allowance remaining</dt><dd className="num">{weeklyAllowance(worker, view.stale)}</dd></div>

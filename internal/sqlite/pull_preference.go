@@ -87,13 +87,15 @@ const betterPullWorkers = `SELECT usage.worker_id,usage.used_percent,usage.obser
  WHERE usage.used_percent<?1 AND usage.observed_at>?2 AND usage.observed_at<=?3
  AND poll.worker_id=usage.worker_id AND worker.id=usage.worker_id AND worker.revoked_at IS NULL
  AND poll.available_capability IS NOT NULL AND poll.available_major=?4
+ AND (?5='' OR (json_extract(update_state.data,'$.version')=?5 AND json_extract(update_state.data,'$.sha256')=?6
+   AND json_extract(update_state.data,'$.contract')=?7))
  AND poll.last_poll_at>?2 AND poll.scheduled_at>?2 AND poll.scheduled_at<=?3
  AND coalesce(json_extract(update_state.data,'$.state'),'') NOT IN ('offered','downloading','switching','awaiting_confirmation')
  AND NOT EXISTS (SELECT 1 FROM aaa_inference_jobs WHERE worker_id=usage.worker_id AND held)
  ORDER BY usage.used_percent,poll.available_capability,usage.worker_id`
 
-func preferredPullWorkers(ctx context.Context, tx *sql.Tx, major string, percent float64, now, cutoff int64) ([]preferredWorker, error) {
-	rows, err := tx.QueryContext(ctx, betterPullWorkers, percent, cutoff, now, major)
+func preferredPullWorkers(ctx context.Context, tx *sql.Tx, major string, percent float64, now, cutoff int64, pair inference.HookPair) ([]preferredWorker, error) {
+	rows, err := tx.QueryContext(ctx, betterPullWorkers, percent, cutoff, now, major, pair.Version, pair.Digest, worker.UpdateContract)
 	if err != nil {
 		return nil, err
 	}
@@ -147,7 +149,7 @@ func exhaustedPullTargets(ctx context.Context, tx *sql.Tx, now, cutoff int64) ([
 	return ids, rows.Err()
 }
 
-func pickPullJob(ctx context.Context, tx *sql.Tx, workerID, major string, capability int, now time.Time, timing *inference.PullTiming) (pullCandidate, string, error) {
+func pickPullJob(ctx context.Context, tx *sql.Tx, workerID, major string, capability int, now time.Time, timing *inference.PullTiming, pairs ...inference.HookPair) (pullCandidate, string, error) {
 	percent := 100.0 // Unknown ranks below all workers with reported headroom.
 	if timing.EffectiveUsage.Fresh(now) {
 		percent = timing.EffectiveUsage.UsedPercent
@@ -177,7 +179,11 @@ func pickPullJob(ctx context.Context, tx *sql.Tx, workerID, major string, capabi
 		timing.UsageDecision = "no_compatible_queued_job"
 		return pullCandidate{}, "", nil
 	}
-	peers, err := preferredPullWorkers(ctx, tx, major, percent, stamp, cutoff)
+	var pair inference.HookPair
+	if len(pairs) != 0 {
+		pair = pairs[0]
+	}
+	peers, err := preferredPullWorkers(ctx, tx, major, percent, stamp, cutoff, pair)
 	if err != nil {
 		return pullCandidate{}, "", err
 	}

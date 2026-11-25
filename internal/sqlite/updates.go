@@ -101,6 +101,23 @@ func saveWorkerUpdate(ctx context.Context, tx *sql.Tx, id string, state worker.U
 	return err
 }
 
+func observeLegacyWorker(ctx context.Context, tx *sql.Tx, now time.Time, id string, pull inference.Pull, contact worker.Contact) (worker.UpdateStatus, error) {
+	state, err := readWorkerUpdate(ctx, tx, id)
+	if err != nil || state.Contract == worker.UpdateContract || contact.Contract == worker.UpdateContract {
+		return worker.UpdateStatus{}, err
+	}
+	alreadyMarked := state.State == "migration_required"
+	state.Observe(contact, pull.ScheduledAt, now)
+	state.State, state.Reason = "migration_required", "unsupported_worker_migration"
+	if err = saveWorkerUpdate(ctx, tx, id, state); err != nil {
+		return worker.UpdateStatus{}, err
+	}
+	if alreadyMarked {
+		return worker.UpdateStatus{}, nil
+	}
+	return state, nil
+}
+
 func decideUpdate(ctx context.Context, tx *sql.Tx, now time.Time, id string, pull inference.Pull, contact worker.Contact, broker worker.UpdateBroker, held bool) (*worker.UpdateOffer, worker.UpdateStatus, bool, error) {
 	state, err := readWorkerUpdate(ctx, tx, id)
 	if err != nil {
@@ -114,10 +131,10 @@ func decideUpdate(ctx context.Context, tx *sql.Tx, now time.Time, id string, pul
 	switch {
 	case state.Active():
 		work = false
-		if state.State == "awaiting_confirmation" && contact.Version == state.Target.Version &&
+		if !contact.Incompatible && !held && state.State == "awaiting_confirmation" && state.Target != nil && contact.Version == state.Target.Version &&
 			contact.Digest == state.Target.SHA256 && contact.Contract == state.Target.Contract && fresh {
 			state.State, state.Reason = "confirmed", ""
-			work = !contact.Incompatible && !held
+			work = true
 		}
 	case !held && contact.Version != "":
 		target, reason, err := agreedTarget(ctx, tx, now, broker)
@@ -140,11 +157,11 @@ func decideUpdate(ctx context.Context, tx *sql.Tx, now time.Time, id string, pul
 			if state.State != "confirmed" {
 				state.State, state.Reason, state.ID, state.Attempt, state.RetryAt = "", "", "", 0, nil
 			}
-		case contact.Contract == "" && !contact.Incompatible:
-			state.Target, state.State, state.Reason = target, "adoption_required", ""
-			state.ID, state.Attempt, state.RetryAt = "", 0, nil
-		case !target.Supports(contact.Version, contact.Contract):
+		case contact.Contract != target.Contract:
 			state.Target, state.State, state.Reason = target, "migration_required", "unsupported_worker_migration"
+			state.ID, state.Attempt, state.RetryAt = "", 0, nil
+		case !target.Advances(contact):
+			state.Target, state.State, state.Reason = target, "deferred", "update_requires_newer_pair"
 			state.ID, state.Attempt, state.RetryAt = "", 0, nil
 		case state.State == "failed" && state.Target != nil && *state.Target == *target &&
 			(state.RetryAt == nil || now.Before(*state.RetryAt)):
@@ -175,21 +192,13 @@ func (r *Repository) ApplyWorkerUpdate(ctx context.Context, credential [32]byte,
 		if err != nil {
 			return err
 		}
-		if input.Action == "adopt" && input.WorkerID != id {
-			return inference.Reject("worker_scope_denied", 404)
-		}
 		matches := state.ID == input.ID && state.Target != nil && *state.Target == input.Target
-		reportingPrevious := contact.Version == state.From.Version &&
-			(state.From.Digest == "" || state.From.Digest == contact.Digest)
+		reportingPrevious := contact.Version == state.From.Version && contact.Contract == state.From.Contract &&
+			state.From.Digest == contact.Digest
 		reportingTarget := contact.Version == input.Target.Version && contact.Digest == input.Target.SHA256 &&
 			contact.Contract == input.Target.Contract
 		switch input.Action {
-		case "adopt", "begin", "activate":
-			if matches && (state.State == "confirmed" || state.State == "awaiting_confirmation" ||
-				((state.State == "downloading" || state.State == "switching") && input.Action != "activate")) {
-				replayed = true
-				return nil
-			}
+		case "begin", "activate":
 			target, reason, err := agreedTarget(ctx, tx, now, broker)
 			if err != nil {
 				return err
@@ -200,6 +209,9 @@ func (r *Repository) ApplyWorkerUpdate(ctx context.Context, credential [32]byte,
 				}
 				return inference.Reject(reason, 409)
 			}
+			if !target.Advances(contact) {
+				return inference.Reject("update_requires_newer_pair", 409)
+			}
 			var held bool
 			if err := tx.QueryRowContext(ctx, heldPullJob, id).Scan(&held); err != nil {
 				return err
@@ -207,22 +219,18 @@ func (r *Repository) ApplyWorkerUpdate(ctx context.Context, credential [32]byte,
 			if held {
 				return inference.Reject("worker_has_held_work", 409)
 			}
+			if matches && reportingPrevious && (state.State == "confirmed" || state.State == "awaiting_confirmation" ||
+				((state.State == "downloading" || state.State == "switching") && input.Action != "activate")) {
+				replayed = true
+				return nil
+			}
 			switch input.Action {
-			case "adopt":
-				if !reportingTarget || state.Active() || state.Contract != "" ||
-					(state.Version != "" && state.Version != input.PreviousVersion) ||
-					!target.Supports(input.PreviousVersion, contact.Contract) {
-					return inference.Reject("update_adoption_conflict", 409)
-				}
-				state.Target, state.ID = target, input.ID
-				state.From = worker.Contact{Version: input.PreviousVersion}
 			case "begin":
 				if !matches || state.State != "offered" || !reportingPrevious || contact.Contract != target.Contract {
 					return inference.Reject("update_offer_stale", 409)
 				}
 			case "activate":
-				if !matches || (state.State != "downloading" && state.State != "switching") ||
-					(!reportingPrevious && !(state.From.Contract == "" && reportingTarget)) {
+				if !matches || (state.State != "downloading" && state.State != "switching") || !reportingPrevious {
 					return inference.Reject("update_attempt_stale", 409)
 				}
 				if state.State == "switching" {
@@ -235,6 +243,9 @@ func (r *Repository) ApplyWorkerUpdate(ctx context.Context, credential [32]byte,
 			state.State, state.Reason, state.StartedAt = "downloading", "", &now
 			state.Attempt++
 		case "applied":
+			if broker.Target == nil || *broker.Target != input.Target {
+				return inference.Reject("update_target_changed", 409)
+			}
 			if !matches || !reportingTarget || (state.State != "switching" && state.State != "awaiting_confirmation" && state.State != "confirmed") {
 				return inference.Reject("update_attempt_stale", 409)
 			}
@@ -244,7 +255,7 @@ func (r *Repository) ApplyWorkerUpdate(ctx context.Context, credential [32]byte,
 			}
 			state.State = "awaiting_confirmation"
 		case "failed":
-			if !matches || (!reportingPrevious && !(state.From.Contract == "" && reportingTarget)) || (!state.Active() && (state.State != "failed" || input.Reason != state.Reason)) {
+			if !matches || !reportingPrevious || (!state.Active() && (state.State != "failed" || input.Reason != state.Reason)) {
 				return inference.Reject("update_attempt_stale", 409)
 			}
 			if state.State == "failed" {
@@ -252,6 +263,8 @@ func (r *Repository) ApplyWorkerUpdate(ctx context.Context, credential [32]byte,
 				return nil
 			}
 			state.Fail(input.Reason, now)
+		default:
+			return inference.Reject("invalid_worker_update", 400)
 		}
 		return saveWorkerUpdate(ctx, tx, id, state)
 	})

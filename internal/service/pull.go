@@ -108,7 +108,9 @@ func (b *Broker) PullWork(ctx context.Context, logger *slog.Logger, credential s
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	result, workerID, replayed, timing, err := repo.WithinPull(ctx, auth.Digest(credential), input, hash, capability, workerContact(reports), b.updateBroker,
-		func(s *inference.State) (*inference.Grant, error) { return b.claimPulledJob(s, input.VerifyStart) })
+		func(s *inference.State) (*inference.Grant, error) {
+			return b.claimPulledJob(s, input.VerifyStart, input.VerifyHookStart)
+		})
 	logger = logger.With("worker_id", workerID, "sequence", input.Sequence, "checker_job_id", input.Checker, "checker_run_id", input.Occurrence)
 	logger.Debug("worker.pull_timing", "scheduled_at", input.ScheduledAt, "entered_at", input.EnteredAt, "duration_ms", b.now().Sub(started).Milliseconds(),
 		"transaction_acquire_us", timing.Acquire.Microseconds(), "queue_lookup_us", timing.Select.Microseconds(), "replayed", replayed)
@@ -166,7 +168,7 @@ func logWeeklyUsage(logger *slog.Logger, sample *worker.WeeklyUsage, received ti
 		"reason", result, "received_at", received, "freshness_ms", worker.WeeklyUsageFreshness.Milliseconds())
 }
 
-func (b *Broker) claimPulledJob(s *inference.State, verifyStart bool) (*inference.Grant, error) {
+func (b *Broker) claimPulledJob(s *inference.State, verifyStart, verifyHookStart bool) (*inference.Grant, error) {
 	for _, job := range s.Jobs {
 		experiment := s.Experiments[job.ExperimentID]
 		if experiment == nil || experiment.State != "queued" || experiment.CurrentJobID != job.ID ||
@@ -186,7 +188,9 @@ func (b *Broker) claimPulledJob(s *inference.State, verifyStart bool) (*inferenc
 		if err != nil {
 			return nil, err
 		}
-		if verifyStart {
+		if verifyHookStart {
+			claim = inference.HookClaimPrefix + claim
+		} else if verifyStart {
 			claim = inference.VerifiedClaimPrefix + claim
 		}
 		job.WorkerID, job.State, job.Held = s.WorkerID, "claimed", true
@@ -320,6 +324,10 @@ func (b *Broker) StartWork(ctx context.Context, logger *slog.Logger, workerID, i
 			return nil, inference.Reject("invalid_work_start", 400)
 		}
 		job := s.Jobs[id]
+		if claimMatches(job, input.ClaimID, input.Generation) && inference.HookClaim(job.LeaseID) &&
+			job.Held && job.StartedAt == nil && s.Experiments[job.ExperimentID].Terminal() {
+			return nil, inference.Reject("hook_claim_terminal", 409, "claim_id", job.LeaseID, "busy_hold", true)
+		}
 		if !claimMatches(job, input.ClaimID, input.Generation) || job.State != "claimed" || !job.Held || !s.Now.Before(job.DeadlineAt) {
 			return nil, inference.Reject("stale_assignment", 409)
 		}
@@ -343,6 +351,21 @@ func (b *Broker) StartWork(ctx context.Context, logger *slog.Logger, workerID, i
 
 func verifyNativeStart(receipt *inference.NativeWorkReceipt, job *inference.Job, input inference.WorkStart) error {
 	proof := input.Verification
+	if inference.HookClaim(job.LeaseID) {
+		if receipt == nil || receipt.Mode != "hook" || proof == nil {
+			return inference.Reject("native_start_proof_required", 409, "claim_id", job.LeaseID, "launch_id", input.LaunchID)
+		}
+		if proof.Reference != job.LeaseID || proof.NativeJob != input.NativeJob || proof.NativeJob != receipt.Checker ||
+			proof.NativeRun != receipt.WakeRun() || !inference.Identifier.MatchString(proof.NativeRun) || proof.Status != "running" ||
+			proof.NativeRun == proof.NativeJob || matchesPresence(job, proof.NativeRun) {
+			return inference.Reject("native_start_proof_mismatch", 409, "claim_id", job.LeaseID, "launch_id", input.LaunchID,
+				"expected_reference", job.LeaseID, "observed_reference", proof.Reference, "expected_native_job_id", receipt.Checker,
+				"expected_native_run_id", receipt.WakeRun(), "observed_native_job_id", proof.NativeJob, "observed_native_run_id", proof.NativeRun,
+				"observed_status", proof.Status)
+		}
+		receipt.Start = proof
+		return nil
+	}
 	if proof == nil && !inference.VerifiedClaim(job.LeaseID) {
 		return nil
 	}
@@ -382,7 +405,7 @@ func (b *Broker) InterruptWork(ctx context.Context, logger *slog.Logger, workerI
 		if !claimMatches(job, input.ClaimID, input.Generation) {
 			return nil, inference.Reject("stale_assignment", 409)
 		}
-		if input.VerifiedStart != inference.VerifiedClaim(job.LeaseID) {
+		if input.VerifiedStart != (inference.VerifiedClaim(job.LeaseID) || inference.HookClaim(job.LeaseID)) {
 			return nil, inference.Reject("native_settlement_proof_required", 409, "claim_id", job.LeaseID, "launch_id", input.LaunchID)
 		}
 		if input.VerifiedStart {
@@ -420,6 +443,16 @@ func verifyNativeSettlement(receipt *inference.NativeWorkReceipt, job *inference
 		return inference.Reject("stale_assignment", 409)
 	}
 	if job.StartedAt == nil {
+		if inference.HookClaim(job.LeaseID) {
+			if receipt.Mode == "hook" && (input.Reason == "launch_not_authorized" ||
+				(input.Reason == "execution_confirmed_stopped" && input.NativeJob == receipt.Checker &&
+					input.NativeRun == receipt.WakeRun() && !matchesPresence(job, input.NativeRun))) {
+				return nil
+			}
+			return inference.Reject("native_settlement_proof_mismatch", 409, "claim_id", job.LeaseID, "launch_id", input.LaunchID,
+				"expected_native_job_id", receipt.Checker, "expected_native_run_id", receipt.WakeRun(),
+				"observed_native_job_id", input.NativeJob, "observed_native_run_id", input.NativeRun)
+		}
 		if receipt.IsChecker(input.NativeJob, job.BusyPresence) || receipt.IsChecker(input.NativeRun, job.BusyPresence) {
 			return inference.Reject("native_settlement_checker_id", 409, "claim_id", job.LeaseID, "launch_id", input.LaunchID,
 				"checker_job_id", receipt.Checker, "checker_run_id", receipt.Occurrence,
@@ -437,4 +470,8 @@ func verifyNativeSettlement(receipt *inference.NativeWorkReceipt, job *inference
 			"observed_native_job_id", input.NativeJob, "observed_native_run_id", input.NativeRun)
 	}
 	return nil
+}
+
+func matchesPresence(job *inference.Job, nativeRun string) bool {
+	return job.BusyPresence != nil && (nativeRun == job.BusyPresence.Occurrence || nativeRun == "event-hook-"+job.BusyPresence.Occurrence)
 }

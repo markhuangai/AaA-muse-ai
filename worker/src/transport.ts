@@ -4,6 +4,7 @@ import { Logger } from './diagnostics.js';
 import { maxModelReportBytes } from './protocol.js';
 import type { System } from './state.js';
 import { VERSION } from './version.js';
+import { archiveDigest, updateContract } from './update-archive.js';
 
 export interface Network {
   fetch: typeof fetch;
@@ -36,11 +37,47 @@ function controlRouteUnavailable(status: number, route: string, data: ObjectValu
 }
 
 export class Transport {
-  constructor(readonly endpoint: string, readonly credential: string, readonly logger: Logger, readonly sys: System, readonly net: Network = network, readonly productVersion = VERSION) { origin(endpoint); }
-  compatibility(response: Response, route: string, data: ObjectValue = {}, updateCapable = false): void {
+  constructor(readonly endpoint: string, readonly credential: string, readonly logger: Logger, readonly sys: System, readonly net: Network = network,
+    readonly productVersion = VERSION, readonly hookDigest?: string) { origin(endpoint); }
+
+  path(route: string): string {
+    return this.hookDigest === undefined ? route : route.replace('/api/v1/worker/', '/api/v1/worker/hook/');
+  }
+
+  workerHeaders(): Record<string, string> {
+    return { 'X-Muse-Worker-Version': this.productVersion, ...(this.hookDigest === undefined ? {} :
+      { 'X-Muse-Worker-Updater': updateContract, 'X-Muse-Worker-SHA256': this.hookDigest }) };
+  }
+
+  private verifyHookResponse(response: Response, route: string, data: ObjectValue, digest: string): void {
+    const declared = response.headers.get('x-muse-service-version');
+    const pin = response.headers.get('x-muse-paired-worker-sha256');
+    if (declared === null && pin === null && (response.status === 429 || response.status >= 500)) return;
+    const updateOnly = pin !== null && archiveDigest.test(pin) && declared?.startsWith('1.') &&
+      (route === '/api/v1/worker/update' || (response.ok && route === '/api/v1/worker/pull' && data.job === null));
+    if (response.ok && route === '/api/v1/worker/pull' && data.update !== undefined) {
+      const update = object(object(data.update).target);
+      requireValue(update.version === declared && update.sha256 === pin && update.contract === updateContract, 'update_offer_pair_mismatch',
+        { expected_version: declared, expected_digest: pin, observed_version: update.version, observed_digest: update.sha256 });
+    }
+    if (data.error !== 'update_required' && (updateOnly || (declared === this.productVersion && pin === digest))) return;
+    const unavailable = response.status === 404 && !pin;
+    throw new Failure(unavailable ? 'hook_broker_unavailable' : 'update_required', {
+      worker_version: this.productVersion, service_version: declared, expected_digest: digest, observed_digest: pin,
+      route: this.path(route), http_status: response.status, reason: data.error,
+      request_id: response.headers.get('x-request-id') ?? '',
+      corrective_action: 'Use the verified paired broker and worker. Reconcile held work on its original pair.',
+    });
+  }
+
+  compatibility(response: Response, route: string, data: ObjectValue = {}, updateCapable = false, digest = this.hookDigest): void {
     const declared = response.headers.get('x-muse-service-version');
     const major = (value: string): string | undefined => /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(dev|rc)\.(0|[1-9][0-9]*))?$/.exec(value)?.[1];
     if (declared !== null) requireValue(major(declared) !== undefined, 'invalid_service_version');
+    if (digest !== undefined) {
+      this.verifyHookResponse(response, route, data, digest);
+      return;
+    }
     const retryable = response.status === 429 || response.status >= 500 || (route.endsWith('/events') && response.status === 409) ||
       controlRouteUnavailable(response.status, route, data, this.credential);
     if (declared === null && retryable && data.error !== 'update_required') return;
@@ -82,7 +119,7 @@ export class Transport {
       const timer = this.net.setTimer(() => controller.abort(), timeoutMs);
       let requestId = this.sys.uuid();
       try {
-        const response = await this.net.fetch(this.endpoint + route, { method, body: input, redirect: 'manual', signal: controller.signal, headers: { ...(this.credential ? { Authorization: 'Bearer ' + this.credential } : {}), Accept: 'application/json', ...(input === undefined ? {} : { 'Content-Type': 'application/json' }), 'X-Request-Id': requestId, 'X-Muse-Worker-Version': this.productVersion, ...metadata, ...(metadata['X-Muse-Enrollment-Operation'] ? { 'X-Muse-Enrollment-Attempt': String(attempt) } : {}) } });
+        const response = await this.net.fetch(this.endpoint + this.path(route), { method, body: input, redirect: 'manual', signal: controller.signal, headers: { ...(this.credential ? { Authorization: 'Bearer ' + this.credential } : {}), Accept: 'application/json', ...(input === undefined ? {} : { 'Content-Type': 'application/json' }), 'X-Request-Id': requestId, ...this.workerHeaders(), ...metadata, ...(metadata['X-Muse-Enrollment-Operation'] ? { 'X-Muse-Enrollment-Attempt': String(attempt) } : {}) } });
         requestId = response.headers.get('x-request-id') || requestId;
         requireValue(response.status < 300 || response.status >= 400, 'redirect_forbidden');
         const raw = await this.body(response);
@@ -94,15 +131,15 @@ export class Transport {
           responseValidation = error.code;
         }
         const validation = responseValidation ? { response_validation_cause: responseValidation } : {};
-        await this.logger.log('DEBUG', 'worker.http_exchange', { ...correlation, ...validation, request_id: requestId, endpoint: this.endpoint, route, method, attempt, duration_ms: this.sys.now() - started, http_status: response.status, input: input === undefined ? null : parse(input), output: responseValidation ? raw : data });
-        this.compatibility(response, route, data, !!metadata['X-Muse-Worker-Updater']);
+        await this.logger.log('DEBUG', 'worker.http_exchange', { ...correlation, ...validation, request_id: requestId, endpoint: this.endpoint, route: this.path(route), method, attempt, duration_ms: this.sys.now() - started, http_status: response.status,
+          service_version: response.headers.get('x-muse-service-version'), service_worker_digest: response.headers.get('x-muse-paired-worker-sha256'),
+          input: input === undefined ? null : parse(input), output: responseValidation ? raw : data });
+        this.compatibility(response, route, data, !!metadata['X-Muse-Worker-Updater'], this.hookDigest === undefined ? undefined : metadata['X-Muse-Worker-SHA256'] ?? this.hookDigest);
         if (!response.ok) throw new Failure(response.status === 401 ? 'worker_unauthorized' : 'broker_rejected', { ...correlation, ...validation, request_id: requestId, route, method, attempt, http_status: response.status, reason: typeof data.error === 'string' ? data.error : 'invalid_error_response' }, response.status === 429 || response.status >= 500 || controlRouteUnavailable(response.status, route, data, this.credential));
         return { data, requestId, status: response.status };
       } catch (error) {
         const failure = error instanceof Failure ? error : new Failure('broker_unreachable', { ...correlation, cause: cause(error), request_id: requestId, route, method, attempt, duration_ms: this.sys.now() - started }, !/CERT|TLS|SSL/.test(cause(error)));
-        if (metadata['X-Muse-Enrollment-Operation']) {
-          failure.fields = { ...correlation, request_id: requestId, attempt, ...failure.fields };
-        }
+        failure.fields = { ...correlation, request_id: requestId, attempt, ...failure.fields };
         // An unstructured control-route 404 must return the subscriber to reconciliation.
         if (!failure.retryable || failure.fields.http_status === 404 || attempt >= attempts) throw failure;
         await this.logger.log('WARN', 'worker.http_retrying', { ...correlation, ...failure.fields, endpoint: this.endpoint, route, method, attempt, delay_ms: attempt * 1000, cause: failure.code,

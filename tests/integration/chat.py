@@ -538,11 +538,10 @@ def main():
     finally:
         failures = []
         for bot in h.bots:
-            if bot.thread.is_alive():
-                try:
-                    bot.stop()
-                except Exception as error:
-                    failures.append(type(error).__name__)
+            try:
+                bot.stop()
+            except Exception as error:
+                failures.append(type(error).__name__)
         for peer in h.peers:
             if peer.thread.is_alive():
                 try:

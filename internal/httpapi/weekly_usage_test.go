@@ -52,7 +52,7 @@ func usageRequest(h *Handler, path, key string, input any, headers ...string) *h
 	if err != nil {
 		panic(err)
 	}
-	request := httptest.NewRequest("POST", path, bytes.NewReader(raw))
+	request := pairedRequest(h, "POST", path, bytes.NewReader(raw))
 	request.Header.Set("Authorization", "Bearer "+key)
 	request.Header.Set("X-Muse-Worker-Version", h.Service.Build().Version)
 	for _, header := range headers {
@@ -60,6 +60,7 @@ func usageRequest(h *Handler, path, key string, input any, headers ...string) *h
 	}
 	response := httptest.NewRecorder()
 	h.ServeHTTP(response, request)
+	rememberTestPull(response, input)
 	return response
 }
 
@@ -140,6 +141,24 @@ func TestWeeklyUsageRanksAcrossBrokersAndReversesAfterSettlement(t *testing.T) {
 		t.Fatal("restart lost the reversed ranking")
 	}
 	requireUsageClaim(t, f.poll(t, 0, 0, usageHeaderValue(25, f.now)), second.ID)
+}
+
+func TestWeeklyUsagePrefersOnlyTheExactPair(t *testing.T) {
+	for _, peer := range []struct{ version, digest string }{{"1.1.0", "a"}, {"1.2.0", "b"}} {
+		t.Run(peer.version+"-"+peer.digest, func(t *testing.T) {
+			f := newUsageFleet(t)
+			clock := func() time.Time { return f.now }
+			first, firstRepo := openPullHTTP(t, f.path, clock)
+			second, secondRepo := openPullHTTP(t, f.path, clock)
+			setUpdateBuild(t, first, firstRepo, clock, "current", "1.2.0", "a", "")
+			setUpdateBuild(t, second, secondRepo, clock, "other", peer.version, peer.digest, "")
+			f.first, f.second = first, second
+			f.poll(t, 1, 0, usageHeaderValue(10, f.now))
+			f.now = f.now.Add(time.Second)
+			request := f.queue(t, "matching-pair", 300)
+			requireUsageClaim(t, f.poll(t, 0, 0, usageHeaderValue(80, f.now)), request.ID)
+		})
+	}
 }
 
 func TestWeeklyUsageWaitIsBoundedAndAllowsUnknownFallback(t *testing.T) {

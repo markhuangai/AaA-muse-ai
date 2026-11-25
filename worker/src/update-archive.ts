@@ -7,28 +7,36 @@ import { Failure, cause, requireValue } from './errors.js';
 import { object, parse, text, type ObjectValue, type Value } from './json.js';
 import type { InstallationIO } from './install-io.js';
 
-export const updateContract = 'native-cron-v1';
+export const updateContract = 'managed-hook-v1';
 const packageName = '@markhuangai/aaa-muse-worker';
 const releaseBase = 'https://github.com/markhuangai/AaA-muse-ai/releases/download/';
-const versionPattern = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(dev|rc)\.(0|[1-9][0-9]*))?$/;
+const versionPattern = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-(dev|rc)\.(0|[1-9][0-9]*))?$/;
 export const archiveDigest = /^[a-f0-9]{64}$/;
 const command = promisify(execFile);
 
 export function updateTarget(value: Value | undefined): ObjectValue {
   const target = object(value);
   const version = text(target.version);
-  requireValue(version.length <= 100 && versionPattern.test(version) && !version.includes('-dev.') &&
-    !version.startsWith('0.') && target.name === packageName && target.contract === updateContract &&
+  requireValue(version.length <= 100 && version.startsWith('1.') && versionPattern.test(version) && !version.includes('-dev.') &&
+    target.name === packageName && target.contract === updateContract &&
     archiveDigest.test(text(target.sha256)) && /^[a-f0-9]{40}$/.test(text(target.source_sha)) &&
     /^(?:[1-9][0-9]*(?:,[1-9][0-9]*)*)?$/.test(text(target.from_majors)) &&
     target.url === releaseBase + 'v' + version + '/markhuangai-aaa-muse-worker-' + version + '.tgz', 'candidate_incompatible');
   return target;
 }
 
+function releaseOrder(version: string): bigint[] | undefined {
+  const parts = version.length <= 100 ? versionPattern.exec(version) : null;
+  if (parts?.[1] !== '1') return;
+  const [, , minor, patch, prerelease, number] = parts;
+  return [BigInt(minor), BigInt(patch), prerelease === 'dev' ? 0n : prerelease === 'rc' ? 1n : 2n, BigInt(number ?? 0)];
+}
+
 export function supportsSource(target: ObjectValue, version: string): boolean {
-  const major = version.split('.')[0];
-  return versionPattern.test(version) && major !== '0' &&
-    (text(target.version).split('.')[0] === major || text(target.from_majors).split(',').includes(major));
+  const from = releaseOrder(version), to = releaseOrder(text(target.version));
+  if (!from || !to) return false;
+  const firstDifference = to.findIndex((part, index) => part !== from[index]);
+  return firstDifference >= 0 && to[firstDifference] > from[firstDifference];
 }
 
 export async function verifyCandidate(io: InstallationIO, entry: string, target: ObjectValue): Promise<void> {

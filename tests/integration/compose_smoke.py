@@ -376,14 +376,19 @@ def named_upgrade(h):
             old, origin = p.running_service(files=p.cleanup_files)
             old_mounts = {m["Destination"]: m for m in h.inspect(old)["Mounts"]}
             p.env.update(MUSE_SQLITE_VOLUME=old_mounts[SQLITE_STATE]["Name"], MUSE_MEDIA_VOLUME=old_mounts[MEDIA]["Name"])
-            code, headers, reply = json_request(h, origin, "/api/v1/admin/enrollments", h.admin)
+            code, _, reply = json_request(h, origin, "/api/v1/admin/enrollments", h.admin)
             require(code == 201, "old Compose broker did not issue an enrollment")
             enrollment = json.loads(reply)["enrollment_code"]
-            worker_version = {"X-Muse-Worker-Version": headers["X-Muse-Service-Version"]}
-            code, event_headers, reply = json_request(h, origin, "/api/v1/worker/enroll",
-                                                      data={"enrollment_code": enrollment}, headers=worker_version)
-            require(code == 201, f"old Compose broker did not store the worker (HTTP {code})")
+            _, headers, _ = h.request(origin, "/api/v1/worker/hook/status")
+            pair = {"X-Muse-Worker-Version": headers["X-Muse-Service-Version"],
+                    "X-Muse-Worker-Updater": "managed-hook-v1",
+                    "X-Muse-Worker-SHA256": headers["X-Muse-Paired-Worker-SHA256"]}
+            enroll = "/api/v1/worker/hook/enroll"
+            code, event_headers, reply = json_request(h, origin, enroll, data={"enrollment_code": enrollment, "phase": "prepare"}, headers=pair)
+            require(code == 201, f"old Compose broker did not prepare the worker (HTTP {code})")
             worker_key = json.loads(reply)["credential"]
+            code, _, _ = json_request(h, origin, enroll, worker_key, {"enrollment_code": enrollment, "phase": "activate"}, headers=pair)
+            require(code == 201, f"old Compose broker did not activate the worker (HTTP {code})")
             prompt = "retained named volume input"
             code, _, body = json_request(h, origin, "/api/v1/media/jobs", h.client,
                                          {"submission_id": secrets.token_hex(16), "prompt": prompt})

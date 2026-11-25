@@ -50,16 +50,18 @@ type Assignment struct {
 }
 
 type Pull struct {
-	Version     int                 `json:"protocol_version"`
-	Sequence    int64               `json:"sequence"`
-	Checker     string              `json:"checker_job_id"`
-	Occurrence  string              `json:"checker_run_id"`
-	ScheduledAt time.Time           `json:"scheduled_at"`
-	EnteredAt   time.Time           `json:"entered_at"`
-	MediaJobs   bool                `json:"media_jobs"`
-	PromptWAV   bool                `json:"prompt_wav"`
-	WeeklyUsage *worker.WeeklyUsage `json:"-"`
-	VerifyStart bool                `json:"-"`
+	Version         int                 `json:"protocol_version"`
+	Sequence        int64               `json:"sequence"`
+	Checker         string              `json:"checker_job_id"`
+	Occurrence      string              `json:"checker_run_id"`
+	ScheduledAt     time.Time           `json:"scheduled_at"`
+	EnteredAt       time.Time           `json:"entered_at"`
+	MediaJobs       bool                `json:"media_jobs"`
+	PromptWAV       bool                `json:"prompt_wav"`
+	WeeklyUsage     *worker.WeeklyUsage `json:"-"`
+	VerifyStart     bool                `json:"-"`
+	VerifyHookStart bool                `json:"-"`
+	ObserveLegacy   bool                `json:"-"`
 }
 
 type Grant struct {
@@ -131,6 +133,16 @@ type WorkStart struct {
 	LaunchID     string            `json:"launch_id"`
 	NativeJob    string            `json:"native_job_id"`
 	Verification *NativeStartProof `json:"verification,omitempty"`
+}
+
+type WakeBinding struct {
+	Version      int    `json:"protocol_version"`
+	SubmissionID string `json:"submission_id"`
+	ClaimID      string `json:"claim_id"`
+	Generation   int64  `json:"generation"`
+	Checker      string `json:"checker_job_id"`
+	Previous     string `json:"previous_invocation_id"`
+	Invocation   string `json:"invocation_id"`
 }
 
 type Interruption struct {

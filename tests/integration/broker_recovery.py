@@ -142,7 +142,9 @@ class Recovery(Routing):
             connection = http.client.HTTPSConnection(address.hostname, address.port, context=ssl.create_default_context(cafile=str(proxy.cert)), timeout=15)
             lost = False
             try:
-                connection.request("POST", "/api/v1/worker/jobs/" + job["id"] + "/decisions", body=json.dumps(body), headers={"Authorization": "Bearer " + worker["credential"], "Content-Type": "application/json"})
+                connection.request("POST", "/api/v1/worker/hook/jobs/" + job["id"] + "/decisions", body=json.dumps(body),
+                                   headers={**self.worker_pair_headers(), "Authorization": "Bearer " + worker["credential"],
+                                            "Content-Type": "application/json"})
                 connection.getresponse()
             except (OSError, http.client.HTTPException):
                 lost = True
@@ -179,9 +181,9 @@ class Recovery(Routing):
             worker = self.new_worker()
             peer = self.pull_peer(worker)
             request, _ = self.submit(self.input(worker, tools=[]), "terminal-race")
-            job, _, start = self.claim(worker, peer, self.experiment(request["id"]))
+            job, _, _ = self.claim(worker, peer, self.experiment(request["id"]))
             result = self.decision_body(job, "race answer")
-            stop = {**start, "submission_id": "verified-stop", "native_run_id": "race-execution", "reason": "execution_confirmed_stopped"}
+            stop = peer.settlement_input(job)
             path = "/api/v1/worker/jobs/" + job["id"]
             ready = threading.Barrier(2, timeout=10)
 
@@ -207,7 +209,8 @@ class Recovery(Routing):
                 require(terminal["state"] == "interrupted" and view["state"] == "interrupted" and not view.get("output"), "late result escaped the interruption fence")
             evidence = self.trace_request(result_headers["X-Request-Id"], request["id"])
             evidence += self.trace_request(stop_headers["X-Request-Id"], request["id"])
-            require(any(event["msg"] == "job.work_settled" and event["claim_id"] == job["lease_id"] and event["native_run_id"] == "race-execution" for event in evidence), "logs do not identify the settled native execution")
+            require(any(event["msg"] == "job.work_settled" and event["claim_id"] == job["lease_id"] and
+                        event["native_run_id"] == stop["native_run_id"] for event in evidence), "logs do not identify the settled native execution")
             self.receipt("recovery.decision_interruption_race", exact_replay=True, state=terminal["state"], broker_processes=2)
         finally:
             self.docker("stop", "--time", "5", sibling)

@@ -1,62 +1,24 @@
-# Muse worker CLI
+# AaA Muse worker
 
-The major-1 worker is a finite TypeScript helper for an enrolled Muse goal. One visible native `agent` cron at `every: "1m"` checks for work. The checker pulls only when idle and hands each claim to a separate native `runonce` agent job. There is no managed hook, service process, or persistent broker connection. Muse proposes answers and tool calls; only the calling client executes client tools.
+The major-1 managed shell hook checks for work over HTTPS every 15 seconds. It wakes a Muse agent for a claim and reports busy presence on later ticks. One hourly native agent cron runs the watchdog.
 
-## Install and verify
+## Installation, detector and recovery
 
-1. Use the control portal on the broker’s HTTPS origin to generate an enrollment prompt for the verified paired major-1 worker archive. Paste it into the owning Muse goal. Review the actual site, shell, and scheduler permissions before enrolling. Build targets Node.js 22.12.0 or newer on a POSIX filesystem. See [deployment](../docs/deployment.md) and [paired releases](../docs/releases.md).
-2. Verify the installer receipt and read back the same goal ID, checker job ID, enabled state, one-minute interval, and exact action. If registration was uncertain, inspect the goal’s active and disabled native jobs. Adopt a single exact match; do not create another checker because a reply or listing is missing.
-3. Keep the same worker ID and private state across restarts. The default path is `$XDG_STATE_HOME/aaa-muse-worker-v1`, falling back to `$HOME/.local/state/aaa-muse-worker-v1`. The state directory is `0700` and `credential.key` is `0600`. Enrollment codes are private, single-use, and valid for fifteen minutes; the long-lived worker credential never goes in a prompt, URL, or argument. Do not reuse a major-0 installation, store, schedule, or key for this cutover.
+1. Open **Workers → Enroll a worker** in the HTTPS portal. Paste the pinned prompt into the main Muse chat for the goal that owns the worker. Review the actual native hook, cron, shell and site permissions.
+2. Verify the authenticated worker ID. Read back the exact enabled 15-second hook, its 120-second script timeout and silent dry run, and one enabled hourly agent watchdog. Resume incomplete setup with the same worker and its saved registration intent.
+3. Use the worker-specific paths under `~/.local/share/aaa-muse-worker-hook-v1` and `~/.local/state/aaa-muse-worker-hook-v1`, or the corresponding XDG paths. The detector and skill are installed in worker-ID-scoped directories. The credential file is private. [Deployment and cutover](../docs/deployment.md)
+4. During the first cutover, keep the original worker's credential and cron until its claims are drained and the new registration is verified. The owner then retires the identified previous schedule and revokes that worker. [Paired releases](../docs/releases.md#automatic-worker-updates)
 
-If the connection drops during enrollment, the installer retries in the same command. If retries run out, use the original prompt with the same private state directory. Setup saves a broker-generated inactive credential in a private journal before it activates the worker. If activation already committed, setup can recover the same worker even after the code expires. If the broker reports that the code expired unused or was consumed by another credential, generate a fresh prompt for the same state directory. An older `enrollment_uncertain` journal without a staged credential requires the owner to inspect issuance records before starting over.
+The wake agent uses `hook-start` with its own `event-hook:<invocation-id>` and the claim's launch ID. It executes the returned brief and submits a decision or media output. `hook-abort` records a clean early stop. The broker checks the bound invocation alongside the worker identity, generation and release. After a lost pull reply, a later tick can rebind the same claim when the journal proves the first tick never attempted a wake.
 
-The installed launcher passes the correct state directory. Source builds can use `node worker/dist/main.js` with `--state-dir /absolute/path`.
+If a wake, start, output delivery or producer remains uncertain, the slot stays held. A matching receipt and stopped local delivery/producer processes permit settlement. The watchdog reports stale ticks, overdue uncertain claims and update failures. For a missing hook, inspect the registered hook from the main Muse chat and verify its next authenticated tick.
 
-| Command | Use |
-| --- | --- |
-| `cron-describe --goal-id ID` | Read the expected checker definition before registration. |
-| `cron-authorize-registration --input FILE` / `cron-confirm --input FILE` | Save the initial registration intent and then confirm the exact read-back. Use `-` for standard input. |
-| `cron-check --input FILE` / `cron-prepare --input FILE` | Process an actual occurrence; persist launch intent before registering a finite work job. |
-| `cron-start --launch-id ID --input FILE` | Read one matching native schedule definition and its running execution before showing the work brief. Use `-` for standard input. Work starts only after authorization. |
-| `cron-producer-intent --launch-id ID` | Reserve a producer only for a finite VM-local process that must outlive the work agent. Run the returned `producer_command` with the executable and its arguments. |
-| `cron-producer --launch-id ID --producer-id ID --pid PID` | Bind an exact PID using a work definition issued before the guarded wrapper. An unobservable legacy reservation keeps the slot held. |
-| `decision-submit --job-id ID --input FILE` / `media-finish --job-id ID` | Submit a validated decision or the original media bytes. Preserve the saved operation and file after a lost reply. |
-| `cron-observe --input FILE` | Reconcile the exact native job and execution after a real checker occurrence. |
-| `status` / `doctor` / `diagnostics-export` | Inspect broker observations or export protected evidence. |
+## Updates
 
-## Paired updates
+The installed archive and the broker must match for enrollment and all work traffic. During version skew an idle managed worker can verify and install a newer 1.x archive pinned by the running brokers. The launcher switches atomically and the worker confirms the running version on its next authenticated pull. Drain work and update attempts before changing the broker version. [Release rules](../docs/releases.md#automatic-worker-updates)
 
-New installations receive automatic updates through the existing one-minute
-checker. For an existing major-1 installation, paste the **Enable automatic
-updates** prompt from its Workers drawer into the same Muse goal. Use the same
-VM user and keep the existing checker, worker credential and state directory.
-Wait for an authenticated pickup to confirm the version you see in the portal.
+## Diagnostics
 
-The helper verifies the paired archive before replacing the launcher and retains
-the previous bundle during recovery. It pauses new work during an uncertain
-switch. If it can verify the previous compatible bundle, it resumes work there
-during transient retry backoff. [Paired versions and rollback](../docs/releases.md#automatic-worker-updates)
+Use `diagnostics-export --state-dir /absolute/path --since RFC3339 --until RFC3339 --decode`. Join worker, hook, wake invocation, original poll, claim, launch and submission IDs. Join request or operation IDs with the management-authenticated `/api/v1/admin/diagnostics/export` on each participating broker. Check capture completeness and keep the raw exports private. INFO shows claim, binding and settlement. WARN records refusals and stalls. Protected DEBUG includes the bounded exchanges.
 
-## Recovery and diagnosis
-
-The paired helper uses the native `subscription-status status` command during each fresh idle pull or busy check-in. The checker sends the weekly percentage, observation time and any recognized reset label through its authenticated HTTPS request. A failed read leaves the check running. Diagnose `cron.weekly_usage_unavailable` in the private export and join it to the check-in by checker run ID. The broker rejects expired samples for routing, and a retry of a pending pull carries its original observation.
-
-A checker can finish while a one-time job is still queued or active. Use native run identity and observable producer identity, not a green checker run, an absent listing, elapsed time, or PID alone. Unknown status retains the claim. A cancelled or expired job cannot start or accept a new result. A previously accepted receipt can still reconcile; the broker releases an accepted claim only after the worker confirms the old work stopped. Revoking the worker blocks the credential and does not prove native work stopped.
-
-For a fresh start, the finite run reads back the exact one-shot definition and its own running execution from Muse. The helper compares the goal, reference, due time, kind and action prompt with the prepared definition. The scheduler job ID comes from the definition. The execution record supplies its parent job ID and a separate run ID. A queued or unobservable report leaves both IDs unbound. A paired broker and worker record the verified job and run and require the same pair at settlement. If your reverse proxy uses a request header allowlist, forward `X-Muse-Worker-Start-Proof` on pickup. An older same-major broker accepts the legacy request after the current helper completes its local check.
-
-For `cron.start_evidence_rejected`, use the protected `cron.start_evidence` capture to compare the expected definition with the reported one. Read the original one-shot and the run history scoped to its scheduler job. A local refusal has a claim and operation ID. Use them to find the subsequent start or settlement and match its HTTP request ID to the broker export. An uncertain HTTP start retains the hold until the checker can verify that the work has stopped.
-
-A check never retries a file upload while the original result helper is active. The helper records its process identity alongside the exact saved result. Once native work and its producers have stopped, recovery checks for an accepted media receipt before sending file bytes again. Unknown delivery identity keeps the hold.
-
-When Muse removes a one-shot definition, look up history scoped to the job identified by `history_lookup`. Pass `matches: []` and the exact `execution` containing `native_job_id`, `native_run_id` and `status`. The helper accepts terminal history for a previously matched job and run, including Muse’s `succeeded` status. A verified stop is durable across checker invocations. An accepted result stays held until the helper can account for its delivery process and producers.
-
-Foreground work has no producer reservation. For work that outlives the agent, the packaged wrapper records its own PID, boot ID and start time before replacing itself with the executable. An unused reservation from that guard expires when the helper verifies terminal execution. Older unbound intents keep the slot held. A native summary that says work ran in the foreground does not provide a process record.
-
-Use `diagnostics-export --state-dir /absolute/path --since RFC3339 --until RFC3339 --decode`. Join worker, checker occurrence, work job and execution, poll sequence, job/claim, producer, and receipt by their distinct identifiers. Join HTTP request IDs and operation IDs to the management-authenticated `/api/v1/admin/diagnostics/export` filters from every participating broker. Decode with `tools/qualification-evidence.mjs` and check omissions before interpreting the chronology. Keep raw exports and journal files private.
-
-In the [portal](../docs/portal.md#worker-management), Never seen means there is no authenticated poll. Quiet begins at one minute without authenticated contact, and Offline at ten minutes. The busy checker reports contact for its held claim without pulling another job. Join `cron.presence_observed` or `cron.presence_unavailable` with the broker request ID. `cron.recovery_pending` gives the hold reason and producer ID when applicable. Use a time-window export to include early input refusals that lack an operation ID.
-
-## Evidence limits
-
-The November 21, 2026 trials measured one account with local synthetic work. Native cron rejected a ten-second recurrence; a long foreground checker coalesced a scheduled occurrence. Separate one-time work and a recurring checker ran concurrently. See [trial evidence and limits](../docs/project-history.md#native-muse-cron). These trials do not qualify the installed paired worker, public HTTPS pickup, live inference, or VM-loss recovery.
+Contact becomes Quiet at one minute and Offline at ten minutes. The November 25 owner probes cover available hook tools, the runtime command, and scheduling during a wake. Token savings, live end-to-end pickup, watchdog alerts and VM replacement recovery still need live measurement. [Project history](../docs/project-history.md#managed-hook-worker)

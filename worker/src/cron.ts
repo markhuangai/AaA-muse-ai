@@ -21,13 +21,13 @@ const nativeStates = ['queued', 'running', 'unobservable', ...terminalNativeStat
 const guardedProducerMode = 'guarded';
 const producerWrapper = fileURLToPath(new URL('../setup/producer.sh', import.meta.url));
 
-function time(value: Value | undefined): number {
+export function time(value: Value | undefined): number {
   const date = text(value);
   requireValue(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,9})?Z$/.test(date) && Number.isFinite(Date.parse(date)), 'utc_time_required');
   return Date.parse(date);
 }
 
-function iso(value: number): string { return new Date(value).toISOString(); }
+export function iso(value: number): string { return new Date(value).toISOString(); }
 
 function shell(value: string): string { return "'" + value.replaceAll("'", "'\\''") + "'"; }
 
@@ -104,7 +104,7 @@ export class Cron {
     return saved;
   }
 
-  private async weeklyUsage(details: ObjectValue): Promise<ObjectValue | undefined> {
+  async weeklyUsage(details: ObjectValue): Promise<ObjectValue | undefined> {
     const started = this.state.sys.now();
     const report = await this.readUsage();
     const observed = this.state.sys.now();
@@ -119,11 +119,12 @@ export class Cron {
     return reading;
   }
 
-  private correlation(claim: ObjectValue): ObjectValue {
+  correlation(claim: ObjectValue): ObjectValue {
     return { job_id: claim.job_id, claim_id: claim.claim_id, operation_id: claim.operation_id, generation: claim.generation,
       launch_id: claim.launch_id, native_job_id: claim.native_job_id ?? null, native_run_id: claim.native_run_id ?? null,
       checker_job_id: claim.checker_job_id, sequence: claim.sequence, pull_run_id: claim.pull_run_id, claimed_at: claim.claimed_at, deadline_at: claim.deadline_at,
-      observing_checker_run_id: claim.observing_checker_run_id ?? null, observed_at: claim.observed_at ?? null };
+      observing_checker_run_id: claim.observing_checker_run_id ?? null, observed_at: claim.observed_at ?? null,
+      execution_mode: claim.execution_mode, wake_invocation_id: claim.wake_invocation_id };
   }
 
   private checkerIDs(claim: ObjectValue, current?: Value): (Value | undefined)[] {
@@ -131,7 +132,7 @@ export class Cron {
       ...(Array.isArray(claim.checker_runs) ? claim.checker_runs : [])];
   }
 
-  private async deliveryBlock(claim: ObjectValue): Promise<string | undefined> {
+  async deliveryBlock(claim: ObjectValue): Promise<string | undefined> {
     if (!claim.result_delivery) return;
     const saved = object(claim.result_delivery);
     const identity = await this.inspectProcess(integer(saved.pid));
@@ -147,7 +148,7 @@ export class Cron {
     return claim.native_run_id !== claim.native_job_id && !checkerIDs.includes(claim.native_run_id);
   }
 
-  private async stoppedBlock(claim: ObjectValue): Promise<ObjectValue | undefined> {
+  async stoppedBlock(claim: ObjectValue): Promise<ObjectValue | undefined> {
     const delivery = await this.deliveryBlock(claim);
     if (delivery) return { cause: delivery };
     for (const value of Array.isArray(claim.producers) ? claim.producers : []) {
@@ -307,22 +308,22 @@ export class Cron {
     }
   }
 
-  private async reportPresence(claim: ObjectValue, tick: ObjectValue, reason?: Value): Promise<void> {
+  async reportPresence(claim: ObjectValue, tick: ObjectValue, reason?: Value, usage?: ObjectValue, sample = true): Promise<void> {
     const details = { ...this.correlation(claim), ...tick, hold_reason: reason ?? null };
     const input = { protocol_version: 1, claim_id: claim.claim_id, generation: claim.generation, checker_job_id: tick.checker_job_id,
       checker_run_id: tick.checker_run_id, scheduled_at: tick.scheduled_at, hold_reason: reason };
     const route = `/api/v1/worker/jobs/${identifier(claim.job_id)}/presence`;
     try {
       const transport = await this.worker.load();
-      const usage = await this.weeklyUsage(details);
-      const reply = await transport.request(route, 'POST', encode(input), { ...details, ...(usage ? { weekly_usage: usage } : {}) }, 1, presenceTimeoutMs,
-        { ...await this.updater?.contactHeaders(), ...weeklyUsageHeaders(usage) });
+      const reading = sample ? await this.weeklyUsage(details) : usage;
+      const reply = await transport.request(route, 'POST', encode(input), { ...details, ...(reading ? { weekly_usage: reading } : {}) }, 1, presenceTimeoutMs,
+        { ...await this.updater?.contactHeaders(), ...weeklyUsageHeaders(reading) });
       requireValue(typeof reply.data.recorded === 'boolean', 'invalid_presence_reply', { request_id: reply.requestId });
       time(reply.data.received_at);
       await this.worker.logger.log('DEBUG', 'cron.presence_observed', { ...details, request_id: reply.requestId, recorded: reply.data.recorded, received_at: reply.data.received_at });
     } catch (error) {
       const fields = error instanceof Failure ? error.fields : {};
-      const unsupported = fields.http_status === 404 && fields.reason === 'not_found';
+      const unsupported = !this.worker.managedHook && fields.http_status === 404 && fields.reason === 'not_found';
       await this.worker.logger.log(unsupported ? 'DEBUG' : 'WARN', 'cron.presence_unavailable', {
         ...details, ...fields, route, cause: cause(error), outcome: unsupported ? 'unsupported_by_broker' : 'contact_unconfirmed',
       });
@@ -461,7 +462,7 @@ export class Cron {
     return await this.replayResult(id);
   }
 
-  private async replayResult(id: string): Promise<ObjectValue> {
+  async replayResult(id: string): Promise<ObjectValue> {
     const planned = await this.state.withLock('cron', async () => {
       const current = await this.read(claimFile);
       requireValue(current?.job_id === id && current.brief && current.pending_result && !current.failure, 'assignment_not_active');
@@ -473,6 +474,7 @@ export class Cron {
       requireValue(identity && !('missing' in identity) && identity.running, 'result_delivery_identity_unavailable');
       const attempt = this.state.sys.uuid();
       current.result_delivery = { attempt, pid, boot: identity.boot, start: identity.start };
+      delete current.result_refusal;
       await this.save(claimFile, current);
       return { current, outcome: 'deliver', attempt } as const;
     });
@@ -481,16 +483,21 @@ export class Cron {
     const brief = object(current.brief);
     const pending = object(current.pending_result);
     let receipt: ObjectValue | undefined;
+    let refusal: string | undefined;
     try {
       await this.worker.logger.log('DEBUG', 'cron.result_delivery_started', { ...this.correlation(current), delivery: current.result_delivery, kind: pending.kind });
       const delivered = pending.kind === 'media' ? await finishMedia(this.worker, id, brief) : await this.worker.submit(id, text(pending.input), brief);
       requireValue(delivered.accepted === true, 'terminal_receipt_unverified');
       receipt = delivered;
+    } catch (error) {
+      if (this.worker.managedHook && (fencedResult(error) || absentMediaResult(error) || invalidDecision(error))) refusal = cause(error);
+      throw error;
     } finally {
       await this.state.withLock('cron', async () => {
         const saved = await this.read(claimFile);
         requireValue(saved?.claim_id === current.claim_id && saved.result_delivery && object(saved.result_delivery).attempt === planned.attempt, 'stale_native_launch');
         if (receipt) saved.receipt = receipt;
+        if (refusal) saved.result_refusal = refusal;
         delete saved.result_delivery;
         await this.save(claimFile, saved);
       });
@@ -499,7 +506,7 @@ export class Cron {
     return { outcome: 'accepted', ...this.correlation(current) };
   }
 
-  private async settle(active: ObjectValue, settlement: ObjectValue, occurrence?: string): Promise<ObjectValue> {
+  async settle(active: ObjectValue, settlement: ObjectValue, occurrence?: string): Promise<ObjectValue> {
     const details: ObjectValue = { ...this.correlation(active), settling_checker_run_id: occurrence ?? active.observing_checker_run_id ?? null };
     const transport = await this.worker.load();
     const { data: receipt, requestId } = await transport.request(`/api/v1/worker/jobs/${identifier(details.job_id)}/interrupt`, 'POST', encode(settlement), details, 1, undefined,
@@ -515,7 +522,7 @@ export class Cron {
       requireValue(object(current.failure).submission_id === settlement.submission_id, 'stale_native_observation');
       await this.save('cron-last-receipt.json', { ...details, receipt, settlement_id: settlement.submission_id, settled_at: iso(this.state.sys.now()) });
       const tick = await this.read(tickFile);
-      if (tick?.pending && tick.sequence === current.sequence) {
+      if (tick?.pending && current.sequence !== undefined && integer(tick.sequence) === integer(current.sequence)) {
         requireValue(object(tick.pending).checker_run_id === current.pull_run_id, 'poll_grant_conflict');
         await this.save(tickFile, { sequence: tick.sequence, scheduled_at: tick.scheduled_at });
       }

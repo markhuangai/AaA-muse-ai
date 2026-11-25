@@ -52,6 +52,7 @@ class TLSFixture:
         self.release_claim = threading.Event()
         self.decision_sizes = []
         self.events = []
+        self.worker_requests = 0
         self.cert = harness.root.resolve() / (name + "-cert.pem")
         key = harness.root.resolve() / (name + "-key.pem")
         subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
@@ -76,7 +77,7 @@ class TLSFixture:
                 self.forward()
 
             def forward(self):
-                path = urllib.parse.urlsplit(self.path).path
+                path = urllib.parse.urlsplit(self.path).path.replace("/api/v1/worker/hook/", "/api/v1/worker/", 1)
                 route = "/downloads/{id}/{token}" if path.startswith("/downloads/") else path
                 if route in ("/mcp", "/downloads/{id}/{token}") and self.headers.get("Host") != urllib.parse.urlsplit(fixture.origin).netloc:
                     with fixture.lock:
@@ -94,6 +95,8 @@ class TLSFixture:
                         fixture.drop_enrollment_requests or fixture.drop_enrollment_replies or fixture.observe_staged_credential) else None
                     operation = self.headers.get("X-Muse-Enrollment-Operation")
                     with fixture.lock:
+                        if path.startswith("/api/v1/worker/"):
+                            fixture.worker_requests += 1
                         if phase and fixture.drop_enrollment_requests.get(phase, 0) > 0:
                             fixture.drop_enrollment_requests[phase] -= 1
                             fixture.events.append({"event": "fixture.enrollment_request_lost", "phase": phase, "operation_id": operation})
@@ -105,7 +108,7 @@ class TLSFixture:
                         if reject:
                             fixture.fail_claims -= 1
                             fixture.failed_claims.append(json.loads(body))
-                        if self.path == "/api/v1/worker/status":
+                        if path == "/api/v1/worker/status":
                             if fixture.allow_statuses:
                                 fixture.allow_statuses -= 1
                             elif fixture.fail_statuses:
@@ -151,7 +154,8 @@ class TLSFixture:
                                "Accept", "MCP-Protocol-Version", "MCP-Method", "MCP-Name", "Mcp-Session-Id",
                                "Forwarded", "X-Forwarded-Host",
                                "X-Request-Id", "X-Portal-Operation-Id", "X-Muse-Enrollment-Operation", "X-Muse-Enrollment-Attempt",
-                               "X-Muse-Worker-Version", "X-Muse-Worker-Updater", "X-Muse-Worker-SHA256", "X-Muse-Interruption", "X-Muse-Worker-Start-Proof",
+                               "X-Muse-Worker-Version", "X-Muse-Worker-Updater", "X-Muse-Worker-SHA256", "X-Muse-Interruption",
+                               "X-Muse-Worker-Start-Proof", "X-Muse-Worker-Hook-Proof",
                                "X-Muse-Worker-Model-Report", "X-Muse-Worker-Weekly-Usage", "X-Muse-Media-Jobs", "X-Muse-Prompt-Wav",
                                "X-Muse-Artifact-Sha256", "X-Muse-Artifact-Size", "X-Muse-Connection-Id", "X-Muse-Connection-Generation",
                                "X-Muse-Generation", "X-Muse-Lease-Id") if key in self.headers}
@@ -166,7 +170,7 @@ class TLSFixture:
                         fixture.media_interrupted.set()
                         self.send_error(503)
                         return
-                    pause = self.command == "PUT" and self.path == fixture.media_pause_path
+                    pause = self.command == "PUT" and path == fixture.media_pause_path
                     if self.command == "PUT" and (fixture.slow_media or pause):
                         split = max(1, len(body) // 2)
                         headers["Content-Length"] = str(len(body))
@@ -242,7 +246,7 @@ class TLSFixture:
                         if delayed_context:
                             fixture.context_captured.set()
                             fixture.release_context.wait(timeout=8)
-                        if self.path == "/api/v1/worker/enroll" and response.status == 201 and fixture.enrollment_accepted is not None:
+                        if path == "/api/v1/worker/enroll" and response.status == 201 and fixture.enrollment_accepted is not None:
                             worker = json.loads(payload).get("worker")
                             if worker:
                                 fixture.enrollment_accepted(worker["id"])
@@ -259,7 +263,7 @@ class TLSFixture:
                             self.close_connection = True
                             return
                     self.send_response(response.status)
-                    for key in ("Content-Type", "X-Request-Id", "X-Muse-Service-Version", "Cache-Control", "Content-Security-Policy",
+                    for key in ("Content-Type", "X-Request-Id", "X-Muse-Service-Version", "X-Muse-Paired-Worker-SHA256", "Cache-Control", "Content-Security-Policy",
                                 "Referrer-Policy", "X-Content-Type-Options", "WWW-Authenticate", "Retry-After", "Allow", "Set-Cookie",
                                 "Content-Disposition", "Mcp-Session-Id"):
                         for value in response.headers.get_all(key, []):

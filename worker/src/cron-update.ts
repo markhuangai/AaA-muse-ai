@@ -3,12 +3,13 @@ import { Failure, cause, requireValue } from './errors.js';
 import type { InstallationIO } from './install-io.js';
 import { encode, identifier, integer, object, text, type ObjectValue, type Value } from './json.js';
 import { State } from './state.js';
-import { launcherScript } from './cron-setup.js';
+import { launcherScript } from './install-io.js';
 import { archiveDigest, supportsSource, updateArchiveIO, updateContract, updateTarget, verifyInstallEntry, type UpdateArchiveIO } from './update-archive.js';
-import { origin, type Transport } from './transport.js';
+import type { Transport } from './transport.js';
 import type { Worker } from './worker.js';
 
 const journalFile = 'cron-update.json';
+export const updateHealthFile = 'hook-update-health.json';
 const installationFile = 'installation.json';
 const launcherFile = 'aaa-muse-worker';
 
@@ -75,40 +76,12 @@ export class CronUpdate {
     return { id, target, stage: 'starting', from: previous, previous_launcher: launcher, started_at_ms: this.state.sys.now() };
   }
 
-  async adopt(expectedOrigin: string, workerID: string, digest: string, root: string): Promise<ObjectValue> {
-    return await this.state.withLock('cron', async () => {
-      await this.idle();
-      const installation = await this.read(installationFile);
-      const checker = await this.read('cron-installation.json');
-      requireValue(installation && checker && checker.command === installation.command && installation.root === root &&
-        installation.worker_id === workerID && installation.origin === origin(expectedOrigin), 'update_adoption_identity_mismatch');
-      const transport = await this.worker.load();
-      const status = await this.worker.identity(transport);
-      const target = updateTarget(status.update_target);
-      requireValue(status.id === workerID && !status.current_claim && target.sha256 === digest &&
-        target.version === this.worker.productVersion, 'update_adoption_pin_changed');
-      verifyInstallEntry(root, this.io.entry);
-      await this.archive.verify(this.io.entry, target);
-      const prior = await this.read(journalFile);
-      if (prior) {
-        requireValue(prior.worker_id === workerID && encode(prior.target) === encode(target), 'update_adoption_conflict');
-        return await this.advance(prior, installation, transport);
-      }
-      if (installation.package_sha256 === digest) return { outcome: 'update_managed', worker_id: workerID };
-      requireValue(!installation.package_sha256, 'update_adoption_conflict');
-      const attempt = await this.newAttempt(installation, this.state.sys.uuid(), target);
-      Object.assign(attempt, { worker_id: workerID, entry: this.io.entry, node: this.io.node, observed_digest: digest });
-      await this.save(attempt);
-      return await this.advance(attempt, installation, transport);
-    });
-  }
-
   async offer(value: Value | undefined, transport: Transport, requestID: string): Promise<ObjectValue> {
     const offer = object(value);
     const target = updateTarget(offer.target);
     const installation = await this.read(installationFile);
     requireValue(installation && installation.package_version === this.worker.productVersion &&
-      installation.package_version !== target.version && installation.package_sha256, 'update_offer_mismatch');
+      installation.package_sha256, 'update_offer_mismatch');
     requireValue(!(await this.read(journalFile)), 'update_attempt_pending');
     await this.contactHeaders();
     const attempt = await this.newAttempt(installation, identifier(offer.id), target);
@@ -130,13 +103,12 @@ export class CronUpdate {
   private async advance(attempt: ObjectValue, installation: ObjectValue, transport: Transport): Promise<ObjectValue> {
     const target = updateTarget(attempt.target);
     const id = identifier(attempt.id);
-    const adopted = typeof attempt.worker_id === 'string';
     const bin = this.bin(installation);
     const details = { operation_id: id, from_version: attempt.from, target_version: target.version, source_sha: target.source_sha,
       expected_digest: target.sha256, offer_request_id: attempt.offer_request_id, worker_id: installation.worker_id };
-    const previousDigest = adopted ? text(target.sha256) : text(installation.package_sha256);
+    const previousDigest = text(installation.package_sha256);
     const report = (action: string, digest: string, reason?: string) => transport.request('/api/v1/worker/update', 'POST', encode({
-      id, action, target, reason, ...(action === 'adopt' ? { worker_id: attempt.worker_id, previous_version: attempt.from } : {}),
+      id, action, target, reason,
     }), details, 1, 5_000, headers(digest));
 
     const actual = await bin.read(launcherFile, 0o700);
@@ -150,15 +122,16 @@ export class CronUpdate {
       await this.state.write(installationFile, encode({ ...installation, package_version: target.version, package_sha256: target.sha256, entry: attempt.entry, node: attempt.node }));
       await report('applied', text(target.sha256));
       await this.worker.logger.log('INFO', 'worker.update_applied', { ...details, observed_digest: attempt.observed_digest, duration_ms: this.state.sys.now() - integer(attempt.started_at_ms) });
+      await this.state.remove(updateHealthFile);
       await this.state.remove(journalFile);
       return { outcome: 'update_confirming', ...details };
     }
     requireValue(actual === attempt.previous_launcher, 'update_launcher_uncertain', details);
-    if (!adopted) await this.contactHeaders();
+    await this.contactHeaders();
 
     if (attempt.stage === 'starting') {
       try {
-        const receipt = await report(adopted ? 'adopt' : 'begin', previousDigest);
+        const receipt = await report('begin', previousDigest);
         attempt.attempt = receipt.data.attempt;
       } catch (error) {
         if (error instanceof Failure && error.fields.http_status === 409) await this.state.remove(journalFile);
@@ -211,6 +184,8 @@ export class CronUpdate {
     }
     requireValue(await bin.read(launcherFile, 0o700) === attempt.previous_launcher, 'update_launcher_uncertain', details);
     const response = await report('failed', previousDigest, text(attempt.reason));
+    await this.state.write(updateHealthFile, encode({ ...details, cause: attempt.reason, retry_at: response.data.retry_at,
+      failed_at: new Date(this.state.sys.now()).toISOString() }));
     await this.worker.logger.log('WARN', 'worker.update_fallback', { ...details, attempt: attempt.attempt, cause: attempt.reason, stage: 'fallback', observed_digest: previousDigest,
       corrective_action: correction(text(attempt.reason)), retry_at: response.data.retry_at });
     await this.state.remove(journalFile);

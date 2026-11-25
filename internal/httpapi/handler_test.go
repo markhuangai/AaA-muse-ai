@@ -42,15 +42,12 @@ func fixture(t *testing.T) (*Handler, *testDB, *bytes.Buffer, *diagnostics.Store
 	redactor := diagnostics.NewRedactor(c.Secrets())
 	logger := diagnostics.NewLogger(&out, store, slog.LevelInfo, redactor, time.Now, func(error) { t.Error("capture failed") }).With("instance_id", "instance")
 	db := &testDB{}
-	svc := service.New(db, c, service.Build{Revision: "revision"}, "instance", time.Now, logger)
+	svc := service.New(db, c, service.Build{Revision: "revision", WorkerPackage: service.PairedWorker(service.DevelopmentVersion, strings.Repeat("a", 64))}, "instance", time.Now, logger)
 	return &Handler{Service: svc, Authority: auth.New(c), Exporter: store, Logger: logger, Redactor: redactor, Random: rand.Reader, Now: time.Now, Failed: make(chan struct{})}, db, &out, store
 }
 func call(h *Handler, method, path, authorization string, body io.Reader) *httptest.ResponseRecorder {
-	r := httptest.NewRequest(method, path, body)
+	r := pairedRequest(h, method, path, body)
 	r.Header.Set("Authorization", authorization)
-	if path == "/api/v1/worker/enroll" {
-		r.Header.Set(service.WorkerVersionHeader, service.DevelopmentVersion)
-	}
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, r)
 	return w

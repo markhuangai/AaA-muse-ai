@@ -31,20 +31,20 @@ export function validateNativeReport(report, readCapture, source) {
   const broker = captures.filter(ref => ref.source === 'broker');
   const peers = captures.filter(ref => ref.source === 'worker');
   need(broker.length === 1 && peers.length === 2 && workers.every(worker => peers.some(ref => ref.worker_id === worker.worker_id &&
-    ref.events.some(event => event.msg === 'setup.native_checker_verified' && event.checker_job_id === worker.checker_job_id))), 'native_e2e_capture_identity');
+    ref.events.some(event => event.msg === 'setup.hook_registration_verified' && event.hook?.id === worker.checker_job_id))), 'native_e2e_capture_identity');
   const server = broker[0].events, local = peers.flatMap(ref => ref.events);
   const opened = report.cycles.map(cycle => cycle.id);
   need(new Set(opened).size === opened.length && [...cycleIDs, 'restart', 'replacement', 'worker-probe', 'interleave-a', 'interleave-b'].every(id => opened.includes(id)), 'native_e2e_cycles_incomplete');
   const matchStart = (event, turn, context) => {
     const sameClaim = value => value.worker_id === turn.worker_id && value.job_id === turn.job_id && value.operation_id === turn.operation_id &&
       value.claim_id === turn.claim_id && value.launch_id === turn.launch_id && value.native_job_id === turn.native_job_id && value.generation === turn.generation;
-    if (event.msg !== 'cron.work_started' || ![turn.claim_id, turn.launch_id, turn.native_job_id, event.request_id].every(identifier) || !sameClaim(event)) return false;
+    if (event.msg !== 'hook.work_started' || ![turn.claim_id, turn.launch_id, turn.native_job_id, event.request_id].every(identifier) || !sameClaim(event)) return false;
     const settled = local.find(value => value.msg === 'cron.work_settled' && sameClaim(value) && value.receipt_state === 'accepted');
-    return identifier(event.pull_run_id) && identifier(settled?.observing_checker_run_id) && settled.observing_checker_run_id !== event.pull_run_id &&
-      identifier(settled.native_run_id) && ![turn.native_job_id, event.checker_job_id, event.pull_run_id, settled.observing_checker_run_id].includes(settled.native_run_id) &&
+    return identifier(event.pull_run_id) && identifier(settled?.settling_checker_run_id) && settled.settling_checker_run_id !== event.wake_invocation_id &&
+      identifier(event.wake_invocation_id) && settled.native_run_id === 'event-hook-' + event.wake_invocation_id &&
       identifier(settled.request_id) &&
       local.some(value => value.msg === 'worker.http_exchange' && value.request_id === event.request_id && sameClaim(value) &&
-        value.route === `/api/v1/worker/jobs/${turn.job_id}/start` && value.http_status === 200 && same(value.output?.context, context)) &&
+        value.route === `/api/v1/worker/hook/jobs/${turn.job_id}/start` && value.http_status === 200 && same(value.output?.context, context)) &&
       server.some(value => value.msg === 'job.work_started' && value.request_id === event.request_id && sameClaim(value)) &&
       server.some(value => value.msg === 'job.work_settled' && value.request_id === settled.request_id && sameClaim(value) && value.native_run_id === settled.native_run_id);
   };

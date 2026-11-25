@@ -8,7 +8,7 @@ FROM node:24.22.2-alpine3.24@sha256:a34ab6d7f6f4813f4d0c5469d74685604b962fbdbf57
 WORKDIR /src
 COPY package.json package-lock.json ./
 COPY worker/package.json ./worker/package.json
-RUN node -e "const u=require('./worker/package.json').aaa_muse_update; if(u.contract!=='native-cron-v1'||!/^([1-9][0-9]*(,[1-9][0-9]*)*)?$/.test(u.from_majors)) process.exit(1); process.stdout.write(u.from_majors)" > /tmp/worker-update-from
+RUN node -e "const u=require('./worker/package.json').aaa_muse_update; if(u.contract!=='managed-hook-v1'||!/^([1-9][0-9]*(,[1-9][0-9]*)*)?$/.test(u.from_majors)) process.exit(1); process.stdout.write(u.from_majors)" > /tmp/worker-update-from
 COPY portal/package.json ./portal/package.json
 RUN npm ci --ignore-scripts --no-audit --no-fund
 COPY portal/index.html portal/tsconfig.json ./portal/
@@ -19,11 +19,12 @@ RUN npm run check --workspace portal && VITE_SOURCE_SHA=${SOURCE_SHA} npm run bu
 FROM go-base AS build
 COPY go.mod go.sum ./
 RUN go mod download \
-    && mkdir -p /out/sqlite-licenses /out/mcp-licenses /out/image-licenses /out/mimetype-licenses \
+    && mkdir -p /out/sqlite-licenses /out/mcp-licenses /out/image-licenses /out/mimetype-licenses /out/mod-licenses \
     && cp "$(go list -m -f '{{.Dir}}' modernc.org/sqlite)"/LICENSE* /out/sqlite-licenses/ \
     && cp "$(go list -m -f '{{.Dir}}' github.com/modelcontextprotocol/go-sdk)"/LICENSE /out/mcp-licenses/ \
     && cp "$(go list -m -f '{{.Dir}}' golang.org/x/image)"/LICENSE /out/image-licenses/ \
-    && cp "$(go list -m -f '{{.Dir}}' github.com/gabriel-vasile/mimetype)"/LICENSE /out/mimetype-licenses/
+    && cp "$(go list -m -f '{{.Dir}}' github.com/gabriel-vasile/mimetype)"/LICENSE /out/mimetype-licenses/ \
+    && cp "$(go list -m -f '{{.Dir}}' golang.org/x/mod)"/LICENSE /out/mod-licenses/
 COPY cmd ./cmd
 COPY internal ./internal
 COPY --from=frontend /tmp/worker-update-from /tmp/worker-update-from
@@ -50,6 +51,7 @@ COPY --from=build /out/sqlite-licenses/ /usr/share/aaa-muse-ai/licenses/sqlite/
 COPY --from=build /out/mcp-licenses/ /usr/share/aaa-muse-ai/licenses/mcp-go-sdk/
 COPY --from=build /out/image-licenses/ /usr/share/aaa-muse-ai/licenses/x-image/
 COPY --from=build /out/mimetype-licenses/ /usr/share/aaa-muse-ai/licenses/mimetype/
+COPY --from=build /out/mod-licenses/ /usr/share/aaa-muse-ai/licenses/x-mod/
 COPY --from=frontend /src/portal/dist /usr/share/aaa-muse-ai/portal
 COPY --from=frontend /src/node_modules/@fontsource/geist/LICENSE /usr/share/aaa-muse-ai/licenses/geist-OFL.txt
 COPY --from=frontend /src/node_modules/@fontsource/geist-mono/LICENSE /usr/share/aaa-muse-ai/licenses/geist-mono-OFL.txt

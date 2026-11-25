@@ -2,14 +2,13 @@
 set +x
 set -euo pipefail
 umask 077
-[[ $# == 6 || ($# == 7 && $7 == --adopt) ]] || { printf '%s\n' '{"level":"ERROR","msg":"setup.runtime_unsupported","cause":"installer_arguments_required","protected_capture_unavailable":true}' >&2; exit 1; }
+[[ $# == 6 ]] || { printf '%s\n' '{"level":"ERROR","msg":"setup.runtime_unsupported","cause":"installer_arguments_required","protected_capture_unavailable":true}' >&2; exit 1; }
 archive=$1
 version=$2
 expected=$3
 origin=$4
 setup_id=$5
 receipt=$6
-adopt=${7:-}
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-(rc|dev)\.[0-9]+)?$ && "$expected" =~ ^[0-9a-f]{64}$ && "$setup_id" =~ ^[0-9a-f]{32}$ ]] || exit 1
 [[ -f "$receipt" && ! -L "$receipt" && -O "$receipt" && $(stat -c '%a:%h' "$receipt") == 600:1 && $(stat -c '%s' "$receipt") -le 65536 ]] || { printf '%s\n' '{"level":"ERROR","msg":"setup.runtime_unsupported","cause":"bootstrap_evidence_unsafe","protected_capture_unavailable":true}' >&2; exit 1; }
 stage=installer
@@ -56,8 +55,8 @@ if ! directory_helper=$(tar -xOzf "$archive" package/setup/private-directory.sh)
   event ERROR setup.package_mismatch
   exit 1
 fi
-root="${XDG_DATA_HOME:-$HOME/.local/share}/aaa-muse-worker-v1"
-state="${XDG_STATE_HOME:-$HOME/.local/state}/aaa-muse-worker-v1"
+root="${XDG_DATA_HOME:-$HOME/.local/share}/aaa-muse-worker-hook-v1"
+state="${XDG_STATE_HOME:-$HOME/.local/state}/aaa-muse-worker-hook-v1"
 [[ "$root" == /* && "$state" == /* ]]
 private_dir "$root" install_directory
 private_dir "$root/releases" bundle_directory
@@ -103,13 +102,9 @@ import { readFileSync } from 'node:fs';
 const [root,version]=process.argv.slice(2);
 const manifest=JSON.parse(readFileSync(root+'/package.json','utf8'));
 const build=JSON.parse(readFileSync(root+'/dist/build.json','utf8'));
-if(manifest.name!=='@markhuangai/aaa-muse-worker'||manifest.version!==version||build.package_version!==version) process.exit(1);
+if(manifest.name!=='@markhuangai/aaa-muse-worker'||manifest.version!==version||build.package_version!==version||manifest.aaa_muse_update?.contract!=='managed-hook-v1') process.exit(1);
 AAA_MUSE_METADATA
 stage=worker
 event INFO setup.package_verified
 execution_started=true
-if [[ "$adopt" == --adopt ]]; then
-  "$node" "$bundle/package/dist/main.js" update-adopt --origin "$origin" --install-dir "$root" --worker-id "$setup_id" --archive-digest "$expected" --bootstrap "$receipt" --state-dir "$state"
-else
-  "$node" "$bundle/package/dist/main.js" setup --origin "$origin" --code-stdin --install-dir "$root" --setup-id "$setup_id" --archive-digest "$expected" --bootstrap "$receipt" --state-dir "$state"
-fi
+"$node" "$bundle/package/dist/main.js" setup --origin "$origin" --code-stdin --install-dir "$root" --setup-id "$setup_id" --archive-digest "$expected" --bootstrap "$receipt" --state-dir "$state"

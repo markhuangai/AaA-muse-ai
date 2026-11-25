@@ -10,6 +10,16 @@ import { encode } from '../dist/json.js';
 import { fixture, CODE, KEY, ID, JOB, claimed } from './helpers.mjs';
 
 const SETUP = '8'.repeat(32);
+const PIN = 'a'.repeat(64);
+
+function managedNetwork(net) {
+  return { ...net, fetch: async (...args) => {
+    const response = await net.fetch(...args);
+    response.headers.set('X-Muse-Paired-Worker-SHA256', PIN);
+    return response;
+  } };
+}
+
 async function setupFixture(t) {
   const f = await fixture(t);
   const emitted = [];
@@ -153,13 +163,29 @@ test('preflight checks an existing asset target before reusing enrollment', asyn
 
 test('setup CLI installs protected worker state without starting a daemon or enabling a hook', async t => {
   const f = await setupFixture(t); const output = [];
-  const io = { files: fs, system: f.state.sys, setup: f.io, network: f.net, env: { HATCH_HOOK_RUNTIME: '/runtime' }, home: () => f.state.root, nodeVersion: process.version,
+  const io = { files: fs, system: f.state.sys, setup: f.io, network: managedNetwork(f.net), env: { HATCH_HOOK_RUNTIME: '/runtime' },
+    emitHook: async (_runtime, action) => encode(action), home: () => f.state.root, nodeVersion: process.version,
     input: async name => name === '-' ? CODE : encode({ level: 'INFO', msg: 'setup.archive_verified', setup_id: SETUP }), stdout: line => output.push(line), stderr: line => f.output.push(line), signal: new AbortController().signal, metadata: async () => ({ source_sha: 'unit' }) };
   const call = (...args) => execute([args[0], '--state-dir', f.state.root, ...args.slice(1)], io);
   assert.equal(await call('setup'), 1);
-  assert.equal(await call('setup', '--origin', 'https://broker.example.test', '--code-stdin', '--install-dir', join(f.state.root, 'installed'), '--setup-id', SETUP, '--bootstrap', '/receipt'), 0);
-  assert.equal(JSON.parse(output.at(-1)).cron_registration, 'pending');
-  assert.equal(await call('hook-check'), 1);
+  assert.equal(await call('setup', '--origin', 'https://broker.example.test', '--code-stdin', '--install-dir', join(f.state.root, 'installed'),
+    '--setup-id', SETUP, '--bootstrap', '/receipt', '--archive-digest', PIN), 0);
+  assert.equal(JSON.parse(output.at(-1)).registration, 'pending');
+  const requests = f.broker.calls.length;
+  assert.equal(await call('hook-check'), 0);
+  assert.deepEqual(JSON.parse(output.at(-1)), { kind: 'silent', reason: 'registration_unverified' });
+  assert.equal(f.broker.calls.length, requests);
+  assert.equal(await call('hook-describe', '--goal-id', 'cli-goal'), 0);
+  const { hook, watchdog } = JSON.parse(output.at(-1));
+  const listing = { goal_id: 'cli-goal', complete: true, hooks: [], watchdogs: [], target: 'hook' };
+  io.input = async () => encode(listing);
+  assert.equal(await call('hook-authorize-registration', '--input', '-'), 0);
+  assert.equal(JSON.parse(output.at(-1)).add_hook, true);
+  io.input = async () => encode({ ...listing, hooks: [hook], watchdogs: [{ ...watchdog, native_job_id: 'cli-watchdog' }], dry_run: 'silent' });
+  assert.equal(await call('hook-confirm', '--input', '-'), 0);
+  assert.equal(JSON.parse(output.at(-1)).outcome, 'registered');
+  assert.equal(await call('watchdog-check'), 0);
+  assert.equal(JSON.parse(output.at(-1)).notify, false);
   assert.equal(await call('run', '--background'), 1);
   assert.equal(await f.state.read('run-stop.json'), undefined);
   assert.equal(await f.state.read('hook-poll.json'), undefined);
@@ -195,9 +221,10 @@ test('failed setup exports verified bootstrap and later authorization rejection 
   const f = await setupFixture(t);
   await f.worker.configure('https://broker.example.test'); await f.worker.enroll(CODE);
   f.broker.denied = true;
-  const io = { files: fs, system: f.state.sys, setup: f.io, network: f.net, env: {}, home: () => f.state.root, nodeVersion: process.version,
+  const io = { files: fs, system: f.state.sys, setup: f.io, network: managedNetwork(f.net), env: {}, home: () => f.state.root, nodeVersion: process.version,
     input: async name => name === '-' ? CODE : encode({ level: 'INFO', msg: 'setup.archive_verified', setup_id: SETUP, expected_digest: 'a'.repeat(64), observed_digest: 'a'.repeat(64) }), stdout() {}, stderr: line => f.output.push(line), signal: new AbortController().signal, metadata: async () => ({ source_sha: 'unit' }) };
-  assert.equal(await execute(['setup', '--state-dir', f.state.root, '--origin', 'https://broker.example.test', '--code-stdin', '--install-dir', join(f.state.root, 'installed'), '--setup-id', SETUP, '--bootstrap', '/receipt'], io), 1);
+  assert.equal(await execute(['setup', '--state-dir', f.state.root, '--origin', 'https://broker.example.test', '--code-stdin', '--install-dir',
+    join(f.state.root, 'installed'), '--setup-id', SETUP, '--bootstrap', '/receipt', '--archive-digest', PIN], io), 1);
   assert.equal(await f.state.read('installation.json'), undefined);
   const exported = (await f.logger.capture.export({}, true)).trim().split('\n').map(JSON.parse);
   assert(exported[0].complete);
@@ -220,7 +247,8 @@ test('CLI imports bootstrap before unsafe credentials and setup-lock timeouts ca
       if (reason === 'unsafe_credential') await fs.chmod(f.state.path('credential.key'), 0o644);
       else { release = await f.state.lock('setup'); f.state.sys.wait = async () => f.advance(10001); }
       try {
-        assert.equal(await execute(['setup', '--state-dir', f.state.root, '--origin', 'https://broker.example.test', '--code-stdin', '--install-dir', join(f.state.root, 'installed'), '--setup-id', SETUP, '--bootstrap', '/receipt'], io), 1);
+        assert.equal(await execute(['setup', '--state-dir', f.state.root, '--origin', 'https://broker.example.test', '--code-stdin', '--install-dir',
+          join(f.state.root, 'installed'), '--setup-id', SETUP, '--bootstrap', '/receipt', '--archive-digest', PIN], io), 1);
       } finally {
         f.state.sys.wait = wait;
         if (release) await release();

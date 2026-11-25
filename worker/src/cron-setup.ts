@@ -1,16 +1,12 @@
 import { isAbsolute, join } from 'node:path';
-import type { InstallationIO } from './install-io.js';
+import { launcherScript, shellQuote as quote, type InstallationIO } from './install-io.js';
 import { State } from './state.js';
 import { Worker } from './worker.js';
 import { encode, identifier, object, parse, text, type ObjectValue } from './json.js';
 import { requireValue } from './errors.js';
 import { archiveDigest } from './update-archive.js';
 
-function quote(value: string): string { return "'" + value.replaceAll("'", "'\\''") + "'"; }
-
-export function launcherScript(node: string, entry: string, state: string): string {
-  return '#!/usr/bin/env bash\nset -euo pipefail\nexec ' + quote(node) + ' ' + quote(entry) + ' "$@" --state-dir ' + quote(state) + '\n';
-}
+export { launcherScript } from './install-io.js';
 
 export class CronSetup {
   constructor(readonly worker: Worker, readonly io: InstallationIO, readonly version: string) {}

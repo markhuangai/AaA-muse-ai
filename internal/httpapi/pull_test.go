@@ -79,7 +79,7 @@ func mediaVideoFixture(t *testing.T) []byte {
 }
 
 func uploadVideo(handler *Handler, key string, grant *inference.Grant, video []byte) *httptest.ResponseRecorder {
-	request := httptest.NewRequest(http.MethodPut, "/api/v1/worker/jobs/"+grant.JobID+"/artifact", bytes.NewReader(video))
+	request := pairedRequest(handler, http.MethodPut, "/api/v1/worker/jobs/"+grant.JobID+"/artifact", bytes.NewReader(video))
 	request.Header.Set("Authorization", "Bearer "+key)
 	request.Header.Set("Content-Type", "video/mp4")
 	request.Header.Set("X-Muse-Lease-Id", grant.ClaimID)
@@ -173,7 +173,7 @@ func TestNativePullOfflineVideoKeepsOriginalDeadlineAndReceipt(t *testing.T) {
 	}
 	video := mediaVideoFixture(t)
 	probe := func(credential, hash, size string) *httptest.ResponseRecorder {
-		request := httptest.NewRequest(http.MethodGet, path+"/media/receipt", nil)
+		request := pairedRequest(first, http.MethodGet, path+"/media/receipt", nil)
 		request.Header.Set("Authorization", "Bearer "+credential)
 		request.Header.Set("X-Muse-Lease-Id", grant.ClaimID)
 		request.Header.Set("X-Muse-Generation", fmt.Sprint(grant.Generation))
@@ -352,28 +352,30 @@ func TestNativePullRejectsOldOccurrencesAndRevokedAuthority(t *testing.T) {
 }
 
 func nativePost(handler *Handler, path, key string, input any) *httptest.ResponseRecorder {
-	return nativePostVersion(handler, path, key, service.DevelopmentVersion, input)
+	return nativePostVersion(handler, path, key, handler.Service.Build().Version, input)
 }
 
 func nativePostVersion(handler *Handler, path, key, version string, input any) *httptest.ResponseRecorder {
+	input = pairedWorkInput(input)
 	body, err := json.Marshal(input)
 	if err != nil {
 		panic(err)
 	}
-	request := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(body))
+	request := pairedRequest(handler, http.MethodPost, path, bytes.NewReader(body))
 	request.Header.Set("Authorization", "Bearer "+key)
-	if version != "" {
-		request.Header.Set(service.WorkerVersionHeader, version)
-	}
+	request.Header.Set(service.WorkerVersionHeader, version)
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
+	rememberTestPull(response, input)
 	return response
 }
 
 func nativeResponse(t *testing.T, response *httptest.ResponseRecorder, status int, output any) {
 	t.Helper()
 	if response.Code != status {
-		t.Fatalf("status %d, want %d", response.Code, status)
+		var reason struct{ Error string }
+		_ = json.Unmarshal(response.Body.Bytes(), &reason)
+		t.Fatalf("status %d, want %d (error %q)", response.Code, status, reason.Error)
 	}
 	if output != nil {
 		if err := json.Unmarshal(response.Body.Bytes(), output); err != nil {
@@ -384,11 +386,8 @@ func nativeResponse(t *testing.T, response *httptest.ResponseRecorder, status in
 
 func enrollNative(t *testing.T, handler *Handler) string {
 	t.Helper()
-	var enrolled struct {
-		Credential string `json:"credential"`
-	}
-	nativeResponse(t, nativePost(handler, "/api/v1/worker/enroll", "", map[string]string{"enrollment_code": issueHTTP(t, handler)}), 201, &enrolled)
-	return enrolled.Credential
+	_, key := enrollHTTP(t, handler, issueHTTP(t, handler))
+	return key
 }
 
 func TestNativeBusyCheckProjectsContactWithoutChangingPollOrClaim(t *testing.T) {
@@ -441,7 +440,7 @@ func TestNativeBusyCheckProjectsContactWithoutChangingPollOrClaim(t *testing.T) 
 	check := inference.BusyCheck{Version: 1, ClaimID: grant.ClaimID, Generation: grant.Generation, Checker: "checker",
 		Occurrence: "busy-one", ScheduledAt: now, Reason: "producer_launch_unobservable"}
 	var receipt inference.PresenceReceipt
-	nativeResponse(t, nativePostVersion(first, route, key, "1.0.0-rc.1", check), 200, &receipt)
+	nativeResponse(t, nativePost(first, route, key, check), 200, &receipt)
 	checkedAt := now
 	if !receipt.Recorded || !receipt.ReceivedAt.Equal(checkedAt) {
 		t.Fatal("busy check was not recorded")
@@ -469,6 +468,23 @@ func TestNativeBusyCheckProjectsContactWithoutChangingPollOrClaim(t *testing.T) 
 	nativeResponse(t, nativePost(first, route, key, next), 400, nil)
 	read("quiet", checkedAt, check.Reason)
 	next.Reason = ""
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	write := func(statement string) {
+		t.Helper()
+		if _, err := db.ExecContext(t.Context(), statement); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, target := range []string{"INSERT ON aaa_worker_weekly_usage", "UPDATE ON aaa_inference_jobs", "INSERT ON aaa_worker_updates"} {
+		write("CREATE TRIGGER presence_failure BEFORE " + target + " BEGIN SELECT RAISE(ABORT, 'controlled presence failure'); END")
+		nativeResponse(t, usageRequest(first, route, key, next, usageHeaderValue(40, now)), 503, nil)
+		read("quiet", checkedAt, check.Reason)
+		write("DROP TRIGGER presence_failure")
+	}
 	nativeResponse(t, nativePost(second, route, key, next), 200, &receipt)
 	checkedAt = now
 	read("recent", checkedAt, "")
@@ -649,7 +665,7 @@ func TestNativePullTargetPriorityAndCancellationFence(t *testing.T) {
 	nativeResponse(t, nativePost(first, jobPath+"/start", workerKey, start), 409, nil)
 	var outcome inference.WorkOutcome
 	settlement := inference.Interruption{Version: 1, SubmissionID: "confirmed-no-start", ClaimID: grant.ClaimID, Generation: grant.Generation,
-		LaunchID: start.LaunchID, NativeJob: start.NativeJob, Reason: "native_cancelled_before_start"}
+		LaunchID: start.LaunchID, Reason: "launch_not_authorized"}
 	nativeResponse(t, nativePost(second, jobPath+"/interrupt", workerKey, settlement), 200, &outcome)
 	if outcome.State != "cancelled" || outcome.ClaimID != grant.ClaimID {
 		t.Fatal("unstarted native cancellation replaced the client cancellation")
@@ -800,7 +816,12 @@ func TestNativeSweepExpiresQueueAndReleasesUntouchedPinAcrossBrokers(t *testing.
 
 func TestNativePullRollsBackWhenClaimOrReceiptCannotCommit(t *testing.T) {
 	for _, write := range []string{
+		"INSERT ON aaa_worker_weekly_usage",
+		"INSERT ON aaa_worker_updates",
+		"UPDATE ON aaa_experiments",
 		"UPDATE ON aaa_inference_jobs",
+		"UPDATE ON aaa_conversations",
+		"UPDATE ON aaa_model_requests",
 		"INSERT ON aaa_conversation_events",
 		"INSERT ON aaa_worker_polls",
 		"UPDATE OF last_contact_at ON aaa_workers",
@@ -829,25 +850,30 @@ func TestNativePullRollsBackWhenClaimOrReceiptCannotCommit(t *testing.T) {
 			}
 			stamp := time.Now().UTC()
 			tick := inference.Pull{Version: 1, Sequence: 1, Checker: "checker", Occurrence: "controlled-rollback", ScheduledAt: stamp, EnteredAt: stamp}
-			failed := nativePost(handler, "/api/v1/worker/pull", key, tick)
-			nativeResponse(t, failed, 503, nil)
-			var jobs, receipts int
+			poll := func() *httptest.ResponseRecorder {
+				return usageRequest(handler, workerPullRoute, key, tick, usageHeaderValue(40, stamp))
+			}
+			nativeResponse(t, poll(), 503, nil)
+			var jobs, receipts, usage int
 			if err = db.QueryRowContext(t.Context(), "SELECT count(*) FROM aaa_inference_jobs WHERE held=1").Scan(&jobs); err != nil {
 				t.Fatal(err)
 			}
 			if err = db.QueryRowContext(t.Context(), "SELECT count(*) FROM aaa_worker_polls").Scan(&receipts); err != nil || jobs != 0 || receipts != 0 {
 				t.Fatal("a failed pull write leaked a durable claim or receipt", jobs, receipts, err)
 			}
+			if err = db.QueryRowContext(t.Context(), "SELECT count(*) FROM aaa_worker_weekly_usage").Scan(&usage); err != nil || usage != 0 {
+				t.Fatal("a failed pull write committed an allowance observation", usage, err)
+			}
 			if _, err = db.ExecContext(t.Context(), "DROP TRIGGER pull_write_failure"); err != nil {
 				t.Fatal(err)
 			}
 			var result inference.PullResult
-			accepted := nativePost(handler, "/api/v1/worker/pull", key, tick)
+			accepted := poll()
 			nativeResponse(t, accepted, 200, &result)
 			if result.Job == nil || result.Job.OperationID != queued.ID || result.Job.Generation != 1 {
 				t.Fatal("exact retry did not reserve the original queued job once")
 			}
-			replay := nativePost(handler, "/api/v1/worker/pull", key, tick)
+			replay := poll()
 			if replay.Code != 200 || !bytes.Equal(replay.Body.Bytes(), accepted.Body.Bytes()) {
 				t.Fatal("a committed pull retry did not replay its original grant")
 			}
@@ -894,6 +920,32 @@ func TestNativePullAndSweepFailClosedOnUnavailableStorage(t *testing.T) {
 	nativeResponse(t, nativePost(first, "/api/v1/worker/pull", key, tick), 503, nil)
 	if _, err = db.ExecContext(t.Context(), view); err != nil {
 		t.Fatal(err)
+	}
+	write := func(statement string, args ...any) {
+		t.Helper()
+		if _, err := db.ExecContext(t.Context(), statement, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, table := range []string{"aaa_worker_polls", "aaa_worker_weekly_usage", "aaa_worker_updates"} {
+		write("ALTER TABLE " + table + " RENAME TO unavailable_fixture")
+		nativeResponse(t, nativePost(first, workerPullRoute, key, tick), 503, nil)
+		write("ALTER TABLE unavailable_fixture RENAME TO " + table)
+	}
+	var jobID string
+	if err = db.QueryRowContext(t.Context(), "SELECT current_job_id FROM aaa_experiments WHERE id=?1", queued.ID).Scan(&jobID); err != nil {
+		t.Fatal(err)
+	}
+	for _, record := range []struct{ table, id string }{
+		{"aaa_inference_jobs", jobID}, {"aaa_experiments", queued.ID},
+	} {
+		var original []byte
+		if err := db.QueryRowContext(t.Context(), "SELECT data FROM "+record.table+" WHERE id=?1", record.id).Scan(&original); err != nil {
+			t.Fatal(err)
+		}
+		write("UPDATE "+record.table+" SET data=?2 WHERE id=?1", record.id, []byte("unreadable"))
+		nativeResponse(t, nativePost(first, workerPullRoute, key, tick), 503, nil)
+		write("UPDATE "+record.table+" SET data=?2 WHERE id=?1", record.id, original)
 	}
 	repo.Close()
 	broker := service.NewBroker(repo, rand.Reader, time.Now, nil)

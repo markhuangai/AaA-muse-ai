@@ -219,6 +219,9 @@ func expire(s *inference.State, events *[]inferenceEvent) {
 }
 
 func (b *Broker) run(ctx context.Context, logger *slog.Logger, ref inference.Ref, operation string, input any, action func(*inference.State, *[]inferenceEvent) (any, error)) (json.RawMessage, error) {
+	pair, hook := inference.PairedHook(ctx)
+	hook = hook && ref.WorkerAuth != "" && ref.JobID != ""
+	ref.NativeWork = ref.NativeWork || hook
 	started := b.now()
 	if ref.Principal == "" {
 		ref.Principal = "system"
@@ -264,6 +267,11 @@ func (b *Broker) run(ctx context.Context, logger *slog.Logger, ref inference.Ref
 		if j := s.Jobs[ref.JobID]; j != nil {
 			observed["job_id"] = j.ID
 			observed["generation"] = j.Generation
+		}
+		if hook {
+			if err := inference.RequireHookPair(s.NativeWork, pair); err != nil {
+				return err
+			}
 		}
 		if s.Receipt != nil {
 			if s.Receipt.InputHash != hash {

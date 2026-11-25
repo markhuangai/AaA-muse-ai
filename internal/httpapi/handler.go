@@ -120,10 +120,21 @@ func (h *Handler) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 	out.Header().Set("X-Request-Id", id)
 	out.Header().Set("Cache-Control", "no-store")
 	if h.Service != nil {
-		out.Header().Set(service.ServiceVersionHeader, h.Service.Build().Version)
+		build := h.Service.Build()
+		out.Header().Set(service.ServiceVersionHeader, build.Version)
+		if hookRequest(r) {
+			out.Header().Set(service.PairedDigestHeader, build.WorkerPackage.SHA256)
+		}
 	}
-	route, requestedWorker := routeFor(r.URL.Path)
+	path := r.URL.Path
+	if tail, ok := strings.CutPrefix(path, hookWorkerPrefix); ok {
+		path = workerPrefix + tail
+	}
+	route, requestedWorker := routeFor(path)
 	logger := h.Logger.With("request_id", id, "route", route)
+	if hookRequest(r) {
+		logger = logger.With("worker_protocol", "managed-hook-v1")
+	}
 	if route == "/api/v1/worker/enroll" || route == "/api/v1/worker/status" {
 		if operation := r.Header.Get("X-Muse-Enrollment-Operation"); workerIDPattern.MatchString(operation) {
 			logger = logger.With("operation_id", operation)
@@ -278,6 +289,11 @@ func (h *Handler) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 			logger = logger.With("portal_session_id", identity.ID)
 		}
 		if route != mcpRoute && role == "unauthenticated" && strings.HasPrefix(authorization, "Bearer ") && strings.HasPrefix(credential, auth.WorkerPrefix) && h.Workers != nil {
+			var compatible bool
+			r, compatible = h.workerCompatibility(w, r, logger, route)
+			if !compatible {
+				return
+			}
 			if route == "/api/v1/worker/pull" || route == workerPresenceRoute || route == workerUpdateRoute {
 				role = "worker"
 			} else {
@@ -315,8 +331,12 @@ func (h *Handler) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 		h.serveMCP(w, r, logger, clientID)
 		return
 	}
-	if !h.workerCompatibility(w, r, logger, route) {
-		return
+	if route == workerEnrollRoute {
+		var compatible bool
+		r, compatible = h.workerCompatibility(w, r, logger, route)
+		if !compatible {
+			return
+		}
 	}
 	if isMediaRoute(route) {
 		h.serveMedia(w, r, logger, route, requestedWorker, clientID, identity.ID)
@@ -380,8 +400,6 @@ func (h *Handler) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 		h.setupRequest(w, r, logger, body)
 	case workerUpdateRoute:
 		h.workerUpdateRequest(w, r, logger, body)
-	case adoptionPromptRoute:
-		h.adoptionPrompt(w, r, logger, requestedWorker, body)
 	case "/v1/models", "/v1/chat/completions":
 		h.chatRequest(w, r, logger, clientID, body)
 	case "/v1/responses":

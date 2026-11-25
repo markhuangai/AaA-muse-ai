@@ -120,6 +120,7 @@ class PullPeer:
         self.condition = threading.Condition()
         self.pulls, self.jobs = [], []
         self.active = None
+        self.invocation = None
 
     def poll_input(self, *, media_jobs=False, prompt_wav=False):
         sequence = len(self.pulls) + 1
@@ -142,6 +143,7 @@ class PullPeer:
                                "claimed": grant is not None, "request_id": headers["X-Request-Id"]})
             if grant is not None:
                 self.active = grant["job_id"]
+                self.invocation = payload["checker_run_id"]
             self.condition.notify_all()
         return grant
 
@@ -149,10 +151,15 @@ class PullPeer:
         payload = self.poll_input()
         return self.poll(origin, payload=payload, headers=usage_header(used_percent, payload["scheduled_at"]))
 
-    def begin(self, grant, origin=None):
+    def start_input(self, grant):
         require(self.active == grant["job_id"], "controlled peer tried to start an unowned grant")
-        start = {"protocol_version": 1, "claim_id": grant["claim_id"], "generation": grant["generation"],
-                 "launch_id": "launch-" + grant["job_id"], "native_job_id": "once-" + grant["job_id"]}
+        return {"protocol_version": 1, "claim_id": grant["claim_id"], "generation": grant["generation"],
+                "launch_id": "launch-" + grant["job_id"], "native_job_id": self.checker,
+                "verification": {"reference": grant["claim_id"], "native_job_id": self.checker,
+                                 "native_run_id": "event-hook-" + self.invocation, "status": "running"}}
+
+    def begin(self, grant, origin=None):
+        start = self.start_input(grant)
         path = "/api/v1/worker/jobs/" + grant["job_id"]
         job, headers = self.h.checked(path + "/start", self.worker["credential"], "POST", start, origin=origin)
         with self.condition:
@@ -171,12 +178,14 @@ class PullPeer:
             self.settle(job, "accepted")
         return value, headers, body
 
-    def settle(self, job, expected=None):
-        body = {"protocol_version": 1, "submission_id": "settle-" + job["id"], "claim_id": job["lease_id"],
+    def settlement_input(self, job):
+        return {"protocol_version": 1, "submission_id": "settle-" + job["id"], "claim_id": job["lease_id"],
                 "generation": job["generation"], "launch_id": job["launch_id"], "native_job_id": job["native_job_id"],
-                "native_run_id": "execution-" + job["id"], "reason": "execution_confirmed_stopped"}
+                "native_run_id": "event-hook-" + self.invocation, "reason": "execution_confirmed_stopped", "verified_start": True}
+
+    def settle(self, job, expected=None):
         path = "/api/v1/worker/jobs/" + job["id"] + "/interrupt"
-        receipt, _ = self.h.checked(path, self.worker["credential"], "POST", body)
+        receipt, _ = self.h.checked(path, self.worker["credential"], "POST", self.settlement_input(job))
         require(receipt["job_id"] == job["id"] and receipt["claim_id"] == job["lease_id"] and
                 receipt["state"] in ([expected] if expected else ["cancelled", "interrupted"]), "controlled peer did not reconcile its claim")
         with self.condition:
@@ -359,8 +368,7 @@ class Inference(WorkerAuth):
             require(grant["job_id"] == job_id and all(replay.result()[0]["job"] == grant for replay in replays), "sibling brokers replayed different grants")
         require(PullPeer(self, other).poll() is None, "foreign worker pulled explicitly targeted work")
         route = "/api/v1/worker/jobs/" + job_id
-        start = {"protocol_version": 1, "claim_id": grant["claim_id"], "generation": grant["generation"],
-                 "launch_id": "launch-" + job_id, "native_job_id": "once-" + job_id}
+        start = peer.start_input(grant)
         self.checked(route + "/start", other["credential"], "POST", start, want=404)
         with ThreadPoolExecutor(max_workers=8) as pool:
             attempts = [pool.submit(self.api, route + "/start", worker["credential"], "POST", start,
@@ -418,8 +426,7 @@ class Inference(WorkerAuth):
             job_id = grant["job_id"]
             submission = "revoke-race-" + secrets.token_hex(8)
             if operation == "start":
-                request = {"protocol_version": 1, "claim_id": grant["claim_id"], "generation": grant["generation"],
-                           "launch_id": "launch-" + job_id, "native_job_id": "once-" + job_id}
+                request = peer.start_input(grant)
             else:
                 job, _, _ = peer.begin(grant)
                 request = {"protocol_version": 1, "submission_id": submission, "connection_id": "", "connection_generation": 0,
@@ -429,9 +436,10 @@ class Inference(WorkerAuth):
             body = json.dumps(request).encode()
             connection = http.client.HTTPConnection(origin.hostname, origin.port, timeout=5)
             try:
-                connection.putrequest("POST", "/api/v1/worker/jobs/" + job_id + "/" + operation)
+                connection.putrequest("POST", "/api/v1/worker/hook/jobs/" + job_id + "/" + operation)
                 connection.putheader("Authorization", "Bearer " + worker["credential"])
-                connection.putheader("X-Muse-Worker-Version", self.worker_version)
+                for name, value in self.worker_pair_headers().items():
+                    connection.putheader(name, value)
                 connection.putheader("Content-Type", "application/json")
                 connection.putheader("Content-Length", str(len(body)))
                 connection.putheader("Expect", "100-continue")
