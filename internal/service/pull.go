@@ -129,6 +129,25 @@ func (b *Broker) PullWork(ctx context.Context, logger *slog.Logger, credential s
 	}
 	if !replayed {
 		logUpdateDecision(ctx, logger, timing.Update, b.now().Sub(started))
+		logWorkerCapability(logger, timing.Capability, timing.CapabilityChanged)
+		if op := timing.ConfirmedUpdateOp; op != nil {
+			logger.Info("worker_op.completed", append(controlLogFields(*op), "update_id", op.UpdateID)...)
+		}
+		if op := timing.UpdateOp; op != nil {
+			if op.State == "running" && result.Update != nil {
+				logger.Info("worker_op.update_triggered", append(controlLogFields(*op), "update_id", op.UpdateID,
+					"previous_update_state", timing.PreviousUpdateState, "target_version", result.Update.Target.Version,
+					"target_sha256", result.Update.Target.SHA256)...)
+			} else {
+				logger.Info("worker_op.completed", controlLogFields(*op)...)
+			}
+		}
+	}
+	for lane, grant := range map[string]*worker.ControlGrant{worker.WorkerOp: result.WorkerOp, worker.AgentTask: result.AgentTask} {
+		if grant != nil {
+			logger.Info(lane+".claimed", "operation_id", grant.OperationID, "claim_id", grant.ClaimID,
+				"generation", grant.Generation, "deadline_at", grant.DeadlineAt, "replayed", replayed)
+		}
 	}
 	if input.WeeklyUsage != nil {
 		logWeeklyUsage(logger, input.WeeklyUsage, b.now(), timing.UsageResult)

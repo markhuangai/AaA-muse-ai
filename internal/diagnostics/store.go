@@ -342,3 +342,49 @@ func validateCapture(b []byte) ([]Record, error) {
 	}
 	return records, nil
 }
+
+func (r *Redactor) WorkerCapture(capture string, decoded bool) (string, error) {
+	if decoded {
+		safe, err := r.JSON(json.RawMessage(capture))
+		if err != nil {
+			return "", err
+		}
+		return string(safe) + "\n", nil
+	}
+	records, err := validateCapture([]byte(capture))
+	if err != nil {
+		return "", err
+	}
+	var payload bytes.Buffer
+	for _, record := range records {
+		part, err := base64.StdEncoding.DecodeString(record.Data)
+		if err != nil {
+			return "", err
+		}
+		payload.Write(part)
+	}
+	safe, err := r.JSON(payload.Bytes())
+	if err != nil {
+		return "", err
+	}
+	header := records[0]
+	header.Event, header.InstanceID, header.CaptureID = r.Text(header.Event), r.Text(header.InstanceID), r.Text(header.CaptureID)
+	header.OperationID, header.RequestID = r.Text(header.OperationID), r.Text(header.RequestID)
+	header.Chunks = (len(safe) + 2047) / 2048
+	sum := sha256.Sum256(safe)
+	header.SHA256 = hex.EncodeToString(sum[:])
+	var output bytes.Buffer
+	encoder := json.NewEncoder(&output)
+	for i := range header.Chunks {
+		header.Chunk = i
+		header.Data = base64.StdEncoding.EncodeToString(safe[i*2048 : min((i+1)*2048, len(safe))])
+		before := output.Len()
+		if err := encoder.Encode(header); err != nil {
+			return "", err
+		}
+		if output.Len()-before > MaxRecordBytes {
+			return "", errors.New("capture_metadata_too_large")
+		}
+	}
+	return output.String(), nil
+}

@@ -408,6 +408,11 @@ silent() { [[ $# == 1 ]]; printf '{"action":"silent","reason":"%s"}\n' "$1"; }
         require(legacy_marker.read_text() == "retained native cron state", "fresh setup altered a native cron installation")
         confirmed = self.checker(worker)
         registration = (worker["state"] / "hook-installation.json").read_bytes()
+        confirmed = json.loads(registration)
+        approved = json.loads((worker["state"] / "hook-expected.json").read_text())
+        require(confirmed["hook_prompt_version"] == "managed-hook-prompt-v2" and
+                confirmed["hook_prompt_sha256"] == hashlib.sha256(approved["hook"]["prompt"].encode()).hexdigest(),
+                "native registration did not confirm the exact task-capable hook prompt")
         self.install(worker, initial)
         require(worker["receipt"]["identity_preserved"] and (worker["state"] / "hook-installation.json").read_bytes() == registration, "install retry changed checker or worker")
         require(self.tick(worker)["outcome"] == "idle", "installed checker did not perform an empty authenticated pull")

@@ -62,7 +62,7 @@ Keep `broker.sqlite3`, its WAL and its shared-memory sidecar together on a local
 
 Take this backup and stop every older broker before starting the first broker with automatic worker updates. That release applies migration 004. [Automatic worker updates](releases.md#automatic-worker-updates)
 
-The weekly allowance feature applies migration 005. Back up the state directory while all brokers are stopped, then upgrade every broker that shares it to the current release. Previous broker binaries require their original SQLite schema. Keep the backup for recovery.
+Schema 6 adds remote worker operations, background tasks, and a shared claim slot. It retains existing inference holds and the checksums of migrations 001–005. Back up the state directory while all brokers are stopped, then upgrade every broker that shares it to the current release. Previous broker binaries require their original SQLite schema. Keep the backup for recovery.
 
 The queue maintains FIFO index entries for fixed, aligned ranges of job deadlines. A pull seeks only the head of each eligible range in priority order; neither expired nor live backlog expands the number of candidates inspected. Queue state and index membership change in the same SQLite transaction. Use the protected pull timing to separate scheduler entry delay, SQLite writer acquisition, and queue lookup.
 

@@ -140,4 +140,6 @@ Authorize each registration separately with hook-authorize-registration --input 
 Call hook-confirm --input - with goal_id, complete: true, dry_run: "silent" and the exact enabled hook and watchdog readbacks in hooks and watchdogs. Report their IDs only after the helper returns registered. A normal shell tick wakes an agent only when it has a broker claim. The five-minute watchdog checks local evidence and reports incidents to the owning chat.
 
 End this installation turn before attempting work. Leave the first work check to the scheduler. Do not claim first unattended execution, model readiness, production HTTPS pickup, refresh survival or VM-loss recovery without exact live observations. Full wipes, account resets and production deployments need separate owner authorization.
+
+Exact hook-confirm readback verifies the background task prompt. The hook can wake an agent for an authorized inference, media, or background task claim.
 `

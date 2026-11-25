@@ -32,9 +32,12 @@ func routeFor(path string) (string, string) {
 	case mcpRoute, "/v1/models", "/v1/chat/completions", "/v1/responses", "/healthz", "/readyz", "/api/v1/admin/status", "/api/v1/admin/diagnostics/export", "/api/v1/admin/enrollments", "/api/v1/admin/setup-prompts", "/api/v1/worker/enroll", "/api/v1/admin/workers", "/api/v1/worker/status", workerUpdateRoute:
 		return path, ""
 	}
-	if strings.HasPrefix(path, "/api/v1/admin/workers/") {
-		parts := strings.Split(strings.TrimPrefix(path, "/api/v1/admin/workers/"), "/")
+	if strings.HasPrefix(path, adminWorkerPrefix) {
+		parts := strings.Split(strings.TrimPrefix(path, adminWorkerPrefix), "/")
 		if workerIDPattern.MatchString(parts[0]) {
+			if route := adminWorkerControlRoute(parts); route != "" {
+				return route, parts[0]
+			}
 			if len(parts) == 1 {
 				return "/api/v1/admin/workers/{id}", parts[0]
 			}
@@ -49,11 +52,27 @@ func routeFor(path string) (string, string) {
 	if route, id := historyRoute(path); route != "unmatched" {
 		return route, id
 	}
+	if route, id := workerControlRoute(path); route != "" {
+		return route, id
+	}
 	return inferenceRoute(path)
 }
 
-func routeMethod(route string) string {
+func routeAllows(route, method string) bool {
+	for _, allowed := range strings.Split(routeAllowHeader(route), ", ") {
+		if method == allowed {
+			return true
+		}
+	}
+	return false
+}
+
+func routeAllowHeader(route string) string {
 	switch route {
+	case opsRoute, tasksRoute:
+		return "GET, POST"
+	case opCancelRoute, taskCancelRoute, workerOpResult, taskBindRoute, taskStartRoute, taskPresenceRoute, taskResultRoute, taskInterruptRoute:
+		return http.MethodPost
 	case mediaJobs, mediaTrials, mcpRoute:
 		return http.MethodPost
 	case workerMediaArtifact:
@@ -114,7 +133,11 @@ func (h *Handler) projectedWorker(r *http.Request, logger *slog.Logger, record w
 	if h.Broker == nil {
 		return v, nil
 	}
-	p, err := h.Broker.Projection(r.Context(), logger, record.ID, own)
+	var builds []service.Build
+	if h.Service != nil {
+		builds = append(builds, h.Service.Build())
+	}
+	p, err := h.Broker.Projection(r.Context(), logger, record.ID, own, builds...)
 	v.Projection = p
 	if !own && p.LastPollAt != nil && (p.Update == nil || p.Update.Contract != worker.UpdateContract) {
 		if v.Update == nil {

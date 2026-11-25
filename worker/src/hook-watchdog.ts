@@ -1,6 +1,8 @@
 import { iso, time } from './cron.js';
 import { updateHealthFile } from './cron-update.js';
 import { requireValue } from './errors.js';
+import { hookOpFile } from './hook-ops.js';
+import { hookTaskFile } from './hook-task.js';
 import { hookInstallation } from './hook-setup.js';
 import { bootIdentity, tickHealthFile } from './hook.js';
 import { encode, integer, object, type ObjectValue } from './json.js';
@@ -40,6 +42,22 @@ export class HookWatchdog {
           generation: claim.generation, deadline_at: claim.deadline_at, wake_invocation_id: claim.wake_invocation_id,
           corrective_action: 'Keep the claim held and inspect the wake and delivery evidence on the matching release.' });
         keys.push({ kind, claim: claim.claim_id });
+      }
+      const task = await this.read(hookTaskFile);
+      if (task && now > time(task.deadline_at)) {
+        const kind = 'task_deadline_exceeded';
+        incidents.push({ kind, operation_id: task.operation_id, task_id: task.id, claim_id: task.claim_id, generation: task.generation,
+          wake_invocation_id: task.wake_invocation_id, deadline_at: task.deadline_at, result_received: !!task.receipt,
+          corrective_action: 'Inspect the correlated task result and stop evidence on the matching release before clearing the hold.' });
+        keys.push({ kind, claim: task.claim_id });
+      }
+      const op = await this.read(hookOpFile);
+      if (op && now - time(op.claimed_at) > staleMs) {
+        const kind = 'worker_op_stalled';
+        incidents.push({ kind, operation_id: op.operation_id, worker_op_id: op.id, claim_id: op.claim_id,
+          generation: op.generation, deadline_at: op.deadline_at, result_saved: !!op.pending_result,
+          corrective_action: 'Inspect the protected operation exchange and verify that the paired broker can accept its result.' });
+        keys.push({ kind, claim: op.claim_id });
       }
       const journal = await this.read('cron-update.json');
       const failed = await this.read(updateHealthFile);

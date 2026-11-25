@@ -1,3 +1,4 @@
+import { WorkerRemoteSections } from './worker-remote';
 import { useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore, type FormEvent, type MouseEvent } from 'react';
 import type { Worker, EnrollmentKind } from './worker-api';
 import type { WorkersController, WorkersView } from './worker-controller';
@@ -138,6 +139,7 @@ function WorkerDetail({ worker, controller, view }: { worker: Worker; controller
         <div><dt>Client-tool waits</dt><dd className="num">{worker.waiting_for_client_tool}</dd></div>
         <div><dt>Background wake</dt><dd>Not independently observed</dd></div>
       </dl><p className="field-note">Busy workers do not pull. The broker cannot see local run observations in real time. Offline does not release the claim or prove the work stopped.</p></section>
+      {controller.remote && <WorkerRemoteSections key={worker.id} worker={worker} controller={controller.remote} stale={disabled} />}
     </div>
     <dialog ref={dialog} aria-labelledby="revoke-title" aria-describedby="revoke-description" onCancel={event => { event.stopPropagation(); setConfirming(false); }} onClose={() => setConfirming(false)}>
       <h2 id="revoke-title">Revoke this worker?</h2><p className="confirm-identity">{worker.name}<br /><code>{worker.id}</code></p><p id="revoke-description">This blocks access for every copy of this worker credential. Registration and history are retained. Remote activity may remain unknown.</p>

@@ -3,7 +3,7 @@ import { Failure, cause, requireValue } from './errors.js';
 import type { InstallationIO } from './install-io.js';
 import { encode, identifier, integer, object, text, type ObjectValue, type Value } from './json.js';
 import { State } from './state.js';
-import { launcherScript } from './install-io.js';
+import { launcherScript, prepareManagedAssets, writeManagedAssets } from './install-io.js';
 import { archiveDigest, supportsSource, updateArchiveIO, updateContract, updateTarget, verifyInstallEntry, type UpdateArchiveIO } from './update-archive.js';
 import type { Transport } from './transport.js';
 import type { Worker } from './worker.js';
@@ -64,7 +64,8 @@ export class CronUpdate {
   }
 
   private async idle() {
-    requireValue(!(await this.read('cron-claim.json')) && !(await this.read('cron-tick.json'))?.pending, 'update_worker_has_pending_work');
+    requireValue(!(await this.read('cron-claim.json')) && !(await this.read('cron-tick.json'))?.pending &&
+      !(await this.read('hook-op.json')) && !(await this.read('hook-task.json')), 'update_worker_has_pending_work');
   }
 
   private async newAttempt(installation: ObjectValue, id: string, target: ObjectValue): Promise<ObjectValue> {
@@ -119,7 +120,15 @@ export class CronUpdate {
       verifyInstallEntry(text(installation.root), text(attempt.entry));
       requireValue(this.worker.productVersion === target.version && this.io.node === attempt.node &&
         attempt.observed_digest === target.sha256, 'update_running_version_unverified');
-      await this.state.write(installationFile, encode({ ...installation, package_version: target.version, package_sha256: target.sha256, entry: attempt.entry, node: attempt.node }));
+      let assets;
+      try { assets = await writeManagedAssets(this.io, this.state, installation); }
+      catch (error) {
+        await this.worker.logger.log('WARN', 'worker.update_asset_refresh_failed', { ...details, stage: 'confirmation', reason: cause(error),
+          corrective_action: 'Repair the private hook and skill directories and let the next tick resume the update.' });
+        throw error;
+      }
+      await this.state.write(installationFile, encode({ ...installation, ...assets, package_version: target.version, package_sha256: target.sha256,
+        entry: attempt.entry, node: attempt.node }));
       await report('applied', text(target.sha256));
       await this.worker.logger.log('INFO', 'worker.update_applied', { ...details, observed_digest: attempt.observed_digest, duration_ms: this.state.sys.now() - integer(attempt.started_at_ms) });
       await this.state.remove(updateHealthFile);
@@ -158,6 +167,16 @@ export class CronUpdate {
         await this.worker.logger.log('DEBUG', 'worker.update_archive_verified', { ...details, ...candidate });
       } catch (error) {
         await fail(knownFailure(error), error);
+      }
+    }
+    if (attempt.stage !== 'failed') {
+      try {
+        const entry = text(attempt.entry);
+        verifyInstallEntry(text(installation.root), entry);
+        await this.archive.verify(entry, target);
+        await prepareManagedAssets(this.io, this.state, installation, true);
+      } catch (error) {
+        await fail('staging_failed', error);
       }
     }
     if (attempt.stage !== 'failed') {

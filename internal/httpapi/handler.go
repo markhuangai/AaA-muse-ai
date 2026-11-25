@@ -16,6 +16,7 @@ import (
 	"github.com/markhuangai/AaA-muse-ai/internal/auth"
 	"github.com/markhuangai/AaA-muse-ai/internal/config"
 	"github.com/markhuangai/AaA-muse-ai/internal/diagnostics"
+	"github.com/markhuangai/AaA-muse-ai/internal/inference"
 	"github.com/markhuangai/AaA-muse-ai/internal/service"
 )
 
@@ -50,7 +51,7 @@ type response struct {
 	stream                                     bool
 	attempted, written                         int
 	writeErr                                   error
-	workerID, enrollmentID                     string
+	workerID, enrollmentID, controlOperation   string
 	conversationID, sessionID, requestRecordID string
 	boundaryFailed                             bool
 	captureReason                              string
@@ -131,8 +132,12 @@ func (h *Handler) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 		path = workerPrefix + tail
 	}
 	route, requestedWorker := routeFor(path)
+	hook := hookRequest(r)
+	if !hook && (route == workerOpResult || strings.HasPrefix(route, taskWorkerBase)) {
+		route = "unmatched"
+	}
 	logger := h.Logger.With("request_id", id, "route", route)
-	if hookRequest(r) {
+	if hook {
 		logger = logger.With("worker_protocol", "managed-hook-v1")
 	}
 	if route == "/api/v1/worker/enroll" || route == "/api/v1/worker/status" {
@@ -162,6 +167,9 @@ func (h *Handler) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 	portalSessionID := ""
 	defer func() {
 		logger = logger.With("worker_id", w.workerID, "enrollment_id", w.enrollmentID)
+		if w.controlOperation != "" {
+			logger = logger.With("operation_id", w.controlOperation)
+		}
 		if w.requestRecordID != "" {
 			logger = logger.With("operation_id", w.requestRecordID, "request_record_id", w.requestRecordID, "conversation_id", w.conversationID, "session_id", w.sessionID)
 		}
@@ -185,11 +193,11 @@ func (h *Handler) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 		}
 		logger.Debug("request.exchange", "method", r.Method, "role", role, "status", w.code, "response", w.body.String(), "response_capture", captureKind, "outcome", outcome, "write_error", detail, "attempted_bytes", w.attempted, "written_bytes", w.written)
 		level := slog.LevelInfo
-		if (route == "/api/v1/worker/pull" || route == workerPresenceRoute) && w.code == http.StatusOK && outcome == "completed" {
+		if (route == "/api/v1/worker/pull" || route == workerPresenceRoute || route == taskPresenceRoute) && w.code == http.StatusOK && outcome == "completed" {
 			level = slog.LevelDebug
 		}
 		logger.Log(r.Context(), level, "request.completed", "method", r.Method, "role", role, "status", w.code, "outcome", outcome, "duration_ms", h.Now().Sub(started).Milliseconds())
-		if action, resource := portalWorkerAction(route); portalSessionID != "" && action != "" {
+		if action, resource := portalWorkerAction(r.Method, route); portalSessionID != "" && action != "" {
 			resourceID := w.enrollmentID
 			if resource == "worker" {
 				resourceID = requestedWorker
@@ -242,7 +250,7 @@ func (h *Handler) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 		if route == "/api/v1/portal/logout" && (cookie != "" || r.Header.Get(portalOperationHeader) != "") {
 			expectedRole = ""
 		} else if cookie != "" && h.Portal != nil {
-			if r.Method == routeMethod(route) && r.Method != http.MethodGet && !allowPortalWrite(w, r, logger) {
+			if routeAllows(route, r.Method) && r.Method != http.MethodGet && r.Method != http.MethodHead && !allowPortalWrite(w, r, logger) {
 				return
 			}
 			identity, renewed, err := h.Portal.AuthenticateBrowser(r.Context(), logger, cookie)
@@ -294,7 +302,8 @@ func (h *Handler) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 			if !compatible {
 				return
 			}
-			if route == "/api/v1/worker/pull" || route == workerPresenceRoute || route == workerUpdateRoute {
+			if route == workerPullRoute || route == workerPresenceRoute || route == workerUpdateRoute ||
+				route == workerOpResult || strings.HasPrefix(route, taskWorkerBase) {
 				role = "worker"
 			} else {
 				record, err := h.Workers.Authenticate(r.Context(), logger, credential)
@@ -320,8 +329,8 @@ func (h *Handler) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	method := routeMethod(route)
-	if r.Method != method {
+	if !routeAllows(route, r.Method) {
+		method := routeAllowHeader(route)
 		logger.Warn("request.rejected", "reason", "method_not_allowed", "expected_method", method, "observed_method", r.Method)
 		w.Header().Set("Allow", method)
 		writeJSON(w, 405, map[string]any{"error": "method_not_allowed"})
@@ -342,11 +351,22 @@ func (h *Handler) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 		h.serveMedia(w, r, logger, route, requestedWorker, clientID, identity.ID)
 		return
 	}
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, MaxBodyBytes))
+	if requireControlJSON(route, r.Method) && !hasJSONContentType(r) {
+		if lane := adminControlLane(route); lane != "" {
+			w.workerID = requestedWorker
+			workerControlError(w, logger, lane, inference.Reject("json_content_type_required", 415, "expected_content_type", "application/json"))
+			return
+		}
+		logger.Warn("request.rejected", "reason", "json_content_type_required", "expected_content_type", "application/json")
+		writeJSON(w, 415, map[string]any{"error": "json_content_type_required"})
+		return
+	}
+	limit := controlBodyLimit(route)
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, limit))
 	if err != nil {
 		var tooLarge *http.MaxBytesError
 		if errors.As(err, &tooLarge) {
-			logger.Warn("request.rejected", "reason", "body_too_large", "max_bytes", MaxBodyBytes)
+			logger.Warn("request.rejected", "reason", "body_too_large", "max_bytes", limit)
 			writeJSON(w, 413, map[string]any{"error": "body_too_large"})
 		} else {
 			writeJSON(w, 400, map[string]any{"error": "invalid_body"})
@@ -358,7 +378,8 @@ func (h *Handler) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]any{"error": "get_body_unsupported"})
 		return
 	}
-	if route != "/api/v1/admin/diagnostics/export" && !adminHistoryRoute(route) && r.URL.RawQuery != "" {
+	if route != "/api/v1/admin/diagnostics/export" && !adminHistoryRoute(route) &&
+		!(r.Method == http.MethodGet && (route == opsRoute || route == tasksRoute)) && r.URL.RawQuery != "" {
 		writeJSON(w, 400, map[string]any{"error": "unsupported_query"})
 		return
 	}
@@ -407,6 +428,10 @@ func (h *Handler) ServeHTTP(out http.ResponseWriter, r *http.Request) {
 	default:
 		if adminHistoryRoute(route) || strings.HasPrefix(route, "/api/v1/requests") {
 			h.historyRequest(w, r, logger, route, requestedWorker, clientID, body)
+		} else if adminControlLane(route) != "" || route == hookPromptRoute {
+			h.adminWorkerControl(w, r, logger, route, requestedWorker, body)
+		} else if route == workerOpResult || strings.HasPrefix(route, taskWorkerBase) {
+			h.workerControlRequest(w, r, logger, route, requestedWorker, body)
 		} else if strings.Contains(route, "/experiments") || route == "/api/v1/worker/pull" || strings.HasPrefix(route, "/api/v1/worker/jobs/") {
 			h.inferenceRequest(w, r, logger, route, requestedWorker, identity, body)
 		} else {

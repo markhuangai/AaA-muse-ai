@@ -15,12 +15,13 @@ const remember = secret => { secrets.push(secret); save(`worker-browser-secrets-
 const pause = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
 let browser;
 
-async function control(path, { method = 'GET', key, body, cookie, workerVersion } = {}) {
+async function control(path, { method = 'GET', key, body, cookie, workerVersion, workerHeaders } = {}) {
   const headers = { 'Content-Type': 'application/json' };
   if (cookie) Object.assign(headers, browserSessionHeaders(cookie, fixture.origin));
   if (key) headers.Authorization = `Bearer ${key}`;
   if (workerVersion) Object.assign(headers, { 'X-Muse-Worker-Version': workerVersion, 'X-Muse-Worker-Updater': 'managed-hook-v1',
     'X-Muse-Worker-SHA256': fixture.pin.sha256 });
+  Object.assign(headers, workerHeaders);
   const response = await fetch(fixture.origin + path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(10_000) });
   const data = response.status === 204 ? null : await response.json();
   return { response, data };
@@ -75,6 +76,70 @@ async function openWorker(page, id) {
   await expect(drawer.getByRole('heading', { level: 2 })).toBeFocused();
   expect(new URL(page.url()).pathname).toBe('/workers');
   expect(await page.locator('tbody tr').filter({ hasText: id }).count()).toBe(1);
+}
+
+async function remoteActions(page, enrolled, width) {
+  const worker = enrolled.worker;
+  const path = '/api/v1/admin/workers/' + worker.id;
+  const tasks = page.getByRole('heading', { name: 'Background agent tasks' }).locator('..');
+  const drawer = page.locator('.worker-drawer');
+  await expect(drawer.locator('.data-panel h3').first()).toHaveText('Registration and access');
+  await expect(tasks.getByText('Hook prompt update required')).toBeVisible();
+  await tasks.getByRole('button', { name: 'Show hook upgrade prompt' }).click();
+  const prompt = tasks.getByLabel('Main chat upgrade prompt');
+  await expect(prompt).toHaveValue(new RegExp('--worker-id ' + worker.id));
+  expect(await prompt.getAttribute('data-sensitive')).toBeNull();
+  const pull = async sequence => {
+    const moment = new Date(Date.now() + sequence * 1000).toISOString();
+    const result = await control('/api/v1/worker/hook/pull', { key: enrolled.credential, workerVersion: fixture.pin.version, method: 'POST',
+      workerHeaders: { 'X-Muse-Worker-Hook-Proof': '1', 'X-Muse-Worker-Agent-Tasks': '1' },
+      body: { protocol_version: 1, sequence, checker_job_id: 'browser-task-hook', checker_run_id: 'browser-task-' + sequence,
+        scheduled_at: moment, entered_at: moment, media_jobs: false, prompt_wav: false } });
+    expect(result.response.status).toBe(200);
+    return result.data;
+  };
+  await pull(1);
+  await drawer.getByRole('button', { name: 'Refresh workers' }).click();
+  await expect(tasks.getByText('Ready', { exact: true })).toBeVisible();
+  await tasks.getByLabel('Task prompt').fill('Check the controlled result <b>without HTML</b>.');
+  const review = tasks.getByRole('button', { name: 'Review task' });
+  await review.click();
+  const dialog = drawer.getByRole('dialog', { name: 'Queue this background task?' });
+  await expect(dialog.getByText(worker.id)).toBeVisible();
+  await expect(dialog.getByText(/permission approvals/)).toBeVisible();
+  await expect(dialog.getByRole('button', { name: 'Cancel' })).toBeFocused();
+  await page.keyboard.press('Escape');
+  await expect(dialog).not.toBeVisible();
+  await expect(drawer).toBeVisible();
+  await expect(review).toBeFocused();
+  await review.click();
+  const pending = page.waitForResponse(response => new URL(response.url()).pathname === path + '/agent-tasks' && response.request().method() === 'POST');
+  await dialog.getByRole('button', { name: 'Confirm task' }).click();
+  const submission = await pending;
+  expect(submission.status()).toBe(202);
+  const task = await submission.json();
+  const picked = await pull(2);
+  expect(picked.agent_task.id).toBe(task.id);
+  const taskPath = '/api/v1/worker/hook/agent-tasks/' + task.id;
+  const identity = { protocol_version: 1, claim_id: picked.agent_task.claim_id, generation: picked.agent_task.generation, launch_id: 'browser-task-launch' };
+  const exchange = (suffix, body) => control(taskPath + '/' + suffix, { key: enrolled.credential, workerVersion: fixture.pin.version, method: 'POST', body });
+  const authorized = await exchange('start', { ...identity, native_job_id: 'browser-task-hook',
+    verification: { reference: identity.claim_id, native_job_id: 'browser-task-hook', native_run_id: 'event-hook-browser-task-2', status: 'running' } });
+  expect(authorized.response.status).toBe(200);
+  expect(authorized.data.prompt).toContain('without HTML');
+  const literal = '<img src=x onerror=alert(1)>';
+  const result = await exchange('result', { ...identity, submission_id: 'browser-task-result', outcome: 'completed', result_text: literal });
+  expect(result.response.status).toBe(200);
+  expect(result.data.held).toBe(true);
+  const settled = await exchange('interrupt', { ...identity, submission_id: 'browser-task-settlement', reason: 'execution_confirmed_stopped',
+    native_job_id: 'browser-task-hook', native_run_id: 'event-hook-browser-task-2', verified_start: true });
+  expect(settled.response.status).toBe(200);
+  await expect(tasks.getByRole('button', { name: /Background task.*Completed/ })).toBeVisible({ timeout: 9000 });
+  await tasks.getByRole('button', { name: /Background task.*Completed/ }).click();
+  await expect(tasks.getByLabel('Worker output')).toHaveText(literal);
+  expect(await tasks.locator('img').count()).toBe(0);
+  await screenshot(page, 'remote', width);
+  passed('portal.worker_remote_task', { width, same_origin: true, verified_target: true, plain_text_output: true });
 }
 
 async function action(page, path, invoke, status = 200) {
@@ -264,6 +329,7 @@ async function viewports() {
     await page.getByRole('link', { name: 'Workers', exact: true }).click();
     await expect(page.getByRole('button', { name: 'Refresh workers' })).toBeEnabled();
     await openWorker(page, enrolled.data.worker.id);
+    await remoteActions(page, enrolled.data, width);
     await page.getByRole('button', { name: 'Revoke worker', exact: true }).focus(); await page.keyboard.press('Enter');
     const dialog = page.getByRole('dialog', { name: 'Revoke this worker?' }); await expect(dialog).toBeVisible();
     await expect(dialog.getByRole('button', { name: 'Cancel', exact: true })).toBeFocused();

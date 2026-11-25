@@ -263,10 +263,99 @@ func (r *Repository) ApplyWorkerUpdate(ctx context.Context, credential [32]byte,
 				return nil
 			}
 			state.Fail(input.Reason, now)
+			retry, err := retryUpdateOp(ctx, tx, id, "running", input.ID, now)
+			if err != nil {
+				return err
+			}
+			if retry != nil {
+				if err := finishRetryUpdate(ctx, tx, retry, "failed", input.Reason, nil, now); err != nil {
+					return err
+				}
+				state.ControlOp = &retry.ControlItem
+			}
 		default:
 			return inference.Reject("invalid_worker_update", 400)
 		}
 		return saveWorkerUpdate(ctx, tx, id, state)
 	})
 	return
+}
+
+func decideControlUpdate(ctx context.Context, tx *sql.Tx, now time.Time, owner string, pull inference.Pull, contact worker.Contact,
+	broker worker.UpdateBroker, held bool, timing *inference.PullTiming,
+) (*worker.UpdateOffer, bool, error) {
+	retry, err := retryUpdateOp(ctx, tx, owner, "queued", "", now)
+	if err != nil {
+		return nil, false, err
+	}
+	if retry != nil && contact.Incompatible && !held {
+		offer, err := forceRetryUpdate(ctx, tx, now, owner, pull, contact, broker, retry, timing)
+		if err != nil || offer != nil {
+			return offer, false, err
+		}
+	}
+	offer, status, work, err := decideUpdate(ctx, tx, now, owner, pull, contact, broker, held)
+	timing.Update = status
+	if err != nil || contact.Incompatible {
+		return offer, work, err
+	}
+	if status.State == "confirmed" && status.ID != "" {
+		running, err := retryUpdateOp(ctx, tx, owner, "running", status.ID, now)
+		if err != nil {
+			return nil, false, err
+		}
+		if running != nil {
+			if err := finishRetryUpdate(ctx, tx, running, "succeeded", "", nil, now); err != nil {
+				return nil, false, err
+			}
+			timing.ConfirmedUpdateOp = &running.ControlItem
+		}
+	}
+	if retry != nil {
+		if err := finishRetryUpdate(ctx, tx, retry, "succeeded", "", json.RawMessage(`{"already_current":true}`), now); err != nil {
+			return nil, false, err
+		}
+		timing.UpdateOp = &retry.ControlItem
+	}
+	return offer, work, nil
+}
+
+func forceRetryUpdate(ctx context.Context, tx *sql.Tx, now time.Time, owner string, pull inference.Pull, contact worker.Contact,
+	broker worker.UpdateBroker, retry *worker.ControlRecord, timing *inference.PullTiming,
+) (*worker.UpdateOffer, error) {
+	target, _, err := agreedTarget(ctx, tx, now, broker)
+	if err != nil || target == nil {
+		return nil, err
+	}
+	if !target.Advances(contact) {
+		reason := "update_requires_newer_pair"
+		if contact.Contract != target.Contract {
+			reason = "unsupported_worker_migration"
+		}
+		if err := finishRetryUpdate(ctx, tx, retry, "failed", reason, nil, now); err != nil {
+			return nil, err
+		}
+		timing.UpdateOp = &retry.ControlItem
+		return nil, nil
+	}
+	state, err := readWorkerUpdate(ctx, tx, owner)
+	if err != nil {
+		return nil, err
+	}
+	timing.PreviousUpdateState = state.State
+	state.Observe(contact, pull.ScheduledAt, now)
+	if state.Target == nil || *state.Target != *target || state.From != state.Contact {
+		state.Attempt = 0
+	}
+	state.Target, state.ID, state.State, state.Reason = target, pull.Occurrence, "offered", ""
+	state.RetryAt, state.StartedAt, state.From = nil, nil, state.Contact
+	retry.State, retry.StartedAt, retry.UpdateID, retry.RemoteOutcome = "running", &now, state.ID, "unknown"
+	if err := saveControl(ctx, tx, worker.WorkerOp, *retry); err != nil {
+		return nil, err
+	}
+	if err := saveWorkerUpdate(ctx, tx, owner, state); err != nil {
+		return nil, err
+	}
+	timing.UpdateOp, timing.Update = &retry.ControlItem, state
+	return &worker.UpdateOffer{ID: state.ID, Target: *target}, nil
 }

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -71,7 +72,7 @@ func TestNativePullWinnerAndDueWorkUseSeekIndexes(t *testing.T) {
 		{nextModelPullJob, "aaa_pull_queue_model_head", []any{"worker", 0, time.Now().UnixMicro(), 0, "after"}},
 		{betterPullWorkers, "aaa_weekly_usage_rank", []any{80, time.Now().Add(-2 * time.Minute).UnixMicro(), time.Now().UnixMicro(), "1", "", "", worker.UpdateContract}},
 		{exhaustedPullWorkers, "aaa_weekly_usage_rank", []any{time.Now().Add(-2 * time.Minute).UnixMicro(), time.Now().UnixMicro()}},
-		{heldPullJob, "aaa_worker_single_held_turn", []any{"worker"}},
+		{heldPullJob, "sqlite_autoindex_aaa_worker_slots_1", []any{"worker"}},
 		{duePullExperiments, "aaa_experiments_due", []any{time.Now().UnixMicro()}},
 		{duePullPins, "aaa_queued_pins_due", []any{time.Now().UnixMicro()}},
 	} {
@@ -367,7 +368,7 @@ func TestSQLiteUnsafeFileAndSchemaRejections(t *testing.T) {
 	t.Run("ledger", func(t *testing.T) {
 		repo := newRepo(t)
 		execute(t, repo, "UPDATE aaa_schema_migrations SET version=?1 WHERE version=?2", SchemaVersion+1, SchemaVersion)
-		if f := failReason(t, repo.Bootstrap(t.Context()), "schema_version_incompatible"); f.Observed != "6" || f.Expected != "5" {
+		if f := failReason(t, repo.Bootstrap(t.Context()), "schema_version_incompatible"); f.Observed != strconv.Itoa(SchemaVersion+1) || f.Expected != strconv.Itoa(SchemaVersion) {
 			t.Fatal(f)
 		}
 		execute(t, repo, "UPDATE aaa_schema_migrations SET checksum='changed' WHERE version=1")
@@ -490,4 +491,59 @@ func TestDatabaseOpenHonorsDirectoryOwnershipHandoff(t *testing.T) {
 	if err := unix.Flock(fd, unix.LOCK_EX|unix.LOCK_NB); err != nil {
 		t.Fatal("closed broker retained its shared lock", err)
 	}
+}
+
+func TestMigrationSixCarriesExistingHoldAndFencesEveryLane(t *testing.T) {
+	repo := openRepo(t, privatePath(t))
+	for i := range 5 {
+		execute(t, repo, migrations[i])
+		execute(t, repo, "INSERT INTO aaa_schema_migrations(version,checksum) VALUES(?1,?2)", i+1, migrationChecksums[i])
+	}
+	enroll(t, repo, "worker")
+	ref := seedRequest(t, repo, "pre-migration", "worker", false)
+	execute(t, repo, "UPDATE aaa_inference_jobs SET held=1,state='claimed' WHERE id=?1", ref.JobID)
+	if err := repo.Bootstrap(t.Context()); err != nil {
+		t.Fatal(Classify(err).Detail())
+	}
+	slot := func(lane, id string) {
+		t.Helper()
+		var gotLane, gotID string
+		if err := repo.db.QueryRowContext(t.Context(), "SELECT lane,item_id FROM aaa_worker_slots WHERE worker_id='worker'").Scan(&gotLane, &gotID); err != nil || gotLane != lane || gotID != id {
+			t.Fatalf("slot = %s/%s, want %s/%s, error %v", gotLane, gotID, lane, id, err)
+		}
+	}
+	slot("inference", ref.JobID)
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	record := worker.ControlRecord{ControlItem: worker.ControlItem{ID: "op", WorkerID: "worker", Kind: worker.Doctor, State: "claimed",
+		Held: true, Claim: &worker.ControlGrant{ClaimID: "op-claim", Generation: 1}, CreatedAt: now, ClaimedAt: &now, DeadlineAt: now.Add(time.Minute)}}
+	save := func(lane string, record worker.ControlRecord) error {
+		return repo.write(t.Context(), func(tx *sql.Tx) error { return saveControl(t.Context(), tx, lane, record) })
+	}
+	if err := save(worker.WorkerOp, record); err == nil {
+		t.Fatal("worker operation acquired a slot occupied by migrated inference")
+	}
+	slot("inference", ref.JobID)
+	execute(t, repo, "UPDATE aaa_inference_jobs SET state='interrupted',held=0 WHERE id=?1", ref.JobID)
+	if err := save(worker.WorkerOp, record); err != nil {
+		t.Fatal(err)
+	}
+	slot(worker.WorkerOp, record.ID)
+	record.ID, record.Kind, record.Prompt = "agent-task", "", "fixture"
+	if err := save(worker.AgentTask, record); err == nil {
+		t.Fatal("agent task acquired a slot occupied by a worker operation")
+	}
+	execute(t, repo, "DELETE FROM aaa_worker_ops WHERE id='op'")
+	if err := save(worker.AgentTask, record); err != nil {
+		t.Fatal(err)
+	}
+	slot(worker.AgentTask, record.ID)
+	if _, err := repo.db.ExecContext(t.Context(), "UPDATE aaa_inference_jobs SET held=1 WHERE id=?1", ref.JobID); err == nil {
+		t.Fatal("inference acquired a slot occupied by a task")
+	}
+	record.Held, record.State = false, "completed"
+	if err := save(worker.AgentTask, record); err != nil {
+		t.Fatal(err)
+	}
+	execute(t, repo, "UPDATE aaa_inference_jobs SET state='claimed',held=1 WHERE id=?1", ref.JobID)
+	slot("inference", ref.JobID)
 }

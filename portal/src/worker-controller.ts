@@ -1,3 +1,4 @@
+import { WorkerRemoteController } from './worker-remote-controller';
 import { APIError, type API, type BrowserReport } from './api';
 import type { System } from './controller';
 import type { Reports } from './reports';
@@ -47,13 +48,19 @@ export class WorkersController {
   #expiry = () => {};
   #visibility = () => {};
   #offlineTick: (() => void) | undefined;
+  readonly remote?: WorkerRemoteController;
   constructor(private api: API, private system: System, private reports: Reports, private authorized: () => boolean,
-    private denied: (requestID: string, operationID: string) => void, private clipboard: (text: string) => Promise<void> = browserCopy) {}
+    private denied: (requestID: string, operationID: string) => void, private clipboard: (text: string) => Promise<void> = browserCopy) {
+    if (api.workerRemote) this.remote = new WorkerRemoteController(api.workerRemote, system, reports, () => this.available(),
+      () => !this.#view.stale && !this.#view.pending && this.#view.lastGood !== null && system.now() - this.#view.lastGood < 60_000, denied);
+  }
 
   snapshot = () => this.#view;
   subscribe = (listener: () => void) => { this.#listeners.add(listener); return () => { this.#listeners.delete(listener); }; };
   private change(patch: Partial<WorkersView>) {
+    const previous = this.#view.selectedID;
     this.#view = { ...this.#view, ...patch };
+    if (previous !== this.#view.selectedID) this.remote?.select(this.#view.selectedID);
     this.syncOfflineClock();
     for (const listener of this.#listeners) listener();
   }
@@ -75,6 +82,7 @@ export class WorkersController {
   reset() {
     this.#unconfirmedRevoke = '';
     this.#active = false;
+    this.remote?.reset();
     this.#generation++;
     this.#abort.abort(); this.#abort = new AbortController();
     this.#poll(); this.#freshness(); this.#expiry(); this.#visibility();

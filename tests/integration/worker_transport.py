@@ -68,6 +68,47 @@ printf '%s\n' 'Usage: {percent}% of free weekly limit.' 'Weekly limit resets Nov
         require(len(starts) == 1 and starts[0]["claim_id"] == grant["claim_id"], "start reply loss exposed another brief")
         self.receipt("worker.start_reply_held", starts=1, second_brief=False, hold_retained=True)
 
+    def remote_operations(self, worker):
+        doctor = self.worker_control(worker, "ops", {"protocol_version": 1, "submission_id": "controlled-doctor", "kind": "doctor"})
+        require(self.tick(worker)["outcome"] == "worker_op_settled", "doctor emitted a wake or failed to settle")
+        doctor = self.worker_control(worker, "ops/" + doctor["id"])
+        require(doctor["state"] == "succeeded" and doctor["result"]["state_permissions"] == "verified" and
+                int(doctor["result"]["available_bytes"]) > 0, "doctor did not inspect the packed worker")
+        since = utc_stamp()
+        scope = "Bearer ControlledBearerCanary1234567890"
+        dense = ('"' + chr(92) + "<>&") * 25000
+        for index in range(4):
+            prompt = "Return the controlled output fixture"
+            task = self.worker_control(worker, "agent-tasks", {"protocol_version": 1, "submission_id": f"transport-task-{index}", "prompt": prompt})
+            _, brief = self.start_agent_task(worker, task)
+            require(brief["prompt"] == prompt, "task input changed before authorized delivery")
+            raw = self.native_cli(worker, "hook-task-finish", "--task-id", task["id"], "--input", "-",
+                                  input_text=json.dumps({"result_text": dense + scope, "summary": "controlled output"}))
+            require(json.loads(raw)["outcome"] == "accepted", "bounded task result was rejected")
+            detail = self.worker_control(worker, "agent-tasks/" + task["id"])
+            require(detail["held"] and detail["result"]["result_text"].endswith("[REDACTED]"), "result leaked a credential or released the hold")
+            require(self.tick(worker)["outcome"] == "background_task_settled", "the accepted task result did not settle")
+        params = {"since": since, "decode": True}
+        request = {"protocol_version": 1, "submission_id": "bounded-output-one", "kind": "diagnostics_export", "params": params}
+        submitted = self.worker_control(worker, "ops", request)
+        require(self.tick(worker)["outcome"] == "worker_op_settled", "bounded export failed or woke Muse")
+        detail = self.worker_control(worker, "ops/" + submitted["id"])
+        result = detail["result"]
+        require(detail["state"] == "succeeded" and detail["result_bytes"] <= 512 * 1024 and result["truncated"] and
+                not result["complete"] and result["next_cursor"] and result["omissions"], "dense JSON export lost its bound or honest cursor")
+        self.assert_private(json.dumps(result), extra=(scope,))
+        second = self.worker_control(worker, "ops", {**request, "submission_id": "bounded-output-two",
+                                                        "params": {**params, "cursor": result["next_cursor"]}})
+        require(self.tick(worker)["outcome"] == "worker_op_settled", "continuation failed")
+        continuation = self.worker_control(worker, "ops/" + second["id"])
+        require(continuation["state"] == "succeeded" and continuation["result"]["output"] != result["output"], "continuation repeated the prior page")
+        evidence = self.export_operation(submitted["id"])
+        exchange = next(record for record in evidence if record.get("msg") == "worker_op.exchange" and record.get("input_omitted"))
+        read = next(record for record in evidence if record.get("response_capture") == "worker_op_result_omitted")
+        require(exchange["truncated"] and exchange["result_bytes"] <= 512 * 1024 and "input" not in exchange and not read["response"],
+                "diagnostics output amplified protected capture")
+        self.receipt("worker.typed_operations_and_bounded_diagnostics", doctor=True, task_count=4, redacted=True, paginated=True, capture_complete=True)
+
     def exercise(self):
         worker = self.environment("transport-hook")
         self.install(worker, self.prompt())
@@ -140,6 +181,7 @@ printf '%s\n' 'Usage: {percent}% of free weekly limit.' 'Weekly limit resets Nov
                 len(starts) == 2 and all(any(e.get("request_id") == start["request_id"] and e["msg"] == "job.work_started"
                     for e in remote) for start in starts), "protected captures could not reconstruct the wrong invocation and two authorized turns")
         self.receipt("worker.hook_transport_and_tool_loop", wake_count=2, refusals=2, busy_work_pulls=0, capture_complete=True)
+        self.remote_operations(worker)
 
 
 if __name__ == "__main__":

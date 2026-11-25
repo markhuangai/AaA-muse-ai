@@ -38,6 +38,19 @@ func inferenceRoute(path string) (string, string) {
 	return "unmatched", ""
 }
 
+func readNativeInterruption(header http.Header) (*inference.InterruptionEvidence, error) {
+	values := header.Values("X-Muse-Interruption")
+	if len(values) == 0 {
+		return nil, nil
+	}
+	status, failure, _ := strings.Cut(values[0], "/")
+	observation, valid := inference.ParseNativeInterruptionEvidence(status, failure)
+	if len(values) != 1 || !valid {
+		return nil, inference.Reject("invalid_interruption_evidence", 400)
+	}
+	return &observation, nil
+}
+
 func inferenceError(w http.ResponseWriter, err error) {
 	code, reason := 503, "service_unavailable"
 	var rejected *inference.Rejection
@@ -97,6 +110,11 @@ func (h *Handler) inferenceRequest(w *response, r *http.Request, logger *slog.Lo
 			input.WeeklyUsage = readWeeklyUsage(r.Header, logger)
 			oldProof, hookProof := r.Header.Values("X-Muse-Worker-Start-Proof"), r.Header.Values("X-Muse-Worker-Hook-Proof")
 			input.VerifyHookStart, input.ObserveLegacy = hookRequest(r), !hookRequest(r)
+			input.AgentTasks, err = workerTaskCapability(r)
+			if err != nil {
+				logger.Warn("worker.pull_rejected", "reason", "invalid_worker_capabilities")
+				break
+			}
 			if (input.VerifyHookStart && (len(oldProof) != 0 || len(hookProof) != 1 || hookProof[0] != "1")) ||
 				(input.ObserveLegacy && (len(hookProof) != 0 || (len(oldProof) != 0 && (len(oldProof) != 1 || oldProof[0] != "1")))) {
 				err = inference.Reject("invalid_native_start_capability", 400)
@@ -143,16 +161,15 @@ func (h *Handler) inferenceRequest(w *response, r *http.Request, logger *slog.Lo
 		err = decodeInferenceInput(body, &input, "protocol_version", "submission_id", "claim_id", "generation", "launch_id", "native_job_id", "native_run_id", "reason")
 		if err == nil {
 			var evidence []inference.InterruptionEvidence
-			if values := r.Header.Values("X-Muse-Interruption"); len(values) != 0 {
-				status, failure, _ := strings.Cut(values[0], "/")
-				observation, valid := inference.ParseNativeInterruptionEvidence(status, failure)
-				if len(values) != 1 || !valid {
-					err = inference.Reject("invalid_interruption_evidence", 400)
-					break
-				}
+			observation, evidenceErr := readNativeInterruption(r.Header)
+			if evidenceErr != nil {
+				err = evidenceErr
+				break
+			}
+			if observation != nil {
 				logger.Debug("worker.interruption_evidence", "job_id", id, "claim_id", input.ClaimID,
 					"native_job_id", input.NativeJob, "native_run_id", input.NativeRun, "submission_id", input.SubmissionID, "evidence", observation)
-				evidence = append(evidence, observation)
+				evidence = append(evidence, *observation)
 			}
 			result, err = h.Broker.InterruptWork(r.Context(), logger, identity.ID, id, input, evidence...)
 		}

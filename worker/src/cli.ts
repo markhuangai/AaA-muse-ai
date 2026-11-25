@@ -14,10 +14,11 @@ import { CronUpdate } from './cron-update.js';
 import { HookRunner, type EmitHook } from './hook.js';
 import { HookSetup, hookTimeoutSeconds, pollSeconds, watchdogEvery } from './hook-setup.js';
 import { HookWatchdog } from './hook-watchdog.js';
+import { preflightLegacyUpdate } from './update-archive.js';
 
 import { VERSION } from './version.js';
 export { VERSION } from './version.js';
-const help = 'aaa-muse-worker setup --origin HTTPS_ORIGIN --code-stdin --install-dir ABSOLUTE_PATH --setup-id ID --archive-digest SHA256 | hook-describe --goal-id ID | hook-authorize-registration --input FILE|- | hook-confirm --input FILE|- | hook-check | hook-start --launch-id ID --run-id ID | hook-abort --launch-id ID --run-id ID --reason REASON | watchdog-check | cron-producer-intent --launch-id ID | status | doctor | media-finish --job-id ID | decision-submit --job-id ID --input FILE|- | diagnostics-export [--operation-id ID] [--request-id ID] [--since RFC3339] [--until RFC3339] [--decode]\nCommon: --state-dir ABSOLUTE_PATH, --help, --version\n';
+const help = 'aaa-muse-worker setup --origin HTTPS_ORIGIN --code-stdin --install-dir ABSOLUTE_PATH --setup-id ID --archive-digest SHA256 | hook-describe --goal-id ID | hook-upgrade-describe --worker-id ID --goal-id ID | hook-authorize-registration --input FILE|- | hook-confirm --input FILE|- | hook-check | hook-start --launch-id ID --run-id ID | hook-abort --launch-id ID --run-id ID --reason REASON | hook-task-start --launch-id ID --run-id ID | hook-task-finish --task-id ID --input FILE|- | hook-task-abort --launch-id ID --run-id ID --reason REASON [--summary TEXT] | watchdog-check | cron-producer-intent --launch-id ID | status | doctor | media-finish --job-id ID | decision-submit --job-id ID --input FILE|- | diagnostics-export [--operation-id ID] [--request-id ID] [--since RFC3339] [--until RFC3339] [--decode]\nCommon: --state-dir ABSOLUTE_PATH, --help, --version\n';
 export interface Adapters {
   files: Files;
   system: System;
@@ -28,6 +29,7 @@ export interface Adapters {
   home(): string;
   nodeVersion: string;
   parentPid?: number;
+  legacyUpdateState?(): Promise<string | undefined>;
   input(file: string): Promise<string>;
   stdout(line: string): void;
   stderr(line: string): void;
@@ -42,6 +44,9 @@ export function argumentsFor(args: string[]): { command: string; flags: Record<s
     setup: ['origin', 'code-stdin', 'install-dir', 'setup-id', 'bootstrap', 'archive-digest'],
     'decision-submit': ['job-id', 'input'], 'diagnostics-export': ['operation-id', 'request-id', 'since', 'until', 'decode'],
     'hook-describe': ['goal-id'], 'hook-authorize-registration': ['input'], 'hook-confirm': ['input'], 'hook-check': [],
+    'hook-upgrade-describe': ['worker-id', 'goal-id'],
+    'hook-task-start': ['launch-id', 'run-id'], 'hook-task-finish': ['task-id', 'input'],
+    'hook-task-abort': ['launch-id', 'run-id', 'reason', 'summary'],
     'hook-start': ['launch-id', 'run-id'], 'hook-abort': ['launch-id', 'run-id', 'reason'], 'watchdog-check': [],
     'cron-producer-intent': ['launch-id'],
     'cron-producer-bind': ['launch-id', 'producer-id'],
@@ -67,7 +72,16 @@ export async function execute(args: string[], io: Adapters): Promise<number> {
     const flags = parsed.flags;
     setupID = typeof flags['setup-id'] === 'string' && /^[0-9a-f]{32}$/.test(flags['setup-id']) ? flags['setup-id'] : undefined;
     if (command === '--help' || flags.help) { io.stdout(help); return 0; }
-    if (command === '--version' || flags.version) { io.stdout(VERSION + '\n'); return 0; }
+    if (command === '--version' || flags.version) {
+      // The published updater invokes the staged candidate with only --version.
+      if (args.length === 1 && io.env.HATCH_HOOK_RUNTIME && io.env.HATCH_HOOK_ID) {
+        const setup = io.setup ?? installationIO(io.home());
+        const inherited = await io.legacyUpdateState?.();
+        if (inherited) await preflightLegacyUpdate(setup, new State(inherited, io.files, io.system), VERSION, io.env.HATCH_HOOK_ID);
+      }
+      io.stdout(VERSION + '\n');
+      return 0;
+    }
     const match = /^v(\d+)\.(\d+)\./.exec(io.nodeVersion);
     requireValue(match && (Number(match[1]) > 22 || (Number(match[1]) === 22 && Number(match[2]) >= 12)), 'node_22_12_required');
     const xdg = io.env.XDG_STATE_HOME;
@@ -108,6 +122,9 @@ export async function execute(args: string[], io: Adapters): Promise<number> {
       case 'hook-describe':
         result = await hookSetup.describe(identifier(flags['goal-id'] as string));
         break;
+      case 'hook-upgrade-describe':
+        result = await hookSetup.describeUpgrade(identifier(flags['worker-id'] as string), identifier(flags['goal-id'] as string));
+        break;
       case 'hook-confirm':
       case 'hook-authorize-registration': {
         requireValue(typeof flags.input === 'string', 'hook_input_required');
@@ -125,6 +142,18 @@ export async function execute(args: string[], io: Adapters): Promise<number> {
       case 'hook-abort':
         requireValue(typeof flags['run-id'] === 'string' && typeof flags.reason === 'string', 'hook_abort_options_required');
         result = await hook.abort(identifier(flags['launch-id'] as string), flags['run-id'], flags.reason);
+        break;
+      case 'hook-task-start':
+        requireValue(typeof flags['run-id'] === 'string', 'hook_run_id_required');
+        result = await hook.tasks.start(identifier(flags['launch-id'] as string), flags['run-id']);
+        break;
+      case 'hook-task-finish':
+        requireValue(typeof flags.input === 'string', 'task_result_input_required');
+        result = await hook.tasks.finish(identifier(flags['task-id'] as string), await io.input(flags.input));
+        break;
+      case 'hook-task-abort':
+        requireValue(typeof flags['run-id'] === 'string' && typeof flags.reason === 'string', 'hook_abort_options_required');
+        result = await hook.tasks.abort(identifier(flags['launch-id'] as string), flags['run-id'], flags.reason, (flags.summary as string | undefined) ?? '');
         break;
       case 'watchdog-check':
         result = await new HookWatchdog(worker).check();
@@ -189,6 +218,10 @@ export async function main(args = process.argv.slice(2)): Promise<number> {
   try {
     return await execute(args, {
       files: fs, system, env: process.env, home: homedir, nodeVersion: process.version, parentPid: process.ppid, signal: controller.signal,
+      async legacyUpdateState() {
+        const args = (await fs.readFile(`/proc/${process.ppid}/cmdline`, 'utf8')).slice(0, -1).split('\0');
+        if (args[2] === 'hook-check' && args.at(-2) === '--state-dir') return args.at(-1);
+      },
       stdout: line => { process.stdout.write(line); }, stderr: line => { process.stderr.write(line); },
       async metadata() { return object(parse(await fs.readFile(fileURLToPath(new URL('./build.json', import.meta.url)), 'utf8'))); },
       async input(file) {

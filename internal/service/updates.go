@@ -72,6 +72,9 @@ func (b *Broker) ApplyWorkerUpdate(ctx context.Context, logger *slog.Logger, cre
 	logger = logger.With("worker_id", id, "operation_id", input.ID, "stage", input.Action,
 		"attempt", state.Attempt, "duration_ms", b.now().Sub(started).Milliseconds(),
 		"reported_version", contact.Version, "observed_digest", contact.Digest, "expected_digest", input.Target.SHA256, "target_version", input.Target.Version)
+	if op := state.ControlOp; op != nil && err == nil && !replayed {
+		logger.Info("worker_op.completed", append(controlLogFields(*op), "update_id", input.ID)...)
+	}
 	logger.Debug("worker.update_exchange", "input", input, "observed", contact, "result", state, "replayed", replayed)
 	if err != nil {
 		var rejected *inference.Rejection

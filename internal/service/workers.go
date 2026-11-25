@@ -235,9 +235,21 @@ func (s *Workers) Revoke(ctx context.Context, logger *slog.Logger, id string) (w
 	logger, started := workerLogger(logger, "worker.revoke").With("worker_id", id), s.now()
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	before, w, err := s.repo.RevokeWorker(ctx, id)
+	var before, w worker.Record
+	var interrupted []worker.ControlItem
+	var err error
+	if repo, ok := s.repo.(interface {
+		RevokeWorkerWithControl(context.Context, string) (worker.Record, worker.Record, []worker.ControlItem, error)
+	}); ok {
+		before, w, interrupted, err = repo.RevokeWorkerWithControl(ctx, id)
+	} else {
+		before, w, err = s.repo.RevokeWorker(ctx, id)
+	}
 	if err != nil {
 		return w, s.failed(logger, err, started)
+	}
+	for _, item := range interrupted {
+		logInterruptedControl(logger, item)
 	}
 	logger.Debug("worker.revoke_exchange", "before", before, "after", w)
 	logger.Info("worker.revoked", "worker", w, "transaction_outcome", "committed", "duration_ms", s.now().Sub(started).Milliseconds())

@@ -155,7 +155,7 @@ class TLSFixture:
                                "Forwarded", "X-Forwarded-Host",
                                "X-Request-Id", "X-Portal-Operation-Id", "X-Muse-Enrollment-Operation", "X-Muse-Enrollment-Attempt",
                                "X-Muse-Worker-Version", "X-Muse-Worker-Updater", "X-Muse-Worker-SHA256", "X-Muse-Interruption",
-                               "X-Muse-Worker-Start-Proof", "X-Muse-Worker-Hook-Proof",
+                               "X-Muse-Worker-Start-Proof", "X-Muse-Worker-Hook-Proof", "X-Muse-Worker-Agent-Tasks",
                                "X-Muse-Worker-Model-Report", "X-Muse-Worker-Weekly-Usage", "X-Muse-Media-Jobs", "X-Muse-Prompt-Wav",
                                "X-Muse-Artifact-Sha256", "X-Muse-Artifact-Size", "X-Muse-Connection-Id", "X-Muse-Connection-Generation",
                                "X-Muse-Generation", "X-Muse-Lease-Id") if key in self.headers}

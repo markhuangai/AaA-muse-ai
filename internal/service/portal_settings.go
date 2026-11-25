@@ -126,7 +126,7 @@ func (r PortalReport) valid() bool {
 	}
 	if r.Event == "portal.worker_state_stale" {
 		return common && r.Component == "workers" && r.Expected == "fresh" && r.Observed == "stale" &&
-			oneOf(r.Cause, "request_failed", "request_timeout", "service_unavailable", "stale_data", "obsolete_response") &&
+			oneOf(r.Cause, "request_failed", "request_timeout", "service_unavailable", "stale_data", "obsolete_response", "invalid_response") &&
 			(r.WorkerID == "" || portalWorkerID.MatchString(r.WorkerID)) && r.RequestSequence >= 1 && r.RequestSequence <= 9007199254740991 &&
 			r.AcceptedSequence >= 0 && r.AcceptedSequence <= 9007199254740991 && r.SessionGeneration >= 0 && r.SessionGeneration <= 9007199254740991 &&
 			r.LatestSequence >= r.RequestSequence && r.LatestSequence >= r.AcceptedSequence && r.LatestSequence <= 9007199254740991

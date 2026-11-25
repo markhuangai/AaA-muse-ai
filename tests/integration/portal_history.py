@@ -164,20 +164,20 @@ class PortalHistory(Portal, Routing):
             if boundary == "safe":
                 self.silence(worker, 605)
             pending, _ = self.submit({**self.request_input(timeout=1800), "messages": canonical + [suffix]}, request["session_id"])
-            old = self.experiment(pending["id"])
-            if boundary == "granted":
-                require(peer.poll()["job_id"] == old["current_job_id"], "grant did not preserve the pin")
-            if boundary == "started":
-                self.claim(worker, peer, old)
             if boundary == "safe":
                 require(self.worker_projection(worker)[0]["connection_status"] == "offline", "silent pin did not go offline")
-                self.until(lambda: self.experiment(pending["id"])["current_job_id"] != old["current_job_id"], "safe pin was not released", timeout=15)
+                self.wait_for_pin_replacement(pending, worker)
                 self.checked("/api/v1/admin/workers/" + worker["worker"]["id"], self.admin, "PATCH", {"name": "Previous worker renamed now"})
                 self.checked("/api/v1/admin/workers/" + replacement["worker"]["id"], self.admin, "PATCH", {"name": "Replacement worker renamed now"})
                 self.deliver(replacement, replacement_peer, pending, {"type": "final", "text": "Full-history replacement"})
                 require(self.read_native(pending)[0]["worker_id"] == replacement["worker"]["id"], "safe replacement did not acquire the pin")
                 require(self.detail(pending)["delivery"]["messages"] == canonical + [suffix], "safe replacement did not retain full context")
             else:
+                old = self.experiment(pending["id"])
+                if boundary == "granted":
+                    require(peer.poll()["job_id"] == old["current_job_id"], "grant did not preserve the pin")
+                if boundary == "started":
+                    self.claim(worker, peer, old)
                 self.silence(worker, 605)
                 require(replacement_peer.poll() is None, "other worker acquired a held or tool-owned pin")
                 current, _ = self.read_native(pending)

@@ -25,7 +25,7 @@ type Redactor struct {
 	current func() *Redactor
 }
 
-var credentialPattern = regexp.MustCompile(`muse_(?:enroll|worker|portal|download)_[A-Za-z0-9_-]{43}|aaa_muse_ai_[a-f0-9]{64}`)
+var credentialPattern = regexp.MustCompile(`muse_(?:enroll|worker|portal|download)_[A-Za-z0-9_-]{43}|aaa_muse_ai_[a-f0-9]{64}|(?i:\bBearer[[:space:]]+[A-Za-z0-9._~+/=-]{16,})`)
 
 func RedactWorkerSecrets(value string) string {
 	return (&Redactor{}).text(value)
@@ -221,4 +221,23 @@ func Cause(err error) string {
 		return "filesystem_path_missing"
 	}
 	return "capture_io_failed"
+}
+
+func (r *Redactor) JSON(raw json.RawMessage) (json.RawMessage, error) {
+	if r.current != nil {
+		return r.current().JSON(raw)
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	var value any
+	if err := decoder.Decode(&value); err != nil {
+		return nil, err
+	}
+	var buffer bytes.Buffer
+	encoder := json.NewEncoder(&buffer)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(r.value("", value)); err != nil {
+		return nil, err
+	}
+	return bytes.TrimSuffix(buffer.Bytes(), []byte("\n")), nil
 }

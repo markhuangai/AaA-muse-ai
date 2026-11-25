@@ -1,3 +1,4 @@
+import { WorkerRemoteAPI } from './worker-remote-api';
 import { isEnrollment, isWorker, object, type Enrollment, type EnrollmentKind, type Worker } from './worker-api';
 import { historyID, historyCursor, isDetail, isExecution, isHistoryPage, isSummary, isTimelineEntry, parseRecordedJSON, type Execution, type HistoryPage, type RequestDetail, type RequestSummary, type TimelineEntry } from './history-api';
 
@@ -55,6 +56,7 @@ export class APIError extends Error {
 }
 
 export interface API {
+  readonly workerRemote?: WorkerRemoteAPI;
   login(password: string, remember: boolean, operation: string, signal: AbortSignal): Promise<void>;
   restore(operation: string, signal: AbortSignal): Promise<void>;
   logout(operation: string, signal: AbortSignal): Promise<void>;
@@ -72,6 +74,7 @@ export interface API {
 }
 
 export class BrowserAPI implements API {
+  readonly workerRemote = new WorkerRemoteAPI((...args) => this.request(...args));
   constructor(private fetcher: typeof fetch = globalThis.fetch.bind(globalThis), private timer: Schedule = schedule,
     private origin = () => globalThis.location.origin) {}
   private async request(path: string, method: string, operation: string, signal: AbortSignal, body?: unknown, parse: (source: string) => unknown = JSON.parse) {
@@ -93,7 +96,11 @@ export class BrowserAPI implements API {
           if (object(data) && ['invalid_worker_name', 'worker_not_found', 'worker_package_unconfigured', 'https_origin_required',
             'invalid_client_key', 'client_key_conflict', 'client_key_save_failed', 'client_key_save_uncertain',
             'history_not_found', 'invalid_cursor', 'experiment_already_completed', 'inference_not_found', 'submission_conflict',
-            'invalid_session', 'portal_session_unavailable', 'session_capacity_exhausted'].includes(String(data.error))) reason = String(data.error);
+            'invalid_session', 'portal_session_unavailable', 'session_capacity_exhausted',
+            'worker_revoked', 'unsupported_worker_migration', 'worker_update_required', 'worker_op_queue_full',
+            'worker_op_already_pending', 'worker_op_not_found', 'worker_op_already_terminal', 'agent_task_queue_full',
+            'worker_agent_tasks_unsupported', 'agent_task_not_found', 'agent_task_already_terminal', 'worker_already_paired',
+            'update_requires_newer_pair', 'update_target_unavailable'].includes(String(data.error))) reason = String(data.error);
         } catch { /* Error bodies are untrusted; retain the HTTP classification. */ }
         const retry = Number(response.headers.get('Retry-After'));
         throw new APIError(reason, response.status, requestID, Number.isFinite(retry) ? Math.max(0, Math.min(3600, retry)) : 0);

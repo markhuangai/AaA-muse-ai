@@ -2,6 +2,7 @@
 import argparse
 import hashlib
 import http.server
+import io
 import json
 import os
 from pathlib import Path
@@ -9,6 +10,7 @@ import shutil
 import ssl
 import subprocess
 import threading
+import tarfile
 import time
 import urllib.parse
 import urllib.request
@@ -25,6 +27,10 @@ STOCK_SHA = "86af219e72b7ac44ce19c41ca7557277d299132d49de2f1dab9240c6834baf14"
 ARCHIVED_1_1 = "ghcr.io/markhuangai/aaa-muse-ai@sha256:ba41ab48c3a1d346140af03327a4e684e855d1b8b352b65cd0b266ee4622e172"
 ARCHIVED_1_1_SHA = "9cb8c77e7c0825f19e6c12ea4e8f36f2b20556ff559bae20848b3e618029fd66"
 RC, NEXT, STABLE = "1.2.0-rc.2", "1.2.0-rc.10", "1.2.0"
+PUBLISHED = "1.1.1-rc.1"
+PUBLISHED_IMAGE = "ghcr.io/markhuangai/aaa-muse-ai@sha256:abcd447e82d93ae50673a14f448dc61718f4dc8bccd36dc7efab6bf66a738f66"
+PUBLISHED_SHA = "b75b6be0788e453315c6681bba90f25e205f5ab43c226bf214d5cd431ee9eb5b"
+BROKEN = "1.2.0-rc.1"
 
 
 class Releases:
@@ -114,7 +120,7 @@ class Updates(WorkerSetup):
     def packages(self):
         releases = {}
         root = Path.cwd()
-        for version in (RC, NEXT, STABLE):
+        for version in (BROKEN, RC, NEXT, STABLE):
             env = {**os.environ, "WORKER_RELEASE_VERSION": version}
             worker = root / "worker"
             with (self.root / ("build-" + version + ".log")).open("w") as log:
@@ -122,8 +128,12 @@ class Updates(WorkerSetup):
                 subprocess.run(["node", "scripts/package.mjs"], cwd=worker, stdout=log, stderr=subprocess.STDOUT, check=True, timeout=60)
             receipt = json.loads((root / ".artifacts/worker-package/latest.json").read_text())
             require(receipt["source"]["source_sha"] == self.args.source_sha and receipt["version"] == version, "packed release source mismatch")
+            if version == BROKEN:
+                archive = self.invalid_hook_archive(receipt["archive"])
+                receipt = {**receipt, "archive": str(archive), "sha256": hashlib.sha256(archive.read_bytes()).hexdigest()}
             releases[version] = {**receipt, "image": self.build_image(root, version, receipt["sha256"])}
-        for version, image, digest in (("1.0.0", STOCK, STOCK_SHA), ("1.1.0", ARCHIVED_1_1, ARCHIVED_1_1_SHA)):
+        published = (("1.0.0", STOCK, STOCK_SHA), ("1.1.0", ARCHIVED_1_1, ARCHIVED_1_1_SHA), (PUBLISHED, PUBLISHED_IMAGE, PUBLISHED_SHA))
+        for version, image, digest in published:
             archive = self.root.resolve() / ("published-" + version + ".tgz")
             url = "https://github.com/markhuangai/AaA-muse-ai/releases/download/v" + version + "/markhuangai-aaa-muse-worker-" + version + ".tgz"
             with urllib.request.urlopen(url, timeout=40) as stream:
@@ -134,9 +144,21 @@ class Updates(WorkerSetup):
             releases[version] = {"image": image, "sha256": digest, "version": version, "archive": str(archive)}
         return releases
 
-    def paired(self, version, primary=True):
+    def invalid_hook_archive(self, source):
+        result = self.root.resolve() / "invalid-hook-worker.tgz"
+        with tarfile.open(source, "r:gz") as original, tarfile.open(result, "w:gz") as changed:
+            for member in original:
+                stream = original.extractfile(member) if member.isfile() else None
+                if member.name == "package/setup/hook.sh":
+                    payload = stream.read() + b"\nif (then\n"
+                    member.size = len(payload)
+                    stream = io.BytesIO(payload)
+                changed.addfile(member, stream)
+        return result
+
+    def paired(self, version, primary=True, state_volume=None):
         self.args.image = self.releases[version]["image"]
-        instance, address, _ = self.launch()
+        instance, address, _ = self.launch(state_volume=state_volume)
         self.ready(instance, address)
         self.worker_pairs.pop(address, None)
         if primary:
@@ -301,6 +323,78 @@ class Updates(WorkerSetup):
             self.stop(other)
         self.receipt("worker_updates.mixed_release_pins", update_deferred=True, archived_workers_unchanged=True)
 
+    def published_install(self):
+        self.paired(PUBLISHED)
+        worker = self.environment("published-first-hop")
+        self.install(worker, self.prompt())
+        goal = "controlled-goal-" + worker["worker"]["id"]
+        definition = json.loads(self.native_cli(worker, "hook-describe", "--goal-id", goal))
+        hook, watchdog = definition["hook"], definition["watchdog"]
+        require(watchdog["every"] == "1h", "published worker did not retain its hourly watchdog")
+        worker.update({"checker": hook["id"], "tick_number": 0})
+        dry_run = json.loads(self.hook(worker, dry=True).stdout)
+        require(dry_run["action"] == "silent", "published hook dry run was not silent")
+        readback = {"goal_id": goal, "complete": True, "dry_run": "silent", "hooks": [hook],
+                    "watchdogs": [{**watchdog, "native_job_id": "controlled-published-watchdog"}]}
+        require(self.registration(worker, "hook-confirm", readback)["outcome"] == "registered",
+                "published worker could not verify its native registration")
+        require(self.tick(worker)["outcome"] == "idle", "published worker could not authenticate")
+        record = json.loads((worker["state"] / "installation.json").read_text())
+        require("skill_path" not in record, "published fixture was not the original installation")
+        return worker
+
+    def published_first_hop(self, worker):
+        credential = worker["credential"]
+        paths = [worker["home"] / "hooks/scripts" / worker["checker"] / "detector.sh",
+                 worker["home"] / "workspace/skills" / worker["checker"] / "SKILL.md",
+                 worker["home"] / ".local/share/aaa-muse-worker-hook-v1/bin/aaa-muse-worker"]
+        before = [path.read_bytes() for path in paths]
+        require(self.tick(worker)["outcome"] == "update_failed" and before == [path.read_bytes() for path in paths],
+                "published updater activated a pinned archive with an invalid shell template")
+        self.record_update(worker, "failed", PUBLISHED)
+        self.allow_pair(RC)
+        paths[1].parent.chmod(0o500)
+        try:
+            require(self.tick(worker)["outcome"] == "update_failed" and before == [path.read_bytes() for path in paths],
+                    "published updater activated with an unwritable skill directory")
+        finally:
+            paths[1].parent.chmod(0o700)
+        failed = self.record_update(worker, "failed", PUBLISHED)
+        require(failed["retry_at"], "directory failure did not establish backoff")
+        self.assets.mode = "corrupt"
+        try:
+            first = self.worker_control(worker, "ops", {"protocol_version": 1, "submission_id": "legacy-retry-backoff", "kind": "retry_update"})
+            require(self.tick(worker)["outcome"] == "update_failed", "retry did not bypass the scheduled backoff")
+            details = self.worker_control(worker, "ops/" + first["id"])
+            require(details["state"] == "failed" and details["reason"] == "archive_digest_mismatch", "failed retry did not settle atomically")
+        finally:
+            self.assets.mode = ""
+        second = self.worker_control(worker, "ops", {"protocol_version": 1, "submission_id": "legacy-retry-manual", "kind": "retry_update"})
+        require(self.tick(worker)["outcome"] == "update_awaiting_confirmation", "retry did not bypass nil RetryAt")
+        self.tick(worker)
+        self.record_update(worker, "confirmed", RC)
+        done = self.worker_control(worker, "ops/" + second["id"])
+        require(done["state"] == "succeeded" and not done["held"], "fresh paired pull did not settle the bound retry")
+        installation = json.loads((worker["state"] / "installation.json").read_text())
+        for key, path, mode in (("detector_sha256", paths[0], 0o700), ("skill_sha256", paths[1], 0o600)):
+            require(installation[key] == hashlib.sha256(path.read_bytes()).hexdigest() and path.stat().st_mode & 0o777 == mode,
+                    "first-hop asset digest or mode differs")
+        require("skill_path" in installation and credential == (worker["state"] / "credential.key").read_text().strip(),
+                "first-hop update changed authority or omitted the skill path")
+        old = json.loads((worker["state"] / "hook-expected.json").read_text())
+        registered = json.loads((worker["state"] / "hook-installation.json").read_text())
+        self.worker_control(worker, "agent-tasks", {"protocol_version": 1, "submission_id": "before-hook-v2", "prompt": "Controlled prompt"}, want=409)
+        update = json.loads(self.native_cli(worker, "hook-upgrade-describe", "--worker-id", worker["worker"]["id"], "--goal-id", old["goal_id"]))
+        require(update["watchdog"] == old["watchdog"], "hook prompt upgrade changed the published watchdog definition")
+        observed = lambda expected: {"goal_id": expected["goal_id"], "complete": True, "dry_run": "silent", "hooks": [expected["hook"]],
+                                    "watchdogs": [{**expected["watchdog"], "native_job_id": registered["watchdog_job_id"]}]}
+        self.registration(worker, "hook-confirm", observed(old), want=1)
+        self.registration(worker, "hook-confirm", observed(update))
+        self.tick(worker)
+        require(self.worker_projection(worker)[0]["agent_tasks_ready"], "confirmed prompt did not enable the paired task capability")
+        self.receipt("worker_updates.published_first_hop", archived=PUBLISHED, malformed_hook_refused=True, unwritable_untouched=True,
+                     retry_backoff_bypassed=True, retry_nil_bypassed=True, skill_path_backfilled=True, same_worker=True)
+
     def exercise(self):
         self.setup()
         self.releases = self.packages()
@@ -309,7 +403,9 @@ class Updates(WorkerSetup):
         self.docker("build", "--label", LABEL + "=" + self.owner, "-f", "tests/integration/worker-setup.Dockerfile", "-t", self.fixture_image, ".", timeout=240)
         self.images.append(self.fixture_image)
         legacy = [self.legacy_install(version) for version in ("1.0.0", "1.1.0")]
-        self.paired(RC)
+        published = self.published_install()
+        self.allow_pair(BROKEN)
+        self.published_first_hop(published)
         worker = self.environment("managed")
         self.install(worker, self.prompt())
         self.checker(worker)
@@ -324,7 +420,11 @@ class Updates(WorkerSetup):
         self.browser(legacy[0], [], never["worker"]["id"], stage="Migration required")
 
         modern, current_origin = self.broker, self.origin_url
-        archived, old_origin = self.paired("1.1.0", primary=False)
+        self.args.image = self.releases["1.1.0"]["image"]
+        incompatible, _, _ = self.launch(expect_startup=False)
+        require(self.docker("wait", incompatible, timeout=30).stdout.strip() != "0" and
+                "schema_version_incompatible" in self.logs(incompatible), "schema-five broker accepted schema six")
+        archived, old_origin = self.paired("1.1.0", primary=False, state_volume=self.volume("archived-schema-five"))
         queued = self.create(worker, "archived broker cannot commit a hook pull", tools=False)
         self.proxy.target = urllib.parse.urlsplit(old_origin)
         try:
@@ -371,12 +471,15 @@ class Updates(WorkerSetup):
         require(not json.loads(self.native_cli(worker, "watchdog-check"))["notify"], "watchdog repeated a failed update notice")
 
         self.allow_pair(STABLE)
+        # The old journal was closed by a failed attempt, so the explicit retry can clear broker suppression.
+        retry = self.worker_control(worker, "ops", {"protocol_version": 1, "submission_id": "newer-worker-retry", "kind": "retry_update"})
         self.assets.mode = ""
         require(self.tick(worker)["outcome"] == "update_awaiting_confirmation", "forward idle switch did not activate the verified pair")
         self.proxy.lose_worker_replies["/api/v1/worker/update"] = 1
         self.tick(worker, want=1)
         self.tick(worker)
         self.record_update(worker, "confirmed", STABLE)
+        require(self.worker_control(worker, "ops/" + retry["id"])["state"] == "succeeded", "newer retry did not wait for paired pull")
         require(worker["credential"] == original and (worker["state"] / "credential.key").read_text().strip() == original,
                 "auto-update replaced the worker identity")
         recovered = json.loads(self.native_cli(worker, "watchdog-check"))

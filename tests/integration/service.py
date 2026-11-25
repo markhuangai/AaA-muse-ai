@@ -19,7 +19,7 @@ RUNTIME_EXECUTABLE = "usr/local/bin/service"
 DIAGNOSTICS = "/var/lib/aaa-muse-ai/diagnostics"
 SQLITE_STATE = "/var/lib/aaa-muse-ai/state"
 SQLITE_FILE = SQLITE_STATE + "/broker.sqlite3"
-SQLITE_SCHEMA = 5
+SQLITE_SCHEMA = 6
 SQLITE_FIXTURE_SETTINGS = "PRAGMA foreign_keys=ON;\nPRAGMA synchronous=FULL;\n"
 LABEL = "io.aaa-muse.test-owner"
 
