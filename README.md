@@ -1,6 +1,6 @@
 # AaA-muse-ai
 
-AaA-muse-ai is a self-hosted broker for using Muse from model clients. A managed shell hook checks for work over outbound HTTPS every 15 seconds. It wakes a Muse agent for each claim, and an hourly watchdog reports stalls. Muse proposes answers and tool calls. The calling client runs its tools under its own permissions and returns the results.
+AaA-muse-ai is a self-hosted broker for using Muse from model clients. A managed shell hook checks for work over outbound HTTPS every 15 seconds. It wakes a Muse agent for each claim, and a five-minute watchdog reports stalls. Muse proposes answers and tool calls. The calling client runs its tools under its own permissions and returns the results.
 
 - Use the OpenAI Chat Completions and Responses subsets for text and function tools, with JSON or buffered SSE. The model alias is `muse-ai`. [API and client setup](docs/history-api.md#openai-chat-completions)
 - Create client keys, enroll workers, and inspect requests in the control portal. [Portal guide](docs/portal.md)
@@ -26,6 +26,8 @@ curl -fsS http://127.0.0.1:8080/readyz
 ```
 
 Serve the portal and API through your HTTPS reverse proxy. Sign in to the portal, open **Workers**, and paste the generated enrollment prompt into Muse as one message. Create a model-client key under **Settings → Client keys**. Point your client at the broker’s HTTPS `/v1` base URL. [Major-1 worker setup](worker/README.md) · [Portal enrollment](docs/portal.md#worker-management)
+
+Existing hourly watchdogs keep their registered Muse schedule through a launcher update. Check the goal’s native cron readback and its diagnostic timestamps to verify the cadence. Live VM retention at five minutes remains unverified. [Worker updates and diagnostics](worker/README.md#updates)
 
 ## Qualification
 

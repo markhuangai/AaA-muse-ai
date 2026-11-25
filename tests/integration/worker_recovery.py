@@ -124,15 +124,40 @@ class WorkerRecovery(WorkerSetup):
     def watchdog_behaviors(self, worker):
         path = worker["state"] / "hook-tick-health.json"
         before = json.loads(path.read_text())
+        begin = utc_stamp()
+
+        def check():
+            result = self.cli(worker, "watchdog-check")
+            require(all(json.loads(line)["level"] != "DEBUG" for line in result.stderr.splitlines()),
+                    "watchdog emitted DEBUG on runtime stderr")
+            return json.loads(result.stdout)
+
+        fresh = utc_stamp(datetime.now(timezone.utc) - timedelta(minutes=4))
+        path.write_text(json.dumps({**before, "boot_id": "previous-boot", "last_tick_at": fresh, "last_success_at": fresh}))
+        quiet = check()
+        require(quiet["boot_changed"] and not quiet["notify"], "watchdog alerted on a fresh tick after a VM reset")
         stale = utc_stamp(datetime.now(timezone.utc) - timedelta(minutes=6))
         path.write_text(json.dumps({**before, "boot_id": "previous-boot", "last_tick_at": stale, "last_success_at": stale}))
-        check = lambda: json.loads(self.native_cli(worker, "watchdog-check"))
         first = check()
         require(first["notify"] and first["boot_changed"] and first["incidents"][0]["kind"] == "hook_tick_stale", "watchdog did not identify VM reset")
         require(not check()["notify"] and self.tick(worker)["outcome"] == "idle", "watchdog repeated an unchanged incident")
         recovered = check()
         require(recovered["notify"] and recovered["outcome"] == "recovered" and not check()["notify"], "watchdog recovery was not deduplicated")
-        self.receipt("worker.watchdog_recovery", stale_hook=True, boot_change=True, recovery=True)
+        events = self.worker_capture(worker, "--since", begin, "--until", utc_stamp())
+        checks = sorted((e for e in events if e["msg"] in ("hook.watchdog_check", "hook.watchdog_notice")),
+                        key=lambda e: e["checked_at"])
+        require([(e["msg"], e["level"], e["notify"], e["outcome"], e["boot_changed"]) for e in checks] == [
+            ("hook.watchdog_check", "DEBUG", False, "healthy", True),
+            ("hook.watchdog_notice", "WARN", True, "incident", True),
+            ("hook.watchdog_check", "DEBUG", False, "incident", True),
+            ("hook.watchdog_notice", "INFO", True, "recovered", False),
+            ("hook.watchdog_check", "DEBUG", False, "healthy", False),
+        ], "protected watchdog evidence did not prove the quiet, incident, deduplication and recovery sequence")
+        require(all(e["watchdog_every"] == "5m" and e["expected_staleness_ms"] == 300_000 and
+                    e["worker_id"] == worker["worker"]["id"] and e["hook_id"] == worker["checker"] and e["watchdog_job_id"]
+                    for e in checks) and checks[1]["last_tick_boot_id"] == "previous-boot" and
+                checks[1]["incidents"][0]["kind"] == "hook_tick_stale", "watchdog did not capture the effective schedule and stale boot evidence")
+        self.receipt("worker.watchdog_recovery", stale_hook=True, boot_change=True, recovery=True, watchdog="5m", capture_complete=True)
 
     def uncertain_wake(self):
         worker = self.environment("uncertain-wake")

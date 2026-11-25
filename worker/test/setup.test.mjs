@@ -163,6 +163,8 @@ test('preflight checks an existing asset target before reusing enrollment', asyn
 
 test('setup CLI installs protected worker state without starting a daemon or enabling a hook', async t => {
   const f = await setupFixture(t); const output = [];
+  let now = Date.parse('2026-11-25T12:00:00Z');
+  f.state.sys.now = () => now;
   const io = { files: fs, system: f.state.sys, setup: f.io, network: managedNetwork(f.net), env: { HATCH_HOOK_RUNTIME: '/runtime' },
     emitHook: async (_runtime, action) => encode(action), home: () => f.state.root, nodeVersion: process.version,
     input: async name => name === '-' ? CODE : encode({ level: 'INFO', msg: 'setup.archive_verified', setup_id: SETUP }), stdout: line => output.push(line), stderr: line => f.output.push(line), signal: new AbortController().signal, metadata: async () => ({ source_sha: 'unit' }) };
@@ -177,15 +179,118 @@ test('setup CLI installs protected worker state without starting a daemon or ena
   assert.equal(f.broker.calls.length, requests);
   assert.equal(await call('hook-describe', '--goal-id', 'cli-goal'), 0);
   const { hook, watchdog } = JSON.parse(output.at(-1));
+  assert.equal(hook.poll_interval_secs, 15);
+  assert.equal(hook.script_timeout_secs, 120);
+  assert.equal(watchdog.every, '5m');
+  assert.equal(watchdog.kind, 'agent');
+  assert.equal(watchdog.enabled, true);
   const listing = { goal_id: 'cli-goal', complete: true, hooks: [], watchdogs: [], target: 'hook' };
   io.input = async () => encode(listing);
   assert.equal(await call('hook-authorize-registration', '--input', '-'), 0);
   assert.equal(JSON.parse(output.at(-1)).add_hook, true);
-  io.input = async () => encode({ ...listing, hooks: [hook], watchdogs: [{ ...watchdog, native_job_id: 'cli-watchdog' }], dry_run: 'silent' });
+  const readback = { ...listing, target: 'watchdog', hooks: [hook],
+    watchdogs: [{ ...watchdog, native_job_id: 'cli-watchdog' }], dry_run: 'silent' };
+  io.input = async () => encode({ ...readback, watchdogs: [{ ...readback.watchdogs[0], every: '1h' }] });
+  assert.equal(await call('hook-authorize-registration', '--input', '-'), 1);
+  assert.equal(await call('hook-confirm', '--input', '-'), 1);
+  io.input = async () => encode(readback);
   assert.equal(await call('hook-confirm', '--input', '-'), 0);
   assert.equal(JSON.parse(output.at(-1)).outcome, 'registered');
-  assert.equal(await call('watchdog-check'), 0);
-  assert.equal(JSON.parse(output.at(-1)).notify, false);
+
+  const expected = JSON.parse(await f.state.read('hook-expected.json'));
+  const hourly = encode({ ...expected, watchdog: { ...expected.watchdog, every: '1h' } });
+  await f.state.write('hook-expected.json', hourly);
+  assert.equal(await call('hook-describe', '--goal-id', 'cli-goal'), 1);
+  assert.equal(await f.state.read('hook-expected.json'), hourly);
+
+  const check = async () => {
+    assert.equal(await call('watchdog-check'), 0);
+    return JSON.parse(output.at(-1));
+  };
+  const tick = new Date(now - 300_000).toISOString();
+  await f.state.write('hook-tick-health.json', encode({ boot_id: 'previous-boot', last_tick_at: tick, last_success_at: tick }));
+  const fresh = await check();
+  assert.equal(fresh.boot_changed, true);
+  assert.equal(fresh.notify, false);
+  now++;
+  const stale = await check();
+  assert.equal(stale.notify, true);
+  assert.equal(stale.incidents[0].kind, 'hook_tick_stale');
+  now++;
+  assert.equal((await check()).notify, false);
+
+  now++;
+  io.env.HATCH_HOOK_ID = hook.id;
+  io.env.HATCH_HOOK_INVOCATION_ID = 'cli-recovery-tick';
+  await f.state.write('cron-tick.json', encode({ last_usage_at: new Date(now).toISOString() }));
+  f.broker.override = ({ path }) => { if (path.endsWith('/pull')) return Response.json({ job: null }); };
+  assert.equal(await call('hook-check'), 0);
+  assert.deepEqual(JSON.parse(output.at(-1)), { kind: 'silent', reason: 'idle' });
+  assert.equal((await check()).outcome, 'recovered');
+  now++;
+  assert.equal((await check()).notify, false);
+
+  assert.equal(await call('diagnostics-export', '--operation-id', SETUP, '--decode'), 0);
+  const raw = output.at(-1);
+  const [metadata, ...events] = raw.trimEnd().split('\n').map(line => JSON.parse(line));
+  assert.equal(metadata.complete, true);
+  assert.deepEqual(metadata.omissions, []);
+  const errors = events.filter(event => event.msg === 'worker.command_failed' &&
+    ['hook-authorize-registration', 'hook-confirm'].includes(event.stopped_operation));
+  assert.equal(errors.length, 2);
+  for (const event of errors) {
+    assert.equal(event.level, 'ERROR');
+    assert.equal(event.worker_id, ID);
+    assert.equal(event.setup_id, SETUP);
+    assert.equal(event.operation_id, SETUP);
+  }
+  const authorization = errors.find(event => event.stopped_operation === 'hook-authorize-registration');
+  assert.equal(authorization.cause, 'watchdog_definition_mismatch');
+  assert.equal(authorization.expected.every, '5m');
+  assert.equal(authorization.observed.every, '1h');
+  const confirmation = errors.find(event => event.stopped_operation === 'hook-confirm');
+  assert.equal(confirmation.cause, 'hook_readback_mismatch');
+  assert.equal(confirmation.expected.watchdog.every, '5m');
+  assert.equal(confirmation.observed.watchdog.every, '1h');
+  const retry = events.find(event => event.msg === 'worker.command_failed' && event.stopped_operation === 'hook-describe');
+  assert.equal(retry.level, 'ERROR');
+  assert.equal(retry.cause, 'hook_definition_changed');
+  assert.equal(retry.worker_id, ID);
+  assert.equal(retry.setup_id, SETUP);
+  const verified = events.find(event => event.msg === 'setup.hook_registration_verified');
+  assert.equal(verified.level, 'INFO');
+  assert.equal(verified.watchdog.every, '5m');
+  assert.equal(verified.watchdog.native_job_id, 'cli-watchdog');
+
+  const checks = events.filter(event => /^hook\.watchdog_(check|notice)$/.test(event.msg))
+    .sort((a, b) => a.checked_at.localeCompare(b.checked_at));
+  assert.deepEqual(checks.map(event => [event.msg, event.level, event.notify, event.outcome, event.boot_changed]), [
+    ['hook.watchdog_check', 'DEBUG', false, 'healthy', true],
+    ['hook.watchdog_notice', 'WARN', true, 'incident', true],
+    ['hook.watchdog_check', 'DEBUG', false, 'incident', true],
+    ['hook.watchdog_notice', 'INFO', true, 'recovered', false],
+    ['hook.watchdog_check', 'DEBUG', false, 'healthy', false],
+  ]);
+  for (const event of checks) {
+    assert.equal(event.watchdog_every, '5m');
+    assert.equal(event.expected_staleness_ms, 300_000);
+    assert.equal(event.hook_id, hook.id);
+    assert.equal(event.watchdog_job_id, 'cli-watchdog');
+    assert.equal(event.worker_id, ID);
+  }
+  assert.equal(checks[1].last_tick_boot_id, 'previous-boot');
+  assert.equal(checks[1].incidents[0].observed_age_ms, 300_001);
+  const healthyTick = events.find(event => event.msg === 'hook.check' && event.outcome === 'idle');
+  assert.equal(healthyTick.watchdog_every, '5m');
+  assert.equal(healthyTick.hook_poll_seconds, 15);
+  const stderr = f.output.map(line => JSON.parse(line));
+  assert(stderr.every(event => event.level !== 'DEBUG'));
+  for (const event of [...errors, retry, checks[1], checks[3]]) {
+    assert(stderr.some(line => line.msg === event.msg && line.command_id === event.command_id && line.level === event.level));
+  }
+  for (const secret of [CODE, KEY]) {
+    assert(!raw.includes(secret) && !f.output.join('').includes(secret), 'diagnostics exposed a credential');
+  }
   assert.equal(await call('run', '--background'), 1);
   assert.equal(await f.state.read('run-stop.json'), undefined);
   assert.equal(await f.state.read('hook-poll.json'), undefined);

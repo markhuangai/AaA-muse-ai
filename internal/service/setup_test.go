@@ -1,8 +1,11 @@
 package service
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"log/slog"
 	"regexp"
 	"strings"
 	"testing"
@@ -36,7 +39,10 @@ func TestSetupPromptUsesIssuedAuthorityAndPinnedMechanics(t *testing.T) {
 }
 
 func TestSetupPromptRequiresVerifiedHookAndWatchdog(t *testing.T) {
-	w, _, logger, _ := workerFixture()
+	w, _, _, _ := workerFixture()
+	var logs bytes.Buffer
+	const requestID = "watchdog-setup-request"
+	logger := slog.New(slog.NewJSONHandler(&logs, nil)).With("request_id", requestID)
 	s := NewSetup(w, PackagePin{Version: "1.0.0-rc.0", SHA256: strings.Repeat("a", 64)})
 	result, err := s.Create(context.Background(), logger, "https://example.test")
 	if err != nil {
@@ -49,7 +55,7 @@ func TestSetupPromptRequiresVerifiedHookAndWatchdog(t *testing.T) {
 	if !strings.HasPrefix(before, "I authorize you to run the verified AaA worker launcher and finish setup in this goal during this turn.") {
 		t.Fatal("setup must start with the owner's same-turn authorization")
 	}
-	if !strings.Contains(before, "Verify one managed shell hook and one hourly native agent watchdog") ||
+	if !strings.Contains(before, "Verify one managed shell hook and one five-minute native agent watchdog") ||
 		!strings.Contains(before, "If Muse requires another approval, show me the specific request.") {
 		t.Fatal("missing scoped checker authorization and Muse approval instructions")
 	}
@@ -62,12 +68,33 @@ func TestSetupPromptRequiresVerifiedHookAndWatchdog(t *testing.T) {
 	}
 	for _, phrase := range []string{
 		"hook-describe", "hook-authorize-registration", "hooks.add", "hooks.enable", "hooks.dry_run", "hook-confirm",
-		"poll_interval_secs: 15", "script_timeout_secs: 120", `every: "1h"`, "Report their IDs only after the helper returns registered",
+		"poll_interval_secs: 15", "script_timeout_secs: 120", `every: "5m"`, "Report their IDs only after the helper returns registered",
 		"Leave the first work check to the scheduler", "VM-loss recovery without exact live observations",
 	} {
 		if !strings.Contains(after, phrase) {
 			t.Fatal("missing managed hook contract", phrase)
 		}
+	}
+	if strings.Contains(result.Prompt, `every: "1h"`) || strings.Contains(result.Prompt, "hourly") {
+		t.Fatal("setup prompt contains the retired watchdog cadence")
+	}
+	var created int
+	for _, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
+		var event map[string]any
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			t.Fatal("invalid setup log event", err)
+		}
+		if event["msg"] != "setup.prompt_created" {
+			continue
+		}
+		created++
+		if event["level"] != "INFO" || event["hook_poll_seconds"] != float64(15) || event["watchdog_every"] != "5m" ||
+			event["setup_id"] != result.EnrollmentID || event["operation_id"] != result.EnrollmentID || event["request_id"] != requestID {
+			t.Fatal("setup log did not identify the issued cadence and operation")
+		}
+	}
+	if created != 1 || strings.Contains(logs.String(), "setup.prompt_detail") || strings.Contains(logs.String(), "muse_enroll_") {
+		t.Fatal("setup runtime logs omitted issuance or exposed protected prompt details")
 	}
 }
 

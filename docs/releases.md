@@ -10,6 +10,8 @@ First enroll the managed-hook worker with the pinned prompt in **Workers**. A na
 
 After that cutover, an idle managed worker can discover a strictly newer 1.x archive when the running brokers agree on its release pin. It downloads the canonical public artifact over HTTPS, checks its version, source and SHA-256, and swaps the launcher atomically. A fresh matching pickup confirms the update. Rollback is unsupported.
 
+New managed-hook enrollments register a five-minute native watchdog. The launcher update leaves any hourly Muse watchdog registered at its existing cadence. Edit that cron in place and verify its native readback, or re-enroll with fresh state. Check `checked_at` in the worker's protected diagnostic export for the observed cadence. Live VM retention at five minutes remains unverified. [Worker update and diagnostics steps](../worker/README.md#updates)
+
 Drain client intake, claims, deliveries and update attempts before switching versions. If a switch interrupts work, the original matching pair is required to reconcile its hold. Use the worker's protected export and the broker diagnostics to identify the observed and expected versions, archive digest and corrective action.
 
 ## Publication
@@ -157,7 +159,7 @@ erase data to clear the refusal.
 
 Use a fresh enrollment prompt from the managed-hook portal. Verify the archive
 and private state modes. Read back the exact enabled 15-second hook and
-goal-owned hourly watchdog, then confirm an authenticated tick on the new
+goal-owned five-minute watchdog, then confirm an authenticated tick on the new
 registration. Reconcile work with the bound wake invocation and the broker's
 terminal receipt. The old release bundles and verification records remain
 available for historical recovery.

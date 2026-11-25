@@ -238,7 +238,7 @@ async function viewports() {
     const text = page.getByLabel('Complete setup prompt', { exact: true });
     expect((await text.inputValue()) === generated.data.setup_prompt).toBe(true);
     expect(generated.data.worker_package.version).toBe(fixture.pin.version); expect(generated.data.worker_package.sha256).toBe(fixture.pin.sha256);
-    for (const instruction of ['poll_interval_secs: 15', 'every: "1h"', 'hook-confirm', 'sha256sum']) {
+    for (const instruction of ['poll_interval_secs: 15', 'every: "5m"', 'hook-confirm', 'sha256sum']) {
       expect(generated.data.setup_prompt.includes(instruction)).toBe(true);
     }
     expect((Date.parse(generated.data.expires_at) - Date.parse(generated.data.created_at)) / 1000).toBe(900);

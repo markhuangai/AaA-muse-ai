@@ -367,7 +367,7 @@ class Updates(WorkerSetup):
         require(self.tick(worker)["outcome"] == "idle", "failed update received job authority")
         notice = json.loads(self.native_cli(worker, "watchdog-check"))
         require(notice["notify"] and any(item["kind"] == "update_failed" for item in notice["incidents"]),
-                "hourly watchdog lost the failed update after idle contact")
+                "watchdog lost the failed update after idle contact")
         require(not json.loads(self.native_cli(worker, "watchdog-check"))["notify"], "watchdog repeated a failed update notice")
 
         self.allow_pair(STABLE)
