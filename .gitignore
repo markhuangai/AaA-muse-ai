@@ -9,3 +9,4 @@ config.yaml
 .env
 worker/dist/
 portal/dist/
+.agents
