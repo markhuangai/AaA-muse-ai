@@ -31,6 +31,8 @@ For existing storage, use a verified image from the installation’s current maj
 
 For a planned major-0 to major-1 cutover, start in a separate Compose directory and project with a verified major-1 image, fresh YAML and credentials, empty SQLite and media directories, and fresh worker enrollment. Use a different host port if both stacks run on the same host. Keep the old files and registrations intact. `db.fresh_store_required` indicates a legacy SQLite file. `media.namespace_rejected` can indicate a populated, unmarked media directory. Correct the mount sources in either case. Namespace markers, prior job history, and download references belong to their original store. [Major-1 clean cutover](releases.md#major-1-clean-cutover)
 
+For the first managed-hook release, drain client intake, held claims, deliveries and update attempts on the existing paired release. Back up the private SQLite store. Remove the old brokers from the serving origin before enrolling the new worker. Verify the exact hook and watchdog registrations before retiring the identified legacy cron and worker credential. Later managed-hook updates use the same drain before the broker changes version. [Paired releases](releases.md#automatic-worker-updates)
+
 For a same-major replacement, inspect the old service container even if it is stopped. Record its project, runtime user, image, and exact mounts.
 
 ```sh

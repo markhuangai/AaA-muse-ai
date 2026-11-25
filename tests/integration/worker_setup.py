@@ -14,7 +14,7 @@ import urllib.parse
 import urllib.request
 
 from inference import Inference
-from native_cron import NativeCronFixture
+from native_cron import ManagedHookFixture
 from service import LABEL, require
 from worker_tls import TLSFixture
 
@@ -73,7 +73,7 @@ class Assets:
         self.thread.join(timeout=5)
 
 
-class WorkerSetup(NativeCronFixture, Inference):
+class WorkerSetup(ManagedHookFixture, Inference):
     def __init__(self, args):
         super().__init__(args)
         self.package = json.loads(Path(args.package_receipt).read_text())
@@ -98,7 +98,7 @@ class WorkerSetup(NativeCronFixture, Inference):
             *temp_mount,
             "-e", "HOME=/home/worker", "-e", "TMPDIR=/home/worker/tmp", "-e", "CURL_CA_BUNDLE=/fixture/ca.pem",
             "-e", "NODE_EXTRA_CA_CERTS=/fixture/ca.pem", self.fixture_image, "bash", "-c", "mkdir -m 700 -p /home/worker/tmp; exec sleep infinity").stdout.strip())
-        return {"container": identity, "home": home, "state": home / ".local/state/aaa-muse-worker-v1"}
+        return {"container": identity, "home": home, "state": home / ".local/state/aaa-muse-worker-hook-v1"}
 
     def command(self, environment, args, input_text=None, want=0, extra=()):
         result = self.docker("exec", "-i", *extra, environment["container"], *args, input_text=input_text, success=False, timeout=180)
@@ -179,15 +179,25 @@ class WorkerSetup(NativeCronFixture, Inference):
     def native_cli(self, worker, *args, input_text=None, want=0):
         return self.cli(worker, *args, input_text=input_text, want=want).stdout
 
-    def hook(self, environment, dry=False, want=0):
+    def worker_capture(self, worker, *filters):
+        raw = self.native_cli(worker, "diagnostics-export", *filters, "--decode")
+        metadata, *events = [json.loads(line) for line in raw.splitlines()]
+        require(metadata["complete"] and not metadata["omissions"], "managed worker capture was incomplete")
+        self.assert_private(raw)
+        return events
+
+    def hook(self, environment, dry=False, invocation="controlled-dry", want=0):
         runtime = environment["home"] / "runtime.sh"
         if not runtime.exists():
-            runtime.write_text('wake(){ printf \'{"action":"wake"}\\n\'; }; silent(){ printf \'{"action":"silent"}\\n\'; };\n')
+            runtime.write_text("""wake() { [[ $# == 2 ]]; printf '{"action":"wake","payload":%s}\n' "$2"; }
+silent() { [[ $# == 1 ]]; printf '{"action":"silent","reason":"%s"}\n' "$1"; }
+""")
             runtime.chmod(0o600)
-        extra = ["-e", "HATCH_HOOK_RUNTIME=/home/worker/runtime.sh"]
+        extra = ["-e", "HATCH_HOOK_RUNTIME=/home/worker/runtime.sh", "-e", "HATCH_HOOK_ID=" + environment["checker"],
+                 "-e", "HATCH_HOOK_INVOCATION_ID=" + invocation, "-e", "PATH=/fixture/bin:/usr/local/bin:/usr/bin:/bin"]
         if dry:
             extra += ["-e", "HATCH_HOOK_DRY_RUN=1"]
-        return self.command(environment, ["bash", environment["receipt"]["hook_path"]], extra=extra, want=want)
+        return self.command(environment, ["bash", environment["receipt"]["detector"]], extra=extra, want=want)
 
     def prepare_setgid_fixture(self, env, prompt):
         home = env["home"]
@@ -196,7 +206,7 @@ class WorkerSetup(NativeCronFixture, Inference):
         for path, mode in parents.items():
             path.mkdir(parents=True, exist_ok=True)
             path.chmod(mode)
-        leaf = home / ".local/share/aaa-muse-worker-v1"
+        leaf = home / ".local/share/aaa-muse-worker-hook-v1"
         uid = os.getuid()
 
         def refused(reason, mode, owner):
@@ -233,7 +243,7 @@ class WorkerSetup(NativeCronFixture, Inference):
         leaf.unlink()
         leaf.mkdir(mode=0o700)
         other_uid = 65534 if uid != 65534 else 65533
-        container_path = "/home/worker/.local/share/aaa-muse-worker-v1"
+        container_path = "/home/worker/.local/share/aaa-muse-worker-hook-v1"
         try:
             self.docker("exec", "--user", "0:0", env["container"], "chown", str(other_uid), container_path)
             refused("wrong_directory_owner", leaf.stat().st_mode & 0o7777, other_uid)
@@ -337,7 +347,7 @@ class WorkerSetup(NativeCronFixture, Inference):
             require(records[0]["complete"] and not records[0]["omissions"] and
                     any(e.get("msg") == "worker.http_retrying" and e.get("enrollment_phase") == phase and e.get("attempt") == 1 and
                         e.get("transport_cause") == "UND_ERR_SOCKET" for e in records) and
-                    any(e.get("msg") == "setup.native_checker_verified" and e.get("checker_job_id") == worker["checker"] for e in records),
+                    any(e.get("msg") == "setup.hook_registration_verified" and e["hook"]["id"] == worker["checker"] for e in records),
                     "worker capture did not explain retry or verify the recovered checker")
             self.receipt("setup.enrollment_connection_recovery", phase=phase, lost=outcome, drops=count,
                          sibling_after_restart=count > 1, worker_count=1, checker_verified=True, idle_poll=True)
@@ -370,29 +380,29 @@ class WorkerSetup(NativeCronFixture, Inference):
         worker = self.environment("primary", mount_system_tmp=True)
         initial = self.prompt()
         prompt = initial["setup_prompt"]
-        require(all(fragment in prompt for fragment in ("Request the actual permissions", "including disabled jobs", 'every: "1m"',
-                    "execution.kind=agent", "After a write or uncertain reply", "Setup is incomplete", "one finite native agent runonce")),
+        require(all(fragment in prompt for fragment in ("Request the actual permissions", "including disabled registrations", 'every: "1h"',
+                    "hooks.add", "hooks.enable", "hooks.dry_run", "hook-confirm")),
                     "broker prompt lost the native checker read-back contract")
         parents = self.prepare_setgid_fixture(worker, initial)
-        legacy = worker["home"] / ".local/state/aaa-muse-worker"
+        legacy = worker["home"] / ".local/state/aaa-muse-worker-v1"
         legacy.mkdir(mode=0o700)
         legacy_marker = legacy / "operator-fixture"
-        legacy_marker.write_text("retained major zero state")
+        legacy_marker.write_text("retained native cron state")
         self.install(worker, initial)
-        require(worker["receipt"]["cron_registration"] == "pending" and self.status(worker)["connection_status"] == "not_observed", "setup falsely claimed a scheduled execution")
+        require(worker["receipt"]["registration"] == "pending" and self.status(worker)["connection_status"] == "not_observed", "setup falsely claimed a scheduled execution")
         require(worker["state"].stat().st_mode & 0o7777 == 0o700 and (worker["state"] / "credential.key").stat().st_mode & 0o7777 == 0o600,
                 "installer did not enforce private state permissions")
         for path, mode in parents.items():
             require(path.stat().st_mode & 0o7777 == mode, "installer changed a parent mode")
-        require(legacy_marker.read_text() == "retained major zero state", "fresh setup altered a major-zero installation")
+        require(legacy_marker.read_text() == "retained native cron state", "fresh setup altered a native cron installation")
         self.checker(worker)
-        registration = (worker["state"] / "cron-installation.json").read_bytes()
+        registration = (worker["state"] / "hook-installation.json").read_bytes()
         self.install(worker, initial)
-        require(worker["receipt"]["identity_preserved"] and (worker["state"] / "cron-installation.json").read_bytes() == registration, "install retry changed checker or worker")
+        require(worker["receipt"]["identity_preserved"] and (worker["state"] / "hook-installation.json").read_bytes() == registration, "install retry changed checker or worker")
         require(self.tick(worker)["outcome"] == "idle", "installed checker did not perform an empty authenticated pull")
         workers, _ = self.checked("/api/v1/admin/workers", self.admin)
         require(len(workers["workers"]) == 1 and workers["workers"][0]["id"] == worker["worker"]["id"], "setup retry consumed another enrollment")
-        require(not (worker["state"] / "launch.json").exists() and not (worker["home"] / "hooks").exists(), "native install left a daemon or hook")
+        require(not (worker["state"] / "launch.json").exists() and (worker["home"] / "hooks/scripts" / worker["checker"] / "detector.sh").is_file(), "setup left a daemon or omitted the managed detector")
         key = worker["state"] / "credential.key"
         key.chmod(0o644)
         try:
@@ -400,10 +410,10 @@ class WorkerSetup(NativeCronFixture, Inference):
         finally:
             key.chmod(0o600)
         evidence = [json.loads(line) for line in self.native_cli(worker, "diagnostics-export", "--decode").splitlines()]
-        require(evidence[0]["complete"] and any(e.get("msg") == "setup.native_checker_verified" and e.get("checker_job_id") == worker["checker"] for e in evidence) and
+        require(evidence[0]["complete"] and any(e.get("msg") == "setup.hook_registration_verified" and e["hook"]["id"] == worker["checker"] for e in evidence) and
                 any(e.get("msg") == "worker.state_unsafe" and e.get("expected_mode") == "600" and e.get("observed_mode") == "644" for e in evidence),
                 "protected setup evidence did not prove read-back or unsafe mode")
-        self.receipt("setup.native_checker_install", interval="1m", protected_state=True, same_registration_on_retry=True, scheduler_fixture="controlled")
+        self.receipt("setup.managed_hook_install", interval="15s", watchdog="1h", protected_state=True, same_registration_on_retry=True, scheduler_fixture="controlled")
 
         corrupt = self.environment("corrupt")
         result = self.install(corrupt, self.prompt(), corrupt=True, want=1)
@@ -428,7 +438,7 @@ class WorkerSetup(NativeCronFixture, Inference):
 
         fallback = self.environment("fallback")
         self.install(fallback, self.prompt(), fallback=True)
-        nodes = list((fallback["home"] / ".local/share/aaa-muse-worker-v1/runtime").glob("node.*/node"))
+        nodes = list((fallback["home"] / ".local/share/aaa-muse-worker-hook-v1/runtime").glob("node.*/node"))
         require(len(nodes) == 1 and nodes[0].is_file() and self.command(fallback, ["/home/worker/" + str(nodes[0].relative_to(fallback["home"])), "--version"]).stdout.strip() == "v24.22.2",
                 "downloaded runtime did not execute at the pinned version")
         bad_node = self.environment("bad-node")

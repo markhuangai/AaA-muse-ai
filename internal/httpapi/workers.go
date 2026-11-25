@@ -41,9 +41,6 @@ func routeFor(path string) (string, string) {
 			if len(parts) == 2 && parts[1] == "qualifications" {
 				return "/api/v1/admin/workers/{id}/qualifications", parts[0]
 			}
-			if len(parts) == 2 && parts[1] == "update-prompt" {
-				return adoptionPromptRoute, parts[0]
-			}
 			if len(parts) == 2 && parts[1] == "revoke" {
 				return "/api/v1/admin/workers/{id}/revoke", parts[0]
 			}
@@ -67,7 +64,7 @@ func routeMethod(route string) string {
 		return http.MethodPost
 	case "/api/v1/admin/workers/{id}":
 		return http.MethodPatch
-	case "/api/v1/requests", "/api/v1/requests/{id}/cancel", "/api/v1/admin/experiments", "/api/v1/admin/experiments/{id}/cancel", "/api/v1/admin/experiments/{id}/tool-results", "/api/v1/worker/jobs/{id}/decisions", "/api/v1/worker/pull", "/api/v1/worker/jobs/{id}/start", "/api/v1/worker/jobs/{id}/interrupt", workerPresenceRoute, workerUpdateRoute, adoptionPromptRoute:
+	case "/api/v1/requests", "/api/v1/requests/{id}/cancel", "/api/v1/admin/experiments", "/api/v1/admin/experiments/{id}/cancel", "/api/v1/admin/experiments/{id}/tool-results", "/api/v1/worker/jobs/{id}/decisions", workerPullRoute, "/api/v1/worker/jobs/{id}/start", "/api/v1/worker/jobs/{id}/interrupt", workerPresenceRoute, workerUpdateRoute, workerBindRoute:
 		return http.MethodPost
 	default:
 		return http.MethodGet
@@ -119,6 +116,12 @@ func (h *Handler) projectedWorker(r *http.Request, logger *slog.Logger, record w
 	}
 	p, err := h.Broker.Projection(r.Context(), logger, record.ID, own)
 	v.Projection = p
+	if !own && p.LastPollAt != nil && (p.Update == nil || p.Update.Contract != worker.UpdateContract) {
+		if v.Update == nil {
+			v.Update = &worker.UpdateStatus{}
+		}
+		v.Update.State, v.Update.Reason = "migration_required", "unsupported_worker_migration"
+	}
 	if p.NativeContactAt != nil {
 		v.LastContactAt = p.NativeContactAt
 	}
@@ -199,13 +202,8 @@ func (h *Handler) enrollRequest(w *response, r *http.Request, logger *slog.Logge
 	code := input["enrollment_code"].(string)
 	switch input["phase"] {
 	case nil:
-		record, e, credential, err := h.Workers.Enroll(r.Context(), logger, code)
-		w.workerID, w.enrollmentID = record.ID, e.ID
-		if err != nil {
-			workerError(w, err)
-			return
-		}
-		writeJSON(w, 201, map[string]any{"worker": viewWorker(record), "credential": credential})
+		logger.Warn("request.rejected", "reason", "enrollment_phase_required")
+		writeJSON(w, 400, map[string]any{"error": "enrollment_phase_required"})
 	case "prepare":
 		e, credential, err := h.Workers.PrepareEnrollment(r.Context(), logger.With("enrollment_phase", "prepare"), code)
 		w.enrollmentID = e.ID

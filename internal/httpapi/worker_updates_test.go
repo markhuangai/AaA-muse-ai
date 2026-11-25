@@ -20,6 +20,9 @@ import (
 
 func versionedHTTP(handler *Handler, method, path, key string, contact worker.Contact, body any) *httptest.ResponseRecorder {
 	raw, _ := json.Marshal(body)
+	if contact.Contract == worker.UpdateContract && path != workerStatusRoute {
+		path = hookPath(path)
+	}
 	request := httptest.NewRequest(method, path, strings.NewReader(string(raw)))
 	if method == http.MethodGet {
 		request = httptest.NewRequest(method, path, nil)
@@ -35,8 +38,12 @@ func versionedHTTP(handler *Handler, method, path, key string, contact worker.Co
 	if contact.Digest != "" {
 		request.Header.Set(service.WorkerDigestHeader, contact.Digest)
 	}
+	if path == hookPath(workerPullRoute) {
+		request.Header.Set("X-Muse-Worker-Hook-Proof", "1")
+	}
 	result := httptest.NewRecorder()
 	handler.ServeHTTP(result, request)
+	rememberTestPull(result, body)
 	return result
 }
 
@@ -117,25 +124,31 @@ func TestManagedWorkerUpdateFencesAndConfirms(t *testing.T) {
 		t.Fatal("retry was not eligible")
 	}
 	operation(h, key, old, offer, "activate", "", 200)
+	if operation(sibling, key, old, offer, "activate", "", 200).Attempt != 2 {
+		t.Fatal("replayed activation changed the attempt")
+	}
 	current := worker.Contact{Version: target.Version, Digest: target.SHA256, Contract: target.Contract}
 	operation(h, key, old, offer, "applied", "", 409)
 	if operation(sibling, key, current, offer, "applied", "", 200).State != "awaiting_confirmation" {
 		t.Fatal("premature confirmation")
+	}
+	if operation(h, key, current, offer, "applied", "", 200).State != "awaiting_confirmation" {
+		t.Fatal("replayed application skipped confirmation")
 	}
 	now = now.Add(time.Minute)
 	if pulled(sibling, 5, current).Update != nil || workerStatus().State != "confirmed" {
 		t.Fatal("fresh target pickup did not confirm")
 	}
 
-	rolled := setUpdateBuild(t, h, repo, clock, "first", "1.0.1-rc.9", "b", "")
+	setUpdateBuild(t, h, repo, clock, "first", "1.0.1-rc.9", "b", "")
 	setUpdateBuild(t, sibling, siblingRepo, clock, "second", "1.0.1", "a", "")
 	now = now.Add(time.Second)
 	if pulled(h, 6, current).Update != nil || workerStatus().Reason != "mixed_broker_releases" {
 		t.Fatal("mixed releases offered a rollback")
 	}
 	now = now.Add(31 * time.Second)
-	if result := pulled(h, 7, current); result.Update == nil || result.Update.Target != rolled {
-		t.Fatal("rollback to agreed pinned prerelease was not offered")
+	if result := pulled(h, 7, current); result.Update != nil || result.Job != nil {
+		t.Fatal("older paired prerelease received update or work authority")
 	}
 }
 
@@ -156,101 +169,48 @@ func TestManagedWorkerMajorRequiresDeclaredMigration(t *testing.T) {
 	if result := pull(1); result.Job != nil || result.Update != nil {
 		t.Fatal("unlisted migration received authority")
 	}
-	target := setUpdateBuild(t, h, repo, clock, "broker", "2.0.0", "a", "1")
+	setUpdateBuild(t, h, repo, clock, "broker", "2.0.0", "a", "1")
 	now = now.Add(time.Minute)
 	result := pull(2)
-	if result.Job != nil || result.Update == nil || result.Update.Target != target {
-		t.Fatal("declared migration did not offer an update-only receipt")
+	if result.Job != nil || result.Update != nil {
+		t.Fatal("the old major declaration granted update authority")
 	}
 	nativeResponse(t, versionedHTTP(h, http.MethodPost, workerUpdateRoute, "invalid", old,
-		worker.UpdateRequest{ID: result.Update.ID, Target: target, Action: "begin"}), 401, nil)
+		worker.UpdateRequest{}), 401, nil)
 }
 
-func TestStockWorkerEnablesUpdatesInPlace(t *testing.T) {
-	now := time.Now().UTC().Truncate(time.Second)
+func TestLegacyContactsAreObservationOnly(t *testing.T) {
+	now := time.Now().UTC()
 	clock := func() time.Time { return now }
 	h, repo := openPullHTTP(t, filepath.Join(mediaSQLiteDirectory(t), "state.sqlite3"), clock)
-	target := setUpdateBuild(t, h, repo, clock, "broker", "1.0.1-rc.1", "b", "")
-	key := enrollNative(t, h)
-	contact := worker.Contact{Version: target.Version, Digest: target.SHA256, Contract: target.Contract}
-	var registered workerView
-	nativeResponse(t, versionedHTTP(h, http.MethodGet, "/api/v1/worker/status", key, contact, nil), 200, &registered)
-	path := "/api/v1/admin/workers/" + registered.ID + "/update-prompt"
-	form := map[string]string{"origin": "https://worker.example.test"}
-	var prompt map[string]string
-	nativeResponse(t, versionedHTTP(h, http.MethodPost, path, testManagementKey, worker.Contact{}, form), 200, &prompt)
-	for _, expected := range []string{target.Version, target.SHA256, target.URL, registered.ID, "--adopt"} {
-		if !strings.Contains(prompt["update_prompt"], expected) {
-			t.Fatal("prompt lost its verified target or worker")
+	target := setUpdateBuild(t, h, repo, clock, "broker", "1.2.0", "a", "")
+	registered, key := enrollHTTP(t, h, issueHTTP(t, h))
+	poll := inference.Pull{Version: 1, Sequence: 1, Checker: "legacy-checker", Occurrence: "legacy-poll", ScheduledAt: now, EnteredAt: now}
+	created, err := h.Broker.Create(t.Context(), h.Logger, inference.Create{Version: 1, WorkerID: registered.ID,
+		SubmissionID: "queued", Messages: []inference.Item{{Type: "message", Role: "user", Text: "queued"}}, Tools: []inference.Tool{}})
+	if err != nil || len(created) == 0 {
+		t.Fatal("legacy fixture could not queue work", err)
+	}
+	for _, legacy := range []worker.Contact{{Version: "1.0.0"}, {Version: "1.1.0", Contract: "native-cron-v1", Digest: strings.Repeat("b", 64)}} {
+		var idle inference.PullResult
+		nativeResponse(t, versionedHTTP(h, "POST", workerPullRoute, key, legacy, poll), 200, &idle)
+		if idle.Job != nil || idle.Update != nil {
+			t.Fatal("legacy update or work authority")
 		}
 	}
-	if strings.Contains(prompt["update_prompt"], "muse_enroll_") || strings.Contains(prompt["update_prompt"], key) {
-		t.Fatal("adoption prompt contains a credential")
+	var status workerView
+	nativeResponse(t, call(h, "GET", workerStatusRoute, "Bearer "+key, nil), 200, &status)
+	if status.Update == nil || status.Update.State != "migration_required" || status.Claim != nil {
+		t.Fatal("legacy migration status missing")
 	}
-	nativeResponse(t, versionedHTTP(h, http.MethodPost, path, key, worker.Contact{}, form), 401, nil)
-	nativeResponse(t, versionedHTTP(h, http.MethodPost, path, testManagementKey, worker.Contact{}, map[string]string{}), 400, nil)
-	nativeResponse(t, versionedHTTP(h, http.MethodPost, path, testManagementKey, worker.Contact{}, map[string]string{"origin": "http://worker.example.test"}), 400, nil)
-	nativeResponse(t, versionedHTTP(h, http.MethodPost, "/api/v1/admin/workers/"+strings.Repeat("1", 32)+"/update-prompt", testManagementKey, worker.Contact{}, form), 404, nil)
-
-	legacy := worker.Contact{Version: "1.0.0"}
-	poll := inference.Pull{Version: 1, Sequence: 1, Checker: "stock-checker", Occurrence: "stock-poll", ScheduledAt: now, EnteredAt: now}
-	var idle inference.PullResult
-	nativeResponse(t, versionedHTTP(h, http.MethodPost, "/api/v1/worker/pull", key, legacy, poll), 200, &idle)
-	if idle.Job != nil || idle.Update != nil {
-		t.Fatal("the stock checker was sent unsupported update authority")
+	nativeResponse(t, call(h, "POST", "/api/v1/admin/workers/"+registered.ID+"/update-prompt", "Bearer "+testManagementKey, nil), 404, nil)
+	nativeResponse(t, versionedHTTP(h, "POST", workerUpdateRoute, key, testBuildContact(h), worker.UpdateRequest{
+		ID: "adopt", Action: "adopt", Target: target}), 400, nil)
+	var granted inference.PullResult
+	nativeResponse(t, versionedHTTP(h, "POST", workerPullRoute, key, testBuildContact(h), poll), 200, &granted)
+	if granted.Job == nil {
+		t.Fatal("legacy observations consumed queued work or sequence")
 	}
-
-	adopt := worker.UpdateRequest{ID: "adoption", Action: "adopt", Target: target, WorkerID: registered.ID, PreviousVersion: "1.0.0"}
-	validate := func(input worker.UpdateRequest, peer worker.Contact, status int) worker.UpdateStatus {
-		var result worker.UpdateStatus
-		response := versionedHTTP(h, http.MethodPost, workerUpdateRoute, key, peer, input)
-		if status == 200 {
-			nativeResponse(t, response, status, &result)
-		} else {
-			nativeResponse(t, response, status, nil)
-		}
-		return result
-	}
-	for _, modify := range []func(*worker.UpdateRequest){
-		func(r *worker.UpdateRequest) { r.Action = "invented" },
-		func(r *worker.UpdateRequest) { r.PreviousVersion = "0.9.1" },
-		func(r *worker.UpdateRequest) { r.Target.URL = "https://untrusted.example/worker.tgz" },
-		func(r *worker.UpdateRequest) { r.Target.Version = "non-semver" },
-		func(r *worker.UpdateRequest) { r.Target.Contract = "unknown-contract" },
-		func(r *worker.UpdateRequest) { r.Target.FromMajors = "1,invalid" },
-		func(r *worker.UpdateRequest) { r.WorkerID = "forged other worker" },
-		func(r *worker.UpdateRequest) { r.Reason = "free text" },
-	} {
-		modified := adopt
-		modify(&modified)
-		validate(modified, contact, 400)
-	}
-	validate(adopt, worker.Contact{Version: target.Version, Contract: target.Contract}, 400)
-	foreign := adopt
-	foreign.WorkerID = strings.Repeat("1", 32)
-	validate(foreign, contact, 404)
-	incompatible := adopt
-	incompatible.PreviousVersion = "1.0.1"
-	validate(incompatible, contact, 409)
-
-	wanted := adopt
-	wanted.Target.SHA256 = strings.Repeat("d", 64)
-	validate(wanted, contact, 409)
-	if adopted := validate(adopt, contact, 200); adopted.State != "downloading" || adopted.From.Version != legacy.Version {
-		t.Fatal(adopted)
-	}
-	phase := worker.UpdateRequest{ID: adopt.ID, Target: target, Action: "activate"}
-	if active := validate(phase, contact, 200); active.State != "switching" {
-		t.Fatal(active)
-	}
-	if replay := validate(phase, contact, 200); replay.State != "switching" || replay.Attempt != 1 {
-		t.Fatal(replay)
-	}
-	phase.Action = "applied"
-	validate(phase, contact, 200)
-	validate(phase, contact, 200)
-	h.Service = service.New(repo, config.Defaults(), service.Build{}, "unpinned", clock, h.Logger)
-	nativeResponse(t, versionedHTTP(h, http.MethodPost, path, testManagementKey, worker.Contact{}, form), 503, nil)
 }
 
 func TestPairedUpdateInvalidatesConflictingPinsAndHeldClaims(t *testing.T) {
@@ -288,9 +248,15 @@ func TestPairedUpdateInvalidatesConflictingPinsAndHeldClaims(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	claimed := offer(3)
-	if claimed.Job == nil || claimed.Update != nil {
-		t.Fatal("mixed brokers stranded compatible work")
+	if result := offer(3); result.Job != nil || result.Update != nil {
+		t.Fatal("mixed brokers granted work to an unpaired worker")
+	}
+	now = now.Add(time.Second)
+	var claimed inference.PullResult
+	nativeResponse(t, versionedHTTP(h, "POST", workerPullRoute, key, testBuildContact(h),
+		inference.Pull{Version: 1, Sequence: 4, Checker: "checker", Occurrence: "tick-4", ScheduledAt: now, EnteredAt: now}), 200, &claimed)
+	if claimed.Job == nil {
+		t.Fatal("exact pair did not grant the queued work")
 	}
 	check := inference.BusyCheck{Version: 1, ClaimID: claimed.Job.ClaimID, Generation: claimed.Job.Generation,
 		Checker: "checker", Occurrence: "busy-check", ScheduledAt: now.Add(time.Second)}
@@ -299,7 +265,8 @@ func TestPairedUpdateInvalidatesConflictingPinsAndHeldClaims(t *testing.T) {
 	invalid := old
 	invalid.Digest = "invalid-digest"
 	nativeResponse(t, versionedHTTP(sibling, http.MethodPost, presenceRoute, key, invalid, check), 400, nil)
-	nativeResponse(t, versionedHTTP(sibling, http.MethodPost, presenceRoute, key, old, check), 200, nil)
+	nativeResponse(t, versionedHTTP(sibling, http.MethodPost, presenceRoute, key, testBuildContact(h), check), 426, nil)
+	nativeResponse(t, versionedHTTP(h, http.MethodPost, presenceRoute, key, testBuildContact(h), check), 200, nil)
 	var status workerView
 	nativeResponse(t, versionedHTTP(h, http.MethodGet, "/api/v1/worker/status", key, old, nil), 200, &status)
 	if status.Update == nil || status.Update.ObservedAt == nil || !status.Update.ObservedAt.Equal(now) ||
@@ -308,7 +275,7 @@ func TestPairedUpdateInvalidatesConflictingPinsAndHeldClaims(t *testing.T) {
 	}
 	setUpdateBuild(t, sibling, siblingRepo, clock, "second", "1.0.1", "a", "")
 	nativeResponse(t, versionedHTTP(h, http.MethodPost, workerUpdateRoute, key, old, begin), 409, nil)
-	if result := offer(4); result.Update != nil || result.Job != nil {
+	if result := offer(5); result.Update != nil || result.Job != nil {
 		t.Fatal("busy worker received an offer")
 	}
 }
@@ -351,6 +318,11 @@ func TestPairedUpdateRollsBackOnStorageFailure(t *testing.T) {
 	if pulled.Update == nil || pulled.Update.Target != target || pulled.Job != nil {
 		t.Fatal("retry did not obtain an offer for the original occurrence")
 	}
+	changed := target
+	changed.PackagePin = service.PairedWorker("1.0.2", strings.Repeat("c", 64))
+	nativeResponse(t, versionedHTTP(h, http.MethodPost, workerUpdateRoute, key, testBuildContact(h), worker.UpdateRequest{
+		ID: pulled.Update.ID, Action: "applied", Target: changed,
+	}), 409, nil)
 	input := worker.UpdateRequest{ID: pulled.Update.ID, Action: "begin", Target: target}
 	send := func(code int) worker.UpdateStatus {
 		t.Helper()
@@ -363,6 +335,12 @@ func TestPairedUpdateRollsBackOnStorageFailure(t *testing.T) {
 		}
 		return result
 	}
+	if _, err := db.ExecContext(t.Context(), "INSERT INTO aaa_update_brokers(instance_id,release,expires_at) VALUES('unreadable',?1,?2)",
+		[]byte("unreadable"), now.Add(time.Minute).UnixMicro()); err != nil {
+		t.Fatal(err)
+	}
+	send(503)
+	write("DELETE FROM aaa_update_brokers WHERE instance_id='unreadable'")
 	write("CREATE TRIGGER reject_attempt BEFORE UPDATE ON aaa_worker_updates BEGIN SELECT RAISE(ABORT, 'fixture attempt write failure'); END")
 	send(503)
 	write("DROP TRIGGER reject_attempt")

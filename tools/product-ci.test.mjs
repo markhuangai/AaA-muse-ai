@@ -28,7 +28,7 @@ function nativeReport() {
   broker.find(event => event.msg === 'lease.rejected' && event.request_id === crossing.request_id).job_id = crossing.job_id;
   for (const worker of report.workers) {
     worker.checker_job_id = 'checker-' + worker.slot;
-    workers.push({ time: report.started_at, level: 'INFO', msg: 'setup.native_checker_verified', worker_id: worker.worker_id, checker_job_id: worker.checker_job_id });
+    workers.push({ time: report.started_at, level: 'INFO', msg: 'setup.hook_registration_verified', worker_id: worker.worker_id, hook: { id: worker.checker_job_id } });
   }
   const seen = new Set();
   for (const cycle of report.cycles) {
@@ -38,11 +38,11 @@ function nativeReport() {
       if (seen.has(job)) continue;
       seen.add(job);
       const claim = Object.fromEntries(['job_id', 'worker_id', 'operation_id', 'claim_id', 'launch_id', 'native_job_id', 'generation'].map(key => [key, turn[key]]));
-      const start = { ...claim, time: turn.started_at, level: 'INFO', request_id: 'start-' + job, pull_run_id: 'pull-' + job };
-      const settle = { ...claim, time: turn.finished_at, level: 'INFO', request_id: 'settle-' + job, native_run_id: 'execution-' + job };
-      workers.push({ ...start, msg: 'cron.work_started' }, { ...start, level: 'DEBUG', msg: 'worker.http_exchange', route: `/api/v1/worker/jobs/${job}/start`,
+      const start = { ...claim, time: turn.started_at, level: 'INFO', request_id: 'start-' + job, pull_run_id: 'pull-' + job, wake_invocation_id: 'wake-' + job };
+      const settle = { ...claim, time: turn.finished_at, level: 'INFO', request_id: 'settle-' + job, native_run_id: 'event-hook-wake-' + job };
+      workers.push({ ...start, msg: 'hook.work_started' }, { ...start, level: 'DEBUG', msg: 'worker.http_exchange', route: `/api/v1/worker/hook/jobs/${job}/start`,
         http_status: 200, output: { context: broker.find(event => event.msg === 'inference.context' && event.job_id === job).context } },
-      { ...settle, msg: 'cron.work_settled', observing_checker_run_id: 'observer-' + job, receipt_state: 'accepted' });
+      { ...settle, msg: 'cron.work_settled', settling_checker_run_id: 'observer-' + job, receipt_state: 'accepted' });
       broker.push({ ...start, msg: 'job.work_started' }, { ...settle, msg: 'job.work_settled' });
     }
   }
@@ -69,7 +69,7 @@ test('native product validation rejects uncoupled claim, context, observation an
     ({ report }) => { report.cycles.pop(); report.cycles = report.cycles.filter(cycle => cycle.id !== 'restart'); },
     ({ report }) => { report.cycles[0].turns[0].claim_id = 'foreign-claim'; },
     ({ workers }) => { workers.find(event => event.msg === 'worker.http_exchange').output = { context: {} }; },
-    ({ workers }) => { workers.find(event => event.msg === 'cron.work_settled').observing_checker_run_id = workers.find(event => event.msg === 'cron.work_started').pull_run_id; },
+    ({ workers }) => { workers.find(event => event.msg === 'cron.work_settled').settling_checker_run_id = workers.find(event => event.msg === 'hook.work_started').wake_invocation_id; },
     ({ broker }) => { broker.find(event => event.msg === 'job.work_settled').request_id = 'other-settlement'; },
     ({ broker }) => { broker.find(event => event.msg === 'lease.fenced').job_id = 'other-job'; },
   ]) {

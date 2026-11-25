@@ -8,7 +8,7 @@ function packaging(t, change = {}) {
   const f = fixture(t);
   const source = { source_sha: 'a'.repeat(40), source_dirty: false, package_version: '1.0.0-dev.0', ...change.build };
   const metadata = { name: '@markhuangai/aaa-muse-worker', version: '1.0.0-dev.0', ...change.metadata };
-  const assets = ['install.sh', 'private-directory.sh', 'producer.sh', 'extract.sh', 'SKILL.md'];
+  const assets = ['install.sh', 'hook.sh', 'private-directory.sh', 'producer.sh', 'extract.sh', 'SKILL.md'];
   for (const asset of assets) f.write('worker/setup/' + asset, 'package fixture');
   for (const [path, raw] of Object.entries({ 'worker/package.json': JSON.stringify(metadata), 'worker/dist/build.json': JSON.stringify(source), 'worker/dist/main.js': 'compiled-worker', 'worker/LICENSE': 'Apache-2.0', 'worker/README.md': 'worker' })) f.write(path, raw);
   const calls = [];
@@ -37,7 +37,8 @@ test('packaging validates metadata, archive inputs, provenance and the same arch
   const receipt = packageWorker([], f.options);
   assert.equal(receipt.outcome, 'passed'); assert.equal(receipt.version, f.source.package_version);
   assert.equal(receipt.sha256.length, 64); assert.equal(receipt.source.source_sha, f.source.source_sha);
-  assert(!receipt.files.some(path => path === 'setup/hook.sh' || path.startsWith('dist/subscriber.')));
+  assert(receipt.files.includes('setup/hook.sh'));
+  assert(!receipt.files.some(path => path.startsWith('dist/subscriber.')));
   const published = JSON.parse(f.read('.artifacts/worker-package/latest.json'));
   assert.deepEqual(published, receipt);
   assert(f.calls.find(call => call.command === 'npm').args.includes('--ignore-scripts'));

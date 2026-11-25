@@ -29,6 +29,8 @@ try {
     await row.getByRole('button').click();
     const drawer = page.getByRole('dialog');
     await expect(drawer.getByText(fixture.stage, { exact: true })).toBeVisible();
+    await expect(drawer.getByRole('button', { name: 'Enable automatic updates' })).toHaveCount(0);
+    await expect(drawer.locator('#worker-update-prompt')).toHaveCount(0);
     if (fixture.failure) await expect(drawer.getByText(fixture.failure, { exact: true })).toBeVisible();
     await verifyWidth(fixture.failure ? 'worker-update-failed' : 'worker-updating', width);
     await drawer.getByRole('button', { name: 'Close', exact: true }).click();

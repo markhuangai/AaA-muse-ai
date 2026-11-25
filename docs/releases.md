@@ -1,54 +1,16 @@
 # Paired product releases
 
-The service and worker share one full release version and source SHA. A service
-accepts every worker in its product major. Minor and patch releases keep that
-worker contract in both version orders. Product versions and
-`protocol_version: 1` identify separate contracts.
+## Paired broker and worker
 
-Workers advertise `X-Muse-Worker-Version` on HTTPS requests. Services
-return `X-Muse-Service-Version`. Incompatible enrollment and starts return HTTP 426 `update_required`. Capable workers can negotiate an update without claiming work. Malformed
-or duplicate version headers return 400. Only major-zero services accept an
-absent legacy header. Legacy status never proves an exact installed version.
-New nonzero workers preflight a legacy server before sending an enrollment code.
-Major 1 uses native cron and a fresh store; do not reuse a major-0 worker or its configuration. Compatibility is not authentication.
-
-At INFO, `worker.compatibility_accepted` records the boundary and legacy status;
-WARN `worker.update_required` records service/worker versions, recommended
-artifact and rejected new authority. The CLI emits ERROR `worker.update_required`
-with manual corrective action and no retry or installation. Export the broker
-diagnostics by the recorded request ID and the worker's protected diagnostics
-through the existing CLI. Keep credential files private; never copy their values
-into the diagnostic request or report. Missing captures remain incomplete.
+Managed hooks use the full broker release, including its RC suffix, and the digest of the worker archive pinned by that broker. Enrollment, pickup, start, media transfer and receipt settlement use hook-specific routes. A version or digest mismatch stops job traffic before it can change a claim or expose its brief.
 
 ## Automatic worker updates
 
-An idle updater-enabled worker follows the exact package paired with the deployed
-broker. The target can be a release candidate, a stable release or an earlier
-updater-enabled release. Workers fetch the canonical public archive over HTTPS
-and verify its digest, version and source before switching the existing launcher.
-A worker reports the running version on authenticated pickup and busy check-in.
-The target becomes confirmed after the same worker makes a fresh pickup from it.
+First enroll the managed-hook worker with the pinned prompt in **Workers**. A native-cron worker displays **Migration required**. To switch, drain work and outstanding receipts on the old pair, update the broker, verify the new registration, then remove the identified old cron and revoke its credential. The schema-5 store, client keys and request history stay with the broker.
 
-Apply the first updater-enabled broker release with all older broker processes
-stopped. Back up the SQLite store before the service applies migration 004.
-Automatic rollback starts with the first updater-enabled release. Older brokers
-require a compatible store and an operator-managed rollback. Later updater-enabled
-brokers defer worker package switches while active brokers advertise different
-release pins. A same-version digest conflict calls for verifying the deployed
-images and release receipt.
+After that cutover, an idle managed worker can discover a strictly newer 1.x archive when the running brokers agree on its release pin. It downloads the canonical public artifact over HTTPS, checks its version, source and SHA-256, and swaps the launcher atomically. A fresh matching pickup confirms the update. Rollback is unsupported.
 
-An automatic major transition requires the paired image and archive to declare
-support for the source worker's updater, state, credential and native checker.
-The portal shows **Migration required** when that declaration is missing.
-The major-0 to major-1 cutover uses separate configuration, credentials and storage.
-
-From **Workers**, open an existing major-1 worker and copy **Enable automatic
-updates** into its own Muse goal once. Wait for a fresh pickup to report the
-target version. A worker with active or uncertain work waits for reconciliation.
-If a download fails and the previous release is compatible and verified, the
-worker serves jobs during retry backoff. An integrity failure calls for operator
-inspection of the paired archive. An uncertain launcher switch keeps the worker
-reserved pending recovery.
+Drain client intake, claims, deliveries and update attempts before switching versions. If a switch interrupts work, the original matching pair is required to reconcile its hold. Use the worker's protected export and the broker diagnostics to identify the observed and expected versions, archive digest and corrective action.
 
 ## Publication
 
@@ -99,14 +61,10 @@ artifact. If a newer complete RC appears before the first stable write, review
 that RC and dispatch again with its tag. A conflicting marker or artifact blocks
 the run.
 
-The native-cron source is for major 1. A selected major-1 RC cannot build or
-promote a new major-0 version. The initial target for this cutover is `1.0.0`.
-The historical `v0.1.0` candidate still reserves its npm version. Version
-conflicts require an eligible unused version; never republish historical bytes
-under an existing tag.
-After a complete `1.0.0` publication, the next eligible merge starts the
-`1.0.1-rc.0` series. An automatic transition to a new major requires the
-migration declaration in both the broker image and the worker archive.
+The managed-hook source is for major 1. A selected major-1 RC can build or
+promote only an eligible major-1 version. Existing tags and npm versions remain
+reserved. Automatic updates require a strictly newer 1.x pair. A move to a new
+major requires separate enrollment and an operator-controlled cutover.
 
 The workflow builds and smoke-tests the requested version from the verified RC
 commit and tree. It checks the same worker on Node 22.12.0 and freezes
@@ -197,9 +155,9 @@ registrations belonging to other goals or remove shared storage. If major 1
 refuses an existing mount, correct that installation's mount mapping; do not
 erase data to clear the refusal.
 
-Use a fresh enrollment prompt from the major-1 portal. Verify the archive,
-private state modes and exactly one enabled goal-owned native agent cron at
-`every: "1m"`. Read back its job ID and action, then check the authenticated
-first poll. A green native run is not a job receipt. Use the claim-bound native
-work run and the broker's terminal receipt to reconcile work. The old release
-bundles and their verification records remain available for historical recovery.
+Use a fresh enrollment prompt from the managed-hook portal. Verify the archive
+and private state modes. Read back the exact enabled 15-second hook and
+goal-owned hourly watchdog, then confirm an authenticated tick on the new
+registration. Reconcile work with the bound wake invocation and the broker's
+terminal receipt. The old release bundles and verification records remain
+available for historical recovery.

@@ -15,19 +15,18 @@ export interface WorkersView {
   message: string;
   requestID: string;
   operationID: string;
-  pending: '' | 'rename' | 'revoke' | 'enrollment' | 'update';
+  pending: '' | 'rename' | 'revoke' | 'enrollment';
   actionMessage: string;
   actionRequestID: string;
   actionOperationID: string;
   enrollment: Enrollment | null;
   enrollmentKind: EnrollmentKind;
   enrollmentMessage: string;
-  updatePrompt: string;
 }
 
 const initial = (): WorkersView => ({ workers: null, offlineClock: 0, selectedID: '', loading: false, stale: true, lastGood: null,
   message: '', requestID: '', operationID: '', pending: '', actionMessage: '', actionRequestID: '', actionOperationID: '',
-  enrollment: null, enrollmentKind: 'prompt', enrollmentMessage: '', updatePrompt: '' });
+  enrollment: null, enrollmentKind: 'prompt', enrollmentMessage: '' });
 
 export async function browserCopy(text: string) {
   if (!navigator.clipboard) throw new Error('clipboard_unavailable');
@@ -157,7 +156,7 @@ export class WorkersController {
 
   select(id: string) {
     if (id && (this.#view.pending || !this.#view.workers?.some(worker => worker.id === id))) return;
-    this.change({ selectedID: id, updatePrompt: '', actionMessage: '', actionRequestID: '', actionOperationID: '' });
+    this.change({ selectedID: id, actionMessage: '', actionRequestID: '', actionOperationID: '' });
   }
 
   async mutate(kind: 'rename' | 'revoke', id: string, name = '') {
@@ -220,35 +219,6 @@ export class WorkersController {
         failure.causeCode === 'https_origin_required' ? 'Open the portal over HTTPS to generate a setup prompt.' :
         failure.status === 403 ? 'The server denied enrollment creation.' : 'Enrollment creation could not be confirmed. No setup text is available. Generate a new enrollment to try again.', actionRequestID: failure.requestID });
     } finally { if (generation === this.#generation) this.change({ pending: '' }); }
-  }
-
-  async createUpdatePrompt(id: string) {
-    if (!this.available() || this.#view.pending || this.#view.stale || this.#view.selectedID !== id) return;
-    const generation = this.#generation;
-    const operation = this.system.id();
-    this.change({ pending: 'update', updatePrompt: '', actionMessage: '', actionRequestID: '', actionOperationID: operation });
-    try {
-      const result = await this.api.workerUpdatePrompt(id, operation, this.#abort.signal);
-      if (generation === this.#generation && this.#view.selectedID === id && this.available())
-        this.change({ updatePrompt: result.value, actionRequestID: result.requestID });
-    } catch (error) {
-      if (generation !== this.#generation || this.#view.selectedID !== id || !this.available()) return;
-      const failure = error instanceof APIError ? error : new APIError('request_failed');
-      if (failure.status === 401) { this.denied(failure.requestID, operation); return; }
-      this.change({ actionMessage: failure.causeCode === 'https_origin_required' ? 'Open the portal over HTTPS to generate an update prompt.' :
-        'The update prompt is unavailable. Refresh workers and verify the service has a paired release.', actionRequestID: failure.requestID });
-    } finally { if (generation === this.#generation) this.change({ pending: '' }); }
-  }
-
-  async copyUpdatePrompt() {
-    const prompt = this.#view.updatePrompt;
-    if (!prompt || !this.available()) return;
-    try {
-      await this.clipboard(prompt);
-      if (this.#view.updatePrompt === prompt) this.change({ actionMessage: 'Update prompt copied.' });
-    } catch {
-      if (this.#view.updatePrompt === prompt) this.change({ actionMessage: 'Clipboard unavailable. Select and copy the update prompt.' });
-    }
   }
 
   async copyEnrollment() {

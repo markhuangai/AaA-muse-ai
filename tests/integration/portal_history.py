@@ -215,7 +215,7 @@ class PortalHistory(Portal, Routing):
         job = self.experiment(race["id"])["current_job_id"]
         self.receipt("portal.history_cancellation_authority", unassigned=True, held_uncertainty=True, late_decision_rejected=True, exact_settlement=True)
         return {"queued": cancellable, "held": blocker, "race": race, "race_control": {"credential": race_worker["credential"], "job_id": job,
-                "version": self.worker_version, "poll": race_peer.poll_input()}}
+                "pair_headers": self.worker_pair_headers(), "poll": race_peer.poll_input()}}
 
     def deliver_claim(self, worker, peer, request):
         return self.claim(worker, peer, self.experiment(request["id"]))[0]

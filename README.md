@@ -1,6 +1,6 @@
 # AaA-muse-ai
 
-AaA-muse-ai is a self-hosted broker for using Muse from model clients. In major 1, a worker's native one-minute Muse cron checks for work over outbound HTTPS and hands a claim to a finite native Muse run. Muse proposes answers and tool calls. The calling client runs its tools under its own permissions and returns the results.
+AaA-muse-ai is a self-hosted broker for using Muse from model clients. A managed shell hook checks for work over outbound HTTPS every 15 seconds. It wakes a Muse agent for each claim, and an hourly watchdog reports stalls. Muse proposes answers and tool calls. The calling client runs its tools under its own permissions and returns the results.
 
 - Use the OpenAI Chat Completions and Responses subsets for text and function tools, with JSON or buffered SSE. The model alias is `muse-ai`. [API and client setup](docs/history-api.md#openai-chat-completions)
 - Create client keys, enroll workers, and inspect requests in the control portal. [Portal guide](docs/portal.md)

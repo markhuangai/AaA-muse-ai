@@ -4,9 +4,18 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"golang.org/x/mod/semver"
 )
 
-const UpdateContract = "native-cron-v1"
+const UpdateContract = "managed-hook-v1"
+
+func (t UpdateTarget) Advances(c Contact) bool {
+	return t.Contract == UpdateContract && t.Contract == c.Contract &&
+		strings.HasPrefix(t.Version, "1.") && strings.HasPrefix(c.Version, "1.") &&
+		semver.IsValid("v"+c.Version) && semver.IsValid("v"+t.Version) &&
+		semver.Compare("v"+t.Version, "v"+c.Version) > 0
+}
 
 type PackagePin struct {
 	Name    string `json:"name"`
@@ -38,7 +47,7 @@ type Contact struct {
 	Version  string `json:"version,omitempty"`
 	Digest   string `json:"sha256,omitempty"`
 	Contract string `json:"contract,omitempty"`
-	// Incompatible is only set after the HTTP major-version check admits an update-only pull.
+	// Incompatible marks authenticated contact without the broker's exact pair.
 	Incompatible bool `json:"-"`
 }
 

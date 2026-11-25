@@ -26,13 +26,14 @@ type httpInferenceStore struct {
 	workers  *httpWorkerStore
 	states   map[string]*inference.State
 	receipts map[string]*inference.Receipt
+	native   map[string]inference.NativeWorkReceipt
 	fail     error
 	output   *bytes.Buffer
 	capture  *diagnostics.Store
 	sequence int64
 }
 
-func (m *httpInferenceStore) WithinPull(ctx context.Context, digest [32]byte, _ inference.Pull, _ string, capability int, _ worker.Contact, _ worker.UpdateBroker, claim func(*inference.State) (*inference.Grant, error)) (inference.PullResult, string, bool, inference.PullTiming, error) {
+func (m *httpInferenceStore) WithinPull(ctx context.Context, digest [32]byte, input inference.Pull, _ string, capability int, _ worker.Contact, _ worker.UpdateBroker, claim func(*inference.State) (*inference.Grant, error)) (inference.PullResult, string, bool, inference.PullTiming, error) {
 	identity, err := m.workers.AuthenticateWorker(ctx, digest)
 	if err != nil {
 		return inference.PullResult{}, "", false, inference.PullTiming{}, err
@@ -59,6 +60,13 @@ func (m *httpInferenceStore) WithinPull(ctx context.Context, digest [32]byte, _ 
 		selected := *pool
 		selected.Jobs = map[string]*inference.Job{candidate.ID: candidate}
 		result.Job, err = claim(&selected)
+		if err == nil && result.Job != nil && inference.HookClaim(result.Job.ClaimID) {
+			pair, _ := inference.PairedHook(ctx)
+			if m.native == nil {
+				m.native = make(map[string]inference.NativeWorkReceipt)
+			}
+			m.native[result.Job.ClaimID] = inference.NativeWorkReceipt{Mode: "hook", Pair: pair, Checker: input.Checker, Occurrence: input.Occurrence}
+		}
 		return err
 	})
 	return result, identity.ID, false, inference.PullTiming{}, err
@@ -147,8 +155,18 @@ func (m *httpInferenceStore) WithinInference(_ context.Context, ref inference.Re
 	}
 	s.Revoked = m.workers.records[wid].RevokedAt != nil
 	s.Receipt = m.receipts[ref.Principal+":"+ref.SubmissionID]
+	job := s.Jobs[ref.JobID]
+	if ref.NativeWork && job != nil {
+		if prior, ok := m.native[job.LeaseID]; ok {
+			s.NativeWork = &prior
+		}
+	}
 	if err = fn(&s); err != nil {
 		return err
+	}
+	if s.NativeWork != nil {
+		m.native[job.LeaseID] = *s.NativeWork
+		s.NativeWork = nil
 	}
 	if s.Receipt != nil {
 		m.receipts[ref.Principal+":"+ref.SubmissionID] = s.Receipt
@@ -213,7 +231,7 @@ func apiJSON(t *testing.T, h *Handler, method, path, key string, input any, want
 	t.Helper()
 	var body io.Reader
 	if input != nil {
-		data, err := json.Marshal(input)
+		data, err := json.Marshal(pairedWorkInput(input))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -372,11 +390,11 @@ func TestNativeInterruptionEvidencePersistsAcrossReceiptReplay(t *testing.T) {
 		LaunchID: "launch", NativeJob: "once", NativeRun: "execution", Reason: "execution_confirmed_stopped"}
 	settle := func(metadata ...string) *httptest.ResponseRecorder {
 		t.Helper()
-		body, err := json.Marshal(input)
+		body, err := json.Marshal(pairedTestStop(input))
 		if err != nil {
 			t.Fatal(err)
 		}
-		request := httptest.NewRequest(http.MethodPost, route+"/interrupt", bytes.NewReader(body))
+		request := pairedRequest(h, http.MethodPost, route+"/interrupt", bytes.NewReader(body))
 		request.Header.Set("Authorization", "Bearer "+key)
 		request.Header.Set(service.WorkerVersionHeader, service.DevelopmentVersion)
 		for _, value := range metadata {

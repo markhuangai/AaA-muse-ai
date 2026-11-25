@@ -73,6 +73,15 @@ func (r *Repository) RecordBusyPresence(ctx context.Context, credential [32]byte
 			return err
 		}
 		operationID = job.ExperimentID
+		if pair, hook := inference.PairedHook(ctx); hook {
+			work, err := readNativeWork(ctx, tx, &job)
+			if err != nil {
+				return err
+			}
+			if err = inference.RequireHookPair(work, pair); err != nil {
+				return err
+			}
+		}
 		receipt, err = record(&job, r.databaseTime())
 		if err != nil || !receipt.Recorded {
 			return err
@@ -111,6 +120,11 @@ func (r *Repository) WithinPull(ctx context.Context, credential [32]byte, input 
 		if err != nil {
 			return err
 		}
+		if input.ObserveLegacy {
+			timing.Update, err = observeLegacyWorker(ctx, tx, now, workerID, input, contact)
+			return err
+		}
+		pair, pairedHook := inference.PairedHook(ctx)
 		var sequence, scheduled int64
 		var priorHash string
 		var saved []byte
@@ -129,6 +143,24 @@ func (r *Repository) WithinPull(ctx context.Context, credential [32]byte, input 
 			}
 			if err = decodeInference(saved, &result); err != nil {
 				return err
+			}
+			if input.VerifyHookStart {
+				if result.Job != nil {
+					job := &inference.Job{WorkerID: workerID, LeaseID: result.Job.ClaimID}
+					work, err := readNativeWork(ctx, tx, job)
+					if err != nil {
+						return err
+					}
+					if !pairedHook {
+						return inference.Reject("update_required", 426, "claim_id", job.LeaseID)
+					}
+					if err = inference.RequireHookPair(work, pair); err != nil {
+						return err
+					}
+				}
+				if result.Update != nil && (broker.Target == nil || result.Update.Target != *broker.Target) {
+					result.Update = nil
+				}
 			}
 			replayed = true
 			timing.PreviousPin = previousPin
@@ -160,7 +192,7 @@ func (r *Repository) WithinPull(ctx context.Context, credential [32]byte, input 
 				if err != nil {
 					return err
 				}
-				candidate, transferFrom, err := pickPullJob(ctx, tx, workerID, major, capability, now, &timing)
+				candidate, transferFrom, err := pickPullJob(ctx, tx, workerID, major, capability, now, &timing, pair)
 				timing.Select = time.Since(lookupStarted)
 				if err != nil {
 					return err
@@ -183,7 +215,7 @@ func (r *Repository) WithinPull(ctx context.Context, credential [32]byte, input 
 					if err != nil {
 						return err
 					}
-					if inference.VerifiedClaim(result.Job.ClaimID) {
+					if inference.VerifiedClaim(result.Job.ClaimID) || inference.HookClaim(result.Job.ClaimID) {
 						if err = recordNativeGrant(ctx, tx, workerID, result.Job.ClaimID, input); err != nil {
 							return err
 						}

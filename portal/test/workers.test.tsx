@@ -74,6 +74,28 @@ test('empty, loading, stale and enrollment states keep usable controls without p
   expect(localStorage.length).toBe(0); expect(sessionStorage.length).toBe(0); portal.dispose();
 });
 
+test('legacy workers show migration status and the enrollment panel supplies setup', async () => {
+  const { portal, api, controller } = await fixture();
+  const legacy = { ...worker(), worker_update: { version: '1.1.0', state: 'migration_required', reason: 'unsupported_worker_migration' } };
+  const newer = { ...worker('b'.repeat(32), 'Newer worker'),
+    worker_update: { version: '1.2.0', state: 'deferred', reason: 'update_requires_newer_pair' } };
+  api.workersWork = async () => ({ value: [legacy, newer], requestID: 'pair-status' });
+  await controller.refresh();
+  render(<Workers controller={controller} />);
+  await act(async () => { fireEvent.click(screen.getByRole('button', { name: legacy.name })); });
+  const drawer = within(screen.getByRole('dialog', { name: legacy.name }));
+  expect(drawer.getByText('Migration required')).toBeTruthy();
+  expect(drawer.queryByRole('button', { name: /enable automatic updates|migrate/i })).toBeNull();
+  expect(screen.getByRole('heading', { name: 'Enroll a worker' })).toBeTruthy();
+  expect(screen.getByRole('button', { name: 'Generate setup prompt' })).toBeTruthy();
+  fireEvent.click(drawer.getByRole('button', { name: 'Close' }));
+  await act(async () => { fireEvent.click(screen.getByRole('button', { name: newer.name })); });
+  const detail = within(screen.getByRole('dialog', { name: newer.name }));
+  expect(detail.getByText('Update deferred')).toBeTruthy();
+  expect(detail.getByText('The broker must run a newer paired release to update this worker.')).toBeTruthy();
+  portal.dispose();
+});
+
 test('native-dialog callbacks issue revocation only after confirmation and expose accepted revocation', async () => {
   const { portal, controller } = await fixture();
   render(<Workers controller={controller} />);

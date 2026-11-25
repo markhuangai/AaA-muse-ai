@@ -48,9 +48,18 @@ async function setup(t, { legacy = false, stage, override } = {}) {
 test('declared update target and candidate metadata restrict the version, provenance and installed path', async t => {
   const f = await setup(t);
   assert.equal(updateTarget(target), target);
+  assert.equal(supportsSource(target, from), true);
+  assert.equal(supportsSource(target, to), false);
+  assert.equal(supportsSource(target, '1.1.0'), false);
   assert.equal(supportsSource(target, '2.0.0'), false);
-  assert.equal(supportsSource({ ...target, from_majors: '2' }, '2.0.0'), true);
+  assert.equal(supportsSource({ ...target, from_majors: '2' }, '2.0.0'), false);
   assert.equal(supportsSource(target, '0.9.0'), false);
+  assert.equal(supportsSource({ ...target, version: '1.0.1-rc.1' }, to), false);
+  assert.equal(supportsSource({ ...target, version: '1.0.1-rc.10' }, '1.0.1-rc.2'), true);
+  assert.equal(supportsSource({ ...target, version: '1.0.1-rc.2' }, '1.0.1-rc.10'), false);
+  assert.equal(supportsSource({ ...target, version: '1.0.1-rc.0' }, '1.0.1-dev.10'), true);
+  assert.equal(supportsSource({ ...target, version: '2.0.0' }, to), false);
+  assert.throws(() => updateTarget({ ...target, version: '2.0.0', url: target.url.replaceAll('1.0.1', '2.0.0') }), /candidate_incompatible/);
   assert.throws(() => updateTarget({ ...target, url: 'https://elsewhere.invalid/worker.tgz' }), /candidate_incompatible/);
   assert.throws(() => verifyInstallEntry(f.state.root, '/outside/main.js'), /update_entry_outside_installation/);
   verifyInstallEntry(f.state.root, f.after);
@@ -84,7 +93,7 @@ test('a journal and the actual launcher reconcile a switched package after a los
   assert.deepEqual(f.actions, ['begin', 'activate', 'applied', 'applied']);
 });
 
-test('failed checksum keeps the previous launcher, and adoption preserves the checker', async t => {
+test('failed checksum keeps the previous launcher and records evidence for the watchdog', async t => {
   const f = await setup(t, { stage: async () => { throw new Failure('archive_digest_mismatch', { observed_digest: 'x' }); } });
   const previous = f.updater(from, f.before);
   const transport = await previous.worker.load();
@@ -97,13 +106,5 @@ test('failed checksum keeps the previous launcher, and adoption preserves the ch
   assert.deepEqual(f.actions, ['begin', 'failed']);
   assert(f.output.some(message => message.includes('worker.update_verification_failed') && message.includes('archive_digest_mismatch')));
 
-  const legacy = await setup(t, { legacy: true });
-  const current = legacy.updater(to, legacy.after);
-  const checker = await legacy.state.read('cron-installation.json');
-  const adopted = await current.adopt(origin, ID, nextSHA, legacy.state.root);
-  assert.equal(adopted.outcome, 'update_awaiting_confirmation');
-  assert.deepEqual(legacy.actions, ['adopt', 'activate']);
-  await current.recover();
-  assert.equal(await legacy.state.read('cron-installation.json'), checker);
-  assert.equal(await legacy.state.read('credential.key'), KEY);
+  assert.equal(JSON.parse(await f.state.read('hook-update-health.json')).cause, 'archive_digest_mismatch');
 });

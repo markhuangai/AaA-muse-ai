@@ -31,7 +31,7 @@ func inferenceRoute(path string) (string, string) {
 		if len(parts) == 1 && strings.Contains(prefix, "admin") {
 			return base, parts[0]
 		}
-		if len(parts) == 2 && ((strings.Contains(prefix, "admin") && (parts[1] == "cancel" || parts[1] == "tool-results")) || (strings.Contains(prefix, "worker") && (parts[1] == "decisions" || parts[1] == "start" || parts[1] == "interrupt" || parts[1] == "presence"))) {
+		if len(parts) == 2 && ((strings.Contains(prefix, "admin") && (parts[1] == "cancel" || parts[1] == "tool-results")) || (strings.Contains(prefix, "worker") && (parts[1] == "decisions" || parts[1] == "start" || parts[1] == "interrupt" || parts[1] == "presence" || parts[1] == "bind"))) {
 			return base + "/" + parts[1], parts[0]
 		}
 	}
@@ -92,14 +92,16 @@ func (h *Handler) inferenceRequest(w *response, r *http.Request, logger *slog.Lo
 				err = contactErr
 				break
 			}
-			contact.Incompatible = !h.Service.Build().Compatible(contact.Version)
+			_, paired := inference.PairedHook(r.Context())
+			contact.Incompatible = !paired
 			input.WeeklyUsage = readWeeklyUsage(r.Header, logger)
-			if values := r.Header.Values("X-Muse-Worker-Start-Proof"); len(values) != 0 {
-				if len(values) != 1 || values[0] != "1" {
-					err = inference.Reject("invalid_native_start_capability", 400)
-					break
-				}
-				input.VerifyStart = true
+			oldProof, hookProof := r.Header.Values("X-Muse-Worker-Start-Proof"), r.Header.Values("X-Muse-Worker-Hook-Proof")
+			input.VerifyHookStart, input.ObserveLegacy = hookRequest(r), !hookRequest(r)
+			if (input.VerifyHookStart && (len(oldProof) != 0 || len(hookProof) != 1 || hookProof[0] != "1")) ||
+				(input.ObserveLegacy && (len(hookProof) != 0 || (len(oldProof) != 0 && (len(oldProof) != 1 || oldProof[0] != "1")))) {
+				err = inference.Reject("invalid_native_start_capability", 400)
+				logger.Warn("worker.pull_rejected", "reason", "invalid_native_start_capability", "hook_proof_count", len(hookProof), "native_proof_count", len(oldProof))
+				break
 			}
 			pulled, w.workerID, err = h.Broker.PullWork(r.Context(), logger, strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "), input, contact)
 			if err == nil {
@@ -112,6 +114,12 @@ func (h *Handler) inferenceRequest(w *response, r *http.Request, logger *slog.Lo
 		err = decodeInferenceInput(body, &input, "protocol_version", "claim_id", "generation", "launch_id", "native_job_id")
 		if err == nil {
 			result, err = h.Broker.StartWork(r.Context(), logger, identity.ID, id, input)
+		}
+	case workerBindRoute:
+		var input inference.WakeBinding
+		err = decodeInferenceInput(body, &input, "protocol_version", "submission_id", "claim_id", "generation", "checker_job_id", "previous_invocation_id", "invocation_id")
+		if err == nil {
+			result, err = h.Broker.BindWake(r.Context(), logger, identity.ID, id, input)
 		}
 	case workerPresenceRoute:
 		var input inference.BusyCheck

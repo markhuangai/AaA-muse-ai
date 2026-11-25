@@ -6,7 +6,7 @@ import { basename, resolve, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const workerDirectory = fileURLToPath(new URL('../', import.meta.url));
-const legacyModules = new Set(['health', 'setup', 'setup-os', 'subscriber', 'upgrade', 'upgrade-evidence', 'watchdog']);
+const legacyModules = new Set(['cron-setup', 'health', 'setup', 'setup-os', 'subscriber', 'upgrade', 'upgrade-evidence', 'watchdog']);
 
 export function packageWorker(args = process.argv.slice(2), { directory = workerDirectory, execute = execFileSync } = {}) {
   const root = resolve(directory, '..');
@@ -29,7 +29,7 @@ export function packageWorker(args = process.argv.slice(2), { directory = worker
   for (const name of ['dist', 'setup', 'LICENSE', 'README.md']) {
     cpSync(join(directory, name), join(staging, name), { recursive: true, filter: path => name !== 'dist' || !legacyModules.has(basename(path).split('.', 1)[0]) });
   }
-  const assets = ['setup/install.sh', 'setup/private-directory.sh', 'setup/producer.sh', 'setup/extract.sh', 'setup/SKILL.md'];
+  const assets = ['setup/install.sh', 'setup/hook.sh', 'setup/private-directory.sh', 'setup/producer.sh', 'setup/extract.sh', 'setup/SKILL.md'];
   writeFileSync(join(staging, 'package.json'), JSON.stringify(metadata, null, 2) + '\n', { mode: 0o600 });
   const result = JSON.parse(execute('npm', ['pack', staging, '--ignore-scripts', '--json', '--pack-destination', owned], { cwd: directory, encoding: 'utf8' }))[0];
   assert.equal(result.name, metadata.name);
@@ -39,7 +39,7 @@ export function packageWorker(args = process.argv.slice(2), { directory = worker
   assert(result.files.some(file => file.path === 'dist/main.js'));
   assert(result.files.some(file => file.path === 'dist/build.json'));
   for (const path of assets) assert(result.files.some(file => file.path === path));
-  assert(!result.files.some(file => ['setup/upgrade-enrolled.sh', 'setup/hook.sh'].includes(file.path) ||
+  assert(!result.files.some(file => file.path === 'setup/upgrade-enrolled.sh' ||
     (file.path.startsWith('dist/') && legacyModules.has(basename(file.path).split('.', 1)[0]))));
   const archive = join(owned, result.filename);
   verifyArchive(archive, metadata.version, source.source_sha, owned, { execute, directory });

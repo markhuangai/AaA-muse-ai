@@ -144,7 +144,7 @@ class Harness:
                 for name in ("etc/ssl/certs/ca-certificates.crt", "etc/alpine-release", "etc/os-release",
                              "usr/share/aaa-muse-ai/portal/index.html",
                              *("usr/share/aaa-muse-ai/licenses/" + name for name in
-                               ("geist-OFL.txt", "geist-mono-OFL.txt", "x-image/LICENSE", "mimetype/LICENSE",
+                               ("geist-OFL.txt", "geist-mono-OFL.txt", "x-image/LICENSE", "mimetype/LICENSE", "x-mod/LICENSE",
                                 "mcp-go-sdk/LICENSE"))):
                     require(name in files and files[name].size > 0, "missing runtime file " + name)
                 require(b"ID=alpine" in fs.extractfile(files["etc/os-release"]).read().splitlines(),

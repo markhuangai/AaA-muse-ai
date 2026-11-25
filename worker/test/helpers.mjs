@@ -48,7 +48,7 @@ export class Broker {
       if (input.idle_ack) this.jobs.get(input.idle_ack.job_id).held = false;
       return response({ connection_status: 'online', work_status: 'idle' });
     }
-    const id = path.split('/')[5];
+    const id = path.replace('/worker/hook/', '/worker/').split('/')[5];
     const current = this.jobs.get(id);
     if (!current) return response({ error: 'inference_not_found' }, 404);
     if (path.endsWith('/claim')) {

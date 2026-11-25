@@ -6,8 +6,15 @@ import * as fs from 'node:fs/promises';
 import { execute, argumentsFor, VERSION } from '../dist/cli.js';
 import { fixture, CODE, KEY, JOB, EXP, claimed } from './helpers.mjs';
 
+const archivePin = 'a'.repeat(64);
 function adapters(f, changes = {}) {
-  return { files: fs, system: f.state.sys, network: f.net, env: {}, home: () => f.state.root, nodeVersion: process.version, input: async () => CODE, stdout: line => f.stdout.push(line), stderr: line => f.output.push(line), signal: new AbortController().signal, metadata: async () => ({ source_sha: 'unit', source_dirty: true }), ...changes };
+  const network = { ...f.net, fetch: async (url, options) => {
+    assert(new URL(url).pathname.startsWith('/api/v1/worker/hook/'));
+    const response = await f.net.fetch(url.replace('/api/v1/worker/hook/', '/api/v1/worker/'), options);
+    response.headers.set('X-Muse-Paired-Worker-SHA256', archivePin);
+    return response;
+  } };
+  return { files: fs, system: f.state.sys, network, env: {}, home: () => f.state.root, nodeVersion: process.version, input: async () => CODE, stdout: line => f.stdout.push(line), stderr: line => f.output.push(line), signal: new AbortController().signal, metadata: async () => ({ source_sha: 'unit', source_dirty: true }), ...changes };
 }
 
 async function nativeBrief(f, changes = {}) {
@@ -32,6 +39,7 @@ test('CLI validates options and runtime without echoing unknown argument values'
 test('CLI runs configure, enrollment, context, decision, status, doctor and export with real state logic', async t => {
   const f = await fixture(t); f.stdout = [];
   const io = adapters(f);
+  await f.state.write('installation.json', JSON.stringify({ package_sha256: archivePin }));
   const run = (...args) => execute([args[0], '--state-dir', f.state.root, ...args.slice(1)], io);
   assert.equal(await run('configure', '--origin', 'https://broker.example.test'), 0);
   assert.equal(await run('enroll', '--code-stdin'), 0);
@@ -76,6 +84,7 @@ test('overlapping CLI decision commands reuse one journal and reject conflicting
   const f = await fixture(t); f.stdout = [];
   await f.worker.configure('https://broker.example.test'); await f.worker.enroll(CODE);
   const brief = await nativeBrief(f);
+  await f.state.write('installation.json', JSON.stringify({ package_sha256: archivePin }));
   f.broker.jobs.set(JOB, brief);
   const input = '{"type":"final","text":"same decision with exact identity"}';
   let release, reached;

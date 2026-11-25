@@ -6,6 +6,7 @@ import { cause, Failure, requireValue } from './errors.js';
 import { decision, encode, identifier, integer, object, parse, text, type ObjectValue, type Value } from './json.js';
 import { correlation, job, version } from './protocol.js';
 import { VERSION } from './version.js';
+import { archiveDigest } from './update-archive.js';
 
 const enrollmentRoute = '/api/v1/worker/enroll';
 const workerCredential = /^muse_worker_[A-Za-z0-9_-]{43}$/;
@@ -21,7 +22,7 @@ function spentEnrollment(error: Failure): boolean {
 export class Worker {
   config: ObjectValue = {};
   credential = '';
-  constructor(readonly state: State, readonly logger: Logger, readonly net?: Network, readonly productVersion = VERSION) {}
+  constructor(readonly state: State, readonly logger: Logger, readonly net?: Network, readonly productVersion = VERSION, readonly managedHook = false) {}
   async readRecord(state: State, name: string, validate?: (record: ObjectValue) => void): Promise<ObjectValue | undefined> {
     let raw: string | undefined;
     try {
@@ -37,7 +38,7 @@ export class Worker {
       throw new Failure('invalid_local_state', { entry, cause: cause(error), diagnostic_recorded: true });
     }
   }
-  async load(enrolled = true): Promise<Transport> {
+  async load(enrolled = true, initialDigest?: string): Promise<Transport> {
     const config = await this.readRecord(this.state, 'config.json', value => { version(value.protocol_version); origin(text(value.origin)); });
     requireValue(config, 'worker_not_configured');
     this.config = config;
@@ -45,7 +46,14 @@ export class Worker {
     this.credential = (await this.state.read('credential.key'))?.trim() ?? '';
     this.logger.redactor.add(this.credential);
     if (enrolled) requireValue(workerCredential.test(this.credential), 'worker_not_enrolled');
-    return new Transport(endpoint, this.credential, this.logger, this.state.sys, this.net, this.productVersion);
+    let digest: string | undefined;
+    if (this.managedHook) {
+      const installed = await this.readRecord(this.state, 'installation.json');
+      const pin = initialDigest ?? installed?.package_sha256;
+      requireValue(typeof pin === 'string' && archiveDigest.test(pin), 'worker_archive_digest_required');
+      digest = pin;
+    }
+    return new Transport(endpoint, this.credential, this.logger, this.state.sys, this.net, this.productVersion, digest);
   }
   async configure(endpoint: string): Promise<ObjectValue> {
     const normalized = origin(endpoint);
@@ -72,12 +80,12 @@ export class Worker {
     }
     return reply.data;
   }
-  async enroll(code: string, setupID?: string): Promise<ObjectValue> {
+  async enroll(code: string, setupID?: string, archiveDigest?: string): Promise<ObjectValue> {
     const setupOperationID = setupID && operationPattern.test(setupID) ? setupID : undefined;
     this.logger.redactor.add(code);
     requireValue(/^muse_enroll_[A-Za-z0-9_-]{43}$/.test(code), 'invalid_enrollment_code');
     return await this.state.withLock('config', async () => {
-      const transport = await this.load(false);
+      const transport = await this.load(false, archiveDigest);
       const saved = await this.readRecord(this.state, 'enrollment.json');
       if (setupOperationID) this.logger.base.operation_id = setupOperationID;
       const codeDigest = digest(code);
@@ -108,8 +116,10 @@ export class Worker {
       const fresh = !saved || saved.state === 'rejected';
       requireValue(fresh || staged, 'enrollment_uncertain', { corrective_action: 'inspect management issuance records, revoke any orphaned identity, then use a separate clean state directory' });
       const journal = { origin: transport.endpoint, code_digest: codeDigest, operation_id: operationID };
-      if (fresh) await transport.enrollmentCompatibility();
-      if (fresh && this.productVersion.startsWith('0.')) return await this.enrollLegacy(transport, code, metadata);
+      if (fresh && !this.managedHook) {
+        await transport.enrollmentCompatibility();
+        if (this.productVersion.startsWith('0.')) return await this.enrollLegacy(transport, code, metadata);
+      }
       let credential = '';
       if (saved?.state === 'staged') {
         credential = text(saved.credential);
@@ -124,11 +134,13 @@ export class Worker {
           try {
             reply = await transport.request(enrollmentRoute, 'POST', encode({ enrollment_code: code, phase: 'prepare' }), { enrollment_phase: 'prepare' }, 3, 10_000, metadata);
           } catch (error) {
-            if (fresh && round === 1 && error instanceof Failure && error.code === 'broker_rejected' &&
+            if (!this.managedHook && fresh && round === 1 && error instanceof Failure && error.code === 'broker_rejected' &&
                 error.fields.http_status === 400 && error.fields.reason === 'unsupported_field' && error.fields.attempt === 1) {
               return await this.enrollLegacy(transport, code, metadata);
             }
             if (error instanceof Failure && (spentEnrollment(error) ||
+                (this.managedHook && fresh && error.fields.attempt === 1 &&
+                  ['update_required', 'hook_broker_unavailable'].includes(error.code)) ||
                 (error.code === 'broker_rejected' && error.fields.http_status === 400 && error.fields.reason === 'enrollment_invalid'))) {
               await this.rejectEnrollment(error);
             }
@@ -142,7 +154,7 @@ export class Worker {
           await this.state.write('enrollment.json', encode({ ...journal, state: 'staged', credential }));
           await this.logger.log('INFO', 'worker.enrollment_prepared', { enrollment_phase: 'prepare', enrollment_id: enrollmentID, request_id: reply.requestId, outcome: 'saved' });
         }
-        const candidate = new Transport(transport.endpoint, credential, this.logger, this.state.sys, this.net, this.productVersion);
+        const candidate = new Transport(transport.endpoint, credential, this.logger, this.state.sys, this.net, this.productVersion, transport.hookDigest);
         let reply;
         try {
           reply = await candidate.request(enrollmentRoute, 'POST', encode({ enrollment_code: code, phase: 'activate' }), { enrollment_phase: 'activate' }, 3, 10_000, metadata);

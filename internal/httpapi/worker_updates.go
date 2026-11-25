@@ -12,7 +12,6 @@ import (
 )
 
 const workerUpdateRoute = "/api/v1/worker/update"
-const adoptionPromptRoute = "/api/v1/admin/workers/{id}/update-prompt"
 
 var updaterContract = regexp.MustCompile(`^[a-z0-9-]{1,40}$`)
 
@@ -21,8 +20,10 @@ func readWorkerContact(r *http.Request) (worker.Contact, error) {
 	contract := r.Header.Get(service.WorkerUpdaterHeader)
 	digest := r.Header.Get(service.WorkerDigestHeader)
 	_, valid := service.ReleaseMajor(version)
-	if len(r.Header.Values(service.WorkerVersionHeader)) > 1 || (version != "" && (!valid || len(version) > 100)) ||
-		len(r.Header.Values(service.WorkerUpdaterHeader)) > 1 || len(r.Header.Values(service.WorkerDigestHeader)) > 1 ||
+	if versions := r.Header.Values(service.WorkerVersionHeader); len(versions) != 0 && (len(versions) != 1 || !valid || len(version) > 100) {
+		return worker.Contact{}, inference.Reject("invalid_worker_version", 400)
+	}
+	if len(r.Header.Values(service.WorkerUpdaterHeader)) > 1 || len(r.Header.Values(service.WorkerDigestHeader)) > 1 ||
 		((contract != "" || digest != "") && (!valid || !updaterContract.MatchString(contract) || !service.ValidWorkerDigest(digest))) {
 		return worker.Contact{}, inference.Reject("invalid_worker_update_headers", 400)
 	}
@@ -51,27 +52,4 @@ func (h *Handler) workerUpdateRequest(w *response, r *http.Request, logger *slog
 		return
 	}
 	writeJSON(w, http.StatusOK, status)
-}
-
-func (h *Handler) adoptionPrompt(w *response, r *http.Request, logger *slog.Logger, id string, body []byte) {
-	if h.Workers == nil || h.Service == nil {
-		inferenceError(w, nil)
-		return
-	}
-	input, err := decodeWorkerInput(body, "origin")
-	if err != nil {
-		inferenceError(w, inference.Reject("invalid_setup_origin", 400))
-		return
-	}
-	if _, err = h.Workers.Registered(r.Context(), logger, id); err != nil {
-		workerError(w, err)
-		return
-	}
-	w.workerID = id
-	prompt, err := service.AdoptionPrompt(logger, input["origin"].(string), id, h.Service.Build().UpdateTarget())
-	if err != nil {
-		inferenceError(w, service.AdoptionError(err))
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]string{"update_prompt": prompt})
 }

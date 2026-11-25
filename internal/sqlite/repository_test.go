@@ -69,7 +69,7 @@ func TestNativePullWinnerAndDueWorkUseSeekIndexes(t *testing.T) {
 		{nextPullJob, "aaa_pull_queue_head", []any{"worker", 2, time.Now().UnixMicro(), 0, ""}},
 		{nextPullJob, "aaa_pull_queue_head", []any{"", 0, time.Now().UnixMicro(), 0, ""}},
 		{nextModelPullJob, "aaa_pull_queue_model_head", []any{"worker", 0, time.Now().UnixMicro(), 0, "after"}},
-		{betterPullWorkers, "aaa_weekly_usage_rank", []any{80, time.Now().Add(-2 * time.Minute).UnixMicro(), time.Now().UnixMicro(), "1"}},
+		{betterPullWorkers, "aaa_weekly_usage_rank", []any{80, time.Now().Add(-2 * time.Minute).UnixMicro(), time.Now().UnixMicro(), "1", "", "", worker.UpdateContract}},
 		{exhaustedPullWorkers, "aaa_weekly_usage_rank", []any{time.Now().Add(-2 * time.Minute).UnixMicro(), time.Now().UnixMicro()}},
 		{heldPullJob, "aaa_worker_single_held_turn", []any{"worker"}},
 		{duePullExperiments, "aaa_experiments_due", []any{time.Now().UnixMicro()}},

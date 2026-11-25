@@ -5,6 +5,12 @@ import type { Logger } from './diagnostics.js';
 import { Failure, requireValue } from './errors.js';
 import { identifier, object, parse, text } from './json.js';
 
+export function shellQuote(value: string): string { return "'" + value.replaceAll("'", "'\\''") + "'"; }
+
+export function launcherScript(node: string, entry: string, state: string): string {
+  return '#!/usr/bin/env bash\nset -euo pipefail\nexec ' + shellQuote(node) + ' ' + shellQuote(entry) + ' "$@" --state-dir ' + shellQuote(state) + '\n';
+}
+
 export interface InstallationIO {
   home: string;
   node: string;

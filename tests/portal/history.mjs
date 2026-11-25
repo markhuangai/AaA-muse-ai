@@ -17,11 +17,10 @@ const remember = value => { secrets.push(value); save(`history-browser-secrets-$
 const pause = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
 let browser;
 
-async function control(path, { key, method = 'GET', body, cookie, workerVersion } = {}) {
-  const headers = { 'Content-Type': 'application/json' };
+async function control(path, { key, method = 'GET', body, cookie, workerHeaders } = {}) {
+  const headers = { 'Content-Type': 'application/json', ...workerHeaders };
   if (cookie) Object.assign(headers, browserSessionHeaders(cookie, fixture.origin));
   if (key) headers.Authorization = `Bearer ${key}`;
-  if (workerVersion) headers['X-Muse-Worker-Version'] = workerVersion;
   const response = await fetch(fixture.origin + path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(10_000) });
   const value = response.status === 204 ? null : await response.json();
   return { response, value };
@@ -262,14 +261,20 @@ async function cancellationOutcomes() {
   const race = fixture.fixtures.cancellation.race, authority = fixture.fixtures.cancellation.race_control; remember(authority.credential);
   await open(page, race.id);
   await page.route(`**/api/v1/admin/experiments/${race.id}/cancel`, async route => {
-    const auth = { key: authority.credential, workerVersion: authority.version, method: 'POST' };
-    const claimed = await control('/api/v1/worker/pull', { ...auth, body: authority.poll }); expect(claimed.response.status).toBe(200);
+    const auth = { key: authority.credential, workerHeaders: authority.pair_headers, method: 'POST' };
+    const claimed = await control('/api/v1/worker/hook/pull', {
+      ...auth, workerHeaders: { ...auth.workerHeaders, 'X-Muse-Worker-Hook-Proof': '1' }, body: authority.poll,
+    }); expect(claimed.response.status).toBe(200);
     const grant = claimed.value.job; expect(grant.job_id).toBe(authority.job_id);
-    const start = { protocol_version: 1, claim_id: grant.claim_id, generation: grant.generation, launch_id: 'browser-launch', native_job_id: 'browser-native-work' };
-    const started = await control(`/api/v1/worker/jobs/${grant.job_id}/start`, { ...auth, body: start }); expect(started.response.status).toBe(200);
+    const path = `/api/v1/worker/hook/jobs/${grant.job_id}`;
+    const run = 'event-hook-' + authority.poll.checker_run_id;
+    const start = { protocol_version: 1, claim_id: grant.claim_id, generation: grant.generation, launch_id: 'browser-launch', native_job_id: authority.poll.checker_job_id };
+    const proof = { reference: grant.claim_id, native_job_id: start.native_job_id, native_run_id: run, status: 'running' };
+    const started = await control(path + '/start', { ...auth, body: { ...start, verification: proof } }); expect(started.response.status).toBe(200);
     const job = started.value;
-    const decided = await control(`/api/v1/worker/jobs/${job.id}/decisions`, { ...auth, body: { protocol_version: 1, submission_id: 'browser-race-decision', connection_id: '', connection_generation: 0, generation: job.generation, lease_id: job.lease_id, conversation_id: job.conversation_id, context_receipt_id: job.context.receipt_id, decision: { type: 'final', text: 'Completion won the cancellation race' } } }); expect(decided.response.status).toBe(200);
-    const settled = await control(`/api/v1/worker/jobs/${job.id}/interrupt`, { ...auth, body: { ...start, submission_id: 'browser-race-settlement', native_run_id: 'browser-native-execution', reason: 'execution_confirmed_stopped' } });
+    const decided = await control(path + '/decisions', { ...auth, body: { protocol_version: 1, submission_id: 'browser-race-decision', connection_id: '', connection_generation: 0, generation: job.generation, lease_id: job.lease_id, conversation_id: job.conversation_id, context_receipt_id: job.context.receipt_id, decision: { type: 'final', text: 'Completion won the cancellation race' } } }); expect(decided.response.status).toBe(200);
+    const settled = await control(path + '/interrupt', { ...auth, body: { ...start, submission_id: 'browser-race-settlement',
+      native_run_id: run, reason: 'execution_confirmed_stopped', verified_start: true } });
     expect(settled.response.status).toBe(200); expect(settled.value.state).toBe('accepted');
     await route.continue();
   });

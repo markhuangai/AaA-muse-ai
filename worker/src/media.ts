@@ -21,7 +21,7 @@ const artifactLimit = 32 * 1024 * 1024;
 const timeout = 120_000;
 
 function assignmentHeaders(t: Transport, j: ObjectValue): Record<string, string> {
-  return { Authorization: 'Bearer ' + t.credential, 'X-Muse-Worker-Version': t.productVersion,
+  return { Authorization: 'Bearer ' + t.credential, ...t.workerHeaders(),
     'X-Muse-Connection-Id': j.connection_id === '' ? '' : identifier(j.connection_id), 'X-Muse-Connection-Generation': String(integer(j.connection_generation)),
     'X-Muse-Generation': String(integer(j.generation)), 'X-Muse-Lease-Id': identifier(j.lease_id) };
 }
@@ -30,7 +30,8 @@ async function transfer<T>(t: Transport, job: ObjectValue, path: string, options
   const controller = new AbortController();
   const timer = t.net.setTimer(() => controller.abort(), timeout);
   try {
-    const response = await t.net.fetch(t.endpoint + '/api/v1/worker/jobs/' + identifier(job.id) + '/' + path, {
+    const route = '/api/v1/worker/jobs/' + identifier(job.id) + '/' + path;
+    const response = await t.net.fetch(t.endpoint + t.path(route), {
       ...options, redirect: 'manual', signal: controller.signal, headers: { ...assignmentHeaders(t, job), ...options.headers },
     });
     if (!response.ok) {
@@ -45,9 +46,15 @@ async function transfer<T>(t: Transport, job: ObjectValue, path: string, options
           reason = error.code;
         }
       } else await response.body?.cancel();
+      if (t.hookDigest !== undefined) t.compatibility(response, route, { error: reason });
       throw new Failure('media_transfer_rejected', { http_status: response.status, request_id: response.headers.get('x-request-id') ?? '', stage: path, reason }, response.status === 429 || response.status >= 500);
     }
-    return await consume(response);
+    try {
+      t.compatibility(response, route);
+      return await consume(response);
+    } finally {
+      if (response.body && !response.body.locked) await response.body.cancel();
+    }
   } finally { t.net.clearTimer(timer); }
 }
 

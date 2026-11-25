@@ -14,20 +14,32 @@ class WorkerAuth(Harness):
         super().__init__(args)
         self.secrets = []
         self.origin_url = None
-        self.worker_version = None
+        self.worker_pairs = {}
 
     def assert_private(self, value, extra=()):
         super().assert_private(value, (*self.secrets, *extra))
 
-    def api(self, path, key=None, method="GET", data=None, origin=None, raw=None, headers=None):
+    def worker_pair_headers(self, origin=None):
+        origin = origin or self.origin_url
+        if origin not in self.worker_pairs:
+            status, observed, _ = self.request(origin, "/api/v1/worker/hook/status")
+            pin = observed.get("X-Muse-Paired-Worker-SHA256")
+            require(status == 401 and pin and observed.get("X-Muse-Service-Version"), "controlled peer did not observe a paired build")
+            self.worker_pairs[origin] = (observed["X-Muse-Service-Version"], pin)
+        version, digest = self.worker_pairs[origin]
+        return {"X-Muse-Worker-Version": version, "X-Muse-Worker-SHA256": digest,
+                "X-Muse-Worker-Updater": "managed-hook-v1"}
+
+    def api(self, path, key=None, method="GET", data=None, origin=None, raw=None, headers=None, legacy=False):
         origin = origin or self.origin_url
         headers = {"Content-Type": "application/json", **(headers or {})}
-        if path.startswith("/api/v1/worker/") and "X-Muse-Worker-Version" not in headers:
-            if self.worker_version is None:
-                status, observed, _ = self.request(origin, "/healthz")
-                require(status == 200 and observed.get("X-Muse-Service-Version"), "controlled peer did not observe a paired build version")
-                self.worker_version = observed["X-Muse-Service-Version"]
-            headers["X-Muse-Worker-Version"] = self.worker_version
+        if not legacy and path.startswith("/api/v1/worker/"):
+            headers = {**self.worker_pair_headers(origin), **headers}
+            if path == "/api/v1/worker/pull":
+                headers.setdefault("X-Muse-Worker-Hook-Proof", "1")
+            if path == "/api/v1/worker/enroll" and isinstance(data, dict) and "phase" not in data:
+                data = {**data, "phase": "prepare"}
+            path = path.replace("/api/v1/worker/", "/api/v1/worker/hook/", 1)
         body = raw if raw is not None else None if data is None else json.dumps(data, ensure_ascii=False).encode()
         return self.request(origin, path, key, method, body, headers)
 
@@ -42,10 +54,15 @@ class WorkerAuth(Harness):
         return value
 
     def enroll(self, enrollment, origin=None):
-        status, headers, body = self.api("/api/v1/worker/enroll", method="POST", data={"enrollment_code": enrollment["enrollment_code"]}, origin=origin)
+        route = "/api/v1/worker/enroll"
+        data = {"enrollment_code": enrollment["enrollment_code"], "phase": "prepare"}
+        status, headers, body = self.api(route, method="POST", data=data, origin=origin)
         value = json.loads(body)
         if status == 201:
-            self.secrets.append(value["credential"])
+            credential = value["credential"]
+            self.secrets.append(credential)
+            status, headers, body = self.api(route, credential, "POST", {**data, "phase": "activate"}, origin=origin)
+            value = {**json.loads(body), "credential": credential}
         return status, headers, value
 
     def diagnose(self, request_id, event_name, reason=None):
@@ -302,11 +319,17 @@ class WorkerAuth(Harness):
         _, events = self.diagnose(headers["X-Request-Id"], "enrollment.issued")
         exchange = next(e for e in events if e["msg"] == "request.exchange")
         require(json.loads(exchange["response"])["enrollment_code"] == "[REDACTED]", "overlapping configured secret left a recoverable enrollment code")
-        status, headers, _ = self.enroll(registration)
+        route = "/api/v1/worker/enroll"
+        data = {"enrollment_code": registration["enrollment_code"], "phase": "prepare"}
+        status, headers, body = self.api(route, method="POST", data=data)
         require(status == 201, "overlapping-secret worker issuance failed")
-        _, events = self.diagnose(headers["X-Request-Id"], "worker.enrolled")
+        credential = json.loads(body)["credential"]
+        self.secrets.append(credential)
+        _, events = self.diagnose(headers["X-Request-Id"], "enrollment.prepared")
         exchange = next(e for e in events if e["msg"] == "request.exchange")
         require(json.loads(exchange["response"])["credential"] == "[REDACTED]", "overlapping configured secret left a recoverable reconnect credential")
+        require(self.api(route, credential, "POST", {**data, "phase": "activate"})[0] == 201,
+                "overlapping-secret worker activation failed")
         logs = self.logs(container)
         self.assert_private(logs)
         require('"level":"DEBUG"' not in logs, "DEBUG reached INFO stdout")

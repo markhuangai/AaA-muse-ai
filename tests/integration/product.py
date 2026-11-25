@@ -35,10 +35,8 @@ class PackedModel:
                 require(grant["outcome"] == "prepare" and grant["job_id"] not in self.seen, "packed checker authorized unexpected or duplicate work")
                 job_id = grant["job_id"]
                 self.seen.add(job_id)
-                self.h.work_definition(self.worker, grant, delay_seconds=1)
-                require(self.h.observe(self.worker, "queued", run=False)["outcome"] == "queued", "registered one-shot was not retained")
                 shown = self.h.start_work(self.worker)
-                require(self.h.observe(self.worker, "running")["outcome"] == "running", "one-shot execution identity was not adopted")
+                require(self.h.tick(self.worker)["outcome"] == "claim_active", "tick overlapped an active wake")
                 self.jobs.append(shown)
                 messages = shown["context"]["messages"]
                 last = messages[-1]
@@ -58,8 +56,7 @@ class PackedModel:
                 else:
                     raise AssertionError("unsupported controlled product input")
                 self.h.native_cli(self.worker, "decision-submit", "--job-id", job_id, "--input", "-", input_text=json.dumps(decision))
-                require(self.h.tick(self.worker)["outcome"] == "running", "observing checker pulled before native settlement")
-                require(self.h.observe(self.worker, "completed")["outcome"] == "settled", "packed native result was not settled")
+                require(self.h.tick(self.worker)["outcome"] == "settled", "packed hook did not settle the accepted result")
         except Exception as error:
             self.errors.append(type(error).__name__ + ": " + str(error))
 
@@ -162,10 +159,12 @@ class Product(WorkerRecovery, History):
         held = self.create(worker, "held native cross-worker fixture", tools=False)
         grant = self.claim_work(worker, held["current_job_id"])
         brief = self.start_work(worker)
-        work = worker["work"]["definition"]
+        work = worker["work"]
         job_id = grant["job_id"]
         start = {"protocol_version": 1, "claim_id": grant["claim_id"], "generation": grant["generation"],
-                 "launch_id": grant["launch_id"], "native_job_id": work["native_job_id"]}
+                 "launch_id": grant["launch_id"], "native_job_id": work["native_job_id"],
+                 "verification": {"reference": grant["claim_id"], "native_job_id": work["native_job_id"],
+                                  "native_run_id": work["native_run_id"], "status": "running"}}
         denied, headers = self.checked("/api/v1/worker/jobs/" + job_id + "/start", other["credential"], "POST", start, want=404)
         require(denied["error"] == "worker_scope_denied", "foreign worker acquired native start authority")
         self.add("boundary.cross-worker", request_id=headers["X-Request-Id"], operation_ids=[held["id"]], job_id=job_id)
@@ -178,7 +177,8 @@ class Product(WorkerRecovery, History):
         self.add("recovery.stale-result", request_id=headers["X-Request-Id"], operation_ids=[held["id"]], job_id=job_id,
                  worker_id=worker["worker"]["id"], generation=grant["generation"], claim_id=grant["claim_id"], reason=rejected["error"])
         self.tick(worker)
-        require(self.observe(worker, "failed")["outcome"] == "settled", "verified stop did not settle cancellation")
+        self.abort(worker)
+        require(self.tick(worker)["outcome"] == "settled", "verified abort did not settle cancellation")
         self.models = [PackedModel(self, item).start() for item in self.workers]
 
     def restart_and_replace(self):
@@ -198,7 +198,7 @@ class Product(WorkerRecovery, History):
             "pending_call_id": prepared["call_id"], "completed_request_id": resumed["turns"][1]["operation_id"]}
         self.add("recovery.tool-dedup", call_id=resumed["call_id"], client_tool_executions=resumed["client_tool_executions"], request_ids=[turn["request_id"] for turn in resumed["turns"]])
         self.stop_models()
-        retained = {name: (worker_b["state"] / name).read_bytes() for name in ("installation.json", "cron-installation.json", "config.json", "credential.key")}
+        retained = {name: (worker_b["state"] / name).read_bytes() for name in ("installation.json", "hook-installation.json", "config.json", "credential.key")}
         self.save_during_reply_loss(worker_b)
         require(all((worker_b["state"] / name).read_bytes() == value for name, value in retained.items()), "worker restart changed installation or credential")
         self.models = [PackedModel(self, worker_b).start()]
@@ -239,15 +239,17 @@ class Product(WorkerRecovery, History):
             worker["slot"] = prompt["slot"]
             self.install(worker, prompt)
             self.workers.append(worker)
-            self.checker(worker)
+            registration = self.checker(worker)
             self.private("product-install-" + worker["slot"] + ".json", json.dumps(worker["receipt"]))
             self.product_observations.append({"kind": "setup_ended", "time": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
                 "worker_id": worker["worker"]["id"], "account_ref": "controlled-container-" + worker["slot"], "setup_id": worker["receipt"]["setup_id"],
-                "checker_job_id": worker["checker"], "recurring_count": 1, "interval_seconds": 60,
+                "checker_job_id": registration["hook_id"], "interval_seconds": 15, "recurring_count": 1,
+                "watchdog_job_id": registration["watchdog_job_id"], "watchdog_interval_seconds": 3600,
                 "state_mode": "0700", "key_file_mode": "0600", "worker_version": self.package["version"], "worker_sha256": self.package["sha256"],
                 "actual_permissions": ["controlled-container-shell"], "observer": "controlled-product-runner", "source_ref": "product-install-" + worker["slot"] + ".json"})
             require(self.tick(worker)["outcome"] == "idle", "fresh checker did not observe idle")
-            self.models.append(PackedModel(self, worker).start())
+        self.models = [PackedModel(self, worker).start() for worker in self.workers]
+        for worker in self.workers:
             ready, trial = self.native_trials(worker)
             self.add("readiness." + worker["slot"], worker_ids=[worker["worker"]["id"]], operation_ids=[ready["id"], trial["id"]], evidence_kind="controlled")
             self.add("idle." + worker["slot"], worker_ids=[worker["worker"]["id"]], operation_ids=[ready["id"]], checker_job_id=worker["checker"], controlled_native_checker=True)

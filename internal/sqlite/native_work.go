@@ -13,6 +13,13 @@ func nativeWorkPrincipal(workerID string) string { return "native-work:" + worke
 
 func recordNativeGrant(ctx context.Context, tx *sql.Tx, workerID, claimID string, pull inference.Pull) error {
 	receipt := inference.NativeWorkReceipt{Checker: pull.Checker, Occurrence: pull.Occurrence}
+	if inference.HookClaim(claimID) {
+		pair, ok := inference.PairedHook(ctx)
+		if !ok {
+			return errors.New("hook_claim_pair_missing")
+		}
+		receipt.Mode, receipt.Pair = "hook", pair
+	}
 	data, err := json.Marshal(receipt)
 	if err != nil {
 		return err
@@ -23,7 +30,7 @@ func recordNativeGrant(ctx context.Context, tx *sql.Tx, workerID, claimID string
 }
 
 func readNativeWork(ctx context.Context, tx *sql.Tx, job *inference.Job) (*inference.NativeWorkReceipt, error) {
-	if job == nil || !inference.VerifiedClaim(job.LeaseID) {
+	if job == nil || (!inference.VerifiedClaim(job.LeaseID) && !inference.HookClaim(job.LeaseID)) {
 		return nil, nil
 	}
 	var data []byte
@@ -42,7 +49,7 @@ func readNativeWork(ctx context.Context, tx *sql.Tx, job *inference.Job) (*infer
 	return &receipt, nil
 }
 
-func recordNativeStart(ctx context.Context, tx *sql.Tx, job *inference.Job, receipt *inference.NativeWorkReceipt) error {
+func saveNativeWork(ctx context.Context, tx *sql.Tx, job *inference.Job, receipt *inference.NativeWorkReceipt) error {
 	data, err := json.Marshal(receipt)
 	if err != nil {
 		return err

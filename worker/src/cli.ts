@@ -10,17 +10,20 @@ import { encode, object, parse, identifier, type ObjectValue } from './json.js';
 import { presenceTimeoutMs, type Network } from './transport.js';
 import { captureBootstrap, installationIO, type InstallationIO } from './install-io.js';
 import { Cron } from './cron.js';
-import { CronSetup } from './cron-setup.js';
 import { CronUpdate } from './cron-update.js';
+import { HookRunner, type EmitHook } from './hook.js';
+import { HookSetup, hookTimeoutSeconds, pollSeconds, watchdogEvery } from './hook-setup.js';
+import { HookWatchdog } from './hook-watchdog.js';
 
 import { VERSION } from './version.js';
 export { VERSION } from './version.js';
-const help = 'aaa-muse-worker setup --origin HTTPS_ORIGIN --code-stdin --install-dir ABSOLUTE_PATH --setup-id ID | update-adopt --origin HTTPS_ORIGIN --install-dir ABSOLUTE_PATH --worker-id ID --archive-digest SHA256 | cron-describe --goal-id ID | cron-authorize-registration --input FILE|- | cron-confirm --input FILE|- | cron-check --input FILE|- | cron-prepare --input FILE|- | cron-observe --input FILE|- | cron-start --launch-id ID --input FILE|- | cron-producer-intent --launch-id ID | cron-producer --launch-id ID --producer-id ID --pid PID | status | doctor | media-finish --job-id ID | decision-submit --job-id ID --input FILE|- | diagnostics-export [--operation-id ID] [--request-id ID] [--since RFC3339] [--until RFC3339] [--decode]\nCommon: --state-dir ABSOLUTE_PATH, --help, --version\n';
+const help = 'aaa-muse-worker setup --origin HTTPS_ORIGIN --code-stdin --install-dir ABSOLUTE_PATH --setup-id ID --archive-digest SHA256 | hook-describe --goal-id ID | hook-authorize-registration --input FILE|- | hook-confirm --input FILE|- | hook-check | hook-start --launch-id ID --run-id ID | hook-abort --launch-id ID --run-id ID --reason REASON | watchdog-check | cron-producer-intent --launch-id ID | status | doctor | media-finish --job-id ID | decision-submit --job-id ID --input FILE|- | diagnostics-export [--operation-id ID] [--request-id ID] [--since RFC3339] [--until RFC3339] [--decode]\nCommon: --state-dir ABSOLUTE_PATH, --help, --version\n';
 export interface Adapters {
   files: Files;
   system: System;
   network?: Network;
   setup?: InstallationIO;
+  emitHook?: EmitHook;
   env: Record<string, string | undefined>;
   home(): string;
   nodeVersion: string;
@@ -35,12 +38,12 @@ export function argumentsFor(args: string[]): { command: string; flags: Record<s
   const command = args[0] ?? '--help';
   const flags: Record<string, string | boolean> = Object.create(null);
   const allowed: Record<string, string[]> = {
-    configure: ['origin'], enroll: ['code-stdin'], status: [], doctor: [], 'media-finish': ['job-id'],
+    configure: ['origin'], enroll: ['code-stdin', 'archive-digest'], status: [], doctor: [], 'media-finish': ['job-id'],
     setup: ['origin', 'code-stdin', 'install-dir', 'setup-id', 'bootstrap', 'archive-digest'],
-    'update-adopt': ['origin', 'install-dir', 'worker-id', 'archive-digest', 'bootstrap'],
     'decision-submit': ['job-id', 'input'], 'diagnostics-export': ['operation-id', 'request-id', 'since', 'until', 'decode'],
-    'cron-describe': ['goal-id'], 'cron-authorize-registration': ['input'], 'cron-confirm': ['input'], 'cron-check': ['input'], 'cron-observe': ['input'], 'cron-prepare': ['input'],
-    'cron-start': ['launch-id', 'native-job-id', 'input'], 'cron-producer-intent': ['launch-id'], 'cron-producer': ['launch-id', 'producer-id', 'pid'],
+    'hook-describe': ['goal-id'], 'hook-authorize-registration': ['input'], 'hook-confirm': ['input'], 'hook-check': [],
+    'hook-start': ['launch-id', 'run-id'], 'hook-abort': ['launch-id', 'run-id', 'reason'], 'watchdog-check': [],
+    'cron-producer-intent': ['launch-id'],
     'cron-producer-bind': ['launch-id', 'producer-id'],
   };
   requireValue(Object.hasOwn(allowed, command) || ['--help', '--version'].includes(command), 'unknown_command');
@@ -69,7 +72,7 @@ export async function execute(args: string[], io: Adapters): Promise<number> {
     requireValue(match && (Number(match[1]) > 22 || (Number(match[1]) === 22 && Number(match[2]) >= 12)), 'node_22_12_required');
     const xdg = io.env.XDG_STATE_HOME;
     requireValue(!xdg || isAbsolute(xdg), 'absolute_xdg_state_home_required');
-    const path = flags['state-dir'] as string | undefined ?? join(xdg || join(io.home(), '.local', 'state'), 'aaa-muse-worker-v1');
+    const path = flags['state-dir'] as string | undefined ?? join(xdg || join(io.home(), '.local', 'state'), 'aaa-muse-worker-hook-v1');
     const state = new State(path, io.files, io.system);
     await state.ensure();
     const metadata = await io.metadata();
@@ -84,54 +87,50 @@ export async function execute(args: string[], io: Adapters): Promise<number> {
     Object.assign(logger.base, { setup_id: flags['setup-id'] ?? installed.setup_id, operation_id: flags['setup-id'] ?? installed.setup_id, worker_id: installed.worker_id });
     const credential = await state.read('credential.key');
     if (credential) logger.redactor.add(credential.trim());
-    const worker = new Worker(state, logger, io.network);
+    const worker = new Worker(state, logger, io.network, VERSION, true);
     const setup = io.setup ?? installationIO(io.home());
     const updater = new CronUpdate(worker, setup);
     const cron = new Cron(worker, undefined, updater);
-    const finiteCheck = ['cron-check', 'cron-observe', 'cron-prepare'].includes(command);
+    const hook = new HookRunner(cron, updater, io.emitHook);
+    const hookSetup = new HookSetup(worker, setup);
+    const finiteCheck = command === 'hook-check' || command === 'watchdog-check';
+    if (finiteCheck) Object.assign(logger.base, { hook_id: io.env.HATCH_HOOK_ID, hook_invocation_id: io.env.HATCH_HOOK_INVOCATION_ID,
+      hook_poll_seconds: pollSeconds, hook_timeout_seconds: hookTimeoutSeconds, watchdog_every: watchdogEvery });
     if (!finiteCheck) await logger.log('INFO', 'worker.command_started');
     let result: ObjectValue;
     switch (command) {
       case 'setup': {
-        requireValue(flags['code-stdin'] && typeof flags.origin === 'string' && typeof flags['install-dir'] === 'string' && typeof flags['setup-id'] === 'string', 'setup_options_required');
-        result = await new CronSetup(worker, io.setup ?? installationIO(io.home()), VERSION).install(flags.origin, (await io.input('-')).trim(), flags['install-dir'], flags['setup-id'], flags['archive-digest'] as string | undefined);
+        requireValue(flags['code-stdin'] && typeof flags.origin === 'string' && typeof flags['install-dir'] === 'string' &&
+          typeof flags['setup-id'] === 'string' && typeof flags['archive-digest'] === 'string', 'setup_options_required');
+        result = await hookSetup.install(flags.origin, (await io.input('-')).trim(), flags['install-dir'], flags['setup-id'], flags['archive-digest']);
         break;
       }
-      case 'update-adopt': {
-        requireValue(typeof flags.origin === 'string' && typeof flags['install-dir'] === 'string' &&
-          typeof flags['archive-digest'] === 'string', 'update_adoption_options_required');
-        const selected = identifier(flags['worker-id'] as string);
-        if (typeof flags.bootstrap === 'string') await captureBootstrap(logger, selected, await io.input(flags.bootstrap));
-        result = await updater.adopt(flags.origin, selected, flags['archive-digest'], flags['install-dir']);
+      case 'hook-describe':
+        result = await hookSetup.describe(identifier(flags['goal-id'] as string));
         break;
-      }
-      case 'cron-describe':
-        result = await new CronSetup(worker, io.setup ?? installationIO(io.home()), VERSION).describe(identifier(flags['goal-id'] as string));
-        break;
-      case 'cron-confirm':
-      case 'cron-authorize-registration':
-      case 'cron-check':
-      case 'cron-prepare':
-      case 'cron-observe': {
-        requireValue(typeof flags.input === 'string', 'cron_input_required');
+      case 'hook-confirm':
+      case 'hook-authorize-registration': {
+        requireValue(typeof flags.input === 'string', 'hook_input_required');
         const raw = await io.input(flags.input);
-        if (command === 'cron-confirm') result = await new CronSetup(worker, io.setup ?? installationIO(io.home()), VERSION).confirm(raw);
-        else if (command === 'cron-authorize-registration') result = await new CronSetup(worker, io.setup ?? installationIO(io.home()), VERSION).authorizeRegistration(raw);
-        else if (command === 'cron-check') result = await cron.check(object(parse(raw)));
-        else if (command === 'cron-prepare') result = await cron.prepare(object(parse(raw)));
-        else result = await cron.observe(object(parse(raw)));
+        result = command === 'hook-confirm' ? await hookSetup.confirm(raw) : await hookSetup.authorizeRegistration(raw);
         break;
       }
-      case 'cron-start':
-        requireValue(!(flags.input && flags['native-job-id']), 'conflicting_native_start_input');
-        result = await cron.start(identifier(flags['launch-id'] as string),
-          typeof flags.input === 'string' ? parse(await io.input(flags.input)) : flags['native-job-id'] as string | undefined);
+      case 'hook-check':
+        io.stdout(await hook.check(io.env));
+        return 0;
+      case 'hook-start':
+        requireValue(typeof flags['run-id'] === 'string', 'hook_run_id_required');
+        result = await hook.start(identifier(flags['launch-id'] as string), flags['run-id']);
+        break;
+      case 'hook-abort':
+        requireValue(typeof flags['run-id'] === 'string' && typeof flags.reason === 'string', 'hook_abort_options_required');
+        result = await hook.abort(identifier(flags['launch-id'] as string), flags['run-id'], flags.reason);
+        break;
+      case 'watchdog-check':
+        result = await new HookWatchdog(worker).check();
         break;
       case 'cron-producer-intent':
         result = await cron.producerIntent(identifier(flags['launch-id'] as string));
-        break;
-      case 'cron-producer':
-        result = await cron.producer(identifier(flags['launch-id'] as string), identifier(flags['producer-id'] as string), Number(flags.pid));
         break;
       case 'cron-producer-bind':
         result = await cron.producer(identifier(flags['launch-id'] as string), identifier(flags['producer-id'] as string), io.parentPid ?? 0, true);
@@ -142,7 +141,7 @@ export async function execute(args: string[], io: Adapters): Promise<number> {
         break;
       case 'enroll':
         requireValue(flags['code-stdin'], 'code_stdin_required');
-        result = await worker.enroll((await io.input('-')).trim());
+        result = await worker.enroll((await io.input('-')).trim(), undefined, flags['archive-digest'] as string | undefined);
         break;
       case 'status':
       case 'doctor': {
@@ -173,7 +172,9 @@ export async function execute(args: string[], io: Adapters): Promise<number> {
     const code = cause(error);
     const event = { stopped_operation: command, cause: code, ...(error instanceof Failure ? error.fields : {}) };
     if (logger && code !== 'diagnostics_unavailable' && !(error instanceof Failure && error.fields.diagnostic_recorded)) {
-      try { await logger.log('ERROR', code === 'update_required' ? 'worker.update_required' : code === 'state_unsafe' ? 'worker.state_unsafe' : 'worker.command_failed', event); }
+      const refusal = ['update_required', 'hook_broker_unavailable', 'hook_run_mismatch', 'work_already_started', 'hook_abort_uncertain', 'hook_abort_producer_active',
+        'stale_hook_launch', 'broker_rejected'].includes(code);
+      try { await logger.log(refusal ? 'WARN' : 'ERROR', code === 'update_required' ? 'worker.update_required' : code === 'state_unsafe' ? 'worker.state_unsafe' : 'worker.command_failed', event); }
       catch { return 1; }
     } else if (!logger) io.stderr(encode({ level: 'ERROR', msg: code === 'state_unsafe' ? 'worker.state_unsafe' : 'worker.command_failed',
       package_version: VERSION, setup_id: setupID, protected_capture_unavailable: true, ...event }) + '\n');

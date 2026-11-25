@@ -127,7 +127,7 @@ class MediaFlow(MCPMedia, Product):
                 identity = submit()
             require(submit() == identity, "exact retry created a second job")
             url = "/api/v1/media/jobs/" + identity
-            grant = self.claim_work(worker, identity, job_id_is_launch=case == "prompt_video")
+            grant = self.claim_work(worker, identity)
             if verified_video is not None:
                 require(grant["claim_id"] != verified_video and self.status(worker)["current_claim"]["job_id"] == identity,
                         "the worker never pulled another job after the verified video")
@@ -135,9 +135,6 @@ class MediaFlow(MCPMedia, Product):
                 verified_video = None
             if case == "prompt_video":
                 bad_id = "checker-coalesced-run-21a1f1d3"
-                wrong = {**worker["work"]["definition"], "native_job_id": bad_id, "status": "unobservable"}
-                require(self.observe(worker, "unobservable", matches=[wrong])["native_job_id"] is None,
-                        "unobservable occurrence became the native job")
                 self.start_work(worker, self_report=bad_id, want=1)
                 require(self.status(worker)["claim_stage"] == "pending_native_start",
                         "misreported checker occurrence disclosed a brief")
@@ -191,19 +188,15 @@ class MediaFlow(MCPMedia, Product):
                     "new receipt did not describe the relayed payload")
             require(self.api(url + "/artifact", self.client)[2] == expected and self.api(url + "/artifact", self.other_client)[0] == 404, "owner download integrity or isolation failed")
             if case == "prompt_video":
-                execution = {"native_job_id": worker["work"]["definition"]["native_job_id"],
-                             "native_run_id": "controlled-execution-" + identity, "status": "succeeded"}
-                lookup = self.tick(worker)["history_lookup"]
-                require(all(lookup[key] == execution[key] for key in ("native_job_id", "native_run_id")),
-                        "early start did not preserve identity when the schedule disappeared")
-                settled = self.observe(worker, "completed", matches=[], execution=execution)
+                execution = {"native_run_id": worker["work"]["native_run_id"]}
+                settled = self.tick(worker)
                 require(self.proxy.media_puts["/api/v1/worker/jobs/" + identity + "/artifact"] == 1,
                         "foreground media was uploaded again during recovery from run history")
                 self.add("media.foreground_video_settled_from_bound_run_history", uploads=1)
                 self.verified_video_diagnosis(worker, grant, bad_id, execution)
                 verified_video = grant["claim_id"]
             elif settled is None:
-                settled = self.observe(worker, "completed")
+                settled = self.tick(worker)
             require(settled["outcome"] == "settled" and not progress.exists(), "worker did not reconcile the confirmed upload")
             if not jobs:
                 require(self.proxy.media_puts["/api/v1/worker/jobs/" + identity + "/artifact"] == delivered_puts,
@@ -283,8 +276,9 @@ class MediaFlow(MCPMedia, Product):
         origin = urllib.parse.urlsplit(self.origin_url)
         connection = http.client.HTTPConnection(origin.hostname, origin.port, timeout=5)
         try:
-            connection.putrequest("PUT", base + "/artifact")
-            for k,v in {**bad, **fence, "Authorization": "Bearer " + worker["credential"], "Content-Length": str(output.stat().st_size)}.items():
+            connection.putrequest("PUT", base.replace("/worker/", "/worker/hook/", 1) + "/artifact")
+            for k,v in {**self.worker_pair_headers(), **bad, **fence, "Authorization": "Bearer " + worker["credential"],
+                        "Content-Length": str(output.stat().st_size)}.items():
                 connection.putheader(k,v)
             connection.endheaders()
             response = connection.getresponse()
@@ -310,8 +304,8 @@ class MediaFlow(MCPMedia, Product):
             try:
                 self.wait_upload_started(identity)
                 busy = self.tick(worker)
-                require(busy["outcome"] == "running" and busy["cause"] == "result_delivery_active", "checker did not return while the original uploader was active")
-                require(self.observe(worker, "completed")["outcome"] == "recovery_pending", "terminal native state ignored a surviving uploader")
+                require(busy["outcome"] == "claim_active" and busy["cause"] == "result_delivery_active", "checker did not return while the original uploader was active")
+                require(self.tick(worker)["outcome"] == "claim_active", "hook released the surviving uploader")
                 require(not transfer.done() and self.proxy.media_puts[route] == before_puts + 1 and self.status(worker)["last_poll_at"] == before_poll,
                         "busy check blocked, duplicated the upload, or performed a pull")
             finally:
@@ -373,7 +367,8 @@ class MediaFlow(MCPMedia, Product):
         _, events = self.decode_export(self.api("/api/v1/admin/diagnostics/export?operation_id=" + identity, self.admin)[2])
         require(any(e["msg"] == "lease.fenced" and e.get("evidence", {}).get("busy_hold") is True for e in events), "missing commit-time fence diagnosis")
         self.proxy.media_pause_path = None
-        require(self.observe(worker, "failed")["outcome"] == "settled" and output.read_bytes() == expected, "fenced upload did not settle after verified stop")
+        self.abort(worker)
+        require(self.tick(worker)["outcome"] == "settled" and output.read_bytes() == expected, "fenced upload did not settle after verified stop")
         self.add("media.cancel_during_upload")
 
     def diagnosis(self, worker, identity, prompt, original):
@@ -451,13 +446,10 @@ class MediaFlow(MCPMedia, Product):
         self.assert_private(worker_raw)
         metadata, *local = [json.loads(line) for line in worker_raw.splitlines()]
         require(metadata["complete"] and not metadata["omissions"], "worker verification evidence is incomplete")
-        rejected = next(event for event in local if event.get("msg") == "cron.start_evidence_rejected")
-        details = next(event for event in local if event.get("msg") == "cron.start_evidence" and event.get("input") == bad_id)
-        started = [event for event in local if event.get("msg") == "cron.work_started"]
+        rejected = next(event for event in local if event.get("cause") == "hook_run_mismatch")
+        started = [event for event in local if event.get("msg") == "hook.work_started"]
         settled = [event for event in local if event.get("msg") == "cron.work_settled"]
-        require(rejected["level"] == "WARN" and rejected["cause"] == "native_start_definition_required" and
-                rejected["observed_native_job_id"] == bad_id and rejected["expected_reference"] == grant["claim_id"] and
-                details["level"] == "DEBUG" and details["expected_definition"]["reference"] == grant["claim_id"] and
+        require(rejected["level"] == "WARN" and rejected["claim_id"] == grant["claim_id"] and
                 len(started) == len(settled) == 1 and started[0]["level"] == settled[0]["level"] == "INFO",
                 "logs did not identify the refused execution and single accepted start")
         for name, event in (("job.work_started", started[0]), ("job.work_settled", settled[0])):
