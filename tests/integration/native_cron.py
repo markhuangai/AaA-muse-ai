@@ -24,7 +24,7 @@ class ManagedHookFixture:
         saved = json.loads(self.native_cli(worker, "hook-describe", "--goal-id", goal))
         hook, watchdog = saved["hook"], saved["watchdog"]
         require(hook["poll_interval_secs"] == 15 and hook["script_timeout_secs"] == 120 and hook["enabled"] and
-                watchdog["every"] == "1h" and watchdog["kind"] == "agent" and watchdog["enabled"],
+                watchdog["every"] == "5m" and watchdog["kind"] == "agent" and watchdog["enabled"],
                 "packed worker described the wrong native registrations")
         listing = {"goal_id": goal, "complete": True, "hooks": [], "watchdogs": []}
         require(self.registration(worker, "hook-authorize-registration", {**listing, "target": "hook"})["add_hook"],
@@ -47,7 +47,9 @@ class ManagedHookFixture:
                 "resumed hook setup could not authorize its first watchdog")
         actual = {**watchdog, "native_job_id": "controlled-watchdog-" + worker["worker"]["id"]}
         verified = {**listing, "watchdogs": [actual], "dry_run": "silent"}
-        self.registration(worker, "hook-confirm", {**verified, "watchdogs": [{**actual, "every": "2h"}]}, want=1)
+        hourly = {**verified, "watchdogs": [{**actual, "every": "1h"}]}
+        self.registration(worker, "hook-authorize-registration", {**hourly, "target": "watchdog"}, want=1)
+        self.registration(worker, "hook-confirm", hourly, want=1)
         result = self.registration(worker, "hook-confirm", verified)
         require(result["outcome"] == "registered" and result["hook_id"] == hook["id"] and
                 result["watchdog_job_id"] == actual["native_job_id"], "exact readback did not establish both identities")

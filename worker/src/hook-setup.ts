@@ -12,7 +12,7 @@ const expectedFile = 'hook-expected.json';
 const intentFile = 'hook-registration-intent.json';
 export const pollSeconds = 15;
 export const hookTimeoutSeconds = 120;
-export const watchdogEvery = '1h';
+export const watchdogEvery = '5m';
 
 function matches(expected: ObjectValue, observed: ObjectValue): boolean {
   return Object.entries(expected).every(([key, value]) => encode(value) === encode(observed[key]));

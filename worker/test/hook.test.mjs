@@ -7,6 +7,7 @@ import { digest } from '../dist/diagnostics.js';
 import { HookRunner, emitHook } from '../dist/hook.js';
 import { HookSetup } from '../dist/hook-setup.js';
 import { HookWatchdog } from '../dist/hook-watchdog.js';
+import { installationIO } from '../dist/install-io.js';
 import { Worker } from '../dist/worker.js';
 import { VERSION } from '../dist/version.js';
 import { fixture, claimed, CODE, ID, JOB, EXP, CONV, KEY } from './helpers.mjs';
@@ -289,6 +290,27 @@ test('watchdog deduplicates stale ticks and retained update failures, then repor
   assert.equal((await watcher.check()).incidents[0].kind, 'update_stalled');
 });
 
+test('a changed boot remains quiet through the five-minute staleness boundary', async t => {
+  const f = await setup(t);
+  let now = startTime;
+  f.state.sys.now = () => now;
+  const tick = new Date(now - 300_000).toISOString();
+  await f.state.write('hook-tick-health.json', JSON.stringify({
+    last_tick_at: tick, last_success_at: tick, boot_id: 'previous-boot',
+  }));
+  const watcher = new HookWatchdog(f.worker, async () => 'current-boot');
+  const fresh = await watcher.check();
+  assert.equal(fresh.boot_changed, true);
+  assert.equal(fresh.notify, false);
+  assert.deepEqual(fresh.incidents, []);
+  now++;
+  const stale = await watcher.check();
+  assert.equal(stale.boot_changed, true);
+  assert.equal(stale.notify, true);
+  assert.equal(stale.incidents[0].kind, 'hook_tick_stale');
+  assert.equal(stale.incidents[0].observed_age_ms, 300_001);
+});
+
 test('setup prepares private detector and resumes native registrations by exact readback', async t => {
   const f = await fixture(t);
   const wire = { ...f.net, fetch: async (...args) => {
@@ -304,15 +326,60 @@ test('setup prepares private detector and resumes native registrations by exact 
   const installed = await setup.install(scope, CODE, join(f.state.root, 'install'), '9'.repeat(32), pin);
   assert.equal(installed.worker_id, ID);
   assert.equal((await fs.stat(installed.detector)).mode & 0o777, 0o700);
+  assert.match(await fs.readFile(installed.skill_path, 'utf8'), /A five-minute native cron calls/);
   const { hook, watchdog } = await setup.describe('owned-goal');
+  assert.equal(hook.poll_interval_secs, 15);
+  assert.equal(hook.script_timeout_secs, 120);
+  assert.equal(watchdog.every, '5m');
+  assert.equal(watchdog.kind, 'agent');
+  assert.equal(watchdog.enabled, true);
   const blank = { goal_id: 'owned-goal', complete: true, hooks: [], watchdogs: [], target: 'hook' };
   assert((await setup.authorizeRegistration(JSON.stringify(blank))).add_hook);
   await assert.rejects(setup.authorizeRegistration(JSON.stringify(blank)), /hook_registration_uncertain/);
   const second = { ...blank, hooks: [hook], target: 'watchdog' };
   assert((await setup.authorizeRegistration(JSON.stringify(second))).add_watchdog);
   const actual = { ...second, dry_run: 'silent', watchdogs: [{ ...watchdog, native_job_id: 'native-watchdog' }] };
+  const hourly = { ...actual, watchdogs: [{ ...actual.watchdogs[0], every: '1h' }] };
+  await assert.rejects(setup.authorizeRegistration(JSON.stringify(hourly)), error => {
+    assert.equal(error.code, 'watchdog_definition_mismatch');
+    assert.equal(error.fields.expected.every, '5m');
+    assert.equal(error.fields.observed.every, '1h');
+    return true;
+  });
+  await assert.rejects(setup.confirm(JSON.stringify(hourly)), error => {
+    assert.equal(error.code, 'hook_readback_mismatch');
+    assert.equal(error.fields.expected.watchdog.every, '5m');
+    assert.equal(error.fields.observed.watchdog.every, '1h');
+    return true;
+  });
   assert.equal((await setup.confirm(JSON.stringify(actual))).outcome, 'registered');
   await assert.rejects(setup.confirm(JSON.stringify({ ...actual, hooks: [{ ...hook, enabled: false }] })), /hook_readback_mismatch/);
+});
+
+test('an existing hourly definition refuses setup but preserves both check paths', async t => {
+  const f = await setup(t);
+  await f.state.write('installation.json', JSON.stringify({
+    worker_id: ID, package_sha256: pin, launcher: '/packed/aaa-muse-worker', detector: '/hooks/detector.sh',
+  }));
+  const registration = new HookSetup(f.worker, installationIO(f.state.root));
+  const definition = await registration.describe('owned-goal');
+  await f.state.write('hook-expected.json', JSON.stringify({
+    ...definition, watchdog: { ...definition.watchdog, every: '1h' },
+  }));
+  const snapshot = async () => {
+    const names = (await f.state.list()).filter(name => name.endsWith('.json')).sort();
+    return Promise.all(names.map(async name => [name, await f.state.read(name)]));
+  };
+  const before = await snapshot();
+  await assert.rejects(registration.describe('owned-goal'), { code: 'hook_definition_changed' });
+  assert.deepEqual(await snapshot(), before);
+
+  f.broker.override = call => { if (call.path.endsWith('/pull')) return hookReply({ job: null }); };
+  assert.equal(await f.runner.check(env('legacy-tick')), 'idle');
+  const watchdog = await new HookWatchdog(f.worker, async () => 'boot').check();
+  assert.equal(watchdog.outcome, 'healthy');
+  assert.equal(watchdog.notify, false);
+  assert.equal(JSON.parse(await f.state.read('hook-expected.json')).watchdog.every, '1h');
 });
 
 test('the real Bash adapter emits exactly one native action with an inert payload', async t => {

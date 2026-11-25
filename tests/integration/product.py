@@ -244,7 +244,7 @@ class Product(WorkerRecovery, History):
             self.product_observations.append({"kind": "setup_ended", "time": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
                 "worker_id": worker["worker"]["id"], "account_ref": "controlled-container-" + worker["slot"], "setup_id": worker["receipt"]["setup_id"],
                 "checker_job_id": registration["hook_id"], "interval_seconds": 15, "recurring_count": 1,
-                "watchdog_job_id": registration["watchdog_job_id"], "watchdog_interval_seconds": 3600,
+                "watchdog_job_id": registration["watchdog_job_id"], "watchdog_interval_seconds": 300,
                 "state_mode": "0700", "key_file_mode": "0600", "worker_version": self.package["version"], "worker_sha256": self.package["sha256"],
                 "actual_permissions": ["controlled-container-shell"], "observer": "controlled-product-runner", "source_ref": "product-install-" + worker["slot"] + ".json"})
             require(self.tick(worker)["outcome"] == "idle", "fresh checker did not observe idle")

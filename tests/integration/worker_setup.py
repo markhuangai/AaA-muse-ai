@@ -380,9 +380,20 @@ silent() { [[ $# == 1 ]]; printf '{"action":"silent","reason":"%s"}\n' "$1"; }
         worker = self.environment("primary", mount_system_tmp=True)
         initial = self.prompt()
         prompt = initial["setup_prompt"]
-        require(all(fragment in prompt for fragment in ("Request the actual permissions", "including disabled registrations", 'every: "1h"',
-                    "hooks.add", "hooks.enable", "hooks.dry_run", "hook-confirm")),
+        require(all(fragment in prompt for fragment in ("Request the actual permissions", "including disabled registrations",
+                    'every: "5m"', "five-minute", "poll_interval_secs: 15", "script_timeout_secs: 120",
+                    "hooks.add", "hooks.enable", "hooks.dry_run", "hook-confirm")) and
+                'every: "1h"' not in prompt and "hourly" not in prompt,
                     "broker prompt lost the native checker read-back contract")
+        setup_id = initial["enrollment_id"]
+        broker_events = self.report_evidence("operation_id", setup_id)
+        created = next(e for e in broker_events if e["msg"] == "setup.prompt_created")
+        detail = next(e for e in broker_events if e["msg"] == "setup.prompt_detail")
+        require(created["level"] == "INFO" and created["watchdog_every"] == "5m" and created["hook_poll_seconds"] == 15 and
+                created["worker_package"] == initial["worker_package"] and created["setup_id"] == setup_id and
+                created["operation_id"] == setup_id and created["request_id"] == detail["request_id"] and
+                detail["level"] == "DEBUG" and 'every: "5m"' in detail["setup_prompt"] and "[REDACTED]" in detail["setup_prompt"],
+                "broker diagnostics did not correlate the watchdog cadence with the protected prompt")
         parents = self.prepare_setgid_fixture(worker, initial)
         legacy = worker["home"] / ".local/state/aaa-muse-worker-v1"
         legacy.mkdir(mode=0o700)
@@ -395,7 +406,7 @@ silent() { [[ $# == 1 ]]; printf '{"action":"silent","reason":"%s"}\n' "$1"; }
         for path, mode in parents.items():
             require(path.stat().st_mode & 0o7777 == mode, "installer changed a parent mode")
         require(legacy_marker.read_text() == "retained native cron state", "fresh setup altered a native cron installation")
-        self.checker(worker)
+        confirmed = self.checker(worker)
         registration = (worker["state"] / "hook-installation.json").read_bytes()
         self.install(worker, initial)
         require(worker["receipt"]["identity_preserved"] and (worker["state"] / "hook-installation.json").read_bytes() == registration, "install retry changed checker or worker")
@@ -409,11 +420,25 @@ silent() { [[ $# == 1 ]]; printf '{"action":"silent","reason":"%s"}\n' "$1"; }
             self.cli(worker, "doctor", want=1)
         finally:
             key.chmod(0o600)
-        evidence = [json.loads(line) for line in self.native_cli(worker, "diagnostics-export", "--decode").splitlines()]
-        require(evidence[0]["complete"] and any(e.get("msg") == "setup.hook_registration_verified" and e["hook"]["id"] == worker["checker"] for e in evidence) and
-                any(e.get("msg") == "worker.state_unsafe" and e.get("expected_mode") == "600" and e.get("observed_mode") == "644" for e in evidence),
-                "protected setup evidence did not prove read-back or unsafe mode")
-        self.receipt("setup.managed_hook_install", interval="15s", watchdog="1h", protected_state=True, same_registration_on_retry=True, scheduler_fixture="controlled")
+        evidence = self.worker_capture(worker, "--operation-id", setup_id)
+        verified = next(e for e in evidence if e["msg"] == "setup.hook_registration_verified")
+        require(verified["level"] == "INFO" and verified["hook"]["id"] == worker["checker"] and
+                verified["hook"]["poll_interval_secs"] == 15 and verified["hook"]["script_timeout_secs"] == 120 and
+                verified["watchdog"]["every"] == "5m" and verified["watchdog"]["native_job_id"] == confirmed["watchdog_job_id"] and
+                verified["dry_run"] == "silent",
+                "protected setup evidence did not prove the exact schedule readback")
+        for command, cause in (("hook-authorize-registration", "watchdog_definition_mismatch"), ("hook-confirm", "hook_readback_mismatch")):
+            event = next(e for e in evidence if e.get("stopped_operation") == command and e.get("cause") == cause)
+            expected, observed = event["expected"], event["observed"]
+            if command == "hook-confirm":
+                expected, observed = expected["watchdog"], observed["watchdog"]
+            require(event["msg"] == "worker.command_failed" and event["level"] == "ERROR" and event["worker_id"] == worker["worker"]["id"] and
+                    event["setup_id"] == setup_id and expected["every"] == "5m" and observed["every"] == "1h",
+                    "protected setup evidence did not identify the rejected hourly watchdog")
+        require(any(e["msg"] == "hook.check" and e.get("watchdog_every") == "5m" for e in evidence) and
+                any(e["msg"] == "worker.state_unsafe" and e.get("expected_mode") == "600" and e.get("observed_mode") == "644" for e in evidence),
+                "protected setup evidence did not prove the effective settings or unsafe mode")
+        self.receipt("setup.managed_hook_install", interval="15s", watchdog="5m", protected_state=True, same_registration_on_retry=True, scheduler_fixture="controlled")
 
         corrupt = self.environment("corrupt")
         result = self.install(corrupt, self.prompt(), corrupt=True, want=1)
