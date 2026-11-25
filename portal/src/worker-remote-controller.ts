@@ -155,6 +155,10 @@ export class WorkerRemoteController {
     const selection = this.#selection;
     const sequence = ++this.#detailSequence[lane];
     const operation = this.system.id();
+    const selected = this.#view.details[lane];
+    if (selected && selected.id !== id) {
+      this.change({ details: { ...this.#view.details, [lane]: null } });
+    }
     try {
       const result = await this.api.detail(this.#view.workerID, lane, id, operation, this.#abort.signal);
       if (this.current(selection) && sequence === this.#detailSequence[lane]) {

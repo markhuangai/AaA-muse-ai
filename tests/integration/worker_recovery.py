@@ -2,6 +2,7 @@
 from datetime import datetime, timedelta, timezone
 import json
 import time
+import urllib.parse
 
 from native_cron import utc_stamp
 from service import require
@@ -195,6 +196,8 @@ class WorkerRecovery(WorkerSetup):
                                                           "prompt": "Retain the current slot", "timeout_seconds": 30})
         wake, _ = self.start_agent_task(worker, task)
         self.docker("restart", self.broker, timeout=35)
+        self.origin_url = self.origin(self.broker)
+        self.proxy.target = urllib.parse.urlsplit(self.origin_url)
         self.ready(self.broker, self.origin_url)
         queued = self.worker_control(worker, "ops", {"protocol_version": 1, "submission_id": "wait-for-background", "kind": "doctor"})
         require(self.tick(worker)["outcome"] == "background_task_active" and self.worker_control(worker, "ops/" + queued["id"])["state"] == "queued",
@@ -203,7 +206,7 @@ class WorkerRecovery(WorkerSetup):
         time.sleep(max(0, (deadline - datetime.now(timezone.utc)).total_seconds()) + 1.25)
         notice = json.loads(self.native_cli(worker, "watchdog-check"))
         require(any(incident["kind"] == "task_deadline_exceeded" and incident["task_id"] == task["id"] for incident in notice["incidents"]),
-                "overdue task did not appear on the hourly watchdog")
+                "overdue task did not appear on the watchdog")
         detail = self.worker_control(worker, "agent-tasks/" + task["id"])
         require(detail["state"] == "interrupted" and detail["held"], "deadline discarded the uncertain slot")
         reply = self.native_cli(worker, "hook-task-abort", "--launch-id", wake["launch_id"], "--run-id", wake["expected_run_id"],

@@ -72,7 +72,7 @@ export class HookTasks {
       }
       if (task.failure) return await this.settle(task);
       if (!task.wake_attempted_at) {
-        if (this.state.sys.now() >= time(task.deadline_at)) {
+        if (!task.binding_intent && this.state.sys.now() >= time(task.deadline_at)) {
           await this.markUnstarted(task);
           return await this.settle(task);
         }
@@ -110,6 +110,7 @@ export class HookTasks {
           await this.save(task);
           await this.worker.logger.log('INFO', 'hook.task_binding_observed', { ...this.fields(task),
             request_id: reply.requestId, submission_id: binding.submission_id, previous_invocation: binding.previous_invocation_id });
+          if (this.state.sys.now() >= time(task.deadline_at)) break;
         } catch (error) {
           if (!terminalControl(error, 'hook_claim_terminal')) throw error;
           await this.markUnstarted(task);

@@ -124,7 +124,7 @@ class Routing(History):
         held_probe = peer_a.poll_input()
         blocked, _ = self.checked("/api/v1/worker/pull", worker_a["credential"], "POST", held_probe)
         require(blocked["job"] is None, "new pull granted a second slot")
-        peer_a.pulls.append({"sequence": held_probe["sequence"]})
+        peer_a.pulls.append({"sequence": held_probe["sequence"], "scheduled_at": held_probe["scheduled_at"]})
         self.decision(worker_a, peer_a, target_job, {"type": "final", "text": "Targeted answer"})
         self.decision(worker_b, peer_b, open_job, {"type": "final", "text": "Open answer"})
         open_first, _ = self.submit(self.request_input("independent before pin"), "independent")

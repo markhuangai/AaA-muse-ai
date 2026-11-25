@@ -420,6 +420,34 @@ test('task binding and started abort retain exact journals until their replies a
   assert.equal(await f.state.read('hook-task.json'), undefined);
 });
 
+test('a lost binding reply is reconciled before settling an expired task without a wake', async t => {
+  const f = await setup(t);
+  const at = () => new Date(f.state.sys.now()).toISOString();
+  const tick = id => ({ checker_job_id: hookID, checker_run_id: id, scheduled_at: at(), entered_at: at() });
+  const grant = { id: JOB, operation_id: JOB, claim_id: 'task-claim', generation: 1,
+    claimed_at: at(), deadline_at: new Date(f.state.sys.now() + 30_000).toISOString() };
+  await f.runner.tasks.saveGrant(grant, { ...tick('pulled'), sequence: 1 });
+  const bindings = [];
+  f.broker.override = call => {
+    if (call.path.endsWith('/bind')) {
+      bindings.push(call.options.body);
+      if (bindings.length === 1) throw new Error('controlled loss after binding');
+      assert.equal(bindings[1], bindings[0]);
+      return hookReply({ task_id: JOB, claim_id: grant.claim_id, invocation_id: 'bound' });
+    }
+    assert(call.path.endsWith('/interrupt'));
+    assert.equal(call.input.native_run_id, 'event-hook-bound');
+    assert.equal(call.input.reason, 'launch_not_authorized');
+    return hookReply({ id: JOB, held: false });
+  };
+  await assert.rejects(f.runner.tasks.active(tick('bound'), {}), /broker_unreachable/);
+  f.advance(31_000);
+  const action = await f.runner.tasks.active(tick('expired'), {});
+  assert.deepEqual(action, { kind: 'silent', reason: 'background_task_settled' });
+  assert.equal(bindings.length, 2);
+  assert.equal(await f.state.read('hook-task.json'), undefined);
+});
+
 test('bounded diagnostics run quietly and exclude their raw result from HTTP capture', async t => {
   const f = await setup(t);
   await f.logger.log('DEBUG', 'worker.controlled_capture', { operation_id: 'filter-source', output: 'diagnostic payload' });

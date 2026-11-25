@@ -180,7 +180,8 @@ func TestPairedWorkerControlPreservesSlotsReceiptsAndOwner(t *testing.T) {
 		t.Fatal("verified wake did not receive the authorized prompt")
 	}
 	now = now.Add(15 * time.Second)
-	presence := inference.BusyCheck{Version: 1, ClaimID: claim, Generation: 1, Checker: "controlled-hook", Occurrence: "tick-5", ScheduledAt: now}
+	presence := inference.BusyCheck{Version: 1, ClaimID: claim, Generation: 1, Checker: "controlled-hook", Occurrence: "tick-5",
+		ScheduledAt: now, Reason: "native_observation_pending"}
 	controlExchange(t, h, "POST", p+"/presence", other, presence, nil, 404, nil)
 	controlExchange(t, h, "POST", p+"/presence", "invalid-credential", presence, nil, 401, nil)
 	controlExchange(t, h, "POST", p+"/presence", "muse_worker_"+strings.Repeat("B", 42)+"A", presence, nil, 401, nil)
@@ -503,6 +504,37 @@ func TestWorkerControlDiagnosticsAndCursorKeepLogsBounded(t *testing.T) {
 	}
 	if omittedRead != 2 || omittedWrite != 2 || rejected != 4 {
 		t.Fatal("protected logs duplicated the payload or lost the rejected result evidence")
+	}
+}
+
+func TestWorkerOpRedactionOverflowSettlesTheAcceptedGrant(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	h := pullHTTPClock(t, filepath.Join(mediaSQLiteDirectory(t), "broker.sqlite3"), func() time.Time { return now })
+	h.Redactor = diagnostics.NewRedactor([]string{"abc"})
+	key, id := controlWorker(t, h)
+	export := worker.DiagnosticsResult{Decoded: true, Complete: true, Captures: 1, Omissions: []string{},
+		Output: []string{`{"text":"` + strings.Repeat("abc ", 100) + `"}`}}
+	encoded, err := json.Marshal(export)
+	if err != nil {
+		t.Fatal(err)
+	}
+	op := controlOp(worker.DiagnosticsExport, "limited-export")
+	limit := len(encoded)
+	op.Params = &worker.DiagnosticsQuery{MaxBytes: &limit}
+	var item worker.ControlItem
+	controlExchange(t, h, "POST", adminWorkerPrefix+id+"/ops", testManagementKey, op, nil, 202, &item)
+	grant := controlPull(t, h, key, now, 1, false).WorkerOp
+	input := worker.ControlResult{Version: 1, SubmissionID: "bounded-result", ClaimID: grant.ClaimID, Generation: 1,
+		Outcome: "succeeded", Result: encoded}
+	path := workerPrefix + "ops/" + item.ID + "/result"
+	accepted := controlExchange(t, h, "POST", path, key, input, nil, 200, &item)
+	if item.Held || item.State != "failed" || item.Reason != "worker_op_redacted_result_too_large" ||
+		item.RemoteOutcome != "succeeded" || item.ResultBytes != 0 || item.ReasonMessage == "" {
+		t.Fatal("redaction overflow did not settle as a bounded and diagnosable failure")
+	}
+	replayed := controlExchange(t, h, "POST", path, key, input, nil, 200, nil)
+	if !bytes.Equal(accepted.Body.Bytes(), replayed.Body.Bytes()) {
+		t.Fatal("redaction overflow changed its replayed receipt")
 	}
 }
 

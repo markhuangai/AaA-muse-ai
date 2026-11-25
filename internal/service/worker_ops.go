@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -99,7 +100,8 @@ func (b *Broker) changeWorkerControl(ctx context.Context, logger *slog.Logger, r
 
 func controlLogFields(item worker.ControlItem) []any {
 	fields := []any{"worker_id", item.WorkerID, "operation_id", item.ID, "item_id", item.ID,
-		"kind", item.Kind, "state", item.State, "reason", item.Reason, "busy_hold", item.Held, "remote_outcome", item.RemoteOutcome,
+		"kind", item.Kind, "state", item.State, "reason", item.Reason, "reason_message", item.ReasonMessage,
+		"busy_hold", item.Held, "remote_outcome", item.RemoteOutcome,
 		"deadline_at", item.DeadlineAt, "result_bytes", item.ResultBytes, "result_sha256", item.ResultSHA256}
 	if item.Claim != nil {
 		fields = append(fields, "claim_id", item.Claim.ClaimID, "generation", item.Claim.Generation, "claimed_at", item.Claim.ClaimedAt)
@@ -273,23 +275,26 @@ func (b *Broker) CompleteWorkerOp(ctx context.Context, logger *slog.Logger, cred
 		if len(input.Result) > limit {
 			return nil, inference.Reject("worker_op_result_too_large", 413, "limit_bytes", limit, "observed_bytes", len(input.Result))
 		}
+		outcome, reason, message := input.Outcome, input.Reason, ""
 		if len(input.Result) != 0 {
 			safe, err := sanitize(record.Kind, input.Result)
 			if err != nil {
 				return nil, err
 			}
 			if len(safe) > limit {
-				return nil, inference.Reject("worker_op_result_too_large", 413, "limit_bytes", limit, "observed_bytes", len(safe))
+				outcome, reason = "failed", "worker_op_redacted_result_too_large"
+				message = fmt.Sprintf("Redaction expanded the result to %d bytes. The limit is %d bytes.", len(safe), limit)
+			} else {
+				record.ResultSHA256, err = inference.Hash(safe)
+				if err != nil {
+					return nil, err
+				}
+				record.Result, record.ResultBytes = safe, len(safe)
 			}
-			record.ResultSHA256, err = inference.Hash(safe)
-			if err != nil {
-				return nil, err
-			}
-			record.Result, record.ResultBytes = safe, len(safe)
 		}
 		if record.Active() {
 			if state.Now.Before(record.DeadlineAt) {
-				record.State, record.Reason, record.FinishedAt = input.Outcome, input.Reason, &state.Now
+				record.State, record.Reason, record.ReasonMessage, record.FinishedAt = outcome, reason, message, &state.Now
 			} else {
 				record.Interrupt("interrupted", "deadline_exceeded", state.Now)
 			}

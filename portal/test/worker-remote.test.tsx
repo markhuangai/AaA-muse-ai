@@ -102,6 +102,32 @@ test('polls only during active work and fences old selections and unconfirmed wr
   controller.reset();
 });
 
+test('keeps a new detail selection when an automatic refresh completes first', async () => {
+  const first = { ...item, state: 'running', held: true };
+  const second = { ...item, id: otherID, state: 'completed' };
+  const outstanding = deferred<Response>();
+  const browser = new BrowserAPI(async input => {
+    const path = String(input);
+    if (path.endsWith(second.id)) return outstanding.promise;
+    if (path.endsWith(first.id)) return response(first);
+    return response({ items: path.endsWith('/agent-tasks') ? [second, first] : [] });
+  });
+  const system = new TestSystem();
+  const controller = new WorkerRemoteController(browser.workerRemote, system, new Reports(new TestAPI(system)), () => true, () => true, vi.fn());
+  try {
+    controller.select(workerID);
+    await settle();
+    await controller.detail('agent-tasks', first.id);
+    const selected = controller.detail('agent-tasks', second.id);
+    await system.advance(5000);
+    outstanding.resolve(response(second));
+    await selected;
+    expect(controller.snapshot().details['agent-tasks']?.id).toBe(second.id);
+  } finally {
+    controller.reset();
+  }
+});
+
 test('names the target in the confirmation and displays task output as text', async () => {
   const show = vi.spyOn(HTMLDialogElement.prototype, 'showModal').mockImplementation(function (this: HTMLDialogElement) {
     this.setAttribute('open', '');

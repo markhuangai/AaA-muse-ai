@@ -327,7 +327,17 @@ class Updates(WorkerSetup):
         self.paired(PUBLISHED)
         worker = self.environment("published-first-hop")
         self.install(worker, self.prompt())
-        self.checker(worker)
+        goal = "controlled-goal-" + worker["worker"]["id"]
+        definition = json.loads(self.native_cli(worker, "hook-describe", "--goal-id", goal))
+        hook, watchdog = definition["hook"], definition["watchdog"]
+        require(watchdog["every"] == "1h", "published worker did not retain its hourly watchdog")
+        worker.update({"checker": hook["id"], "tick_number": 0})
+        dry_run = json.loads(self.hook(worker, dry=True).stdout)
+        require(dry_run["action"] == "silent", "published hook dry run was not silent")
+        readback = {"goal_id": goal, "complete": True, "dry_run": "silent", "hooks": [hook],
+                    "watchdogs": [{**watchdog, "native_job_id": "controlled-published-watchdog"}]}
+        require(self.registration(worker, "hook-confirm", readback)["outcome"] == "registered",
+                "published worker could not verify its native registration")
         require(self.tick(worker)["outcome"] == "idle", "published worker could not authenticate")
         record = json.loads((worker["state"] / "installation.json").read_text())
         require("skill_path" not in record, "published fixture was not the original installation")
@@ -375,6 +385,7 @@ class Updates(WorkerSetup):
         registered = json.loads((worker["state"] / "hook-installation.json").read_text())
         self.worker_control(worker, "agent-tasks", {"protocol_version": 1, "submission_id": "before-hook-v2", "prompt": "Controlled prompt"}, want=409)
         update = json.loads(self.native_cli(worker, "hook-upgrade-describe", "--worker-id", worker["worker"]["id"], "--goal-id", old["goal_id"]))
+        require(update["watchdog"] == old["watchdog"], "hook prompt upgrade changed the published watchdog definition")
         observed = lambda expected: {"goal_id": expected["goal_id"], "complete": True, "dry_run": "silent", "hooks": [expected["hook"]],
                                     "watchdogs": [{**expected["watchdog"], "native_job_id": registered["watchdog_job_id"]}]}
         self.registration(worker, "hook-confirm", observed(old), want=1)

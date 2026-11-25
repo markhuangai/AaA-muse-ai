@@ -269,7 +269,7 @@ func (b *Broker) HookUpgradePrompt(ctx context.Context, id string) (HookPrompt, 
 	hookID := "aaa-muse-worker-" + id
 	prompt := fmt.Sprintf(`Update the existing worker %s in this main Muse chat. Keep its credentials, state directory, launcher, and watchdog.
 Locate the installed worker launcher and the owning goal ID. Run its hook-upgrade-describe --worker-id %s --goal-id <actual-goal-id> command. Stop if it fails.
-Read the actual hook and hourly watchdog for this goal. Require one matching hook with ID %s and one unchanged watchdog. Use the returned definition to update the existing hook prompt with hooks.update if offered. If Muse offers only remove and add, first record the exact original definition, then replace only this hook using the same ID. Stop on ambiguous readback and show the owner the exact status.
+Read the actual hook and existing watchdog for this goal. Require one matching hook with ID %s and one unchanged watchdog. Use the returned definition to update the existing hook prompt with hooks.update if offered. If Muse offers only remove and add, first record the exact original definition, then replace only this hook using the same ID. Stop on ambiguous readback and show the owner the exact status.
 Read back the actual definition, dry run the hook and require silent, then submit the actual unique hook and watchdog, goal_id, complete=true and dry_run="silent" to the installed launcher's hook-confirm --input -. Report registration only if the command confirms it. Keep setup credentials out of chat.`, id, id, hookID)
 	return HookPrompt{WorkerID: id, HookID: hookID, PromptContract: worker.HookPromptContract, UpgradePrompt: prompt}, nil
 }
