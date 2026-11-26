@@ -12,7 +12,6 @@ import (
 	"io/fs"
 	"path/filepath"
 	"sort"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
