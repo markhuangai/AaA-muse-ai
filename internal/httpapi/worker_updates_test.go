@@ -124,6 +124,9 @@ func TestConfirmedUpdateLogsOnlyTheTransition(t *testing.T) {
 			offered++
 			retryLogged = retryLogged || line["operation_id"] == retryOffer.ID
 		case "confirmed":
+			if line["sequence"] != float64(3) {
+				t.Fatalf("confirmed INFO belongs only to the transition poll, got sequence %v", line["sequence"])
+			}
 			confirmed++
 		}
 	}

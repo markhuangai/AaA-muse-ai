@@ -77,9 +77,11 @@ class Portal(WorkerAuth):
             require(status == 404 and headers.get("Cache-Control") == "no-store" and "text/html" not in headers.get("Content-Type", ""),
                     "frontend concealed or cached an API or asset error")
             if route == "/assets/missing.js":
-                event, _ = self.diagnose(headers["X-Request-Id"], "portal.assets_unavailable", "filesystem_path_missing")
+                event, exchanges = self.diagnose(headers["X-Request-Id"], "portal.assets_unavailable", "filesystem_path_missing")
                 require(event["level"] == "ERROR" and event["revision"] == self.args.source_sha and event["component"] == "shell" and event["asset_path"] == "assets/missing.js", "asset diagnosis lacks build, severity or safe identity")
                 require(event["expected_state"] == "available" and event["observed_state"] == "unavailable", "asset diagnosis lacks state comparison")
+                require(any(e["msg"] == "request.exchange" and e["level"] == "DEBUG" and e["status"] == status for e in exchanges),
+                        "debug asset exchange lacks the matching HTTP status")
                 self.receipt("portal.log_only_asset_diagnosis", request_id=headers["X-Request-Id"], cause=event["cause"], asset_path=event["asset_path"],
                              corrective_action="Correct the public asset path or rebuild the matching combined image.")
         require(self.api("/api/v1/portal/logout", token, "POST")[0] == 204, "logout failed")

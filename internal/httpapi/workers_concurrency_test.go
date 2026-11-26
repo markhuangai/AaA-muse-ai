@@ -113,17 +113,27 @@ func TestProjectionExpiryParityAndStorageDiagnosis(t *testing.T) {
 	nativeResponse(t, failed, 503, nil)
 	requestID := failed.Header().Get("X-Request-Id")
 	store := h.Exporter.(*diagnostics.Store)
-	var diagnosed, observedRejection bool
+	var diagnosed, operationFailed, observedRejection bool
 	for _, event := range capturedHTTP(t, store) {
-		if event["msg"] == "inference.storage_exchange" && event["request_id"] == requestID {
-			diagnosed = event["sqlite_code"] == "1" && event["phase"] == "statement" && event["transaction_outcome"] == "rolled_back" && event["level"] == "DEBUG"
-		}
 		if event["msg"] == "lease.rejected" && event["reason"] == "worker_revoked" && event["level"] == "WARN" {
 			observedRejection = true
 		}
+		if event["request_id"] != requestID {
+			continue
+		}
+		duration, hasDuration := event["duration_ms"].(float64)
+		matches := event["operation"] == "projection" && event["cause"] == "sqlite_error" && event["sqlite_code"] == "1" &&
+			event["phase"] == "statement" && event["transaction_outcome"] == "rolled_back" && event["attempt"] == float64(1) && hasDuration && duration >= 0
+		switch event["msg"] {
+		case "inference.storage_exchange":
+			detail, hasDetail := event["detail"].(string)
+			diagnosed = matches && event["level"] == "DEBUG" && hasDetail && strings.Contains(detail, "aaa_worker_connections")
+		case "inference.operation_failed":
+			operationFailed = matches && event["level"] == "ERROR" && event["outcome"] == "operation_stopped"
+		}
 	}
-	if !diagnosed || !observedRejection {
-		t.Fatal("missing read-only projection failure evidence")
+	if !diagnosed || !operationFailed || !observedRejection {
+		t.Fatalf("projection evidence incomplete: storage exchange=%v operation failed=%v revoked warning=%v", diagnosed, operationFailed, observedRejection)
 	}
 }
 

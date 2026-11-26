@@ -266,6 +266,9 @@ func TestPortalPublicAssetsAndReservedAPIs(t *testing.T) {
 		if w.Code != 404 || w.Header().Get("Cache-Control") != "no-store" || strings.Contains(w.Body.String(), "compiled shell") {
 			t.Fatalf("SPA fallback concealed error on %s", route)
 		}
+		if route == "/assets/missing.js" {
+			assertPortalAssetEvidence(t, h, w, "assets/missing.js", "filesystem_path_missing")
+		}
 	}
 	h.Assets = nil
 	missing := portalHTTP(h, "GET", "/", "", "", nil)
@@ -302,23 +305,27 @@ func assertPortalAssetEvidence(t *testing.T, h *Handler, failed *httptest.Respon
 		payload.Write(mustDecode(t, row.Data))
 	}
 	events := json.NewDecoder(strings.NewReader(payload.String()))
+	var diagnosed, exchanged bool
 	for events.More() {
 		var event map[string]any
 		if events.Decode(&event) != nil {
 			t.Fatal("invalid exported asset event")
 		}
-		if event["msg"] != "portal.assets_unavailable" {
-			continue
-		}
-		for key, expected := range map[string]string{"level": "ERROR", "request_id": requestID, "revision": "development", "component": "shell", "asset_path": asset, "cause": cause, "expected_state": "available", "observed_state": "unavailable", "outcome": "failed"} {
-			if event[key] != expected {
-				t.Fatalf("asset diagnosis missing %s", key)
+		switch event["msg"] {
+		case "portal.assets_unavailable":
+			for key, expected := range map[string]string{"level": "ERROR", "request_id": requestID, "revision": "development", "component": "shell", "asset_path": asset, "cause": cause, "expected_state": "available", "observed_state": "unavailable", "outcome": "failed"} {
+				if event[key] != expected {
+					t.Fatalf("asset diagnosis missing %s", key)
+				}
 			}
+			diagnosed = true
+		case "request.exchange":
+			exchanged = event["level"] == "DEBUG" && event["request_id"] == requestID && event["status"] == float64(failed.Code)
 		}
-		t.Log("Asset failure is diagnosable from exported build, path, severity and filesystem cause; correct the image contents or permissions.")
-		return
 	}
-	t.Fatal("asset failure event absent from collected logs")
+	if !diagnosed || !exchanged {
+		t.Fatalf("asset failure diagnostic evidence incomplete for status %d: cause=%v exchange=%v", failed.Code, diagnosed, exchanged)
+	}
 }
 
 func TestPortalLargeYAMLReconstruction(t *testing.T) {

@@ -323,7 +323,17 @@ func TestRuntimeCaptureFailureStopsService(t *testing.T) {
 			}
 			files.fail.Store(true)
 			response, err = client.Get("http://" + origin + "/healthz")
-			if err == nil {
+			if files.capacity {
+				if err != nil {
+					t.Fatal("the admitted request did not receive its fail-closed response", err)
+				}
+				var failure map[string]string
+				decodeErr := json.NewDecoder(response.Body).Decode(&failure)
+				_ = response.Body.Close()
+				if decodeErr != nil || response.StatusCode != http.StatusServiceUnavailable || failure["error"] != "diagnostics_unavailable" {
+					t.Fatalf("capture failure response: status %d, error %q, decode %v", response.StatusCode, failure["error"], decodeErr)
+				}
+			} else if err == nil {
 				_, _ = io.Copy(io.Discard, response.Body)
 				_ = response.Body.Close()
 			}
@@ -437,7 +447,7 @@ type capacityFile struct {
 }
 
 func (file capacityFile) Write(payload []byte) (int, error) {
-	if file.full.Load() {
+	if file.full.Load() && bytes.Contains(payload, []byte(`"event":"request.admitted"`)) {
 		return 0, syscall.ENOSPC
 	}
 	return file.AppendFile.Write(payload)
