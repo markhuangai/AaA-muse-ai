@@ -224,10 +224,8 @@ func (s *Store) Snapshot(filter Filter) (Snapshot, error) {
 	if filter.Since.After(result.Metadata.SnapshotAt) || filter.Until.After(result.Metadata.SnapshotAt) {
 		missing("requested_interval_extends_after_snapshot")
 	}
-	if !metadata.PrunedThrough.IsZero() && (filter.Since.IsZero() || !filter.Since.After(metadata.PrunedThrough)) {
-		result.Metadata.Complete = false
-		result.Metadata.Omissions = append(result.Metadata.Omissions, "expired_or_capacity_pruned_evidence")
-	}
+	expiredOrPruned := !metadata.PrunedThrough.IsZero() && (filter.Since.IsZero() || !filter.Since.After(metadata.PrunedThrough))
+	cutoff := metadata.SnapshotAt.Add(-s.retention)
 	for _, entry := range entries {
 		file, err := s.files.OpenRead(filepath.Join(s.dir, entry.name))
 		if errors.Is(err, fs.ErrNotExist) {
@@ -241,6 +239,10 @@ func (s *Store) Snapshot(filter Filter) (Snapshot, error) {
 			if (!filter.Since.IsZero() && r.Time.Before(filter.Since)) || (!filter.Until.IsZero() && r.Time.After(filter.Until)) || (filter.RequestID != "" && r.RequestID != filter.RequestID) || (filter.OperationID != "" && r.OperationID != filter.OperationID) {
 				return
 			}
+			if r.Time.Before(cutoff) {
+				expiredOrPruned = true
+				return
+			}
 			result.Records = append(result.Records, capture)
 			result.Metadata.Captures++
 		})
@@ -251,6 +253,9 @@ func (s *Store) Snapshot(filter Filter) (Snapshot, error) {
 		if incomplete {
 			missing("incomplete_capture:" + entry.name)
 		}
+	}
+	if expiredOrPruned {
+		missing("expired_or_capacity_pruned_evidence")
 	}
 	if result.Metadata.Captures == 0 && (filter.RequestID != "" || filter.OperationID != "") {
 		missing("requested_identity_not_captured_in_interval")

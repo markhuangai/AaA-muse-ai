@@ -154,11 +154,16 @@ func TestUnchangedLegacyContactPreservesObservationOrder(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	for _, action := range []string{"INSERT", "UPDATE"} {
+		execute(t, repo, fmt.Sprintf(`CREATE TRIGGER forbid_legacy_receipt_%s BEFORE %s ON aaa_inference_receipts
+			BEGIN SELECT RAISE(ABORT, 'wrote a legacy observation receipt'); END`, action, action))
+	}
 	observe(repo, contact, 0)
-	execute(t, repo, `CREATE TRIGGER forbid_legacy_update BEFORE UPDATE ON aaa_worker_updates
-		BEGIN SELECT RAISE(ABORT, 'rewrote unchanged legacy contact'); END`)
 	latest := time.Second + 900*time.Nanosecond
 	observe(repo, contact, latest)
+	execute(t, repo, `CREATE TRIGGER forbid_legacy_update BEFORE UPDATE ON aaa_worker_updates
+		BEGIN SELECT RAISE(ABORT, 'rewrote a duplicate or stale legacy contact'); END`)
+	observe(sibling, contact, latest)
 	observe(sibling, worker.Contact{Version: "0.9.1", Digest: strings.Repeat("b", 64)}, latest-400*time.Nanosecond)
 	state, err := sibling.WorkerProjection(ctx, "legacy", false)
 	if err != nil || state.WorkerUpdate == nil || state.WorkerUpdate.State != "migration_required" ||

@@ -413,6 +413,34 @@ func TestRetentionIndexOrdersEventTimes(t *testing.T) {
 	}
 }
 
+func TestRetentionSnapshotExpiresCapturesInMixedSegments(t *testing.T) {
+	store, now := openFixture(t, 128*1024*1024)
+	base := *now
+	var out bytes.Buffer
+	logger := fixtureLogger(store, now, &out)
+	logger.Info("expired")
+	*now = base.Add(2 * time.Hour)
+	logger.Info("newest")
+	boundary := base.Add(time.Hour)
+	*now = boundary
+	logger.Info("at_cutoff")
+	*now = boundary.Add(7 * 24 * time.Hour)
+
+	snapshot, err := store.Snapshot(Filter{})
+	if err != nil || snapshot.Metadata.Complete || snapshot.Metadata.Captures != 2 || !snapshot.Metadata.PrunedThrough.IsZero() ||
+		len(snapshot.Metadata.Omissions) != 1 || snapshot.Metadata.Omissions[0] != "expired_or_capacity_pruned_evidence" {
+		t.Fatalf("mixed-segment expiry: %+v, %v", snapshot.Metadata, err)
+	}
+	retained := payloads(t, snapshot)
+	if retained[0]["msg"] != "newest" || retained[1]["msg"] != "at_cutoff" {
+		t.Fatalf("wrong retained captures: %v", retained)
+	}
+	current, err := store.Snapshot(Filter{Since: boundary})
+	if err != nil || !current.Metadata.Complete || current.Metadata.Captures != 2 {
+		t.Fatalf("in-retention interval was incomplete: %+v, %v", current.Metadata, err)
+	}
+}
+
 type failingFiles struct {
 	OSFiles
 	fail         string
