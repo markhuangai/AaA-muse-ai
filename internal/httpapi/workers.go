@@ -129,15 +129,22 @@ func viewWorker(w worker.Record) workerView {
 }
 
 func (h *Handler) projectedWorker(r *http.Request, logger *slog.Logger, record worker.Record, own bool) (workerView, error) {
-	v := viewWorker(record)
 	if h.Broker == nil {
-		return v, nil
+		return viewWorker(record), nil
 	}
-	var builds []service.Build
+	p, err := h.Broker.Projection(r.Context(), logger, record.ID, own, h.projectionBuilds()...)
+	return applyWorkerProjection(record, p, own), err
+}
+
+func (h *Handler) projectionBuilds() []service.Build {
 	if h.Service != nil {
-		builds = append(builds, h.Service.Build())
+		return []service.Build{h.Service.Build()}
 	}
-	p, err := h.Broker.Projection(r.Context(), logger, record.ID, own, builds...)
+	return nil
+}
+
+func applyWorkerProjection(record worker.Record, p inference.Projection, own bool) workerView {
+	v := viewWorker(record)
 	v.Projection = p
 	if !own && p.LastPollAt != nil && (p.Update == nil || p.Update.Contract != worker.UpdateContract) {
 		if v.Update == nil {
@@ -148,7 +155,7 @@ func (h *Handler) projectedWorker(r *http.Request, logger *slog.Logger, record w
 	if p.NativeContactAt != nil {
 		v.LastContactAt = p.NativeContactAt
 	}
-	return v, err
+	return v
 }
 
 func workerError(w http.ResponseWriter, err error) {
@@ -296,13 +303,19 @@ func (h *Handler) workerRequest(w *response, r *http.Request, logger *slog.Logge
 			return
 		}
 		workers := make([]workerView, 0, len(records))
-		for _, record := range records {
-			v, err := h.projectedWorker(r, logger, record, false)
+		if h.Broker == nil {
+			for _, record := range records {
+				workers = append(workers, viewWorker(record))
+			}
+		} else {
+			projections, err := h.Broker.Projections(r.Context(), logger, records, h.projectionBuilds()...)
 			if err != nil {
 				inferenceError(w, err)
 				return
 			}
-			workers = append(workers, v)
+			for index, record := range records {
+				workers = append(workers, applyWorkerProjection(record, projections[index], false))
+			}
 		}
 		writeJSON(w, 200, map[string]any{"workers": workers})
 	case "/api/v1/worker/status":

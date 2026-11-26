@@ -60,6 +60,8 @@ Confirm the rendered mount sources before starting and check readiness, mounts, 
 
 Keep `broker.sqlite3`, its WAL and its shared-memory sidecar together on a local filesystem. SQLite requires the directory to be `0700` and the database and sidecars to be regular files with mode `0600`. Same-host sibling brokers use the same SQLite version and storage. For a backup, stop all brokers writing to the database and copy the complete private state directory. Back up configuration and protected diagnostics separately. Media has its own expiry lifecycle.
 
+Protected diagnostics append to private `segment-*.ndjson` files. Legacy `capture-*.ndjson` files remain readable after an upgrade and age out under the same retention limits. Keep each broker's diagnostics directory dedicated to that process. Fully appended, unpruned captures survive a process-only crash; a torn tail is identified as incomplete in the export. Dirty segments sync in the background at a 250 ms target interval, on rotation, and during clean shutdown. This is not a sudden host power-loss bound. The SQLite store remains in WAL mode with `synchronous=FULL`.
+
 Take this backup and stop every older broker before starting the first broker with automatic worker updates. That release applies migration 004. [Automatic worker updates](releases.md#automatic-worker-updates)
 
 Schema 6 adds remote worker operations, background tasks, and a shared claim slot. It retains existing inference holds and the checksums of migrations 001–005. Back up the state directory while all brokers are stopped, then upgrade every broker that shares it to the current release. Previous broker binaries require their original SQLite schema. Keep the backup for recovery.

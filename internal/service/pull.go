@@ -107,7 +107,7 @@ func (b *Broker) PullWork(ctx context.Context, logger *slog.Logger, credential s
 	started := b.now()
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	result, workerID, replayed, timing, err := repo.WithinPull(ctx, auth.Digest(credential), input, hash, capability, workerContact(reports), b.updateBroker,
+	result, workerID, replayed, timing, err := repo.WithinPull(ctx, auth.Digest(credential), input, hash, capability, workerContact(reports), b.updateRecord(),
 		func(s *inference.State) (*inference.Grant, error) {
 			return b.claimPulledJob(s, input.VerifyStart, input.VerifyHookStart)
 		})
@@ -127,8 +127,11 @@ func (b *Broker) PullWork(ctx context.Context, logger *slog.Logger, credential s
 		}
 		return inference.PullResult{}, workerID, err
 	}
+	if timing.UpdateBrokerRecorded {
+		b.updateBrokerNeedsSync.Store(false)
+	}
 	if !replayed {
-		logUpdateDecision(ctx, logger, timing.Update, b.now().Sub(started))
+		logUpdateDecision(ctx, logger, timing.Update, timing.UpdateStateChanged, b.now().Sub(started))
 		logWorkerCapability(logger, timing.Capability, timing.CapabilityChanged)
 		if op := timing.ConfirmedUpdateOp; op != nil {
 			logger.Info("worker_op.completed", append(controlLogFields(*op), "update_id", op.UpdateID)...)

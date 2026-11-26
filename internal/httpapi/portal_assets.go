@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"path"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -13,6 +14,8 @@ import (
 )
 
 const portalCSP = "default-src 'none'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'"
+
+var fingerprintedAsset = regexp.MustCompile(`^assets/.+-[A-Za-z0-9_-]{8,}\.(?:js|css|woff2|woff|svg)$`)
 
 func (h *Handler) portalAsset(w *response, r *http.Request, logger *slog.Logger) bool {
 	shell := r.URL.Path == "/" || r.URL.Path == "/settings" || r.URL.Path == "/workers" || r.URL.Path == "/requests"
@@ -59,6 +62,9 @@ func (h *Handler) portalAsset(w *response, r *http.Request, logger *slog.Logger)
 	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
 	logger.Debug("portal.asset_served", "component", "shell", "asset_path", name, "bytes", len(data), "response_capture", "public_asset_reference", "outcome", "served")
+	if !shell && fingerprintedAsset.MatchString(name) {
+		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	}
 	w.WriteHeader(200)
 	if r.Method == http.MethodGet {
 		_, _ = w.Write(data)

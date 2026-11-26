@@ -124,6 +124,13 @@ func (r *Repository) WithinPull(ctx context.Context, credential [32]byte, input 
 			timing.Update, err = observeLegacyWorker(ctx, tx, now, workerID, input, contact)
 			return err
 		}
+		if broker.ForceRecord && broker.ID != "" {
+			if err := recordUpdateBroker(ctx, tx, now, broker); err != nil {
+				return err
+			}
+			timing.UpdateBrokerRecorded = true
+			broker.ForceRecord = false
+		}
 		pair, pairedHook := inference.PairedHook(ctx)
 		var sequence, scheduled int64
 		var priorHash string
@@ -195,7 +202,7 @@ func (r *Repository) WithinPull(ctx context.Context, credential [32]byte, input 
 				return err
 			}
 			if pairedHook && !contact.Incompatible {
-				timing.Capability, timing.CapabilityChanged, err = recordWorkerCapability(ctx, tx, workerID, input.AgentTasks, input.ScheduledAt, now)
+				timing.Capability, timing.CapabilityChanged, err = recordWorkerCapability(ctx, tx, workerID, input.AgentTasks, input.ScheduledAt, now, true)
 				if err != nil {
 					return err
 				}

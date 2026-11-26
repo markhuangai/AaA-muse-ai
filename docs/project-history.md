@@ -2,6 +2,12 @@
 
 These entries record decisions and evidence at the dates shown. See the release guide for the current publication and qualification rules. [Paired product releases](releases.md)
 
+## Portal responsiveness with enrolled pools
+
+On November 26, 2026 the owner approved the portal-scale plan at `ecdb2c914e26527fab02a5c76dbe9526e53c0bd5`, then amended the diagnostics durability criterion at `03:44:46Z`. The broker uses background sync with a 250 ms target, not a hard power-loss bound. Completed, unpruned appends survive a process-only crash. The delivery preserves the existing export wire format and legacy capture files. Rolling-log libraries and SQLite diagnostics storage were rejected because they could not preserve the small byte limits, conservative retention watermark and independent diagnostic export together.
+
+The controlled design reduces SQLite writer contention without changing schema 6 or hold/fencing semantics: worker projections use a query-only pool, writes enter a context-aware gate, and idle polls and sweeps avoid no-op writes. Recovery-facing risks are false completeness after pruning and lost claim status on stale reads. The store persists a conservative watermark before deletion and exports a fixed offset; projections apply effective expiry without changing the persisted claim. The reported deployment stalls were not remeasured on the owner's host. Only controlled validation and PR delivery were authorized; live qualification, release and deployment did not change.
+
 ## Five-minute managed-hook watchdog
 
 On November 25, 2026 the owner approved a five-minute native agent watchdog for new managed-hook enrollments from `2a0734470bd3f335d7992d035c536634a7c0b432`. The shell hook still checks every 15 seconds with a 120-second script timeout. The watchdog reports staleness above 300,000 ms. `managed-hook-v1` changes the launcher while Muse retains the registered cron schedule. The owner approved an independently audited and reviewed PR with controlled checks, full CI, CodeQL, Codex and configured AI review, and exempted CodeRabbit for this delivery.

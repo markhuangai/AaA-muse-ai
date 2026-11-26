@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -38,6 +39,7 @@ func fixture(t *testing.T) (*Handler, *testDB, *bytes.Buffer, *diagnostics.Store
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = store.Close() })
 	var out bytes.Buffer
 	redactor := diagnostics.NewRedactor(c.Secrets())
 	logger := diagnostics.NewLogger(&out, store, slog.LevelInfo, redactor, time.Now, func(error) { t.Error("capture failed") }).With("instance_id", "instance")
@@ -59,11 +61,11 @@ type blockedExportFiles struct {
 	once             sync.Once
 }
 
-func (f *blockedExportFiles) ReadFile(path string) ([]byte, error) {
-	if strings.HasPrefix(filepath.Base(path), "capture-") {
+func (f *blockedExportFiles) OpenRead(path string) (*os.File, error) {
+	if name := filepath.Base(path); strings.HasPrefix(name, "capture-") || strings.HasPrefix(name, "segment-") {
 		f.once.Do(func() { close(f.started); <-f.release })
 	}
-	return f.OSFiles.ReadFile(path)
+	return f.OSFiles.OpenRead(path)
 }
 
 func TestDiagnosticsExportDoesNotBlockHealthOrStatus(t *testing.T) {
@@ -73,6 +75,7 @@ func TestDiagnosticsExportDoesNotBlockHealthOrStatus(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = store.Close() })
 	h.Logger = diagnostics.NewLogger(io.Discard, store, slog.LevelInfo, diagnostics.NewRedactor(nil), time.Now, func(err error) { t.Errorf("capture failed: %v", err) })
 	h.Exporter = store
 	h.Logger.Info("fixture")

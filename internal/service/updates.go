@@ -45,12 +45,19 @@ func (b *Broker) renewUpdateBroker(ctx context.Context, logger *slog.Logger) err
 	bounded, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	err := b.repo.(updateRepository).RenewUpdateBroker(bounded, b.updateBroker)
+	b.updateBrokerNeedsSync.Store(err != nil)
 	if err != nil {
 		failure := sqlite.Classify(err)
 		logger.Warn("worker.update_broker_renewal_failed", "cause", failure.Reason, "phase", failure.Phase, "sqlite_code", failure.Code,
 			"target", b.updateBroker.Target, "retry_seconds", updateBrokerInterval.Seconds())
 	}
 	return err
+}
+
+func (b *Broker) updateRecord() worker.UpdateBroker {
+	record := b.updateBroker
+	record.ForceRecord = b.updateBrokerNeedsSync.Load()
+	return record
 }
 
 func (b *Broker) ApplyWorkerUpdate(ctx context.Context, logger *slog.Logger, credential string, contact worker.Contact, input worker.UpdateRequest) (worker.UpdateStatus, string, error) {
@@ -68,7 +75,11 @@ func (b *Broker) ApplyWorkerUpdate(ctx context.Context, logger *slog.Logger, cre
 	started := b.now()
 	bounded, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	state, id, replayed, err := repo.ApplyWorkerUpdate(bounded, auth.Digest(credential), contact, b.updateBroker, input)
+	record := b.updateRecord()
+	state, id, replayed, err := repo.ApplyWorkerUpdate(bounded, auth.Digest(credential), contact, record, input)
+	if err == nil && record.ForceRecord {
+		b.updateBrokerNeedsSync.Store(false)
+	}
 	logger = logger.With("worker_id", id, "operation_id", input.ID, "stage", input.Action,
 		"attempt", state.Attempt, "duration_ms", b.now().Sub(started).Milliseconds(),
 		"reported_version", contact.Version, "observed_digest", contact.Digest, "expected_digest", input.Target.SHA256, "target_version", input.Target.Version)
@@ -120,15 +131,19 @@ func validateWorkerUpdate(input worker.UpdateRequest, contact worker.Contact) er
 	return nil
 }
 
-func logUpdateDecision(ctx context.Context, logger *slog.Logger, state worker.UpdateStatus, elapsed time.Duration) {
+func logUpdateDecision(ctx context.Context, logger *slog.Logger, state worker.UpdateStatus, changed bool, elapsed time.Duration) {
 	if state.State == "" {
 		return
 	}
 	logger = logger.With("operation_id", state.ID, "reported_version", state.Version, "observed_digest", state.Digest,
 		"target", state.Target, "attempt", state.Attempt, "state", state.State, "stage", "pickup", "retry_at", state.RetryAt, "duration_ms", elapsed.Milliseconds())
 	switch state.State {
-	case "offered", "confirmed":
+	case "offered":
 		logger.Info("worker.update_pickup", "transaction_outcome", "committed")
+	case "confirmed":
+		if changed {
+			logger.Info("worker.update_pickup", "transaction_outcome", "committed")
+		}
 	case "deferred", "migration_required":
 		logger.Warn("worker.update_deferred", "cause", state.Reason, "corrective_action", updateCorrection(state.Reason))
 	default:

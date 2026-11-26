@@ -409,6 +409,71 @@ func TestSQLiteWriterAndSnapshotCanOverlap(t *testing.T) {
 	}
 }
 
+func TestSQLitePoolPolicyAndWaitingWriteCancellation(t *testing.T) {
+	repo := newRepo(t)
+	if repo.db.Stats().MaxOpenConnections != 4 || repo.readDB.Stats().MaxOpenConnections < 4 || repo.readDB.Stats().MaxOpenConnections > 8 {
+		t.Fatal("SQLite pool size policy not applied")
+	}
+	for _, check := range []struct {
+		db    *sql.DB
+		query string
+		want  int
+	}{{repo.db, "PRAGMA synchronous", 2}, {repo.readDB, "PRAGMA query_only", 1}, {repo.readDB, "PRAGMA foreign_keys", 1}} {
+		var got int
+		if err := check.db.QueryRowContext(t.Context(), check.query).Scan(&got); err != nil || got != check.want {
+			t.Fatalf("%s = %d, want %d: %v", check.query, got, check.want, err)
+		}
+	}
+	repo.writeSem <- struct{}{}
+	defer func() { <-repo.writeSem }()
+	ctx, cancel := context.WithTimeout(t.Context(), 25*time.Millisecond)
+	defer cancel()
+	err := repo.write(ctx, func(*sql.Tx) error { t.Fatal("cancelled waiter ran SQL"); return nil })
+	failure := Classify(err)
+	if !errors.Is(err, context.DeadlineExceeded) || failure.Phase != "begin" || failure.Outcome != "not_started" {
+		t.Fatalf("wrong cancellation outcome: %+v", failure)
+	}
+}
+
+func TestSQLitePortalReadsUseIndexes(t *testing.T) {
+	repo := newRepo(t)
+	for _, check := range []struct {
+		query   string
+		args    []any
+		indexes []string
+	}{
+		{workerControlDue, []any{0}, []string{"aaa_worker_op_due", "aaa_agent_task_due"}},
+		{projectionRows, []any{`["worker"]`, false}, []string{"aaa_worker_single_held_turn"}},
+		{pendingToolCounts, []any{`["worker"]`}, []string{"aaa_conversations_tool_wait"}},
+		{waitingExperimentCounts, []any{`["worker"]`, 0}, []string{"aaa_experiments_active"}},
+	} {
+		rows, err := repo.readDB.QueryContext(t.Context(), "EXPLAIN QUERY PLAN "+check.query, check.args...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var plan strings.Builder
+		for rows.Next() {
+			var id, parent, unused int
+			var detail string
+			if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+				rows.Close()
+				t.Fatal(err)
+			}
+			if strings.HasPrefix(detail, "SEARCH ") {
+				plan.WriteString(detail + "\n")
+			}
+		}
+		if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+			t.Fatal(err)
+		}
+		for _, index := range check.indexes {
+			if !strings.Contains(plan.String(), index) {
+				t.Fatalf("missing indexed seek %s:\n%s", index, plan.String())
+			}
+		}
+	}
+}
+
 func TestSQLiteTransactionFailureOutcomes(t *testing.T) {
 	repo := newRepo(t)
 	execute(t, repo, "CREATE TABLE parent(id INTEGER PRIMARY KEY); CREATE TABLE child(id INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED)")

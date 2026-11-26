@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/markhuangai/AaA-muse-ai/internal/auth"
@@ -23,12 +24,13 @@ type InferenceRepository interface {
 }
 
 type Broker struct {
-	Media        *media.Store
-	repo         InferenceRepository
-	random       io.Reader
-	now          func() time.Time
-	Wait         func(context.Context, time.Duration) error
-	updateBroker worker.UpdateBroker
+	Media                 *media.Store
+	repo                  InferenceRepository
+	random                io.Reader
+	now                   func() time.Time
+	Wait                  func(context.Context, time.Duration) error
+	updateBroker          worker.UpdateBroker
+	updateBrokerNeedsSync atomic.Bool
 }
 
 func NewBroker(repo InferenceRepository, random io.Reader, now func() time.Time, wait func(context.Context, time.Duration) error) *Broker {
@@ -432,6 +434,17 @@ func (b *Broker) run(ctx context.Context, logger *slog.Logger, ref inference.Ref
 }
 
 func (b *Broker) Projection(ctx context.Context, logger *slog.Logger, id string, workerAuth bool, builds ...Build) (inference.Projection, error) {
+	if repo, ok := b.repo.(projectionRepository); ok {
+		started := b.now()
+		bounded, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		state, err := repo.WorkerProjection(bounded, id, workerAuth)
+		if err != nil {
+			logProjectionFailure(logger, id, workerAuth, b.now().Sub(started), err)
+			return inference.Projection{}, err
+		}
+		return readProjection(state, workerAuth, builds), nil
+	}
 	ref := inference.Ref{WorkerID: id, Principal: "management", CountPendingTools: true, PollProjection: true}
 	if workerAuth {
 		ref.WorkerAuth = id
@@ -439,22 +452,7 @@ func (b *Broker) Projection(ctx context.Context, logger *slog.Logger, id string,
 	}
 	var p inference.Projection
 	_, err := b.run(ctx, logger, ref, "projection", nil, func(s *inference.State, _ *[]inferenceEvent) (any, error) {
-		p = project(s)
-		if since := s.Connection.OfflineSince; !workerAuth && !s.Revoked && since != nil {
-			elapsed := max(0, s.Now.Sub(*since).Milliseconds())
-			p.OfflineForMS = &elapsed
-		}
-		applyPullProjection(&p, s)
-		p.Update = s.WorkerUpdate
-		p.ControlProjection = s.ControlProjection
-		if p.ActiveSlotLane != "" {
-			p.WorkStatus = "busy"
-		}
-		if !workerAuth && !s.Revoked {
-			paired := len(builds) > 0 && p.Update != nil && builds[0].Paired(p.Update.Contact)
-			p.WorkerOpsReady = p.Update == nil || (p.Update.Version == "" && p.Update.Contract == "") || paired
-			p.AgentTasksReady = paired && s.WorkerCapability != nil && s.WorkerCapability.AgentTasks
-		}
+		p = buildProjection(s, workerAuth, builds)
 		return p, nil
 	})
 	return p, err

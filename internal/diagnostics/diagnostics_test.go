@@ -24,6 +24,7 @@ func openFixture(t *testing.T, maxBytes int64) (*Store, *time.Time) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = s.Close() })
 	return s, &now
 }
 func fixtureLogger(s *Store, now *time.Time, out *bytes.Buffer) *slog.Logger {
@@ -150,8 +151,7 @@ func TestCorruptChunksAreExplicit(t *testing.T) {
 	s, now := openFixture(t, 1024*1024)
 	var out bytes.Buffer
 	fixtureLogger(s, now, &out).Info("fixture", "value", strings.Repeat("x", 5000))
-	entries, _ := s.captures()
-	path := filepath.Join(s.dir, entries[0].Name())
+	path := filepath.Join(s.dir, s.active.name)
 	good, _ := os.ReadFile(path)
 	records, err := validateCapture(good)
 	if err != nil {
@@ -224,18 +224,23 @@ func (f *countingFiles) Remove(p string) error {
 }
 
 func TestCapacityPruningBatchesDurableMetadata(t *testing.T) {
-	s, now := openFixture(t, 128*1024*1024)
+	s, now := openFixture(t, 6144)
 	var out bytes.Buffer
 	logger := fixtureLogger(s, now, &out)
 	for i := 0; i < 64; i++ {
 		logger.Info("fixture")
 	}
-	s.maxBytes = s.retainedBytes
 	files := &countingFiles{}
 	s.files = files
 	logger.Debug("larger", "payload", strings.Repeat("x", 12000))
-	if files.removes < 2 || files.writes != 2 {
-		t.Fatalf("pruning %d captures required %d durable writes; want capture and one watermark", files.removes, files.writes)
+	if files.removes != 0 || files.writes != 0 {
+		t.Fatal("appending touched retention metadata")
+	}
+	if _, err := s.Snapshot(Filter{}); err != nil {
+		t.Fatal(err)
+	}
+	if files.removes < 2 || files.writes != 1 || s.retainedBytes > s.maxBytes {
+		t.Fatalf("pruning %d segments required %d watermark writes with %d bytes left", files.removes, files.writes, s.retainedBytes)
 	}
 	reopened, err := Open(OSFiles{}, s.dir, "replacement", func() time.Time { return *now }, 7*24*time.Hour, s.maxBytes)
 	if err != nil {
@@ -248,20 +253,22 @@ func TestCapacityPruningBatchesDurableMetadata(t *testing.T) {
 }
 
 func TestInterruptedPruningKeepsConservativeWatermark(t *testing.T) {
-	s, now := openFixture(t, 128*1024*1024)
+	s, now := openFixture(t, 6144)
 	var out bytes.Buffer
 	logger := fixtureLogger(s, now, &out)
 	for i := 0; i < 4; i++ {
 		logger.Info("fixture")
 		*now = now.Add(time.Second)
 	}
-	s.maxBytes = 6144
 	s.files = &failingFiles{fail: "remove", after: 1}
 	payload, err := json.Marshal(map[string]any{"time": *now, "msg": "larger", "level": "DEBUG", "payload": strings.Repeat("x", 12000)})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = s.Write(payload); err == nil {
+	if _, err = s.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.Snapshot(Filter{}); err == nil {
 		t.Fatal("ignored interrupted deletion")
 	}
 	b, err := os.ReadFile(filepath.Join(s.dir, "retention.json"))
@@ -285,11 +292,11 @@ type pausedCaptureFiles struct {
 	once             sync.Once
 }
 
-func (f *pausedCaptureFiles) ReadFile(path string) ([]byte, error) {
-	if strings.HasPrefix(filepath.Base(path), "capture-") {
+func (f *pausedCaptureFiles) OpenRead(path string) (*os.File, error) {
+	if managedCapture(filepath.Base(path)) {
 		f.once.Do(func() { close(f.started); <-f.release })
 	}
-	return f.OSFiles.ReadFile(path)
+	return f.OSFiles.OpenRead(path)
 }
 
 func TestSnapshotReportsConcurrentPruning(t *testing.T) {
@@ -325,6 +332,9 @@ func TestSnapshotReportsConcurrentPruning(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		if _, err := s.prune(); err != nil {
+			t.Fatal(err)
+		}
 	case <-time.After(2 * time.Second):
 		unblock()
 		<-written
@@ -335,7 +345,7 @@ func TestSnapshotReportsConcurrentPruning(t *testing.T) {
 	select {
 	case result := <-exported:
 		metadata := result.snapshot.Metadata
-		if result.err != nil || metadata.Complete || metadata.Captures != 0 || len(metadata.Omissions) != 1 || !strings.HasPrefix(metadata.Omissions[0], "capture_removed_during_export:capture-") {
+		if result.err != nil || metadata.Complete || metadata.Captures != 0 || len(metadata.Omissions) != 1 || !strings.HasPrefix(metadata.Omissions[0], "capture_removed_during_export:segment-") {
 			t.Fatalf("concurrent evidence loss was hidden: %+v, %v", metadata, result.err)
 		}
 	case <-time.After(5 * time.Second):
@@ -360,16 +370,16 @@ func TestCaptureWritesDoNotRescanHistory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(reopened.retained) != 64 || reopened.retainedBytes != capacity || files.reads != 65 || files.scans != 1 {
+	if len(reopened.retained) != 1 || reopened.retainedBytes != capacity || files.reads != 1 || files.scans != 1 {
 		t.Fatal("restart did not rebuild retained size/time metadata once")
 	}
 	files.reads, files.scans = 0, 0
 	fixtureLogger(reopened, now, &out).Info("fixture")
-	if files.reads != 0 || files.scans != 0 || reopened.retainedBytes > capacity || len(reopened.retained) >= 65 {
+	if files.reads != 0 || files.scans != 0 {
 		t.Fatal("capacity pruning rescanned history or exceeded its bound")
 	}
 	snapshot, err := reopened.Snapshot(Filter{})
-	if err != nil || snapshot.Metadata.Complete || snapshot.Metadata.Captures != len(reopened.retained) {
+	if err != nil || snapshot.Metadata.Complete || snapshot.Metadata.Captures != 1 || reopened.retainedBytes > capacity {
 		t.Fatal("indexed pruning lost completeness metadata")
 	}
 	var actualBytes int64
@@ -398,7 +408,7 @@ func TestRetentionIndexOrdersEventTimes(t *testing.T) {
 	if payloads(t, snapshot)[0]["msg"] != "newer" || !s.state.PrunedThrough.Equal(base.Add(-time.Hour)) {
 		t.Fatal("expiry removed the wrong capture")
 	}
-	if _, err = Open(&failingFiles{fail: "read", after: 1}, s.dir, "replacement", func() time.Time { return *now }, 7*24*time.Hour, s.maxBytes); err == nil {
+	if _, err = Open(&failingFiles{fail: "open_read"}, s.dir, "replacement", func() time.Time { return *now }, 7*24*time.Hour, s.maxBytes); err == nil {
 		t.Fatal("ignored retained-capture read failure on restart")
 	}
 }
@@ -446,6 +456,18 @@ func (f *failingFiles) ReadFile(p string) ([]byte, error) {
 	}
 	return f.OSFiles.ReadFile(p)
 }
+func (f *failingFiles) OpenRead(p string) (*os.File, error) {
+	if f.hit("open_read") {
+		return nil, fs.ErrPermission
+	}
+	return f.OSFiles.OpenRead(p)
+}
+func (f *failingFiles) CreateAppend(p string) (AppendFile, error) {
+	if f.hit("create_append") {
+		return nil, fs.ErrPermission
+	}
+	return f.OSFiles.CreateAppend(p)
+}
 func (f *failingFiles) WriteFile(p string, b []byte, m fs.FileMode) error {
 	if f.hit("write") {
 		return fs.ErrPermission
@@ -484,20 +506,29 @@ func TestCaptureIOFailures(t *testing.T) {
 			logger.Info("existing")
 			files.fail = method
 			payload := []byte(`{"time":"2026-11-08T01:02:03Z","msg":"large","level":"DEBUG","data":"` + strings.Repeat("x", 12000) + `"}`)
-			if _, err := s.Write(payload); err == nil {
+			if _, err := s.Write(payload); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.Snapshot(Filter{}); err == nil {
 				t.Fatal("ignored write/retention failure")
 			}
 		})
 	}
-	for _, method := range []string{"readdir", "read"} {
-		t.Run("snapshot-"+method, func(t *testing.T) {
+	for _, method := range []string{"open_read", "create_append"} {
+		t.Run(method, func(t *testing.T) {
 			s, now := openFixture(t, 6144)
 			files := &failingFiles{}
 			s.files = files
 			var out bytes.Buffer
 			fixtureLogger(s, now, &out).Info("existing")
 			files.fail = method
-			if _, err := s.Snapshot(Filter{}); err == nil {
+			var err error
+			if method == "open_read" {
+				_, err = s.Snapshot(Filter{})
+			} else {
+				_, err = s.Write([]byte(`{"msg":"create another segment"}`))
+			}
+			if err == nil {
 				t.Fatal("ignored export read failure")
 			}
 		})
@@ -506,9 +537,12 @@ func TestCaptureIOFailures(t *testing.T) {
 		s, now := openFixture(t, 6144)
 		var out bytes.Buffer
 		fixtureLogger(s, now, &out).Info("existing")
-		s.files = &failingFiles{fail: "write", after: 1}
+		s.files = &failingFiles{fail: "write"}
 		payload := []byte(`{"time":"2026-11-08T01:02:03Z","msg":"large","level":"DEBUG","data":"` + strings.Repeat("x", 12000) + `"}`)
-		if _, err := s.Write(payload); err == nil {
+		if _, err := s.Write(payload); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.Snapshot(Filter{}); err == nil {
 			t.Fatal("ignored retention-state write failure")
 		}
 	})

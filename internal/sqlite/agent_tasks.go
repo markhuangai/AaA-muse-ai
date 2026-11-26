@@ -26,7 +26,7 @@ func workerCapability(ctx context.Context, tx *sql.Tx, workerID string) (*worker
 	return &cap, nil
 }
 
-func recordWorkerCapability(ctx context.Context, tx *sql.Tx, workerID string, supportsTasks bool, scheduled, now time.Time) (*worker.Capability, bool, error) {
+func recordWorkerCapability(ctx context.Context, tx *sql.Tx, workerID string, supportsTasks bool, scheduled, now time.Time, skipUnchanged bool) (*worker.Capability, bool, error) {
 	prior, err := workerCapability(ctx, tx, workerID)
 	if err != nil {
 		return nil, false, err
@@ -34,6 +34,9 @@ func recordWorkerCapability(ctx context.Context, tx *sql.Tx, workerID string, su
 	cap := worker.Capability{AgentTasks: supportsTasks, ObservedAt: now}
 	if supportsTasks {
 		cap.PromptContract = worker.HookPromptContract
+	}
+	if skipUnchanged && prior != nil && prior.AgentTasks == cap.AgentTasks && prior.PromptContract == cap.PromptContract {
+		return prior, false, nil
 	}
 	change, err := tx.ExecContext(ctx, `INSERT INTO aaa_worker_capabilities(worker_id,agent_tasks,prompt_contract,observed_at,scheduled_at)
 		VALUES(?1,?2,?3,?4,?5) ON CONFLICT(worker_id) DO UPDATE SET agent_tasks=excluded.agent_tasks,
@@ -140,7 +143,7 @@ func (r *Repository) RecordAgentTaskPresence(ctx context.Context, credential [32
 		if err != nil {
 			return err
 		}
-		cap, capChanged, err = recordWorkerCapability(ctx, tx, workerID, supportsTasks, input.ScheduledAt, now)
+		cap, capChanged, err = recordWorkerCapability(ctx, tx, workerID, supportsTasks, input.ScheduledAt, now, false)
 		if err != nil {
 			return err
 		}
@@ -239,7 +242,22 @@ func interruptControlWork(ctx context.Context, tx *sql.Tx, owner string, now tim
 	return items, nil
 }
 
+const workerControlDue = `SELECT
+		EXISTS(SELECT 1 FROM aaa_worker_ops WHERE state IN ('queued','claimed','running') AND deadline_at<=?1)
+		OR EXISTS(SELECT 1 FROM aaa_agent_tasks WHERE state IN ('queued','claimed','running') AND deadline_at<=?1)
+		OR EXISTS(SELECT 1 FROM aaa_worker_ops item JOIN aaa_workers w ON w.id=item.worker_id
+			WHERE item.state IN ('queued','claimed','running') AND w.revoked_at IS NOT NULL)
+		OR EXISTS(SELECT 1 FROM aaa_agent_tasks item JOIN aaa_workers w ON w.id=item.worker_id
+			WHERE item.state IN ('queued','claimed','running') AND w.revoked_at IS NOT NULL)`
+
 func (r *Repository) SweepWorkerControl(ctx context.Context) (items []worker.ControlItem, err error) {
+	var pending bool
+	err = r.read(ctx, func(tx *sql.Tx) error {
+		return tx.QueryRowContext(ctx, workerControlDue, r.databaseTime().UnixMicro()).Scan(&pending)
+	})
+	if err != nil || !pending {
+		return nil, err
+	}
 	err = r.write(ctx, func(tx *sql.Tx) error {
 		items, err = interruptControlWork(ctx, tx, "", r.databaseTime())
 		return err

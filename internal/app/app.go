@@ -71,10 +71,13 @@ func sleep(ctx context.Context, delay time.Duration) error {
 	}
 }
 
-func Run(ctx context.Context, args []string, build service.Build, d Dependencies) int {
+func Run(ctx context.Context, args []string, build service.Build, d Dependencies) (exitCode int) {
 	build = build.Normalized()
 	operation := fmt.Sprintf("startup-%d", d.Now().UnixNano())
+	var stderrMu sync.Mutex
 	fatal := func(event, cause string, attrs []any) {
+		stderrMu.Lock()
+		defer stderrMu.Unlock()
 		emergency(d.Stderr, event, cause, append([]any{"operation_id", operation, "revision", build.Revision, "version", build.Version}, attrs...))
 	}
 	flags := flag.NewFlagSet("aaa-muse-ai", flag.ContinueOnError)
@@ -155,6 +158,19 @@ func Run(ctx context.Context, args []string, build service.Build, d Dependencies
 	}
 	failed := make(chan struct{})
 	var failOnce sync.Once
+	failCapture := func(err error) {
+		failOnce.Do(func() {
+			fatal("diagnostics.capture_failed", diagnostics.Cause(err), []any{"instance_id", instance})
+			close(failed)
+		})
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			failCapture(err)
+			exitCode = 1
+		}
+	}()
+	store.StartMaintenance(250*time.Millisecond, failCapture)
 	current := func() *config.Config { return &c }
 	var clientKeys *config.ClientKeyFile
 	if d.ClientKeyFile != nil {
@@ -162,12 +178,7 @@ func Run(ctx context.Context, args []string, build service.Build, d Dependencies
 		current = clientKeys.Current
 	}
 	redactor := diagnostics.NewLiveRedactor(current)
-	logger := diagnostics.NewLogger(d.Stdout, store, level(c.Diagnostics.Level), redactor, d.Now, func(err error) {
-		failOnce.Do(func() {
-			fatal("diagnostics.capture_failed", diagnostics.Cause(err), []any{"instance_id", instance})
-			close(failed)
-		})
-	}).With("instance_id", instance, "revision", build.Revision, "dirty", build.Dirty)
+	logger := diagnostics.NewLogger(d.Stdout, store, level(c.Diagnostics.Level), redactor, d.Now, failCapture).With("instance_id", instance, "revision", build.Revision, "dirty", build.Dirty)
 	startup := logger.With("operation_id", operation)
 	startup.Info("config.loaded", "configuration", c, "management_key_source", map[bool]string{true: "generated", false: "configured"}[generated])
 	select {

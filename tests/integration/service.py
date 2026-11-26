@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import select
 import subprocess
@@ -22,6 +23,7 @@ SQLITE_FILE = SQLITE_STATE + "/broker.sqlite3"
 SQLITE_SCHEMA = 6
 SQLITE_FIXTURE_SETTINGS = "PRAGMA foreign_keys=ON;\nPRAGMA synchronous=FULL;\n"
 LABEL = "io.aaa-muse.test-owner"
+PORTAL_ASSET = re.compile(r"assets/.+-[A-Za-z0-9_-]{8,}\.(?:js|css|woff2|woff|svg)")
 
 
 def require(condition, message):
@@ -149,6 +151,10 @@ class Harness:
                     require(name in files and files[name].size > 0, "missing runtime file " + name)
                 require(b"ID=alpine" in fs.extractfile(files["etc/os-release"]).read().splitlines(),
                         "runtime metadata is not Alpine")
+                portal_root = "usr/share/aaa-muse-ai/portal/"
+                assets = [name.removeprefix(portal_root) for name in files if name.startswith(portal_root + "assets/")]
+                require(assets and all(PORTAL_ASSET.fullmatch(asset) for asset in assets),
+                        "runtime portal contains unfingerprinted assets")
             compressed = len(subprocess.check_output(["gzip", "-n", "-6", "-c", str(archive)], timeout=30))
             require(info["Architecture"] != "amd64" or compressed <= 12 * 1024 * 1024,
                     "compressed amd64 rootfs exceeds the 12 MiB budget")

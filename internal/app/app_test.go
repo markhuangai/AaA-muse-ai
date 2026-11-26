@@ -395,11 +395,11 @@ type toggleFiles struct {
 	fail atomic.Bool
 }
 
-func (f *toggleFiles) WriteFile(p string, b []byte, m fs.FileMode) error {
+func (f *toggleFiles) CheckDirWritable(p string) error {
 	if f.fail.Load() {
 		return fs.ErrPermission
 	}
-	return f.OSFiles.WriteFile(p, b, m)
+	return f.OSFiles.CheckDirWritable(p)
 }
 
 func TestRuntimeHelpers(t *testing.T) {
