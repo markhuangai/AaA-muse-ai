@@ -278,7 +278,8 @@ func TestWorkerPullExternalBusyIsDiagnosed(t *testing.T) {
 		}
 		switch event["msg"] {
 		case "worker.pull_failed":
-			busy = event["reason"] == "database_busy" && event["sqlite_code"] == "5" && event["phase"] == "begin" && event["transaction_outcome"] == "not_started"
+			busy = event["level"] == "ERROR" && event["cause"] == "database_busy" && event["reason"] == "database_busy" &&
+				event["sqlite_code"] == "5" && event["phase"] == "begin" && event["transaction_outcome"] == "not_started"
 		case "worker.pull_timing":
 			acquired, valid := event["transaction_acquire_us"].(float64)
 			timing = event["level"] == "DEBUG" && valid && acquired >= 1000000 && event["queue_lookup_us"] == float64(0) && event["duration_ms"] != nil

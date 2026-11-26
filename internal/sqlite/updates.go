@@ -13,6 +13,8 @@ import (
 )
 
 const updateBrokerWindow = 30 * time.Second
+const legacyObservationPrincipal = "legacy-poll:"
+const legacyObservationID = "contact"
 
 func recordUpdateBroker(ctx context.Context, tx *sql.Tx, now time.Time, broker worker.UpdateBroker) error {
 	raw, err := json.Marshal(broker.Target)
@@ -90,17 +92,32 @@ func agreedTarget(ctx context.Context, tx *sql.Tx, now time.Time, broker worker.
 }
 
 func readWorkerUpdate(ctx context.Context, tx *sql.Tx, id string) (state worker.UpdateStatus, err error) {
-	var data, poll []byte
-	err = tx.QueryRowContext(ctx, `SELECT u.data,p.result FROM aaa_worker_updates u
-		LEFT JOIN aaa_worker_polls p ON p.worker_id=u.worker_id WHERE u.worker_id=?1`, id).Scan(&data, &poll)
+	var data, poll, legacy []byte
+	err = tx.QueryRowContext(ctx, `SELECT u.data,p.result,legacy.data FROM aaa_worker_updates u
+		LEFT JOIN aaa_worker_polls p ON p.worker_id=u.worker_id
+		LEFT JOIN aaa_inference_receipts legacy ON legacy.principal='`+legacyObservationPrincipal+`'||u.worker_id AND legacy.submission_id='`+legacyObservationID+`'
+		WHERE u.worker_id=?1`, id).Scan(&data, &poll, &legacy)
 	if errors.Is(err, sql.ErrNoRows) {
 		return state, nil
 	}
 	if err == nil {
-		if err = json.Unmarshal(data, &state); err == nil {
-			var observations pollObservations
-			observations, err = readPollObservations(poll)
-			observations.Update.recoverUpdate(&state)
+		var observations pollObservations
+		if observations, err = readPollObservations(poll); err == nil {
+			state, err = decodeWorkerUpdate(data, observations.Update, legacy)
+		}
+	}
+	return
+}
+
+func decodeWorkerUpdate(data []byte, poll updateObservation, legacy []byte) (state worker.UpdateStatus, err error) {
+	if err = json.Unmarshal(data, &state); err != nil {
+		return
+	}
+	state.Observe(state.Contact, poll.Scheduled, poll.Observed)
+	if legacy != nil {
+		var stamp updateObservation
+		if err = json.Unmarshal(legacy, &stamp); err == nil {
+			state.Observe(state.Contact, stamp.Scheduled, stamp.Observed)
 		}
 	}
 	return
@@ -122,10 +139,19 @@ func observeLegacyWorker(ctx context.Context, tx *sql.Tx, now time.Time, id stri
 		return worker.UpdateStatus{}, err
 	}
 	alreadyMarked := state.State == "migration_required"
-	previous := state.Contact
+	previous := state
 	state.Observe(contact, pull.ScheduledAt, now)
-	if alreadyMarked && state.Contact == previous {
-		return worker.UpdateStatus{}, nil
+	if alreadyMarked && state.Contact == previous.Contact {
+		if !state.ScheduledAt.After(previous.ScheduledAt) {
+			return worker.UpdateStatus{}, nil
+		}
+		data, err := json.Marshal(updateObservation{state.ScheduledAt, *state.ObservedAt})
+		if err != nil {
+			return worker.UpdateStatus{}, err
+		}
+		_, err = tx.ExecContext(ctx, `INSERT INTO aaa_inference_receipts(principal,submission_id,data) VALUES(?1,?2,?3)
+			ON CONFLICT(principal,submission_id) DO UPDATE SET data=excluded.data`, legacyObservationPrincipal+id, legacyObservationID, data)
+		return worker.UpdateStatus{}, err
 	}
 	state.State, state.Reason = "migration_required", "unsupported_worker_migration"
 	if err = saveWorkerUpdate(ctx, tx, id, state); err != nil {

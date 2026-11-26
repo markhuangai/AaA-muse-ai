@@ -25,9 +25,14 @@ type observationStamp struct {
 	Observed  int64 `json:"observed"`
 }
 
+type updateObservation struct {
+	Scheduled time.Time `json:"scheduled"`
+	Observed  time.Time `json:"observed"`
+}
+
 type pollObservations struct {
-	Update     observationStamp `json:"update,omitzero"`
-	Capability observationStamp `json:"capability,omitzero"`
+	Update     updateObservation `json:"update,omitzero"`
+	Capability observationStamp  `json:"capability,omitzero"`
 }
 
 type storedPullResult struct {
@@ -45,12 +50,6 @@ func readPollObservations(data []byte) (pollObservations, error) {
 		}
 	}
 	return saved.Observations, nil
-}
-
-func (stamp observationStamp) recoverUpdate(state *worker.UpdateStatus) {
-	if stamp != (observationStamp{}) {
-		state.Observe(state.Contact, time.UnixMicro(stamp.Scheduled).UTC(), time.UnixMicro(stamp.Observed).UTC())
-	}
 }
 
 func loadPullCandidate(ctx context.Context, tx *sql.Tx, candidate pullCandidate, state *inference.State) error {
@@ -238,7 +237,7 @@ func (r *Repository) WithinPull(ctx context.Context, credential [32]byte, input 
 				timing.UpdateBrokerRecorded = true
 			}
 			if timing.Update.ObservedAt != nil {
-				observations.Update = observationStamp{timing.Update.ScheduledAt.UnixMicro(), timing.Update.ObservedAt.UnixMicro()}
+				observations.Update = updateObservation{timing.Update.ScheduledAt, *timing.Update.ObservedAt}
 			}
 			if pairedHook && !contact.Incompatible {
 				timing.Capability, timing.CapabilityChanged, err = recordWorkerCapability(ctx, tx, workerID, input.AgentTasks, input.ScheduledAt, now, true)

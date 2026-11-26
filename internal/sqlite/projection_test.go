@@ -78,7 +78,8 @@ func TestSteadyPollWritesOnlyPollAndWorker(t *testing.T) {
 	}
 	poll := func(sequence int64, wantChanged bool) {
 		t.Helper()
-		input := inference.Pull{Version: 1, Sequence: sequence, Checker: "checker", Occurrence: fmt.Sprint("occurrence-", sequence), ScheduledAt: now, EnteredAt: now, AgentTasks: true}
+		scheduled := now.Add(900 * time.Nanosecond)
+		input := inference.Pull{Version: 1, Sequence: sequence, Checker: "checker", Occurrence: fmt.Sprint("occurrence-", sequence), ScheduledAt: scheduled, EnteredAt: scheduled, AgentTasks: true}
 		_, _, _, timing, err := repo.WithinPull(ctx, credential, input, input.Occurrence, 0, contact, broker, func(*inference.State) (*inference.Grant, error) {
 			t.Fatal("idle pull claimed work")
 			return nil, nil
@@ -101,7 +102,8 @@ func TestSteadyPollWritesOnlyPollAndWorker(t *testing.T) {
 	poll(2, false)
 	counts("aaa_worker_polls", "aaa_workers")
 	execute(t, repo, `CREATE TRIGGER blocked_refresh BEFORE INSERT ON aaa_update_brokers BEGIN SELECT RAISE(ABORT, 'registration unavailable'); END`)
-	replay := inference.Pull{Version: 1, Sequence: 2, Checker: "checker", Occurrence: "occurrence-2", ScheduledAt: now, EnteredAt: now, AgentTasks: true}
+	scheduled := now.Add(900 * time.Nanosecond)
+	replay := inference.Pull{Version: 1, Sequence: 2, Checker: "checker", Occurrence: "occurrence-2", ScheduledAt: scheduled, EnteredAt: scheduled, AgentTasks: true}
 	forced := broker
 	forced.ForceRecord = true
 	_, _, replayed, timing, err := repo.WithinPull(ctx, credential, replay, replay.Occurrence, 0, contact, forced, nil)
@@ -121,17 +123,46 @@ func TestSteadyPollWritesOnlyPollAndWorker(t *testing.T) {
 	if err := repo.write(ctx, func(tx *sql.Tx) error { return saveControl(ctx, tx, worker.AgentTask, claim) }); err != nil {
 		t.Fatal(err)
 	}
-	lastPoll := now
+	lastObserved, lastScheduled := now, now.Add(900*time.Nanosecond)
 	now = now.Add(time.Second)
 	stale := worker.Contact{Version: "1.2.2", Digest: strings.Repeat("a", 64), Contract: worker.UpdateContract}
-	input := inference.BusyCheck{ClaimID: "claim", Generation: 1, Checker: "checker", Occurrence: "delayed-presence", ScheduledAt: lastPoll.Add(-time.Microsecond)}
+	input := inference.BusyCheck{ClaimID: "claim", Generation: 1, Checker: "checker", Occurrence: "delayed-presence", ScheduledAt: lastScheduled.Add(-400 * time.Nanosecond)}
 	receipt, _, capability, change, err := repo.RecordAgentTaskPresence(ctx, credential, claim.ID, input, stale, false)
 	if err != nil || !receipt.Recorded || capability != nil || change {
 		t.Fatalf("delayed presence incorrectly superseded poll capability: %+v %v %v %v", receipt, capability, change, err)
 	}
 	projection, err := repo.WorkerProjection(ctx, "worker", false)
 	if err != nil || projection.WorkerUpdate == nil || projection.WorkerCapability == nil || projection.WorkerUpdate.Contact != contact ||
-		!projection.WorkerUpdate.ScheduledAt.Equal(lastPoll) || !projection.WorkerCapability.AgentTasks || !projection.WorkerCapability.ObservedAt.Equal(lastPoll) {
+		!projection.WorkerUpdate.ScheduledAt.Equal(lastScheduled) || !projection.WorkerCapability.AgentTasks || !projection.WorkerCapability.ObservedAt.Equal(lastObserved) {
 		t.Fatalf("delayed presence overwrote latest paired observation: %+v %v", projection, err)
+	}
+}
+
+func TestUnchangedLegacyContactPreservesObservationOrder(t *testing.T) {
+	ctx, path := t.Context(), privatePath(t)
+	repo, sibling := openRepo(t, path), openRepo(t, path)
+	if err := repo.Bootstrap(ctx); err != nil {
+		t.Fatal(err)
+	}
+	credential := enroll(t, repo, "legacy")
+	base := repo.databaseTime()
+	contact := worker.Contact{Version: "0.9.2", Digest: strings.Repeat("a", 64)}
+	observe := func(target *Repository, reported worker.Contact, offset time.Duration) {
+		t.Helper()
+		input := inference.Pull{ObserveLegacy: true, ScheduledAt: base.Add(offset)}
+		if _, _, _, _, err := target.WithinPull(ctx, credential, input, "", 0, reported, worker.UpdateBroker{}, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	observe(repo, contact, 0)
+	execute(t, repo, `CREATE TRIGGER forbid_legacy_update BEFORE UPDATE ON aaa_worker_updates
+		BEGIN SELECT RAISE(ABORT, 'rewrote unchanged legacy contact'); END`)
+	latest := time.Second + 900*time.Nanosecond
+	observe(repo, contact, latest)
+	observe(sibling, worker.Contact{Version: "0.9.1", Digest: strings.Repeat("b", 64)}, latest-400*time.Nanosecond)
+	state, err := sibling.WorkerProjection(ctx, "legacy", false)
+	if err != nil || state.WorkerUpdate == nil || state.WorkerUpdate.State != "migration_required" ||
+		state.WorkerUpdate.Contact != contact || !state.WorkerUpdate.ScheduledAt.Equal(base.Add(latest)) || state.LastPollAt != nil {
+		t.Fatalf("projection lost legacy observation or fabricated a native poll: %+v %v", state, err)
 	}
 }

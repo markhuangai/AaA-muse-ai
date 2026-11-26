@@ -9,13 +9,14 @@ import (
 	"github.com/markhuangai/AaA-muse-ai/internal/worker"
 )
 
-const projectionRows = `SELECT w.id, w.revoked_at, w.last_contact_at, c.data, p.last_poll_at, p.result, u.data, rt.data,
+const projectionRows = `SELECT w.id, w.revoked_at, w.last_contact_at, c.data, p.last_poll_at, p.result, u.data, legacy.data, rt.data,
 	cap.agent_tasks, cap.prompt_contract, cap.observed_at, cap.scheduled_at, slot.lane, op.data, task.data,
 	usage.used_percent, usage.observed_at, usage.reset_label, held.data, e.id, e.state, e.deadline_at
 	FROM aaa_workers w
 	LEFT JOIN aaa_worker_connections c ON c.worker_id=w.id
 	LEFT JOIN aaa_worker_polls p ON p.worker_id=w.id
 	LEFT JOIN aaa_worker_updates u ON u.worker_id=w.id
+	LEFT JOIN aaa_inference_receipts legacy ON legacy.principal='` + legacyObservationPrincipal + `'||w.id AND legacy.submission_id='` + legacyObservationID + `'
 	LEFT JOIN aaa_worker_routing rt ON rt.worker_id=w.id
 	LEFT JOIN aaa_worker_capabilities cap ON cap.worker_id=w.id
 	LEFT JOIN aaa_worker_slots slot ON slot.worker_id=w.id
@@ -86,11 +87,11 @@ func (r *Repository) workerProjections(ctx context.Context, ids []string, own bo
 func scanProjection(row scanner, now time.Time, own bool) (*inference.State, error) {
 	state := &inference.State{Now: now}
 	var revoked, contact, polled, capabilityAt, capabilitySchedule, usageAt, deadline *int64
-	var connection, poll, update, routing, op, task, held []byte
+	var connection, poll, update, legacy, routing, op, task, held []byte
 	var tasks *bool
 	var contract, lane, reset, experimentID, experimentState *string
 	var used *float64
-	if err := row.Scan(&state.WorkerID, &revoked, &contact, &connection, &polled, &poll, &update, &routing,
+	if err := row.Scan(&state.WorkerID, &revoked, &contact, &connection, &polled, &poll, &update, &legacy, &routing,
 		&tasks, &contract, &capabilityAt, &capabilitySchedule, &lane, &op, &task, &used, &usageAt, &reset, &held,
 		&experimentID, &experimentState, &deadline); err != nil {
 		return nil, err
@@ -114,11 +115,10 @@ func scanProjection(row scanner, now time.Time, own bool) (*inference.State, err
 		}
 	}
 	if update != nil {
-		var value worker.UpdateStatus
-		if err := decodeInference(update, &value); err != nil {
+		value, err := decodeWorkerUpdate(update, observations.Update, legacy)
+		if err != nil {
 			return nil, err
 		}
-		observations.Update.recoverUpdate(&value)
 		if value.ObservedAt != nil || value.State != "" {
 			state.WorkerUpdate = &value
 		}

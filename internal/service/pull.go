@@ -124,7 +124,7 @@ func (b *Broker) PullWork(ctx context.Context, logger *slog.Logger, credential s
 			if grant := result.Job; grant != nil {
 				logger = logger.With("operation_id", grant.OperationID, "job_id", grant.JobID, "claim_id", grant.ClaimID, "generation", grant.Generation)
 			}
-			logger.Error("worker.pull_failed", "reason", failure.Reason, "phase", failure.Phase, "sqlite_code", failure.Code, "transaction_outcome", failure.Outcome)
+			logger.Error("worker.pull_failed", "reason", failure.Reason, "cause", failure.Reason, "phase", failure.Phase, "sqlite_code", failure.Code, "transaction_outcome", failure.Outcome)
 		}
 		return inference.PullResult{}, workerID, err
 	}
