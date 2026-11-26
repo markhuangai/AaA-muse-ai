@@ -141,6 +141,7 @@ func TestWorkerPoolConcurrentPortalReads(t *testing.T) {
 	const active = 20
 	const revoked = 5
 	const polls = 16
+	const captureCapacity = 4 << 20
 	const budget = 1500 * time.Millisecond
 	path := filepath.Join(mediaSQLiteDirectory(t), "state.sqlite3")
 	handlers := make([]*Handler, 0, 2)
@@ -148,7 +149,7 @@ func TestWorkerPoolConcurrentPortalReads(t *testing.T) {
 	for index := range 2 {
 		h, repo := openPullHTTP(t, path, time.Now)
 		name := fmt.Sprintf("sibling-%d", index)
-		store, err := diagnostics.Open(diagnostics.OSFiles{}, t.TempDir(), name, time.Now, time.Hour, 64<<10)
+		store, err := diagnostics.Open(diagnostics.OSFiles{}, t.TempDir(), name, time.Now, time.Hour, captureCapacity)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -156,8 +157,9 @@ func TestWorkerPoolConcurrentPortalReads(t *testing.T) {
 		h.Exporter = store
 		h.Logger = diagnostics.NewLogger(io.Discard, store, slog.LevelInfo, h.Redactor, time.Now, func(err error) { t.Error(err) }).With("instance_id", name)
 		setUpdateBuild(t, h, repo, time.Now, name, "1.0.1", "a", "")
-		for range 90 {
-			h.Logger.Debug("capacity.fixture", "detail", strings.Repeat("x", 900))
+		seed := strings.Repeat("x", 16<<10)
+		for range 200 {
+			h.Logger.Debug("capacity.fixture", "detail", seed)
 		}
 		if snapshot, err := store.Snapshot(diagnostics.Filter{}); err != nil || snapshot.Metadata.Complete || snapshot.Metadata.PrunedThrough.IsZero() {
 			t.Fatalf("fixture did not drive capacity eviction: %+v %v", snapshot.Metadata, err)
@@ -287,7 +289,7 @@ func TestWorkerPoolConcurrentPortalReads(t *testing.T) {
 			}
 		}
 		if !timing || !completed {
-			t.Fatal("scale diagnostics lost pull timing or request completion")
+			t.Fatalf("sibling %d scale diagnostics: pull timing=%v request completion=%v", index, timing, completed)
 		}
 	}
 	t.Logf("%d workers, %d active polls, %d revoked polls, 52 list reads, four sibling sweeps; slowest HTTP response %s",
