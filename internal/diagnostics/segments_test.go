@@ -62,6 +62,46 @@ func TestSegmentRotationAndBounds(t *testing.T) {
 	}
 }
 
+func TestRepresentativeSegmentCountAtDefaultCapacity(t *testing.T) {
+	const capacity = 128 << 20
+	store, now := openFixture(t, capacity)
+	sizes := []int{192, 192, 512, 960, 2048, 6 << 10, 28 << 10}
+	values := make([]string, len(sizes))
+	for index, size := range sizes {
+		values[index] = strings.Repeat("x", size)
+	}
+	for index := 0; store.retainedBytes < capacity+4*segmentCap(capacity); index++ {
+		writeSegmentEvent(t, store, now.Add(time.Duration(index)*time.Microsecond), values[index%len(values)])
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(store.dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	var retained int64
+	for _, entry := range entries {
+		if !strings.HasPrefix(entry.Name(), "segment-") {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Size() > segmentCap(capacity) {
+			t.Fatalf("representative segment exceeds its cap: %s is %d bytes", entry.Name(), info.Size())
+		}
+		count++
+		retained += info.Size()
+	}
+	t.Logf("representative small/medium captures: %d segments, %d/%d bytes retained", count, retained, capacity)
+	if retained != store.retainedBytes || retained > capacity || retained <= capacity-segmentCap(capacity) || count < 60 || count > 75 {
+		t.Fatalf("representative traffic did not meet the segment-count target near capacity")
+	}
+}
+
 func TestSegmentCrashRecovery(t *testing.T) {
 	if dir := os.Getenv("AAA_TEST_CRASH_CAPTURE_DIR"); dir != "" {
 		store, err := Open(OSFiles{}, dir, "crashed", time.Now, time.Hour, 128<<20)
@@ -294,6 +334,50 @@ func (files delayedSegmentFiles) Remove(path string) error {
 		files.beforeRemove()
 	}
 	return files.OSFiles.Remove(path)
+}
+
+func TestSnapshotPrunesWhileMaintenanceSyncs(t *testing.T) {
+	entered, release := make(chan struct{}), make(chan struct{})
+	var first sync.Once
+	files := delayedSegmentFiles{beforeSync: func() { first.Do(func() { close(entered); <-release }) }}
+	store, err := Open(files, t.TempDir(), "instance", time.Now, time.Hour, 6144)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var exporting sync.WaitGroup
+	defer func() {
+		close(release)
+		exporting.Wait()
+		if err := store.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
+	writeSegmentEvent(t, store, time.Now(), "first capture")
+	store.StartMaintenance(time.Millisecond, func(err error) { t.Error(err) })
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("maintenance did not enter active segment sync")
+	}
+	writeSegmentEvent(t, store, time.Now(), strings.Repeat("x", 12000))
+	writeSegmentEvent(t, store, time.Now(), "retained capture")
+	result := make(chan Snapshot, 1)
+	exporting.Go(func() {
+		snapshot, err := store.Snapshot(Filter{})
+		if err != nil {
+			t.Error(err)
+		}
+		result <- snapshot
+	})
+	select {
+	case snapshot := <-result:
+		if snapshot.Metadata.Complete || snapshot.Metadata.PrunedThrough.IsZero() ||
+			snapshot.Metadata.Captures != 1 || payloads(t, snapshot)[0]["value"] != "retained capture" {
+			t.Fatalf("export did not prune over-capacity evidence: %+v", snapshot.Metadata)
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("export pruning waited for background segment sync")
+	}
 }
 
 func TestSegmentWritesDoNotWaitForSyncOrPruning(t *testing.T) {

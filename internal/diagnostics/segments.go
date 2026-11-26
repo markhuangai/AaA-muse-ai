@@ -284,7 +284,6 @@ func (s *Store) prune() (bool, error) {
 type maintenance struct {
 	stop, done chan struct{}
 	rotate     chan struct{}
-	prune      chan chan error
 }
 
 func (s *Store) StartMaintenance(interval time.Duration, onFailure func(error)) {
@@ -293,7 +292,7 @@ func (s *Store) StartMaintenance(interval time.Duration, onFailure func(error)) 
 	if s.closed || s.maintenance != nil {
 		return
 	}
-	m := &maintenance{stop: make(chan struct{}), done: make(chan struct{}), rotate: make(chan struct{}, 1), prune: make(chan chan error)}
+	m := &maintenance{stop: make(chan struct{}), done: make(chan struct{}), rotate: make(chan struct{}, 1)}
 	s.maintenance = m
 	go s.maintain(m, interval, onFailure)
 }
@@ -307,9 +306,6 @@ func (s *Store) maintain(m *maintenance, interval time.Duration, onFailure func(
 		select {
 		case <-m.stop:
 			return
-		case result := <-m.prune:
-			_, err = s.prune()
-			result <- err
 		case <-m.rotate:
 			err = s.flush(false)
 		case <-ticker.C:
@@ -335,7 +331,7 @@ func (s *Store) maintain(m *maintenance, interval time.Duration, onFailure func(
 
 func (s *Store) pruneForSnapshot() error {
 	s.mu.Lock()
-	m, closed, failed := s.maintenance, s.closed, s.failedErr
+	closed, failed := s.closed, s.failedErr
 	s.mu.Unlock()
 	if closed {
 		return fs.ErrClosed
@@ -343,22 +339,15 @@ func (s *Store) pruneForSnapshot() error {
 	if failed != nil {
 		return failed
 	}
-	if m == nil {
-		_, err := s.prune()
-		return err
-	}
-	result := make(chan error, 1)
-	select {
-	case m.prune <- result:
-		return <-result
-	case <-m.done:
+	_, err := s.prune()
+	if err != nil {
 		s.mu.Lock()
-		defer s.mu.Unlock()
-		if s.failedErr != nil {
-			return s.failedErr
+		if s.failedErr == nil {
+			s.failedErr = err
 		}
-		return fs.ErrClosed
+		s.mu.Unlock()
 	}
+	return err
 }
 
 func (s *Store) Flush() error { return s.flush(true) }

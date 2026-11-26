@@ -21,6 +21,7 @@ import (
 	"github.com/markhuangai/AaA-muse-ai/internal/diagnostics"
 	"github.com/markhuangai/AaA-muse-ai/internal/inference"
 	"github.com/markhuangai/AaA-muse-ai/internal/service"
+	"github.com/markhuangai/AaA-muse-ai/internal/sqlite"
 	"github.com/markhuangai/AaA-muse-ai/internal/worker"
 )
 
@@ -129,6 +130,7 @@ func TestProjectionExpiryParityAndStorageDiagnosis(t *testing.T) {
 func TestWorkerPoolConcurrentPortalReads(t *testing.T) {
 	const active = 20
 	const revoked = 5
+	const polls = 16
 	const budget = 1500 * time.Millisecond
 	path := filepath.Join(mediaSQLiteDirectory(t), "state.sqlite3")
 	handlers := make([]*Handler, 0, 2)
@@ -154,13 +156,14 @@ func TestWorkerPoolConcurrentPortalReads(t *testing.T) {
 		handlers = append(handlers, h)
 		stores = append(stores, store)
 	}
-	keys := make([]string, active)
-	for index := range active + revoked {
+	keys := make([]string, active+revoked)
+	for index := range keys {
 		worker, key := enrollHTTP(t, handlers[0], issueHTTP(t, handlers[0]))
-		if index < active {
-			keys[index] = key
-		} else if _, err := handlers[0].Workers.Revoke(t.Context(), handlers[0].Logger, worker.ID); err != nil {
-			t.Fatal(err)
+		keys[index] = key
+		if index >= active {
+			if _, err := handlers[0].Workers.Revoke(t.Context(), handlers[0].Logger, worker.ID); err != nil {
+				t.Fatal(err)
+			}
 		}
 	}
 	var running sync.WaitGroup
@@ -168,12 +171,12 @@ func TestWorkerPoolConcurrentPortalReads(t *testing.T) {
 	var sweeps atomic.Int64
 	var pollers, readers atomic.Int64
 	started := make(chan struct{})
-	check := func(response int, elapsed time.Duration) {
+	check := func(response, expected int, elapsed time.Duration) {
 		t.Helper()
 		for prior := slowest.Load(); int64(elapsed) > prior && !slowest.CompareAndSwap(prior, int64(elapsed)); prior = slowest.Load() {
 		}
-		if response != 200 || elapsed > budget {
-			t.Errorf("concurrent HTTP response %d in %s (limit %s)", response, elapsed, budget)
+		if response != expected || elapsed > budget {
+			t.Errorf("concurrent HTTP response %d in %s (want %d in at most %s)", response, elapsed, expected, budget)
 		}
 	}
 	for index, key := range keys {
@@ -181,7 +184,11 @@ func TestWorkerPoolConcurrentPortalReads(t *testing.T) {
 			<-started
 			pollers.Add(1)
 			defer pollers.Add(-1)
-			for poll := range 16 {
+			expected := http.StatusOK
+			if index >= active {
+				expected = http.StatusUnauthorized
+			}
+			for poll := range polls {
 				now := time.Now().UTC()
 				input := inference.Pull{Version: 1, Sequence: int64(poll + 1), Checker: "checker", Occurrence: fmt.Sprintf("poll-%d", poll), ScheduledAt: now, EnteredAt: now}
 				data, err := json.Marshal(input)
@@ -195,7 +202,7 @@ func TestWorkerPoolConcurrentPortalReads(t *testing.T) {
 				request.Header.Set(worker.AgentTasksHeader, "1")
 				response := httptest.NewRecorder()
 				handler.ServeHTTP(response, request)
-				check(response.Code, time.Since(now))
+				check(response.Code, expected, time.Since(now))
 				time.Sleep(160 * time.Millisecond)
 			}
 		})
@@ -208,7 +215,7 @@ func TestWorkerPoolConcurrentPortalReads(t *testing.T) {
 			for range 26 {
 				begin := time.Now()
 				result := call(handler, http.MethodGet, "/api/v1/admin/workers", "Bearer "+testManagementKey, nil)
-				check(result.Code, time.Since(begin))
+				check(result.Code, http.StatusOK, time.Since(begin))
 				var list struct{ Workers []workerView }
 				if err := json.Unmarshal(result.Body.Bytes(), &list); err != nil || len(list.Workers) != active+revoked {
 					t.Error("portal refresh did not include the complete pool", err)
@@ -223,7 +230,7 @@ func TestWorkerPoolConcurrentPortalReads(t *testing.T) {
 			defer ticker.Stop()
 			for range 2 {
 				<-ticker.C
-				if pollers.Load() != active || readers.Load() != 2 {
+				if pollers.Load() != active+revoked || readers.Load() != 2 {
 					t.Error("periodic sweep did not overlap both full request workloads")
 				}
 				if err := handler.Broker.Sweep(t.Context(), handler.Logger); err != nil {
@@ -273,7 +280,8 @@ func TestWorkerPoolConcurrentPortalReads(t *testing.T) {
 			t.Fatal("scale diagnostics lost pull timing or request completion")
 		}
 	}
-	t.Logf("25 workers, 320 idle polls, 52 list reads, four sibling sweeps; slowest HTTP response %s", time.Duration(slowest.Load()))
+	t.Logf("%d workers, %d active polls, %d revoked polls, 52 list reads, four sibling sweeps; slowest HTTP response %s",
+		active+revoked, active*polls, revoked*polls, time.Duration(slowest.Load()))
 }
 
 func TestWorkerPullExternalBusyIsDiagnosed(t *testing.T) {
@@ -290,8 +298,14 @@ func TestWorkerPullExternalBusyIsDiagnosed(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer lock.Rollback()
+	const busyTimeout = sqlite.BusyTimeoutMS * time.Millisecond
+	const tolerance = time.Second
+	const budget = busyTimeout + tolerance
 	now := time.Now().UTC()
 	failed := nativePost(h, workerPullRoute, key, inference.Pull{Version: 1, Sequence: 1, Checker: "checker", Occurrence: "busy", ScheduledAt: now, EnteredAt: now})
+	if elapsed := time.Since(now); elapsed > budget {
+		t.Errorf("pull with an external writer lock took %s, want at most %s", elapsed, budget)
+	}
 	nativeResponse(t, failed, 503, nil)
 	requestID := failed.Header().Get("X-Request-Id")
 	var busy, timing, completed bool
@@ -305,9 +319,11 @@ func TestWorkerPullExternalBusyIsDiagnosed(t *testing.T) {
 				event["sqlite_code"] == "5" && event["phase"] == "begin" && event["transaction_outcome"] == "not_started"
 		case "worker.pull_timing":
 			acquired, valid := event["transaction_acquire_us"].(float64)
-			timing = event["level"] == "DEBUG" && valid && acquired >= 1000000 && event["queue_lookup_us"] == float64(0) && event["duration_ms"] != nil
+			timing = event["level"] == "DEBUG" && valid && acquired >= float64((busyTimeout-tolerance).Microseconds()) &&
+				acquired <= float64(budget.Microseconds()) && event["queue_lookup_us"] == float64(0) && event["duration_ms"] != nil
 		case "request.completed":
-			completed = event["duration_ms"] != nil
+			duration, valid := event["duration_ms"].(float64)
+			completed = valid && duration >= float64((busyTimeout-tolerance).Milliseconds()) && duration <= float64(budget.Milliseconds())
 		}
 	}
 	if !busy || !timing || !completed {
