@@ -6,12 +6,14 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"io"
 	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -197,6 +199,67 @@ func TestCorruptChunksAreExplicit(t *testing.T) {
 	}
 	if _, err = Open(OSFiles{}, s.dir, "replacement", func() time.Time { return *now }, time.Hour, 1024*1024); err == nil {
 		t.Fatal("invalid retained metadata accepted on restart")
+	}
+	first := bytes.TrimSuffix(encode(records[:1]), []byte("\n"))
+	oversized := append(first, bytes.Repeat([]byte(" "), MaxRecordBytes-len(first))...)
+	oversized = append(oversized, '\n')
+	if err = os.WriteFile(path, oversized, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.Snapshot(Filter{}); err == nil {
+		t.Fatal("overlong first chunk accepted by export")
+	}
+	if _, err = Open(OSFiles{}, s.dir, "replacement", func() time.Time { return *now }, time.Hour, 1024*1024); err == nil {
+		t.Fatal("overlong first chunk accepted on restart")
+	}
+}
+
+type resolveLogValue func() slog.Value
+
+func (resolve resolveLogValue) LogValue() slog.Value { return resolve() }
+
+func TestConcurrentLoggerTimestampsFollowAppendOrder(t *testing.T) {
+	store, now := openFixture(t, 128<<20)
+	base := now.Add(-time.Minute)
+	firstBlocked, allowFirst := make(chan struct{}), make(chan struct{})
+	secondStarted, secondStamped, secondDone := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	var index atomic.Int64
+	logger := NewLogger(io.Discard, store, slog.LevelInfo, NewRedactor(nil), func() time.Time {
+		stamp := index.Add(1)
+		if stamp == 2 {
+			close(secondStamped)
+		}
+		return base.Add(time.Duration(stamp) * time.Second)
+	}, func(err error) { t.Error(err) })
+	var writers sync.WaitGroup
+	writers.Go(func() {
+		logger.With("stream", "first").Debug("first", "value", resolveLogValue(func() slog.Value {
+			close(firstBlocked)
+			<-allowFirst
+			return slog.StringValue("resolved")
+		}))
+	})
+	<-firstBlocked
+	writers.Go(func() {
+		close(secondStarted)
+		logger.WithGroup("second").Debug("second")
+		close(secondDone)
+	})
+	<-secondStarted
+	select {
+	case <-secondStamped:
+		<-secondDone
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(allowFirst)
+	writers.Wait()
+	snapshot, err := store.Snapshot(Filter{})
+	if err != nil || snapshot.Metadata.Captures != 2 || len(store.retained) != 0 || store.active == nil {
+		t.Fatalf("concurrency caused false segment rotation: %+v %v", snapshot.Metadata, err)
+	}
+	events := payloads(t, snapshot)
+	if events[0]["msg"] != "first" || events[1]["msg"] != "second" {
+		t.Fatalf("append order did not match capture timestamps: %v", events)
 	}
 }
 

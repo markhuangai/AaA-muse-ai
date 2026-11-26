@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -20,6 +21,7 @@ import (
 	"github.com/markhuangai/AaA-muse-ai/internal/diagnostics"
 	"github.com/markhuangai/AaA-muse-ai/internal/inference"
 	"github.com/markhuangai/AaA-muse-ai/internal/service"
+	"github.com/markhuangai/AaA-muse-ai/internal/worker"
 )
 
 type legacyProjectionRepository struct{ service.InferenceRepository }
@@ -181,8 +183,18 @@ func TestWorkerPoolConcurrentPortalReads(t *testing.T) {
 			defer pollers.Add(-1)
 			for poll := range 16 {
 				now := time.Now().UTC()
-				input := inference.Pull{Version: 1, Sequence: int64(poll + 1), Checker: "checker", Occurrence: fmt.Sprintf("poll-%d", poll), ScheduledAt: now, EnteredAt: now, AgentTasks: true}
-				response := nativePost(handlers[(index+poll)%2], workerPullRoute, key, input)
+				input := inference.Pull{Version: 1, Sequence: int64(poll + 1), Checker: "checker", Occurrence: fmt.Sprintf("poll-%d", poll), ScheduledAt: now, EnteredAt: now}
+				data, err := json.Marshal(input)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				handler := handlers[(index+poll)%2]
+				request := pairedRequest(handler, http.MethodPost, workerPullRoute, bytes.NewReader(data))
+				request.Header.Set("Authorization", "Bearer "+key)
+				request.Header.Set(worker.AgentTasksHeader, "1")
+				response := httptest.NewRecorder()
+				handler.ServeHTTP(response, request)
 				check(response.Code, time.Since(now))
 				time.Sleep(160 * time.Millisecond)
 			}
@@ -229,6 +241,17 @@ func TestWorkerPoolConcurrentPortalReads(t *testing.T) {
 	for index, handler := range handlers {
 		var workerStatus workerView
 		nativeResponse(t, call(handler, "GET", workerStatusRoute, "Bearer "+keys[index], nil), 200, &workerStatus)
+		var result struct{ Workers []workerView }
+		nativeResponse(t, call(handler, http.MethodGet, "/api/v1/admin/workers", "Bearer "+testManagementKey, nil), 200, &result)
+		ready := 0
+		for _, record := range result.Workers {
+			if record.AgentTasksReady && record.CapabilitiesObservedAt != nil {
+				ready++
+			}
+		}
+		if ready != active || workerStatus.CapabilitiesObservedAt == nil {
+			t.Fatalf("scale polls recorded task capability for %d/%d active workers", ready, active)
+		}
 		snapshot, err := stores[index].Snapshot(diagnostics.Filter{})
 		if err != nil || snapshot.Metadata.Captures == 0 {
 			t.Fatal("scale capture unavailable", err)

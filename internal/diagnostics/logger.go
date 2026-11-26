@@ -182,16 +182,22 @@ type handler struct {
 	stdout, capture slog.Handler
 	failed          func(error)
 	once            *sync.Once
+	captureMu       *sync.Mutex
 	now             func() time.Time
 }
 
 func NewLogger(stdout io.Writer, store io.Writer, level slog.Level, redactor *Redactor, now func() time.Time, failed func(error)) *slog.Logger {
-	return slog.New(&handler{stdout: slog.NewJSONHandler(stdout, &slog.HandlerOptions{Level: level, ReplaceAttr: redactor.Replace}), capture: slog.NewJSONHandler(store, &slog.HandlerOptions{Level: slog.LevelDebug, ReplaceAttr: redactor.Replace}), failed: failed, once: &sync.Once{}, now: now})
+	return slog.New(&handler{stdout: slog.NewJSONHandler(stdout, &slog.HandlerOptions{Level: level, ReplaceAttr: redactor.Replace}), capture: slog.NewJSONHandler(store, &slog.HandlerOptions{Level: slog.LevelDebug, ReplaceAttr: redactor.Replace}), failed: failed, once: &sync.Once{}, captureMu: &sync.Mutex{}, now: now})
 }
 func (h *handler) Enabled(_ context.Context, level slog.Level) bool { return level >= slog.LevelDebug }
-func (h *handler) Handle(ctx context.Context, r slog.Record) error {
+func (h *handler) captureRecord(ctx context.Context, r *slog.Record) error {
+	h.captureMu.Lock()
+	defer h.captureMu.Unlock()
 	r.Time = h.now().UTC()
-	if err := h.capture.Handle(ctx, r); err != nil {
+	return h.capture.Handle(ctx, *r)
+}
+func (h *handler) Handle(ctx context.Context, r slog.Record) error {
+	if err := h.captureRecord(ctx, &r); err != nil {
 		h.once.Do(func() { h.failed(err) })
 		return err
 	}
@@ -204,10 +210,10 @@ func (h *handler) Handle(ctx context.Context, r slog.Record) error {
 	return nil
 }
 func (h *handler) WithAttrs(attrs []slog.Attr) slog.Handler {
-	return &handler{stdout: h.stdout.WithAttrs(attrs), capture: h.capture.WithAttrs(attrs), failed: h.failed, once: h.once, now: h.now}
+	return &handler{stdout: h.stdout.WithAttrs(attrs), capture: h.capture.WithAttrs(attrs), failed: h.failed, once: h.once, captureMu: h.captureMu, now: h.now}
 }
 func (h *handler) WithGroup(name string) slog.Handler {
-	return &handler{stdout: h.stdout.WithGroup(name), capture: h.capture.WithGroup(name), failed: h.failed, once: h.once, now: h.now}
+	return &handler{stdout: h.stdout.WithGroup(name), capture: h.capture.WithGroup(name), failed: h.failed, once: h.once, captureMu: h.captureMu, now: h.now}
 }
 
 func Cause(err error) string {

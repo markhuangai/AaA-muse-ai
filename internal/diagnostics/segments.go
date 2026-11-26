@@ -151,7 +151,10 @@ func segmentBounds(file interface {
 	io.ReaderAt
 }, size int64, legacy bool) (segment, error) {
 	first, err := bufio.NewReaderSize(file, MaxRecordBytes).ReadSlice('\n')
-	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, bufio.ErrBufferFull) {
+	if err != nil {
+		if errors.Is(err, io.EOF) || errors.Is(err, bufio.ErrBufferFull) {
+			return segment{}, errors.New("capture_file_invalid")
+		}
 		return segment{}, err
 	}
 	header, valid := recordHeader(first)

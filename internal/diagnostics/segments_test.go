@@ -52,8 +52,12 @@ func TestSegmentRotationAndBounds(t *testing.T) {
 	if _, _, ready := store.snapshotEntries(); ready {
 		t.Fatal("export cut accepted over-capacity evidence appended after the previous prune")
 	}
+	started := time.Now()
 	snapshot, err = store.Snapshot(Filter{})
-	if err != nil || snapshot.Metadata.Captures != 0 || store.retainedBytes != 0 {
+	if elapsed := time.Since(started); elapsed >= 250*time.Millisecond {
+		t.Fatalf("export waited %s to prune without periodic maintenance", elapsed)
+	}
+	if err != nil || snapshot.Metadata.Captures != 0 || snapshot.Metadata.Complete || store.retainedBytes != 0 {
 		t.Fatalf("oversize segment survived pruning: %+v %d %v", snapshot.Metadata, store.retainedBytes, err)
 	}
 }
@@ -259,5 +263,91 @@ func TestSegmentMaintenanceWithConcurrentSnapshot(t *testing.T) {
 	running.Wait()
 	if err := store.Close(); err != nil || store.retainedBytes > store.maxBytes {
 		t.Fatalf("maintenance left bytes out of bounds: %d %v", store.retainedBytes, err)
+	}
+}
+
+type delayedSegmentFiles struct {
+	OSFiles
+	beforeSync, beforeRemove func()
+}
+
+type delayedSegmentFile struct {
+	AppendFile
+	beforeSync func()
+}
+
+func (files delayedSegmentFiles) CreateAppend(path string) (AppendFile, error) {
+	file, err := files.OSFiles.CreateAppend(path)
+	if err != nil || files.beforeSync == nil {
+		return file, err
+	}
+	return delayedSegmentFile{file, files.beforeSync}, nil
+}
+
+func (file delayedSegmentFile) Sync() error {
+	file.beforeSync()
+	return file.AppendFile.Sync()
+}
+
+func (files delayedSegmentFiles) Remove(path string) error {
+	if files.beforeRemove != nil {
+		files.beforeRemove()
+	}
+	return files.OSFiles.Remove(path)
+}
+
+func TestSegmentWritesDoNotWaitForSyncOrPruning(t *testing.T) {
+	for _, operation := range []string{"sync", "remove"} {
+		t.Run(operation, func(t *testing.T) {
+			entered, release := make(chan struct{}), make(chan struct{})
+			var first sync.Once
+			blockFirst := func() { first.Do(func() { close(entered); <-release }) }
+			var files delayedSegmentFiles
+			if operation == "sync" {
+				files.beforeSync = blockFirst
+			} else {
+				files.beforeRemove = blockFirst
+			}
+			store, err := Open(files, t.TempDir(), "instance", time.Now, time.Hour, 6144)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var work sync.WaitGroup
+			defer func() { close(release); work.Wait(); _ = store.Close() }()
+			if operation == "sync" {
+				writeSegmentEvent(t, store, time.Now(), "dirty segment")
+				work.Go(func() {
+					if err := store.Flush(); err != nil {
+						t.Error(err)
+					}
+				})
+			} else {
+				writeSegmentEvent(t, store, time.Now(), strings.Repeat("x", 12000))
+				work.Go(func() {
+					if _, err := store.Snapshot(Filter{}); err != nil {
+						t.Error(err)
+					}
+				})
+			}
+			select {
+			case <-entered:
+			case <-time.After(2 * time.Second):
+				t.Fatalf("fixture did not enter %s", operation)
+			}
+			written := make(chan error, 1)
+			work.Go(func() {
+				payload := []byte(fmt.Sprintf(`{"time":%q,"msg":"concurrent with disk operation"}`, time.Now().UTC().Format(time.RFC3339Nano)))
+				_, err := store.Write(payload)
+				written <- err
+			})
+			select {
+			case err := <-written:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(250 * time.Millisecond):
+				t.Fatalf("capture write waited for %s", operation)
+			}
+		})
 	}
 }

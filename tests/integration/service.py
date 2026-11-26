@@ -523,10 +523,14 @@ class Harness:
         self.ready(retained, retained_origin)
         for _ in range(12):
             self.request(retained_origin, "/api/v1/admin/status", self.admin)
-        _, _, body = self.request(retained_origin, "/api/v1/admin/diagnostics/export", self.admin)
+        started = time.monotonic()
+        code, _, body = self.request(retained_origin, "/api/v1/admin/diagnostics/export", self.admin)
+        elapsed = time.monotonic() - started
+        require(code == 200 and elapsed < 0.250, "capacity export did not complete within 250 ms")
         metadata, _ = self.decode_export(body)
         require(not metadata["complete"] and metadata["omissions"], "capacity eviction was reported as complete")
-        self.receipt("capture.reconstruction_and_retention", exact_output_bytes=len(status), max_chunk_bytes=6144, omissions_reported=True)
+        self.receipt("capture.reconstruction_and_retention", exact_output_bytes=len(status), max_chunk_bytes=6144,
+                     omissions_reported=True, capacity_export_ms=round(elapsed * 1000, 2))
 
     def migration_rejection(self):
         self.sql("UPDATE aaa_schema_migrations SET checksum='deliberately-invalid-test-checksum' WHERE version=1;")
