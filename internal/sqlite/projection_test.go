@@ -100,6 +100,15 @@ func TestSteadyPollWritesOnlyPollAndWorker(t *testing.T) {
 	now = now.Add(time.Second)
 	poll(2, false)
 	counts("aaa_worker_polls", "aaa_workers")
+	execute(t, repo, `CREATE TRIGGER blocked_refresh BEFORE INSERT ON aaa_update_brokers BEGIN SELECT RAISE(ABORT, 'registration unavailable'); END`)
+	replay := inference.Pull{Version: 1, Sequence: 2, Checker: "checker", Occurrence: "occurrence-2", ScheduledAt: now, EnteredAt: now, AgentTasks: true}
+	forced := broker
+	forced.ForceRecord = true
+	_, _, replayed, timing, err := repo.WithinPull(ctx, credential, replay, replay.Occurrence, 0, contact, forced, nil)
+	if err != nil || !replayed || timing.UpdateBrokerRecorded {
+		t.Fatalf("committed replay depended on repairing broker registration: %v %+v %v", replayed, timing, err)
+	}
+	execute(t, repo, "DROP TRIGGER blocked_refresh; DELETE FROM fixture_writes")
 	now = now.Add(14 * time.Second)
 	poll(3, false)
 	counts("aaa_update_brokers", "aaa_worker_polls", "aaa_workers")
@@ -107,4 +116,22 @@ func TestSteadyPollWritesOnlyPollAndWorker(t *testing.T) {
 	broker.ForceRecord = true
 	poll(4, false)
 	counts("aaa_update_brokers", "aaa_worker_polls", "aaa_workers")
+	claim := worker.ControlRecord{ControlItem: worker.ControlItem{ID: "task", WorkerID: "worker", State: "claimed", Held: true,
+		CreatedAt: now, DeadlineAt: now.Add(time.Hour), Claim: &worker.ControlGrant{ClaimID: "claim", Generation: 1}}, Pair: contact, Checker: "checker"}
+	if err := repo.write(ctx, func(tx *sql.Tx) error { return saveControl(ctx, tx, worker.AgentTask, claim) }); err != nil {
+		t.Fatal(err)
+	}
+	lastPoll := now
+	now = now.Add(time.Second)
+	stale := worker.Contact{Version: "1.2.2", Digest: strings.Repeat("a", 64), Contract: worker.UpdateContract}
+	input := inference.BusyCheck{ClaimID: "claim", Generation: 1, Checker: "checker", Occurrence: "delayed-presence", ScheduledAt: lastPoll.Add(-time.Microsecond)}
+	receipt, _, capability, change, err := repo.RecordAgentTaskPresence(ctx, credential, claim.ID, input, stale, false)
+	if err != nil || !receipt.Recorded || capability != nil || change {
+		t.Fatalf("delayed presence incorrectly superseded poll capability: %+v %v %v %v", receipt, capability, change, err)
+	}
+	projection, err := repo.WorkerProjection(ctx, "worker", false)
+	if err != nil || projection.WorkerUpdate == nil || projection.WorkerCapability == nil || projection.WorkerUpdate.Contact != contact ||
+		!projection.WorkerUpdate.ScheduledAt.Equal(lastPoll) || !projection.WorkerCapability.AgentTasks || !projection.WorkerCapability.ObservedAt.Equal(lastPoll) {
+		t.Fatalf("delayed presence overwrote latest paired observation: %+v %v", projection, err)
+	}
 }

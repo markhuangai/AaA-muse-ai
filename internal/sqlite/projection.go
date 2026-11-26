@@ -9,8 +9,8 @@ import (
 	"github.com/markhuangai/AaA-muse-ai/internal/worker"
 )
 
-const projectionRows = `SELECT w.id, w.revoked_at, w.last_contact_at, c.data, p.last_poll_at, u.data, rt.data,
-	cap.agent_tasks, cap.prompt_contract, cap.observed_at, slot.lane, op.data, task.data,
+const projectionRows = `SELECT w.id, w.revoked_at, w.last_contact_at, c.data, p.last_poll_at, p.result, u.data, rt.data,
+	cap.agent_tasks, cap.prompt_contract, cap.observed_at, cap.scheduled_at, slot.lane, op.data, task.data,
 	usage.used_percent, usage.observed_at, usage.reset_label, held.data, e.id, e.state, e.deadline_at
 	FROM aaa_workers w
 	LEFT JOIN aaa_worker_connections c ON c.worker_id=w.id
@@ -85,13 +85,13 @@ func (r *Repository) workerProjections(ctx context.Context, ids []string, own bo
 
 func scanProjection(row scanner, now time.Time, own bool) (*inference.State, error) {
 	state := &inference.State{Now: now}
-	var revoked, contact, polled, capabilityAt, usageAt, deadline *int64
-	var connection, update, routing, op, task, held []byte
+	var revoked, contact, polled, capabilityAt, capabilitySchedule, usageAt, deadline *int64
+	var connection, poll, update, routing, op, task, held []byte
 	var tasks *bool
 	var contract, lane, reset, experimentID, experimentState *string
 	var used *float64
-	if err := row.Scan(&state.WorkerID, &revoked, &contact, &connection, &polled, &update, &routing,
-		&tasks, &contract, &capabilityAt, &lane, &op, &task, &used, &usageAt, &reset, &held,
+	if err := row.Scan(&state.WorkerID, &revoked, &contact, &connection, &polled, &poll, &update, &routing,
+		&tasks, &contract, &capabilityAt, &capabilitySchedule, &lane, &op, &task, &used, &usageAt, &reset, &held,
 		&experimentID, &experimentState, &deadline); err != nil {
 		return nil, err
 	}
@@ -99,6 +99,10 @@ func scanProjection(row scanner, now time.Time, own bool) (*inference.State, err
 		return nil, inference.Reject("worker_revoked", 401, "correlation", nil, "expected_worker_id", state.WorkerID, "observed_worker_id", state.WorkerID)
 	}
 	state.Revoked, state.LastContactAt, state.LastPollAt = revoked != nil, instant(contact), instant(polled)
+	observations, err := readPollObservations(poll)
+	if err != nil {
+		return nil, err
+	}
 	for _, field := range []struct {
 		data []byte
 		dest any
@@ -114,11 +118,15 @@ func scanProjection(row scanner, now time.Time, own bool) (*inference.State, err
 		if err := decodeInference(update, &value); err != nil {
 			return nil, err
 		}
+		observations.Update.recoverUpdate(&value)
 		if value.ObservedAt != nil || value.State != "" {
 			state.WorkerUpdate = &value
 		}
 	}
 	if tasks != nil {
+		if stamp := observations.Capability; stamp != (observationStamp{}) && stamp.Scheduled > *capabilitySchedule {
+			capabilityAt = &stamp.Observed
+		}
 		observed := instant(capabilityAt)
 		state.WorkerCapability = &worker.Capability{AgentTasks: *tasks, PromptContract: *contract, ObservedAt: *observed}
 		state.ControlProjection.PromptContract, state.ControlProjection.CapabilitiesObservedAt = *contract, observed

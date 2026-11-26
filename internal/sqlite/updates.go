@@ -90,13 +90,18 @@ func agreedTarget(ctx context.Context, tx *sql.Tx, now time.Time, broker worker.
 }
 
 func readWorkerUpdate(ctx context.Context, tx *sql.Tx, id string) (state worker.UpdateStatus, err error) {
-	var data []byte
-	err = tx.QueryRowContext(ctx, "SELECT data FROM aaa_worker_updates WHERE worker_id=?1", id).Scan(&data)
+	var data, poll []byte
+	err = tx.QueryRowContext(ctx, `SELECT u.data,p.result FROM aaa_worker_updates u
+		LEFT JOIN aaa_worker_polls p ON p.worker_id=u.worker_id WHERE u.worker_id=?1`, id).Scan(&data, &poll)
 	if errors.Is(err, sql.ErrNoRows) {
 		return state, nil
 	}
 	if err == nil {
-		err = json.Unmarshal(data, &state)
+		if err = json.Unmarshal(data, &state); err == nil {
+			var observations pollObservations
+			observations, err = readPollObservations(poll)
+			observations.Update.recoverUpdate(&state)
+		}
 	}
 	return
 }
@@ -174,6 +179,7 @@ func decideUpdate(ctx context.Context, tx *sql.Tx, now time.Time, id string, pul
 		if err != nil {
 			return nil, state, false, err
 		}
+		timing.UpdateBrokerRecorded = timing.UpdateBrokerRecorded || (broker.ForceRecord && broker.ID != "")
 		switch {
 		case reason != "":
 			state.Target, state.State, state.Reason = broker.Target, "deferred", reason
@@ -221,12 +227,6 @@ func (r *Repository) ApplyWorkerUpdate(ctx context.Context, credential [32]byte,
 		id, err = nativeWorker(ctx, tx, credential)
 		if err != nil {
 			return err
-		}
-		if broker.ForceRecord && broker.ID != "" {
-			if err := recordUpdateBroker(ctx, tx, now, broker); err != nil {
-				return err
-			}
-			broker.ForceRecord = false
 		}
 		state, err = readWorkerUpdate(ctx, tx, id)
 		if err != nil {
@@ -316,6 +316,11 @@ func (r *Repository) ApplyWorkerUpdate(ctx context.Context, credential [32]byte,
 		default:
 			return inference.Reject("invalid_worker_update", 400)
 		}
+		if (input.Action == "applied" || input.Action == "failed") && broker.ForceRecord && broker.ID != "" {
+			if err := recordUpdateBroker(ctx, tx, now, broker); err != nil {
+				return err
+			}
+		}
 		return saveWorkerUpdate(ctx, tx, id, state)
 	})
 	return
@@ -332,6 +337,9 @@ func decideControlUpdate(ctx context.Context, tx *sql.Tx, now time.Time, owner s
 		offer, err := forceRetryUpdate(ctx, tx, now, owner, pull, contact, broker, retry, timing)
 		if err != nil || offer != nil {
 			return offer, false, err
+		}
+		if timing.UpdateBrokerRecorded {
+			broker.ForceRecord = false
 		}
 	}
 	offer, status, work, err := decideUpdate(ctx, tx, now, owner, pull, contact, broker, held, timing)
@@ -364,6 +372,9 @@ func forceRetryUpdate(ctx context.Context, tx *sql.Tx, now time.Time, owner stri
 	broker worker.UpdateBroker, retry *worker.ControlRecord, timing *inference.PullTiming,
 ) (*worker.UpdateOffer, error) {
 	target, _, err := agreedTarget(ctx, tx, now, broker)
+	if err == nil && broker.ForceRecord && broker.ID != "" {
+		timing.UpdateBrokerRecorded = true
+	}
 	if err != nil || target == nil {
 		return nil, err
 	}

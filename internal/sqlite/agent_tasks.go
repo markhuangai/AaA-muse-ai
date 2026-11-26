@@ -12,22 +12,36 @@ import (
 )
 
 func workerCapability(ctx context.Context, tx *sql.Tx, workerID string) (*worker.Capability, error) {
+	capability, _, err := scheduledWorkerCapability(ctx, tx, workerID)
+	return capability, err
+}
+
+func scheduledWorkerCapability(ctx context.Context, tx *sql.Tx, workerID string) (*worker.Capability, int64, error) {
 	var cap worker.Capability
-	var observed int64
-	err := tx.QueryRowContext(ctx, "SELECT agent_tasks,prompt_contract,observed_at FROM aaa_worker_capabilities WHERE worker_id=?1", workerID).
-		Scan(&cap.AgentTasks, &cap.PromptContract, &observed)
+	var observed, scheduled int64
+	var poll []byte
+	err := tx.QueryRowContext(ctx, `SELECT c.agent_tasks,c.prompt_contract,c.observed_at,c.scheduled_at,p.result
+		FROM aaa_worker_capabilities c LEFT JOIN aaa_worker_polls p ON p.worker_id=c.worker_id WHERE c.worker_id=?1`, workerID).
+		Scan(&cap.AgentTasks, &cap.PromptContract, &observed, &scheduled, &poll)
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
+		return nil, 0, nil
 	}
 	if err != nil {
-		return nil, err
+		return nil, 0, err
+	}
+	observations, err := readPollObservations(poll)
+	if err != nil {
+		return nil, 0, err
+	}
+	if stamp := observations.Capability; stamp != (observationStamp{}) && stamp.Scheduled > scheduled {
+		scheduled, observed = stamp.Scheduled, stamp.Observed
 	}
 	cap.ObservedAt = time.UnixMicro(observed).UTC()
-	return &cap, nil
+	return &cap, scheduled, nil
 }
 
 func recordWorkerCapability(ctx context.Context, tx *sql.Tx, workerID string, supportsTasks bool, scheduled, now time.Time, skipUnchanged bool) (*worker.Capability, bool, error) {
-	prior, err := workerCapability(ctx, tx, workerID)
+	prior, fence, err := scheduledWorkerCapability(ctx, tx, workerID)
 	if err != nil {
 		return nil, false, err
 	}
@@ -35,8 +49,11 @@ func recordWorkerCapability(ctx context.Context, tx *sql.Tx, workerID string, su
 	if supportsTasks {
 		cap.PromptContract = worker.HookPromptContract
 	}
+	if prior != nil && scheduled.UnixMicro() <= fence {
+		return nil, false, nil
+	}
 	if skipUnchanged && prior != nil && prior.AgentTasks == cap.AgentTasks && prior.PromptContract == cap.PromptContract {
-		return prior, false, nil
+		return &cap, false, nil
 	}
 	change, err := tx.ExecContext(ctx, `INSERT INTO aaa_worker_capabilities(worker_id,agent_tasks,prompt_contract,observed_at,scheduled_at)
 		VALUES(?1,?2,?3,?4,?5) ON CONFLICT(worker_id) DO UPDATE SET agent_tasks=excluded.agent_tasks,

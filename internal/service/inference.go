@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -31,6 +32,8 @@ type Broker struct {
 	Wait                  func(context.Context, time.Duration) error
 	updateBroker          worker.UpdateBroker
 	updateBrokerNeedsSync atomic.Bool
+	updateBrokerSyncMu    sync.Mutex
+	updateBrokerFailure   uint64
 }
 
 func NewBroker(repo InferenceRepository, random io.Reader, now func() time.Time, wait func(context.Context, time.Duration) error) *Broker {

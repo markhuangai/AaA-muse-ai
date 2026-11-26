@@ -164,6 +164,7 @@ func TestWorkerPoolConcurrentPortalReads(t *testing.T) {
 	var running sync.WaitGroup
 	var slowest atomic.Int64
 	var sweeps atomic.Int64
+	var pollers, readers atomic.Int64
 	started := make(chan struct{})
 	check := func(response int, elapsed time.Duration) {
 		t.Helper()
@@ -176,7 +177,9 @@ func TestWorkerPoolConcurrentPortalReads(t *testing.T) {
 	for index, key := range keys {
 		running.Go(func() {
 			<-started
-			for poll := range 7 {
+			pollers.Add(1)
+			defer pollers.Add(-1)
+			for poll := range 16 {
 				now := time.Now().UTC()
 				input := inference.Pull{Version: 1, Sequence: int64(poll + 1), Checker: "checker", Occurrence: fmt.Sprintf("poll-%d", poll), ScheduledAt: now, EnteredAt: now, AgentTasks: true}
 				response := nativePost(handlers[(index+poll)%2], workerPullRoute, key, input)
@@ -188,7 +191,9 @@ func TestWorkerPoolConcurrentPortalReads(t *testing.T) {
 	for _, handler := range handlers {
 		running.Go(func() {
 			<-started
-			for range 12 {
+			readers.Add(1)
+			defer readers.Add(-1)
+			for range 26 {
 				begin := time.Now()
 				result := call(handler, http.MethodGet, "/api/v1/admin/workers", "Bearer "+testManagementKey, nil)
 				check(result.Code, time.Since(begin))
@@ -202,18 +207,23 @@ func TestWorkerPoolConcurrentPortalReads(t *testing.T) {
 		})
 		running.Go(func() {
 			<-started
-			timer := time.NewTimer(time.Second)
-			defer timer.Stop()
-			<-timer.C
-			if err := handler.Broker.Sweep(t.Context(), handler.Logger); err != nil {
-				t.Error(err)
+			ticker := time.NewTicker(time.Second)
+			defer ticker.Stop()
+			for range 2 {
+				<-ticker.C
+				if pollers.Load() != active || readers.Load() != 2 {
+					t.Error("periodic sweep did not overlap both full request workloads")
+				}
+				if err := handler.Broker.Sweep(t.Context(), handler.Logger); err != nil {
+					t.Error(err)
+				}
+				sweeps.Add(1)
 			}
-			sweeps.Add(1)
 		})
 	}
 	close(started)
 	running.Wait()
-	if sweeps.Load() != 2 {
+	if sweeps.Load() != 4 {
 		t.Fatal("periodic sweeps did not run under concurrent polling")
 	}
 	for index, handler := range handlers {
@@ -240,5 +250,43 @@ func TestWorkerPoolConcurrentPortalReads(t *testing.T) {
 			t.Fatal("scale diagnostics lost pull timing or request completion")
 		}
 	}
-	t.Logf("25 workers, 140 idle polls, 24 list reads, two sibling sweeps; slowest HTTP response %s", time.Duration(slowest.Load()))
+	t.Logf("25 workers, 320 idle polls, 52 list reads, four sibling sweeps; slowest HTTP response %s", time.Duration(slowest.Load()))
+}
+
+func TestWorkerPullExternalBusyIsDiagnosed(t *testing.T) {
+	path := filepath.Join(mediaSQLiteDirectory(t), "state.sqlite3")
+	h, _ := openPullHTTP(t, path, time.Now)
+	key := enrollNative(t, h)
+	external, err := sql.Open("sqlite", "file:"+path+"?_txlock=immediate")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = external.Close() })
+	lock, err := external.BeginTx(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Rollback()
+	now := time.Now().UTC()
+	failed := nativePost(h, workerPullRoute, key, inference.Pull{Version: 1, Sequence: 1, Checker: "checker", Occurrence: "busy", ScheduledAt: now, EnteredAt: now})
+	nativeResponse(t, failed, 503, nil)
+	requestID := failed.Header().Get("X-Request-Id")
+	var busy, timing, completed bool
+	for _, event := range capturedHTTP(t, h.Exporter.(*diagnostics.Store)) {
+		if event["request_id"] != requestID {
+			continue
+		}
+		switch event["msg"] {
+		case "worker.pull_failed":
+			busy = event["reason"] == "database_busy" && event["sqlite_code"] == "5" && event["phase"] == "begin" && event["transaction_outcome"] == "not_started"
+		case "worker.pull_timing":
+			acquired, valid := event["transaction_acquire_us"].(float64)
+			timing = event["level"] == "DEBUG" && valid && acquired >= 1000000 && event["queue_lookup_us"] == float64(0) && event["duration_ms"] != nil
+		case "request.completed":
+			completed = event["duration_ms"] != nil
+		}
+	}
+	if !busy || !timing || !completed {
+		t.Fatalf("busy evidence incomplete: error=%v timing=%v completed=%v", busy, timing, completed)
+	}
 }

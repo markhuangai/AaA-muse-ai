@@ -1,6 +1,9 @@
 """Exercise the shipped Compose storage layout on an isolated Docker project."""
 
 from contextlib import contextmanager
+import base64
+from datetime import datetime, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -395,6 +398,17 @@ def named_upgrade(h):
             require(code == 202, "old Compose broker did not store the job")
             job = json.loads(body)["job_id"]
             p.compose("stop", "service", files=p.cleanup_files)
+            legacy_request = "legacy-capture-fixture"
+            stamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            legacy_event = {"time": stamp, "level": "DEBUG", "msg": "compose.legacy_fixture", "instance_id": "legacy-broker",
+                            "request_id": legacy_request, "fixture": "unchanged old-format event"}
+            payload = json.dumps(legacy_event, separators=(",", ":")).encode()
+            legacy_record = {"type": "event", "time": stamp, "event": legacy_event["msg"], "level": "DEBUG", "instance_id": "legacy-broker",
+                             "request_id": legacy_request, "capture_id": legacy_request, "chunk": 0, "chunks": 1,
+                             "payload_sha256": hashlib.sha256(payload).hexdigest(), "data_base64": base64.b64encode(payload).decode()}
+            legacy_path = f"{DIAGNOSTICS}/capture-{legacy_request}.ndjson"
+            h.run_tools("sh", "-ec", 'printf "%s\\n" "$1" > "$2"; chmod 0644 "$2"', "legacy-fixture",
+                        json.dumps(legacy_record, separators=(",", ":")), legacy_path, options=("--volumes-from", old))
             newer = owner if owner != "10001:10001" else "10002:10002"
             config_owner(newer)
             h.run_tools("chmod", "0644", SQLITE_STATE + "/broker.sqlite3", options=("--volumes-from", old))
@@ -423,7 +437,13 @@ def named_upgrade(h):
             metadata, records = h.decode_export(reply)
             require(metadata["complete"] and records, "enrollment diagnostic evidence was lost")
             h.assert_private(json.dumps(records), (enrollment, worker_key))
-            h.receipt("compose.named_upgrade", database=True, media=True, diagnostics=True, mixed_owners=True, old_compose=True)
+            status, _, reply = h.request(new_origin, "/api/v1/admin/diagnostics/export?request_id=" + legacy_request, h.admin)
+            require(status == 200, "legacy capture export failed after upgrade")
+            metadata, records = h.decode_export(reply)
+            require(metadata["complete"] and records == [legacy_event], "legacy capture did not decode unchanged")
+            require(h.run_tools("stat", "-c", "%a:%u:%g", legacy_path, options=("--volumes-from", new)).stdout.strip()
+                    == f"600:{expected_uid}:{expected_gid}", "legacy capture permissions were not repaired")
+            h.receipt("compose.named_upgrade", database=True, media=True, diagnostics=True, legacy_capture=True, mixed_owners=True, old_compose=True)
         finally:
             config_owner(owner)
 

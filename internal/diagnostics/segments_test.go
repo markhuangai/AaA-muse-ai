@@ -49,6 +49,9 @@ func TestSegmentRotationAndBounds(t *testing.T) {
 	if store.active != nil {
 		t.Fatal("capture larger than the entire allowance was not sealed")
 	}
+	if _, _, ready := store.snapshotEntries(); ready {
+		t.Fatal("export cut accepted over-capacity evidence appended after the previous prune")
+	}
 	snapshot, err = store.Snapshot(Filter{})
 	if err != nil || snapshot.Metadata.Captures != 0 || store.retainedBytes != 0 {
 		t.Fatalf("oversize segment survived pruning: %+v %d %v", snapshot.Metadata, store.retainedBytes, err)

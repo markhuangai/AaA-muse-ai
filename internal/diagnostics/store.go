@@ -180,24 +180,38 @@ func (s *Store) Write(payload []byte) (int, error) {
 	return len(payload), nil
 }
 
-func (s *Store) snapshotEntries() (Metadata, []segment) {
+func (s *Store) snapshotEntries() (Metadata, []segment, bool) {
 	s.pruneMu.Lock()
 	defer s.pruneMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	metadata := Metadata{Type: "export", Complete: true, CreatedAt: s.state.CreatedAt, SnapshotAt: s.now().UTC(), PrunedThrough: s.state.PrunedThrough, Omissions: []string{}}
+	now := s.now().UTC()
+	cutoff := now.Add(-s.retention)
+	if s.retainedBytes > s.maxBytes || (len(s.retained) != 0 && s.retained[0].maxTime.Before(cutoff)) ||
+		(s.active != nil && s.active.maxTime.Before(cutoff)) {
+		return Metadata{}, nil, false
+	}
+	metadata := Metadata{Type: "export", Complete: true, CreatedAt: s.state.CreatedAt, SnapshotAt: now, PrunedThrough: s.state.PrunedThrough, Omissions: []string{}}
 	entries := append([]segment(nil), s.retained...)
 	if s.active != nil {
 		entries = append(entries, s.active.segment)
 	}
-	return metadata, entries
+	return metadata, entries, true
 }
 
 func (s *Store) Snapshot(filter Filter) (Snapshot, error) {
-	if err := s.pruneForSnapshot(); err != nil {
-		return Snapshot{}, err
+	var metadata Metadata
+	var entries []segment
+	for {
+		if err := s.pruneForSnapshot(); err != nil {
+			return Snapshot{}, err
+		}
+		var ready bool
+		metadata, entries, ready = s.snapshotEntries()
+		if ready {
+			break
+		}
 	}
-	metadata, entries := s.snapshotEntries()
 	sort.Slice(entries, func(i, j int) bool { return entries[i].name < entries[j].name })
 	result := Snapshot{Metadata: metadata}
 	missing := func(reason string) {

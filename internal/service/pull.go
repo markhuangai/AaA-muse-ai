@@ -107,7 +107,8 @@ func (b *Broker) PullWork(ctx context.Context, logger *slog.Logger, credential s
 	started := b.now()
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	result, workerID, replayed, timing, err := repo.WithinPull(ctx, auth.Digest(credential), input, hash, capability, workerContact(reports), b.updateRecord(),
+	record, generation := b.updateRecord()
+	result, workerID, replayed, timing, err := repo.WithinPull(ctx, auth.Digest(credential), input, hash, capability, workerContact(reports), record,
 		func(s *inference.State) (*inference.Grant, error) {
 			return b.claimPulledJob(s, input.VerifyStart, input.VerifyHookStart)
 		})
@@ -128,7 +129,7 @@ func (b *Broker) PullWork(ctx context.Context, logger *slog.Logger, credential s
 		return inference.PullResult{}, workerID, err
 	}
 	if timing.UpdateBrokerRecorded {
-		b.updateBrokerNeedsSync.Store(false)
+		b.finishUpdateRecord(generation)
 	}
 	if !replayed {
 		logUpdateDecision(ctx, logger, timing.Update, timing.UpdateStateChanged, b.now().Sub(started))

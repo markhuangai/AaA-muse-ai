@@ -559,10 +559,13 @@ func TestCaptureIOFailures(t *testing.T) {
 	if _, err := Open(OSFiles{}, s.dir, "instance", func() time.Time { return *now }, time.Hour, 1024*1024); err == nil {
 		t.Fatal("accepted damaged retention state")
 	}
+	if err := s.saveState(s.state); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.Mkdir(filepath.Join(s.dir, "capture-not-regular.ndjson"), 0700); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.captures(); err == nil {
+	if _, err := Open(OSFiles{}, s.dir, "instance", func() time.Time { return *now }, time.Hour, 1024*1024); err == nil {
 		t.Fatal("accepted non-regular capture")
 	}
 	if err := (OSFiles{}).WriteFile(filepath.Join(s.dir, "missing", "file"), nil, 0600); err == nil {

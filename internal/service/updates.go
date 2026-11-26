@@ -44,20 +44,36 @@ func (b *Broker) EnableUpdates(ctx context.Context, logger *slog.Logger, id stri
 func (b *Broker) renewUpdateBroker(ctx context.Context, logger *slog.Logger) error {
 	bounded, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	err := b.repo.(updateRepository).RenewUpdateBroker(bounded, b.updateBroker)
-	b.updateBrokerNeedsSync.Store(err != nil)
+	record, generation := b.updateRecord()
+	err := b.repo.(updateRepository).RenewUpdateBroker(bounded, record)
 	if err != nil {
+		b.updateBrokerSyncMu.Lock()
+		b.updateBrokerFailure++
+		b.updateBrokerNeedsSync.Store(true)
+		b.updateBrokerSyncMu.Unlock()
 		failure := sqlite.Classify(err)
 		logger.Warn("worker.update_broker_renewal_failed", "cause", failure.Reason, "phase", failure.Phase, "sqlite_code", failure.Code,
 			"target", b.updateBroker.Target, "retry_seconds", updateBrokerInterval.Seconds())
+	} else {
+		b.finishUpdateRecord(generation)
 	}
 	return err
 }
 
-func (b *Broker) updateRecord() worker.UpdateBroker {
+func (b *Broker) updateRecord() (worker.UpdateBroker, uint64) {
+	b.updateBrokerSyncMu.Lock()
+	defer b.updateBrokerSyncMu.Unlock()
 	record := b.updateBroker
 	record.ForceRecord = b.updateBrokerNeedsSync.Load()
-	return record
+	return record, b.updateBrokerFailure
+}
+
+func (b *Broker) finishUpdateRecord(generation uint64) {
+	b.updateBrokerSyncMu.Lock()
+	defer b.updateBrokerSyncMu.Unlock()
+	if generation == b.updateBrokerFailure {
+		b.updateBrokerNeedsSync.Store(false)
+	}
 }
 
 func (b *Broker) ApplyWorkerUpdate(ctx context.Context, logger *slog.Logger, credential string, contact worker.Contact, input worker.UpdateRequest) (worker.UpdateStatus, string, error) {
@@ -75,10 +91,10 @@ func (b *Broker) ApplyWorkerUpdate(ctx context.Context, logger *slog.Logger, cre
 	started := b.now()
 	bounded, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	record := b.updateRecord()
+	record, generation := b.updateRecord()
 	state, id, replayed, err := repo.ApplyWorkerUpdate(bounded, auth.Digest(credential), contact, record, input)
-	if err == nil && record.ForceRecord {
-		b.updateBrokerNeedsSync.Store(false)
+	if err == nil && record.ForceRecord && record.ID != "" && (!replayed || input.Action == "begin" || input.Action == "activate") {
+		b.finishUpdateRecord(generation)
 	}
 	logger = logger.With("worker_id", id, "operation_id", input.ID, "stage", input.Action,
 		"attempt", state.Attempt, "duration_ms", b.now().Sub(started).Milliseconds(),
