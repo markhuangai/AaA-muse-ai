@@ -1,9 +1,11 @@
 package httpapi
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -59,6 +61,78 @@ func setUpdateBuild(t *testing.T, h *Handler, r *sqlite.Repository, now func() t
 		t.Fatal(err)
 	}
 	return *target
+}
+
+func TestConfirmedUpdateLogsOnlyTheTransition(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	clock := func() time.Time { return now }
+	h, repo := openPullHTTP(t, filepath.Join(mediaSQLiteDirectory(t), "state.sqlite3"), clock)
+	var output bytes.Buffer
+	h.Logger = slog.New(slog.NewJSONHandler(&output, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	target := setUpdateBuild(t, h, repo, clock, "broker", "1.0.1", "a", "")
+	key, workerID := controlWorker(t, h)
+	old := worker.Contact{Version: "1.0.0", Digest: strings.Repeat("b", 64), Contract: worker.UpdateContract}
+	current := worker.Contact{Version: target.Version, Digest: target.SHA256, Contract: target.Contract}
+	poll := func(sequence int64, contact worker.Contact) inference.PullResult {
+		t.Helper()
+		now = now.Add(time.Second)
+		input := inference.Pull{Version: 1, Sequence: sequence, Checker: "checker", Occurrence: fmt.Sprint("poll-", sequence), ScheduledAt: now, EnteredAt: now}
+		var result inference.PullResult
+		nativeResponse(t, versionedHTTP(h, "POST", workerPullRoute, key, contact, input), 200, &result)
+		return result
+	}
+	offer := poll(1, old).Update
+	if offer == nil {
+		t.Fatal("worker did not receive an offer")
+	}
+	nativeResponse(t, versionedHTTP(h, "POST", workerUpdateRoute, key, old,
+		worker.UpdateRequest{ID: offer.ID, Target: target, Action: "begin"}), 200, nil)
+	nativeResponse(t, versionedHTTP(h, "POST", workerUpdateRoute, key, old,
+		worker.UpdateRequest{ID: offer.ID, Target: target, Action: "failed", Reason: "archive_unavailable"}), 200, nil)
+	controlExchange(t, h, "POST", "/api/v1/admin/workers/"+workerID+"/ops", testManagementKey,
+		worker.OpRequest{ControlRequest: worker.ControlRequest{Version: inference.Version, SubmissionID: "retry-fixture"}, Kind: worker.RetryUpdate}, nil, 202, nil)
+	retryOffer := poll(2, old).Update
+	if retryOffer == nil || retryOffer.ID == offer.ID {
+		t.Fatal("pending retry did not produce a distinct offer")
+	}
+	for _, action := range []string{"begin", "activate", "applied"} {
+		contact := old
+		if action == "applied" {
+			contact = current
+		}
+		nativeResponse(t, versionedHTTP(h, "POST", workerUpdateRoute, key, contact, worker.UpdateRequest{ID: retryOffer.ID, Target: target, Action: action}), 200, nil)
+	}
+	for _, sequence := range []int64{3, 4, 5} {
+		poll(sequence, current)
+	}
+	offered, confirmed, timing := 0, 0, 0
+	retryLogged := false
+	decoder := json.NewDecoder(&output)
+	for decoder.More() {
+		var line map[string]any
+		if err := decoder.Decode(&line); err != nil {
+			t.Fatal(err)
+		}
+		if line["msg"] == "worker.pull_timing" && line["level"] == "DEBUG" {
+			timing++
+		}
+		if line["msg"] != "worker.update_pickup" || line["level"] != "INFO" || line["transaction_outcome"] != "committed" {
+			continue
+		}
+		switch line["state"] {
+		case "offered":
+			offered++
+			retryLogged = retryLogged || line["operation_id"] == retryOffer.ID
+		case "confirmed":
+			if line["sequence"] != float64(3) {
+				t.Fatalf("confirmed INFO belongs only to the transition poll, got sequence %v", line["sequence"])
+			}
+			confirmed++
+		}
+	}
+	if offered != 2 || !retryLogged || confirmed != 1 || timing != 5 {
+		t.Fatalf("offered=%d confirmed=%d protected poll timing=%d", offered, confirmed, timing)
+	}
 }
 
 func TestManagedWorkerUpdateFencesAndConfirms(t *testing.T) {

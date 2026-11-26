@@ -36,19 +36,32 @@ func scanWorker(row scanner) (w worker.Record, err error) {
 }
 
 func (r *Repository) write(ctx context.Context, action func(*sql.Tx) error) error {
-	return r.transaction(ctx, nil, action)
+	if err := ctx.Err(); err != nil {
+		return beginFailure(err)
+	}
+	select {
+	case r.writeSem <- struct{}{}:
+		defer func() { <-r.writeSem }()
+	case <-ctx.Done():
+		return beginFailure(ctx.Err())
+	}
+	return transaction(ctx, r.db, nil, action)
 }
 
 func (r *Repository) read(ctx context.Context, action func(*sql.Tx) error) error {
-	return r.transaction(ctx, &sql.TxOptions{ReadOnly: true}, action)
+	return transaction(ctx, r.readDB, &sql.TxOptions{ReadOnly: true}, action)
 }
 
-func (r *Repository) transaction(ctx context.Context, options *sql.TxOptions, action func(*sql.Tx) error) (err error) {
-	tx, err := r.db.BeginTx(ctx, options)
+func beginFailure(err error) error {
+	failure := Classify(err)
+	failure.Phase, failure.Outcome = "begin", "not_started"
+	return failure
+}
+
+func transaction(ctx context.Context, db *sql.DB, options *sql.TxOptions, action func(*sql.Tx) error) (err error) {
+	tx, err := db.BeginTx(ctx, options)
 	if err != nil {
-		failure := Classify(err)
-		failure.Phase, failure.Outcome = "begin", "not_started"
-		return failure
+		return beginFailure(err)
 	}
 	defer tx.Rollback()
 	if err = action(tx); err != nil {

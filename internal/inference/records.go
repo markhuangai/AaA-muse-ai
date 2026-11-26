@@ -82,20 +82,22 @@ type PullResult struct {
 }
 
 type PullTiming struct {
-	Acquire             time.Duration
-	Select              time.Duration
-	PreviousPin         string
-	PreviousPinReason   string
-	Update              worker.UpdateStatus
-	UpdateOp            *worker.ControlItem
-	ConfirmedUpdateOp   *worker.ControlItem
-	PreviousUpdateState string
-	Capability          *worker.Capability
-	CapabilityChanged   bool
-	UsageResult         string
-	UsageDecision       string
-	EffectiveUsage      *worker.WeeklyUsage
-	UsageDeferrals      []UsageDeferral
+	Acquire              time.Duration
+	Select               time.Duration
+	PreviousPin          string
+	PreviousPinReason    string
+	Update               worker.UpdateStatus
+	UpdateOp             *worker.ControlItem
+	ConfirmedUpdateOp    *worker.ControlItem
+	PreviousUpdateState  string
+	UpdateStateChanged   bool
+	UpdateBrokerRecorded bool
+	Capability           *worker.Capability
+	CapabilityChanged    bool
+	UsageResult          string
+	UsageDecision        string
+	EffectiveUsage       *worker.WeeklyUsage
+	UsageDeferrals       []UsageDeferral
 }
 
 type UsageDeferral struct {

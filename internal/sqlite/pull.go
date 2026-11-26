@@ -20,6 +20,38 @@ const duePullExperiments = `SELECT id FROM aaa_experiments
 const duePullPins = `SELECT id FROM aaa_inference_jobs
 	WHERE state='queued' AND pin_check_at IS NOT NULL AND pin_check_at<=?1 ORDER BY pin_check_at,id LIMIT 32`
 
+type observationStamp struct {
+	Scheduled int64 `json:"scheduled"`
+	Observed  int64 `json:"observed"`
+}
+
+type updateObservation struct {
+	Scheduled time.Time `json:"scheduled"`
+	Observed  time.Time `json:"observed"`
+}
+
+type pollObservations struct {
+	Update     updateObservation `json:"update,omitzero"`
+	Capability observationStamp  `json:"capability,omitzero"`
+}
+
+type storedPullResult struct {
+	inference.PullResult
+	Observations pollObservations `json:"_observations,omitzero"`
+}
+
+func readPollObservations(data []byte) (pollObservations, error) {
+	var saved struct {
+		Observations pollObservations `json:"_observations"`
+	}
+	if data != nil {
+		if err := decodeInference(data, &saved); err != nil {
+			return pollObservations{}, err
+		}
+	}
+	return saved.Observations, nil
+}
+
 func loadPullCandidate(ctx context.Context, tx *sql.Tx, candidate pullCandidate, state *inference.State) error {
 	var raw []byte
 	if err := tx.QueryRowContext(ctx, "SELECT data FROM aaa_inference_jobs WHERE id=?1", candidate.job).Scan(&raw); err != nil {
@@ -181,6 +213,10 @@ func (r *Repository) WithinPull(ctx context.Context, credential [32]byte, input 
 		case input.ScheduledAt.UnixMicro() <= scheduled:
 			return inference.Reject("obsolete_occurrence", 409)
 		default:
+			observations, err := readPollObservations(saved)
+			if err != nil {
+				return err
+			}
 			timing.UsageResult, err = recordWeeklyUsage(ctx, tx, workerID, input.WeeklyUsage, input.ScheduledAt, now)
 			if err != nil {
 				return err
@@ -194,10 +230,22 @@ func (r *Repository) WithinPull(ctx context.Context, credential [32]byte, input 
 			if err != nil {
 				return err
 			}
+			if broker.ForceRecord && broker.ID != "" && !timing.UpdateBrokerRecorded {
+				if err := recordUpdateBroker(ctx, tx, now, broker); err != nil {
+					return err
+				}
+				timing.UpdateBrokerRecorded = true
+			}
+			if timing.Update.ObservedAt != nil {
+				observations.Update = updateObservation{timing.Update.ScheduledAt, *timing.Update.ObservedAt}
+			}
 			if pairedHook && !contact.Incompatible {
-				timing.Capability, timing.CapabilityChanged, err = recordWorkerCapability(ctx, tx, workerID, input.AgentTasks, input.ScheduledAt, now)
+				timing.Capability, timing.CapabilityChanged, err = recordWorkerCapability(ctx, tx, workerID, input.AgentTasks, input.ScheduledAt, now, true)
 				if err != nil {
 					return err
+				}
+				if timing.Capability != nil {
+					observations.Capability = observationStamp{input.ScheduledAt.UnixMicro(), now.UnixMicro()}
 				}
 				if work && result.Update == nil {
 					result.WorkerOp, err = grantControl(ctx, tx, worker.WorkerOp, workerID, input, pair, now)
@@ -264,7 +312,7 @@ func (r *Repository) WithinPull(ctx context.Context, credential [32]byte, input 
 					}
 				}
 			}
-			encoded, err := json.Marshal(result)
+			encoded, err := json.Marshal(storedPullResult{result, observations})
 			if err != nil {
 				return err
 			}

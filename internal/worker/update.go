@@ -39,8 +39,9 @@ func (t UpdateTarget) Supports(version, contract string) bool {
 }
 
 type UpdateBroker struct {
-	ID     string
-	Target *UpdateTarget
+	ID          string
+	Target      *UpdateTarget
+	ForceRecord bool `json:"-"`
 }
 
 type Contact struct {

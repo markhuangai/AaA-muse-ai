@@ -11,7 +11,7 @@ import (
 
 func (r *Repository) PortalPassword(ctx context.Context) (auth.PortalPasswordState, error) {
 	var state auth.PortalPasswordState
-	err := r.db.QueryRowContext(ctx, "SELECT generation,salt,verifier FROM aaa_portal_password WHERE id=1").
+	err := r.readDB.QueryRowContext(ctx, "SELECT generation,salt,verifier FROM aaa_portal_password WHERE id=1").
 		Scan(&state.Generation, &state.Salt, &state.Verifier)
 	if errors.Is(err, sql.ErrNoRows) {
 		err = nil
@@ -88,7 +88,7 @@ func (r *Repository) PortalGrant(ctx context.Context, generation int64, digest [
 	var expires *int64
 	const query = `SELECT p.generation,g.digest IS NOT NULL,g.expires_at FROM aaa_portal_password p
 		LEFT JOIN aaa_portal_grants g ON g.generation=p.generation AND g.digest=?1 WHERE p.id=1`
-	if err := r.db.QueryRowContext(ctx, query, digest[:]).Scan(&current, &found, &expires); err != nil {
+	if err := r.readDB.QueryRowContext(ctx, query, digest[:]).Scan(&current, &found, &expires); err != nil {
 		return time.Time{}, err
 	}
 	if current != generation {
@@ -106,12 +106,16 @@ func (r *Repository) PortalGrant(ctx context.Context, generation int64, digest [
 func (r *Repository) RenewPortalGrant(ctx context.Context, generation int64, digest [32]byte, previous, expires time.Time) (bool, error) {
 	const query = `UPDATE aaa_portal_grants SET expires_at=?1 WHERE digest=?2 AND generation=?3 AND expires_at=?4
 		AND generation=(SELECT generation FROM aaa_portal_password WHERE id=1)`
-	result, err := r.db.ExecContext(ctx, query, expires.UnixMicro(), digest[:], generation, previous.UnixMicro())
-	if err != nil {
-		return false, err
-	}
-	count, err := result.RowsAffected()
-	return count == 1, err
+	var count int64
+	err := r.write(ctx, func(tx *sql.Tx) error {
+		result, err := tx.ExecContext(ctx, query, expires.UnixMicro(), digest[:], generation, previous.UnixMicro())
+		if err != nil {
+			return err
+		}
+		count, err = result.RowsAffected()
+		return err
+	})
+	return err == nil && count == 1, err
 }
 
 func (r *Repository) RevokePortalGrant(ctx context.Context, generation int64, digest [32]byte) (bool, error) {

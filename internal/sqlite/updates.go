@@ -39,39 +39,49 @@ func agreedTarget(ctx context.Context, tx *sql.Tx, now time.Time, broker worker.
 	if broker.ID == "" {
 		return nil, "", nil
 	}
-	// Rejoin in the deciding transaction if this instance missed a renewal.
-	if err := recordUpdateBroker(ctx, tx, now, broker); err != nil {
-		return nil, "", err
-	}
-	rows, err := tx.QueryContext(ctx, "SELECT instance_id,release FROM aaa_update_brokers WHERE expires_at>?1 ORDER BY instance_id", now.UnixMicro())
-	if err != nil {
-		return nil, "", err
-	}
-	defer rows.Close()
 	expected, err := json.Marshal(broker.Target)
 	if err != nil {
 		return nil, "", err
 	}
+	rows, err := tx.QueryContext(ctx, "SELECT instance_id,release,expires_at FROM aaa_update_brokers WHERE expires_at>?1 ORDER BY instance_id", now.UnixMicro())
+	if err != nil {
+		return nil, "", err
+	}
+	defer rows.Close()
 	reason := ""
+	seen, refresh := false, broker.ForceRecord
 	for rows.Next() {
 		var sibling string
 		var raw []byte
-		if err := rows.Scan(&sibling, &raw); err != nil {
+		var expires int64
+		if err := rows.Scan(&sibling, &raw, &expires); err != nil {
 			return nil, "", err
 		}
+		if sibling == broker.ID {
+			seen = true
+			refresh = refresh || !bytes.Equal(raw, expected) || expires <= now.Add(updateBrokerWindow/2).UnixMicro()
+			continue
+		}
 		if !bytes.Equal(raw, expected) {
-			reason = "mixed_broker_releases"
+			if reason == "" {
+				reason = "mixed_broker_releases"
+			}
 			var peer *worker.UpdateTarget
 			if err := json.Unmarshal(raw, &peer); err != nil {
 				return nil, "", err
 			}
 			if peer != nil && broker.Target != nil && peer.Version == broker.Target.Version && peer.SHA256 != broker.Target.SHA256 {
-				return nil, "release_digest_conflict", nil
+				reason = "release_digest_conflict"
 			}
 		}
 	}
 	if err := rows.Err(); err != nil {
 		return nil, "", err
+	}
+	if refresh || !seen {
+		if err := recordUpdateBroker(ctx, tx, now, broker); err != nil {
+			return nil, "", err
+		}
 	}
 	if reason != "" {
 		return nil, reason, nil
@@ -80,14 +90,26 @@ func agreedTarget(ctx context.Context, tx *sql.Tx, now time.Time, broker worker.
 }
 
 func readWorkerUpdate(ctx context.Context, tx *sql.Tx, id string) (state worker.UpdateStatus, err error) {
-	var data []byte
-	err = tx.QueryRowContext(ctx, "SELECT data FROM aaa_worker_updates WHERE worker_id=?1", id).Scan(&data)
+	var data, poll []byte
+	err = tx.QueryRowContext(ctx, `SELECT u.data,p.result FROM aaa_worker_updates u
+		LEFT JOIN aaa_worker_polls p ON p.worker_id=u.worker_id WHERE u.worker_id=?1`, id).Scan(&data, &poll)
 	if errors.Is(err, sql.ErrNoRows) {
 		return state, nil
 	}
 	if err == nil {
-		err = json.Unmarshal(data, &state)
+		var observations pollObservations
+		if observations, err = readPollObservations(poll); err == nil {
+			state, err = decodeWorkerUpdate(data, observations.Update)
+		}
 	}
+	return
+}
+
+func decodeWorkerUpdate(data []byte, poll updateObservation) (state worker.UpdateStatus, err error) {
+	if err = json.Unmarshal(data, &state); err != nil {
+		return
+	}
+	state.Observe(state.Contact, poll.Scheduled, poll.Observed)
 	return
 }
 
@@ -107,7 +129,11 @@ func observeLegacyWorker(ctx context.Context, tx *sql.Tx, now time.Time, id stri
 		return worker.UpdateStatus{}, err
 	}
 	alreadyMarked := state.State == "migration_required"
+	previous := state
 	state.Observe(contact, pull.ScheduledAt, now)
+	if alreadyMarked && state.Contact == previous.Contact && !state.ScheduledAt.After(previous.ScheduledAt) {
+		return worker.UpdateStatus{}, nil
+	}
 	state.State, state.Reason = "migration_required", "unsupported_worker_migration"
 	if err = saveWorkerUpdate(ctx, tx, id, state); err != nil {
 		return worker.UpdateStatus{}, err
@@ -118,7 +144,26 @@ func observeLegacyWorker(ctx context.Context, tx *sql.Tx, now time.Time, id stri
 	return state, nil
 }
 
-func decideUpdate(ctx context.Context, tx *sql.Tx, now time.Time, id string, pull inference.Pull, contact worker.Contact, broker worker.UpdateBroker, held bool) (*worker.UpdateOffer, worker.UpdateStatus, bool, error) {
+func sameUpdateTime(first, second *time.Time) bool {
+	if first == nil || second == nil {
+		return first == second
+	}
+	return first.Equal(*second)
+}
+
+func updateMateriallyEqual(first, second worker.UpdateStatus) bool {
+	if first.Contact != second.Contact || first.From != second.From || first.ID != second.ID || first.State != second.State ||
+		first.Reason != second.Reason || first.Attempt != second.Attempt || !sameUpdateTime(first.RetryAt, second.RetryAt) ||
+		!sameUpdateTime(first.StartedAt, second.StartedAt) {
+		return false
+	}
+	if first.Target == nil || second.Target == nil {
+		return first.Target == second.Target
+	}
+	return *first.Target == *second.Target
+}
+
+func decideUpdate(ctx context.Context, tx *sql.Tx, now time.Time, id string, pull inference.Pull, contact worker.Contact, broker worker.UpdateBroker, held bool, timing *inference.PullTiming) (*worker.UpdateOffer, worker.UpdateStatus, bool, error) {
 	state, err := readWorkerUpdate(ctx, tx, id)
 	if err != nil {
 		return nil, state, false, err
@@ -141,6 +186,7 @@ func decideUpdate(ctx context.Context, tx *sql.Tx, now time.Time, id string, pul
 		if err != nil {
 			return nil, state, false, err
 		}
+		timing.UpdateBrokerRecorded = timing.UpdateBrokerRecorded || (broker.ForceRecord && broker.ID != "")
 		switch {
 		case reason != "":
 			state.Target, state.State, state.Reason = broker.Target, "deferred", reason
@@ -175,7 +221,8 @@ func decideUpdate(ctx context.Context, tx *sql.Tx, now time.Time, id string, pul
 			work = false
 		}
 	}
-	if state != previous {
+	timing.UpdateStateChanged = state.State != previous.State
+	if (previous.ObservedAt == nil && state.ObservedAt != nil) || !updateMateriallyEqual(state, previous) || state.State == "awaiting_confirmation" {
 		err = saveWorkerUpdate(ctx, tx, id, state)
 	}
 	return offer, state, work, err
@@ -276,6 +323,11 @@ func (r *Repository) ApplyWorkerUpdate(ctx context.Context, credential [32]byte,
 		default:
 			return inference.Reject("invalid_worker_update", 400)
 		}
+		if (input.Action == "applied" || input.Action == "failed") && broker.ForceRecord && broker.ID != "" {
+			if err := recordUpdateBroker(ctx, tx, now, broker); err != nil {
+				return err
+			}
+		}
 		return saveWorkerUpdate(ctx, tx, id, state)
 	})
 	return
@@ -293,8 +345,11 @@ func decideControlUpdate(ctx context.Context, tx *sql.Tx, now time.Time, owner s
 		if err != nil || offer != nil {
 			return offer, false, err
 		}
+		if timing.UpdateBrokerRecorded {
+			broker.ForceRecord = false
+		}
 	}
-	offer, status, work, err := decideUpdate(ctx, tx, now, owner, pull, contact, broker, held)
+	offer, status, work, err := decideUpdate(ctx, tx, now, owner, pull, contact, broker, held, timing)
 	timing.Update = status
 	if err != nil || contact.Incompatible {
 		return offer, work, err
@@ -324,6 +379,9 @@ func forceRetryUpdate(ctx context.Context, tx *sql.Tx, now time.Time, owner stri
 	broker worker.UpdateBroker, retry *worker.ControlRecord, timing *inference.PullTiming,
 ) (*worker.UpdateOffer, error) {
 	target, _, err := agreedTarget(ctx, tx, now, broker)
+	if err == nil && broker.ForceRecord && broker.ID != "" {
+		timing.UpdateBrokerRecorded = true
+	}
 	if err != nil || target == nil {
 		return nil, err
 	}
@@ -357,5 +415,6 @@ func forceRetryUpdate(ctx context.Context, tx *sql.Tx, now time.Time, owner stri
 		return nil, err
 	}
 	timing.UpdateOp, timing.Update = &retry.ControlItem, state
+	timing.UpdateStateChanged = true
 	return &worker.UpdateOffer{ID: state.ID, Target: *target}, nil
 }

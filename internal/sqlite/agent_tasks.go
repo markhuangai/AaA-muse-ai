@@ -12,28 +12,48 @@ import (
 )
 
 func workerCapability(ctx context.Context, tx *sql.Tx, workerID string) (*worker.Capability, error) {
-	var cap worker.Capability
-	var observed int64
-	err := tx.QueryRowContext(ctx, "SELECT agent_tasks,prompt_contract,observed_at FROM aaa_worker_capabilities WHERE worker_id=?1", workerID).
-		Scan(&cap.AgentTasks, &cap.PromptContract, &observed)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	cap.ObservedAt = time.UnixMicro(observed).UTC()
-	return &cap, nil
+	capability, _, err := scheduledWorkerCapability(ctx, tx, workerID)
+	return capability, err
 }
 
-func recordWorkerCapability(ctx context.Context, tx *sql.Tx, workerID string, supportsTasks bool, scheduled, now time.Time) (*worker.Capability, bool, error) {
-	prior, err := workerCapability(ctx, tx, workerID)
+func scheduledWorkerCapability(ctx context.Context, tx *sql.Tx, workerID string) (*worker.Capability, int64, error) {
+	var cap worker.Capability
+	var observed, scheduled int64
+	var poll []byte
+	err := tx.QueryRowContext(ctx, `SELECT c.agent_tasks,c.prompt_contract,c.observed_at,c.scheduled_at,p.result
+		FROM aaa_worker_capabilities c LEFT JOIN aaa_worker_polls p ON p.worker_id=c.worker_id WHERE c.worker_id=?1`, workerID).
+		Scan(&cap.AgentTasks, &cap.PromptContract, &observed, &scheduled, &poll)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, 0, nil
+	}
+	if err != nil {
+		return nil, 0, err
+	}
+	observations, err := readPollObservations(poll)
+	if err != nil {
+		return nil, 0, err
+	}
+	if stamp := observations.Capability; stamp != (observationStamp{}) && stamp.Scheduled > scheduled {
+		scheduled, observed = stamp.Scheduled, stamp.Observed
+	}
+	cap.ObservedAt = time.UnixMicro(observed).UTC()
+	return &cap, scheduled, nil
+}
+
+func recordWorkerCapability(ctx context.Context, tx *sql.Tx, workerID string, supportsTasks bool, scheduled, now time.Time, skipUnchanged bool) (*worker.Capability, bool, error) {
+	prior, fence, err := scheduledWorkerCapability(ctx, tx, workerID)
 	if err != nil {
 		return nil, false, err
 	}
 	cap := worker.Capability{AgentTasks: supportsTasks, ObservedAt: now}
 	if supportsTasks {
 		cap.PromptContract = worker.HookPromptContract
+	}
+	if prior != nil && scheduled.UnixMicro() <= fence {
+		return nil, false, nil
+	}
+	if skipUnchanged && prior != nil && prior.AgentTasks == cap.AgentTasks && prior.PromptContract == cap.PromptContract {
+		return &cap, false, nil
 	}
 	change, err := tx.ExecContext(ctx, `INSERT INTO aaa_worker_capabilities(worker_id,agent_tasks,prompt_contract,observed_at,scheduled_at)
 		VALUES(?1,?2,?3,?4,?5) ON CONFLICT(worker_id) DO UPDATE SET agent_tasks=excluded.agent_tasks,
@@ -140,7 +160,7 @@ func (r *Repository) RecordAgentTaskPresence(ctx context.Context, credential [32
 		if err != nil {
 			return err
 		}
-		cap, capChanged, err = recordWorkerCapability(ctx, tx, workerID, supportsTasks, input.ScheduledAt, now)
+		cap, capChanged, err = recordWorkerCapability(ctx, tx, workerID, supportsTasks, input.ScheduledAt, now, false)
 		if err != nil {
 			return err
 		}
@@ -239,7 +259,22 @@ func interruptControlWork(ctx context.Context, tx *sql.Tx, owner string, now tim
 	return items, nil
 }
 
+const workerControlDue = `SELECT
+		EXISTS(SELECT 1 FROM aaa_worker_ops WHERE state IN ('queued','claimed','running') AND deadline_at<=?1)
+		OR EXISTS(SELECT 1 FROM aaa_agent_tasks WHERE state IN ('queued','claimed','running') AND deadline_at<=?1)
+		OR EXISTS(SELECT 1 FROM aaa_worker_ops item JOIN aaa_workers w ON w.id=item.worker_id
+			WHERE item.state IN ('queued','claimed','running') AND w.revoked_at IS NOT NULL)
+		OR EXISTS(SELECT 1 FROM aaa_agent_tasks item JOIN aaa_workers w ON w.id=item.worker_id
+			WHERE item.state IN ('queued','claimed','running') AND w.revoked_at IS NOT NULL)`
+
 func (r *Repository) SweepWorkerControl(ctx context.Context) (items []worker.ControlItem, err error) {
+	var pending bool
+	err = r.read(ctx, func(tx *sql.Tx) error {
+		return tx.QueryRowContext(ctx, workerControlDue, r.databaseTime().UnixMicro()).Scan(&pending)
+	})
+	if err != nil || !pending {
+		return nil, err
+	}
 	err = r.write(ctx, func(tx *sql.Tx) error {
 		items, err = interruptControlWork(ctx, tx, "", r.databaseTime())
 		return err

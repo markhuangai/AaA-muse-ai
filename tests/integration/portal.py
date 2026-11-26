@@ -41,6 +41,14 @@ class Portal(WorkerAuth):
         return session, headers
 
     def boundaries(self):
+        status, headers, body = self.api("/")
+        require(status == 200 and headers.get("Cache-Control") == "no-store", "portal shell is not fresh")
+        asset = re.search(rb'(?:src|href)="(/assets/[^\"]+)"', body)
+        require(asset is not None, "compiled portal shell lacks an asset reference")
+        asset_path = asset[1].decode()
+        status, headers, _ = self.api(asset_path)
+        require(status == 200 and headers.get("Cache-Control") == "public, max-age=31536000, immutable",
+                "built portal asset was not served with immutable caching")
         session, _ = self.login()
         token = session["session_token"]
         for key in (None, self.portal, self.client, self.admin):
@@ -66,11 +74,14 @@ class Portal(WorkerAuth):
         require(details["settings"]["effective_yaml"] == value["effective_yaml"], "captured configuration cannot be reconstructed exactly")
         for route in ("/api/v1/missing", "/api/v1/portal/missing", "/v1/missing", "/assets/missing.js", "/.env", "/assets/source.js.map"):
             status, headers, body = self.api(route)
-            require(status == 404 and "text/html" not in headers.get("Content-Type", ""), "frontend concealed an API or asset error")
+            require(status == 404 and headers.get("Cache-Control") == "no-store" and "text/html" not in headers.get("Content-Type", ""),
+                    "frontend concealed or cached an API or asset error")
             if route == "/assets/missing.js":
-                event, _ = self.diagnose(headers["X-Request-Id"], "portal.assets_unavailable", "filesystem_path_missing")
+                event, exchanges = self.diagnose(headers["X-Request-Id"], "portal.assets_unavailable", "filesystem_path_missing")
                 require(event["level"] == "ERROR" and event["revision"] == self.args.source_sha and event["component"] == "shell" and event["asset_path"] == "assets/missing.js", "asset diagnosis lacks build, severity or safe identity")
                 require(event["expected_state"] == "available" and event["observed_state"] == "unavailable", "asset diagnosis lacks state comparison")
+                require(any(e["msg"] == "request.exchange" and e["level"] == "DEBUG" and e["status"] == status for e in exchanges),
+                        "debug asset exchange lacks the matching HTTP status")
                 self.receipt("portal.log_only_asset_diagnosis", request_id=headers["X-Request-Id"], cause=event["cause"], asset_path=event["asset_path"],
                              corrective_action="Correct the public asset path or rebuild the matching combined image.")
         require(self.api("/api/v1/portal/logout", token, "POST")[0] == 204, "logout failed")

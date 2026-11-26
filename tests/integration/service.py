@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import select
 import subprocess
@@ -22,6 +23,7 @@ SQLITE_FILE = SQLITE_STATE + "/broker.sqlite3"
 SQLITE_SCHEMA = 6
 SQLITE_FIXTURE_SETTINGS = "PRAGMA foreign_keys=ON;\nPRAGMA synchronous=FULL;\n"
 LABEL = "io.aaa-muse.test-owner"
+PORTAL_ASSET = re.compile(r"assets/.+-[A-Za-z0-9_-]{8,}\.(?:js|css|woff2|woff|svg)")
 
 
 def require(condition, message):
@@ -149,6 +151,10 @@ class Harness:
                     require(name in files and files[name].size > 0, "missing runtime file " + name)
                 require(b"ID=alpine" in fs.extractfile(files["etc/os-release"]).read().splitlines(),
                         "runtime metadata is not Alpine")
+                portal_root = "usr/share/aaa-muse-ai/portal/"
+                assets = [name.removeprefix(portal_root) for name in files if name.startswith(portal_root + "assets/")]
+                require(assets and all(PORTAL_ASSET.fullmatch(asset) for asset in assets),
+                        "runtime portal contains unfingerprinted assets")
             compressed = len(subprocess.check_output(["gzip", "-n", "-6", "-c", str(archive)], timeout=30))
             require(info["Architecture"] != "amd64" or compressed <= 12 * 1024 * 1024,
                     "compressed amd64 rootfs exceeds the 12 MiB budget")
@@ -517,10 +523,14 @@ class Harness:
         self.ready(retained, retained_origin)
         for _ in range(12):
             self.request(retained_origin, "/api/v1/admin/status", self.admin)
-        _, _, body = self.request(retained_origin, "/api/v1/admin/diagnostics/export", self.admin)
+        started = time.monotonic()
+        code, _, body = self.request(retained_origin, "/api/v1/admin/diagnostics/export", self.admin)
+        elapsed = time.monotonic() - started
+        require(code == 200 and elapsed < 0.250, "capacity export did not complete within 250 ms")
         metadata, _ = self.decode_export(body)
         require(not metadata["complete"] and metadata["omissions"], "capacity eviction was reported as complete")
-        self.receipt("capture.reconstruction_and_retention", exact_output_bytes=len(status), max_chunk_bytes=6144, omissions_reported=True)
+        self.receipt("capture.reconstruction_and_retention", exact_output_bytes=len(status), max_chunk_bytes=6144,
+                     omissions_reported=True, capacity_export_ms=round(elapsed * 1000, 2))
 
     def migration_rejection(self):
         self.sql("UPDATE aaa_schema_migrations SET checksum='deliberately-invalid-test-checksum' WHERE version=1;")

@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -281,50 +282,79 @@ func TestConnectRetriesAndDiagnosis(t *testing.T) {
 }
 
 func TestRuntimeCaptureFailureStopsService(t *testing.T) {
-	d, _, errout, _ := fixtureDependencies(t, false)
-	files := &toggleFiles{}
-	d.Files = files
-	address := make(chan string, 1)
-	d.Listen = func(network, _ string) (net.Listener, error) {
-		l, err := net.Listen(network, "127.0.0.1:0")
-		if err == nil {
-			address <- l.Addr().String()
-		}
-		return l, err
-	}
-	result := make(chan int, 1)
-	go func() { result <- Run(t.Context(), nil, service.Build{}, d) }()
-	var origin string
-	select {
-	case origin = <-address:
-	case code := <-result:
-		t.Fatalf("startup exited before listening (status %d)", code)
-	case <-time.After(10 * time.Second):
-		t.Fatal("startup did not listen within 10 seconds")
-	}
-	client := &http.Client{Timeout: time.Second}
-	response, err := client.Get("http://" + origin + "/healthz")
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, _ = io.Copy(io.Discard, response.Body)
-	_ = response.Body.Close()
-	files.fail.Store(true)
-	response, err = client.Get("http://" + origin + "/healthz")
-	if err == nil {
-		_, _ = io.Copy(io.Discard, response.Body)
-		_ = response.Body.Close()
-	}
-	select {
-	case code := <-result:
-		if code != 1 {
-			t.Fatal("capture failure did not fail process")
-		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("service continued without capture")
-	}
-	if !strings.Contains(errout.String(), "diagnostics.capture_failed") || !strings.Contains(errout.String(), "filesystem_permission_denied") {
-		t.Fatal("missing corrective cause")
+	for _, scenario := range []struct {
+		name, cause string
+	}{
+		{"permission", "filesystem_permission_denied"},
+		{"capacity", "filesystem_capacity_exhausted"},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			d, _, errout, _ := fixtureDependencies(t, false)
+			files := &toggleFiles{capacity: scenario.name == "capacity"}
+			d.Files = files
+			address := make(chan string, 1)
+			d.Listen = func(network, _ string) (net.Listener, error) {
+				listener, err := net.Listen(network, "127.0.0.1:0")
+				if err == nil {
+					address <- listener.Addr().String()
+				}
+				return listener, err
+			}
+			build := (service.Build{Revision: "capture-failure-fixture"}).Normalized()
+			result := make(chan int, 1)
+			go func() { result <- Run(t.Context(), nil, build, d) }()
+			var origin string
+			select {
+			case origin = <-address:
+			case code := <-result:
+				t.Fatalf("startup exited before listening (status %d)", code)
+			case <-time.After(10 * time.Second):
+				t.Fatal("startup did not listen within 10 seconds")
+			}
+			client := &http.Client{Timeout: time.Second}
+			response, err := client.Get("http://" + origin + "/healthz")
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, _ = io.Copy(io.Discard, response.Body)
+			_ = response.Body.Close()
+			if response.StatusCode != http.StatusOK {
+				t.Fatalf("healthy startup returned %d", response.StatusCode)
+			}
+			files.fail.Store(true)
+			response, err = client.Get("http://" + origin + "/healthz")
+			if files.capacity {
+				if err != nil {
+					t.Fatal("the admitted request did not receive its fail-closed response", err)
+				}
+				var failure map[string]string
+				decodeErr := json.NewDecoder(response.Body).Decode(&failure)
+				_ = response.Body.Close()
+				if decodeErr != nil || response.StatusCode != http.StatusServiceUnavailable || failure["error"] != "diagnostics_unavailable" {
+					t.Fatalf("capture failure response: status %d, error %q, decode %v", response.StatusCode, failure["error"], decodeErr)
+				}
+			} else if err == nil {
+				_, _ = io.Copy(io.Discard, response.Body)
+				_ = response.Body.Close()
+			}
+			select {
+			case code := <-result:
+				if code != 1 {
+					t.Fatalf("capture failure exited with %d, want 1", code)
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatal("service continued without capture")
+			}
+			var terminal map[string]string
+			if err := json.Unmarshal(errout.Bytes(), &terminal); err != nil {
+				t.Fatal("expected exactly one terminal JSON log", err)
+			}
+			if terminal["msg"] != "diagnostics.capture_failed" || terminal["level"] != "ERROR" || terminal["cause"] != scenario.cause ||
+				terminal["outcome"] != "stopped" || terminal["instance_id"] == "" || terminal["operation_id"] == "" ||
+				terminal["revision"] != build.Revision || terminal["version"] != build.Version {
+				t.Fatal("terminal capture failure lacked its cause or correlation fields")
+			}
+		})
 	}
 }
 
@@ -392,14 +422,35 @@ func TestRunRefusesLegacySQLiteWithoutChangingItsLedger(t *testing.T) {
 
 type toggleFiles struct {
 	diagnostics.OSFiles
-	fail atomic.Bool
+	capacity bool
+	fail     atomic.Bool
 }
 
-func (f *toggleFiles) WriteFile(p string, b []byte, m fs.FileMode) error {
-	if f.fail.Load() {
+func (f *toggleFiles) CheckDirWritable(p string) error {
+	if !f.capacity && f.fail.Load() {
 		return fs.ErrPermission
 	}
-	return f.OSFiles.WriteFile(p, b, m)
+	return f.OSFiles.CheckDirWritable(p)
+}
+
+func (files *toggleFiles) CreateAppend(path string) (diagnostics.AppendFile, error) {
+	file, err := files.OSFiles.CreateAppend(path)
+	if err != nil || !files.capacity {
+		return file, err
+	}
+	return capacityFile{AppendFile: file, full: &files.fail}, nil
+}
+
+type capacityFile struct {
+	diagnostics.AppendFile
+	full *atomic.Bool
+}
+
+func (file capacityFile) Write(payload []byte) (int, error) {
+	if file.full.Load() && bytes.Contains(payload, []byte(`"event":"request.admitted"`)) {
+		return 0, syscall.ENOSPC
+	}
+	return file.AppendFile.Write(payload)
 }
 
 func TestRuntimeHelpers(t *testing.T) {

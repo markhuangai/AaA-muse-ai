@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"time"
 
@@ -52,9 +53,10 @@ var migrationChecksums = func() (result [SchemaVersion]string) {
 }()
 
 type Repository struct {
-	db    *sql.DB
-	now   func() time.Time
-	state *os.File
+	db, readDB *sql.DB
+	writeSem   chan struct{}
+	now        func() time.Time
+	state      *os.File
 }
 
 type Failure struct {
@@ -127,7 +129,20 @@ func OpenWithClock(_ context.Context, path string, now func() time.Time) (*Repos
 		_ = state.Close()
 		return nil, err
 	}
-	return &Repository{db: db, now: now, state: state}, nil
+	db.SetMaxOpenConns(4)
+	db.SetMaxIdleConns(2)
+	query.Set("_txlock", "deferred")
+	query.Add("_pragma", "query_only(1)")
+	uri.RawQuery = query.Encode()
+	readDB, err := sql.Open("sqlite", uri.String())
+	if err != nil {
+		_ = db.Close()
+		_ = state.Close()
+		return nil, err
+	}
+	readDB.SetMaxOpenConns(min(max(4, runtime.NumCPU()), 8))
+	readDB.SetMaxIdleConns(4)
+	return &Repository{db: db, readDB: readDB, writeSem: make(chan struct{}, 1), now: now, state: state}, nil
 }
 
 func secureFile(path string) error {
@@ -158,6 +173,7 @@ func secureFile(path string) error {
 }
 
 func (r *Repository) Close() {
+	_ = r.readDB.Close()
 	_ = r.db.Close()
 	_ = r.state.Close()
 }
@@ -165,7 +181,7 @@ func (r *Repository) Close() {
 func (r *Repository) databaseTime() time.Time { return r.now().UTC().Truncate(time.Microsecond) }
 
 func (r *Repository) Ping(ctx context.Context) error {
-	version, err := verifySchema(r.db.QueryContext(ctx, "SELECT version, checksum FROM aaa_schema_migrations ORDER BY version"))
+	version, err := verifySchema(r.readDB.QueryContext(ctx, "SELECT version, checksum FROM aaa_schema_migrations ORDER BY version"))
 	if err == nil && version != SchemaVersion {
 		err = incompatibleSchema(version)
 	}

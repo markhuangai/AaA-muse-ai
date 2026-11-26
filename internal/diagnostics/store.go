@@ -8,11 +8,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"path/filepath"
 	"sort"
-	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -54,23 +55,26 @@ type retentionState struct {
 	CreatedAt     time.Time `json:"created_at"`
 	PrunedThrough time.Time `json:"pruned_through"`
 }
-type retainedCapture struct {
-	name string
-	time time.Time
-	size int64
-}
-
 type Store struct {
-	mu            sync.Mutex
-	files         Files
-	dir, instance string
-	now           func() time.Time
-	retention     time.Duration
-	maxBytes      int64
-	sequence      uint64
-	state         retentionState
-	retained      []retainedCapture
-	retainedBytes int64
+	mu, pruneMu, syncMu sync.Mutex
+	files               Files
+	dir, instance       string
+	now                 func() time.Time
+	retention           time.Duration
+	maxBytes            int64
+	captureSequence     atomic.Uint64
+	segmentSequence     uint64
+	state               retentionState
+	retained            []segment
+	retainedBytes       int64
+	active              *segmentWriter
+	sealed              []*segmentWriter
+	lastWritableCheck   time.Time
+	failedErr           error
+	closed              bool
+	closeOnce           sync.Once
+	closeErr            error
+	maintenance         *maintenance
 }
 
 func Open(files Files, dir, instance string, now func() time.Time, retention time.Duration, maxBytes int64) (*Store, error) {
@@ -96,13 +100,15 @@ func Open(files Files, dir, instance string, now func() time.Time, retention tim
 	} else if !errors.Is(err, fs.ErrNotExist) {
 		return nil, err
 	}
-	if err = s.saveState(); err != nil {
+	if errors.Is(err, fs.ErrNotExist) {
+		if err = s.saveState(s.state); err != nil {
+			return nil, err
+		}
+	}
+	if err = s.loadSegments(); err != nil {
 		return nil, err
 	}
-	if err = s.loadCaptures(); err != nil {
-		return nil, err
-	}
-	if err = s.prune(); err != nil {
+	if _, err = s.prune(); err != nil {
 		return nil, err
 	}
 	return s, nil
@@ -116,10 +122,13 @@ func (s *Store) atomic(name string, b []byte) error {
 	if err := s.files.Chmod(p+".tmp", 0600); err != nil {
 		return err
 	}
-	return s.files.Rename(p+".tmp", p)
+	if err := s.files.Rename(p+".tmp", p); err != nil {
+		return err
+	}
+	return s.syncDirectory()
 }
-func (s *Store) saveState() error {
-	b, err := json.Marshal(s.state)
+func (s *Store) saveState(state retentionState) error {
+	b, err := json.Marshal(state)
 	if err != nil {
 		return err
 	}
@@ -127,8 +136,6 @@ func (s *Store) saveState() error {
 }
 
 func (s *Store) Write(payload []byte) (int, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	var event struct {
 		Time        time.Time `json:"time"`
 		Message     string    `json:"msg"`
@@ -140,8 +147,7 @@ func (s *Store) Write(payload []byte) (int, error) {
 	if err := json.Unmarshal(payload, &event); err != nil {
 		return 0, errors.New("capture_event_invalid")
 	}
-	s.sequence++
-	id := fmt.Sprintf("%020d-%s-%020d", s.now().UnixNano(), s.instance, s.sequence)
+	id := fmt.Sprintf("%020d-%s-%020d", s.now().UnixNano(), s.instance, s.captureSequence.Add(1))
 	h := sha256.Sum256(payload)
 	count := (len(payload) + 2047) / 2048
 	var output bytes.Buffer
@@ -158,119 +164,54 @@ func (s *Store) Write(payload []byte) (int, error) {
 		output.Write(b)
 		output.WriteByte('\n')
 	}
-	name := "capture-" + id + ".ndjson"
-	if err := s.atomic(name, output.Bytes()); err != nil {
-		return 0, err
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return 0, fs.ErrClosed
 	}
-	s.remember(retainedCapture{name: name, time: event.Time, size: int64(output.Len())})
-	if err := s.prune(); err != nil {
+	if s.failedErr != nil {
+		return 0, s.failedErr
+	}
+	if err := s.appendCapture(event.Time, output.Bytes()); err != nil {
+		s.failedErr = err
 		return 0, err
 	}
 	return len(payload), nil
 }
 
-func (s *Store) captures() ([]fs.DirEntry, error) {
-	entries, err := s.files.ReadDir(s.dir)
-	if err != nil {
-		return nil, err
-	}
-	var captures []fs.DirEntry
-	for _, e := range entries {
-		if strings.HasPrefix(e.Name(), "capture-") && strings.HasSuffix(e.Name(), ".ndjson") {
-			if !e.Type().IsRegular() {
-				return nil, errors.New("capture_file_invalid")
-			}
-			captures = append(captures, e)
-		}
-	}
-	sort.Slice(captures, func(i, j int) bool { return captures[i].Name() < captures[j].Name() })
-	return captures, nil
-}
-
-func (s *Store) readCapture(name string) ([]byte, Record, error) {
-	b, err := s.files.ReadFile(filepath.Join(s.dir, name))
-	if err != nil {
-		return nil, Record{}, err
-	}
-	line, _, _ := bytes.Cut(b, []byte("\n"))
-	var r Record
-	if json.Unmarshal(line, &r) != nil {
-		return nil, Record{}, errors.New("capture_file_invalid")
-	}
-	return b, r, nil
-}
-
-func (s *Store) loadCaptures() error {
-	entries, err := s.captures()
-	if err != nil {
-		return err
-	}
-	for _, e := range entries {
-		b, r, err := s.readCapture(e.Name())
-		if err != nil {
-			return err
-		}
-		s.remember(retainedCapture{name: e.Name(), time: r.Time, size: int64(len(b))})
-	}
-	return nil
-}
-
-func (s *Store) remember(c retainedCapture) {
-	i := sort.Search(len(s.retained), func(i int) bool { return s.retained[i].time.After(c.time) })
-	s.retained = append(s.retained, retainedCapture{})
-	copy(s.retained[i+1:], s.retained[i:])
-	s.retained[i] = c
-	s.retainedBytes += c.size
-}
-
-func (s *Store) prune() error {
-	cutoff := s.now().Add(-s.retention)
-	count, remaining := 0, s.retainedBytes
-	for _, oldest := range s.retained {
-		if remaining <= s.maxBytes && !oldest.time.Before(cutoff) {
-			break
-		}
-		count++
-		remaining -= oldest.size
-		if oldest.time.After(s.state.PrunedThrough) {
-			s.state.PrunedThrough = oldest.time
-		}
-	}
-	if count == 0 {
-		return nil
-	}
-	// Persist the whole batch watermark before deletion so an interruption cannot hide lost evidence.
-	if err := s.saveState(); err != nil {
-		return err
-	}
-	for range count {
-		oldest := s.retained[0]
-		if err := s.files.Remove(filepath.Join(s.dir, oldest.name)); err != nil {
-			return err
-		}
-		s.retainedBytes -= oldest.size
-		s.retained[0] = retainedCapture{}
-		s.retained = s.retained[1:]
-	}
-	return nil
-}
-
-func (s *Store) snapshotEntries() (Metadata, []fs.DirEntry, error) {
+func (s *Store) snapshotEntries() (Metadata, []segment, bool) {
+	s.pruneMu.Lock()
+	defer s.pruneMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := s.prune(); err != nil {
-		return Metadata{}, nil, err
+	now := s.now().UTC()
+	cutoff := now.Add(-s.retention)
+	if s.retainedBytes > s.maxBytes || (len(s.retained) != 0 && s.retained[0].maxTime.Before(cutoff)) ||
+		(s.active != nil && s.active.maxTime.Before(cutoff)) {
+		return Metadata{}, nil, false
 	}
-	metadata := Metadata{Type: "export", Complete: true, CreatedAt: s.state.CreatedAt, SnapshotAt: s.now().UTC(), PrunedThrough: s.state.PrunedThrough, Omissions: []string{}}
-	entries, err := s.captures()
-	return metadata, entries, err
+	metadata := Metadata{Type: "export", Complete: true, CreatedAt: s.state.CreatedAt, SnapshotAt: now, PrunedThrough: s.state.PrunedThrough, Omissions: []string{}}
+	entries := append([]segment(nil), s.retained...)
+	if s.active != nil {
+		entries = append(entries, s.active.segment)
+	}
+	return metadata, entries, true
 }
 
 func (s *Store) Snapshot(filter Filter) (Snapshot, error) {
-	metadata, entries, err := s.snapshotEntries()
-	if err != nil {
-		return Snapshot{}, err
+	var metadata Metadata
+	var entries []segment
+	for {
+		if err := s.pruneForSnapshot(); err != nil {
+			return Snapshot{}, err
+		}
+		var ready bool
+		metadata, entries, ready = s.snapshotEntries()
+		if ready {
+			break
+		}
 	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].name < entries[j].name })
 	result := Snapshot{Metadata: metadata}
 	missing := func(reason string) {
 		result.Metadata.Complete = false
@@ -282,32 +223,38 @@ func (s *Store) Snapshot(filter Filter) (Snapshot, error) {
 	if filter.Since.After(result.Metadata.SnapshotAt) || filter.Until.After(result.Metadata.SnapshotAt) {
 		missing("requested_interval_extends_after_snapshot")
 	}
-	if !metadata.PrunedThrough.IsZero() && (filter.Since.IsZero() || !filter.Since.After(metadata.PrunedThrough)) {
-		result.Metadata.Complete = false
-		result.Metadata.Omissions = append(result.Metadata.Omissions, "expired_or_capacity_pruned_evidence")
-	}
-	// Capture files are immutable after rename; reading outside the lock lets request logging continue during exports.
-	for _, e := range entries {
-		b, _, err := s.readCapture(e.Name())
+	expiredOrPruned := !metadata.PrunedThrough.IsZero() && (filter.Since.IsZero() || !filter.Since.After(metadata.PrunedThrough))
+	cutoff := metadata.SnapshotAt.Add(-s.retention)
+	for _, entry := range entries {
+		file, err := s.files.OpenRead(filepath.Join(s.dir, entry.name))
 		if errors.Is(err, fs.ErrNotExist) {
-			missing("capture_removed_during_export:" + e.Name())
+			missing("capture_removed_during_export:" + entry.name)
 			continue
 		}
 		if err != nil {
 			return Snapshot{}, err
 		}
-		records, err := validateCapture(b)
+		incomplete, err := streamCaptures(io.LimitReader(file, entry.size), func(r Record, capture []byte) {
+			if (!filter.Since.IsZero() && r.Time.Before(filter.Since)) || (!filter.Until.IsZero() && r.Time.After(filter.Until)) || (filter.RequestID != "" && r.RequestID != filter.RequestID) || (filter.OperationID != "" && r.OperationID != filter.OperationID) {
+				return
+			}
+			if r.Time.Before(cutoff) {
+				expiredOrPruned = true
+				return
+			}
+			result.Records = append(result.Records, capture)
+			result.Metadata.Captures++
+		})
+		err = errors.Join(err, file.Close())
 		if err != nil {
-			result.Metadata.Complete = false
-			result.Metadata.Omissions = append(result.Metadata.Omissions, "incomplete_capture:"+e.Name())
-			continue
+			return Snapshot{}, err
 		}
-		r := records[0]
-		if (!filter.Since.IsZero() && r.Time.Before(filter.Since)) || (!filter.Until.IsZero() && r.Time.After(filter.Until)) || (filter.RequestID != "" && r.RequestID != filter.RequestID) || (filter.OperationID != "" && r.OperationID != filter.OperationID) {
-			continue
+		if incomplete {
+			missing("incomplete_capture:" + entry.name)
 		}
-		result.Records = append(result.Records, b)
-		result.Metadata.Captures++
+	}
+	if expiredOrPruned {
+		missing("expired_or_capacity_pruned_evidence")
 	}
 	if result.Metadata.Captures == 0 && (filter.RequestID != "" || filter.OperationID != "") {
 		missing("requested_identity_not_captured_in_interval")

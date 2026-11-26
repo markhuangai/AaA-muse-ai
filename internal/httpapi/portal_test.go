@@ -241,36 +241,47 @@ func (portalBrokenFS) Open(string) (fs.File, error) { return nil, fs.ErrPermissi
 
 func TestPortalPublicAssetsAndReservedAPIs(t *testing.T) {
 	h, _, _, _ := portalHTTPFixture(t)
-	for _, route := range []string{"/", "/settings", "/assets/main.js", "/assets/main.css", "/assets/font.woff2", "/assets/font.woff", "/assets/mark.svg"} {
+	const immutable = "public, max-age=31536000, immutable"
+	const hashed = "/assets/main-aZ02_-b7.js"
+	h.Assets.(fstest.MapFS)[hashed[1:]] = &fstest.MapFile{Data: []byte("fingerprinted public code")}
+	for _, route := range []string{"/", "/settings", "/workers", "/requests", "/assets/main.js", "/assets/main.css", "/assets/font.woff2", "/assets/font.woff", "/assets/mark.svg"} {
 		w := portalHTTP(h, "GET", route, "", "", nil)
-		if w.Code != 200 || w.Header().Get("Content-Security-Policy") != portalCSP || w.Header().Get("X-Content-Type-Options") != "nosniff" || w.Header().Get("Referrer-Policy") != "no-referrer" {
+		if w.Code != 200 || w.Header().Get("Cache-Control") != "no-store" || w.Header().Get("Content-Security-Policy") != portalCSP || w.Header().Get("X-Content-Type-Options") != "nosniff" || w.Header().Get("Referrer-Policy") != "no-referrer" {
 			t.Fatal("public asset boundary failed")
+		}
+	}
+	for _, method := range []string{"GET", "HEAD"} {
+		if w := portalHTTP(h, method, hashed, "", "", nil); w.Code != 200 || w.Header().Get("Cache-Control") != immutable {
+			t.Fatalf("fingerprinted asset not immutable for %s", method)
 		}
 	}
 	if w := portalHTTP(h, "HEAD", "/settings", "", "", nil); w.Code != 200 || w.Body.Len() != 0 || w.Header().Get("Content-Length") == "" {
 		t.Fatal("HEAD did not preserve asset metadata")
 	}
-	if portalHTTP(h, "POST", "/", "", "", nil).Code != 405 {
+	if w := portalHTTP(h, "POST", hashed, "", "", nil); w.Code != 405 || w.Header().Get("Cache-Control") != "no-store" {
 		t.Fatal("frontend accepted mutation method")
 	}
-	for _, route := range []string{"/api/v1/missing", "/api/v1/portal/missing", "/v1/missing", "/assets/missing.js", "/assets/../config.yaml", "/assets/source.js.map", "/assets/main.js?key=ignored", "/.env", "/other-page"} {
+	for _, route := range []string{"/api/v1/missing", "/api/v1/portal/missing", "/v1/missing", "/assets/missing.js", "/assets/missing-0abcdef1.js", "/assets/../config.yaml", "/assets/source.js.map", hashed + "?key=ignored", "/.env", "/other-page"} {
 		w := portalHTTP(h, "GET", route, "", "", nil)
-		if w.Code != 404 || strings.Contains(w.Body.String(), "compiled shell") {
+		if w.Code != 404 || w.Header().Get("Cache-Control") != "no-store" || strings.Contains(w.Body.String(), "compiled shell") {
 			t.Fatalf("SPA fallback concealed error on %s", route)
+		}
+		if route == "/assets/missing.js" {
+			assertPortalAssetEvidence(t, h, w, "assets/missing.js", "filesystem_path_missing")
 		}
 	}
 	h.Assets = nil
 	missing := portalHTTP(h, "GET", "/", "", "", nil)
-	if missing.Code != 503 {
+	if missing.Code != 503 || missing.Header().Get("Cache-Control") != "no-store" {
 		t.Fatal("missing compiled shell concealed")
 	}
 	assertPortalAssetEvidence(t, h, missing, "index.html", "filesystem_path_missing")
 	h.Assets = portalBrokenFS{}
-	unreadable := portalHTTP(h, "GET", "/assets/main.js", "", "", nil)
-	if unreadable.Code != 503 {
+	unreadable := portalHTTP(h, "GET", hashed, "", "", nil)
+	if unreadable.Code != 503 || unreadable.Header().Get("Cache-Control") != "no-store" {
 		t.Fatal("asset permission failure concealed")
 	}
-	assertPortalAssetEvidence(t, h, unreadable, "assets/main.js", "filesystem_permission_denied")
+	assertPortalAssetEvidence(t, h, unreadable, hashed[1:], "filesystem_permission_denied")
 }
 
 func assertPortalAssetEvidence(t *testing.T, h *Handler, failed *httptest.ResponseRecorder, asset, cause string) {
@@ -294,23 +305,27 @@ func assertPortalAssetEvidence(t *testing.T, h *Handler, failed *httptest.Respon
 		payload.Write(mustDecode(t, row.Data))
 	}
 	events := json.NewDecoder(strings.NewReader(payload.String()))
+	var diagnosed, exchanged bool
 	for events.More() {
 		var event map[string]any
 		if events.Decode(&event) != nil {
 			t.Fatal("invalid exported asset event")
 		}
-		if event["msg"] != "portal.assets_unavailable" {
-			continue
-		}
-		for key, expected := range map[string]string{"level": "ERROR", "request_id": requestID, "revision": "development", "component": "shell", "asset_path": asset, "cause": cause, "expected_state": "available", "observed_state": "unavailable", "outcome": "failed"} {
-			if event[key] != expected {
-				t.Fatalf("asset diagnosis missing %s", key)
+		switch event["msg"] {
+		case "portal.assets_unavailable":
+			for key, expected := range map[string]string{"level": "ERROR", "request_id": requestID, "revision": "development", "component": "shell", "asset_path": asset, "cause": cause, "expected_state": "available", "observed_state": "unavailable", "outcome": "failed"} {
+				if event[key] != expected {
+					t.Fatalf("asset diagnosis missing %s", key)
+				}
 			}
+			diagnosed = true
+		case "request.exchange":
+			exchanged = event["level"] == "DEBUG" && event["request_id"] == requestID && event["status"] == float64(failed.Code)
 		}
-		t.Log("Asset failure is diagnosable from exported build, path, severity and filesystem cause; correct the image contents or permissions.")
-		return
 	}
-	t.Fatal("asset failure event absent from collected logs")
+	if !diagnosed || !exchanged {
+		t.Fatalf("asset failure diagnostic evidence incomplete for status %d: cause=%v exchange=%v", failed.Code, diagnosed, exchanged)
+	}
 }
 
 func TestPortalLargeYAMLReconstruction(t *testing.T) {

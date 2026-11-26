@@ -207,7 +207,7 @@ func (m *composeMounts) entryMode(i int, relative string) fs.FileMode {
 		}
 	case diagnosticsMount:
 		if !nested && (name == "retention.json" || name == "retention.json.tmp" ||
-			strings.HasPrefix(name, "capture-") && (strings.HasSuffix(name, ".ndjson") || strings.HasSuffix(name, ".ndjson.tmp"))) {
+			(strings.HasPrefix(name, "capture-") || strings.HasPrefix(name, "segment-")) && (strings.HasSuffix(name, ".ndjson") || strings.HasSuffix(name, ".ndjson.tmp"))) {
 			return 0600
 		}
 	case mediaMount:

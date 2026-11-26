@@ -48,6 +48,8 @@ func TestComposeMountsRepairDedicatedFilesAndHoldStateLock(t *testing.T) {
 	capture := filepath.Join(m.roots[diagnosticsMount].path, "capture-sample.ndjson")
 	files := []string{yaml, db, db + "-wal", db + "-shm", db + "-journal", artifact, capture,
 		filepath.Join(m.roots[diagnosticsMount].path, "retention.json"),
+		filepath.Join(m.roots[diagnosticsMount].path, "segment-sample.ndjson"),
+		filepath.Join(m.roots[diagnosticsMount].path, "segment-sample.ndjson.tmp"),
 		filepath.Join(m.roots[mediaMount].path, ".aaa-muse-media-v1")}
 	for _, path := range files {
 		writeMountFixture(t, path, "retained bytes")
