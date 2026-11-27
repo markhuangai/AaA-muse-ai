@@ -4,17 +4,193 @@ import json
 import socket
 import ssl
 import subprocess
+import sys
 import threading
 import time
 import urllib.parse
+from collections.abc import MutableMapping, MutableSequence
+
+
+class LockedList(MutableSequence):
+    def __init__(self, lock, values=()):
+        self.lock = lock
+        self._values = list(values)
+
+    def __getitem__(self, index):
+        with self.lock:
+            return self._values[index]
+
+    def __setitem__(self, index, value):
+        with self.lock:
+            self._values[index] = value
+
+    def __delitem__(self, index):
+        with self.lock:
+            del self._values[index]
+
+    def __len__(self):
+        with self.lock:
+            return len(self._values)
+
+    def __iter__(self):
+        with self.lock:
+            return iter(self._values.copy())
+
+    def insert(self, index, value):
+        with self.lock:
+            self._values.insert(index, value)
+
+    def append(self, value):
+        with self.lock:
+            self._values.append(value)
+
+    def pop(self, index=-1):
+        with self.lock:
+            return self._values.pop(index)
+
+
+class LockedDict(MutableMapping):
+    def __init__(self, lock, values=()):
+        self.lock = lock
+        self._values = {}
+        self.update(values)
+
+    def __getitem__(self, key):
+        with self.lock:
+            return self._values[key]
+
+    def __setitem__(self, key, value):
+        with self.lock:
+            self._values[key] = LockedList(self.lock, value) if isinstance(value, list) else value
+
+    def __delitem__(self, key):
+        with self.lock:
+            del self._values[key]
+
+    def __iter__(self):
+        with self.lock:
+            return iter(self._values.copy())
+
+    def __len__(self):
+        with self.lock:
+            return len(self._values)
+
+
+def locked_attribute(name):
+    def get(instance):
+        with instance.lock:
+            return instance.__dict__[name]
+
+    def set_value(instance, value):
+        with instance.lock:
+            if isinstance(value, dict):
+                value = LockedDict(instance.lock, value)
+            elif isinstance(value, list):
+                value = LockedList(instance.lock, value)
+            instance.__dict__[name] = value
+
+    return property(get, set_value)
+
+
+class ThreadingTLSServer(http.server.ThreadingHTTPServer):
+    daemon_threads = True
+    request_queue_size = 128
+
+    def __init__(self, server_address, handler_class, ssl_context, on_event=None, handshake_timeout=10, io_timeout=45):
+        self.ssl_context = ssl_context
+        self.on_event = on_event
+        self.handshake_timeout = handshake_timeout
+        self.io_timeout = io_timeout
+        self._client_lock = threading.Lock()
+        self._client_sockets = set()
+        self._closing = False
+        super().__init__(server_address, handler_class)
+
+    def record_error(self, event, error):
+        record = {"event": event, "cause": type(error).__name__}
+        if self.on_event:
+            self.on_event(record)
+        else:
+            print(json.dumps(record), file=sys.stderr)
+
+    def handle_error(self, request, client_address):
+        self.record_error("fixture.client_error", sys.exc_info()[1])
+
+    def process_request_thread(self, request, client_address):
+        tls_socket = None
+        event = "fixture.tls_handshake_failed"
+        try:
+            with self._client_lock:
+                if self._closing:
+                    return
+                self._client_sockets.add(request)
+                request.settimeout(self.handshake_timeout)
+                tls_socket = self.ssl_context.wrap_socket(request, server_side=True, do_handshake_on_connect=False)
+                self._client_sockets.discard(request)
+                self._client_sockets.add(tls_socket)
+            tls_socket.do_handshake()
+            tls_socket.settimeout(self.io_timeout)
+            event = "fixture.client_error"
+            self.finish_request(tls_socket, client_address)
+        except Exception as error:
+            self.record_error(event, error)
+        finally:
+            with self._client_lock:
+                self._client_sockets.discard(request)
+                if tls_socket is not None:
+                    self._client_sockets.discard(tls_socket)
+            try:
+                self.shutdown_request(tls_socket or request)
+            except Exception as error:
+                self.record_error("fixture.client_error", error)
+
+    def interrupt_clients(self, closing=False):
+        with self._client_lock:
+            if closing:
+                self._closing = True
+            sockets = list(self._client_sockets)
+        for client in sockets:
+            try:
+                socket.socket.shutdown(client, socket.SHUT_RDWR)
+            except OSError:
+                continue
 
 
 class TLSFixture:
+    target = locked_attribute("target")
+    drop_decision = locked_attribute("drop_decision")
+    interrupt_media = locked_attribute("interrupt_media")
+    slow_media = locked_attribute("slow_media")
+    media_pause_path = locked_attribute("media_pause_path")
+    media_puts = locked_attribute("media_puts")
+    media_status = locked_attribute("media_status")
+    lose_media_ack = locked_attribute("lose_media_ack")
+    lose_mcp_reply = locked_attribute("lose_mcp_reply")
+    dropped = locked_attribute("dropped")
+    expire_heartbeat = locked_attribute("expire_heartbeat")
+    delayed_heartbeat = locked_attribute("delayed_heartbeat")
+    fail_claims = locked_attribute("fail_claims")
+    failed_claims = locked_attribute("failed_claims")
+    allow_statuses = locked_attribute("allow_statuses")
+    fail_statuses = locked_attribute("fail_statuses")
+    worker_route_failures = locked_attribute("worker_route_failures")
+    lose_worker_replies = locked_attribute("lose_worker_replies")
+    enrollment_accepted = locked_attribute("enrollment_accepted")
+    observe_staged_credential = locked_attribute("observe_staged_credential")
+    drop_enrollment_requests = locked_attribute("drop_enrollment_requests")
+    drop_enrollment_replies = locked_attribute("drop_enrollment_replies")
+    pause_decision = locked_attribute("pause_decision")
+    delay_context_job = locked_attribute("delay_context_job")
+    pause_claim = locked_attribute("pause_claim")
+    decision_sizes = locked_attribute("decision_sizes")
+    events = locked_attribute("events")
+    worker_requests = locked_attribute("worker_requests")
+
     def __init__(self, harness, target, name="tls"):
         self.harness = harness
+        self.lock = threading.RLock()
         self.target = urllib.parse.urlsplit(target)
         self.connections = []
-        self.lock = threading.Lock()
         self.drop_decision = False
         self.interrupt_media = False
         self.media_interrupted = threading.Event()
@@ -61,6 +237,8 @@ class TLSFixture:
         fixture = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
             def log_message(self, *_):
                 return
 
@@ -77,22 +255,40 @@ class TLSFixture:
                 self.forward()
 
             def forward(self):
+                self.close_connection = True
                 path = urllib.parse.urlsplit(self.path).path.replace("/api/v1/worker/hook/", "/api/v1/worker/", 1)
                 route = "/downloads/{id}/{token}" if path.startswith("/downloads/") else path
+                lengths = self.headers.get_all("Content-Length", [])
+                try:
+                    if len(lengths) > 1 or (lengths and (not lengths[0].isascii() or not lengths[0].isdigit())):
+                        raise ValueError
+                    content_length = int(lengths[0]) if lengths else 0
+                    if content_length > sys.maxsize:
+                        raise ValueError
+                except (ValueError, OverflowError):
+                    fixture.events.append({"event": "fixture.invalid_content_length"})
+                    self.send_error(400)
+                    return
                 if route in ("/mcp", "/downloads/{id}/{token}") and self.headers.get("Host") != urllib.parse.urlsplit(fixture.origin).netloc:
                     with fixture.lock:
                         fixture.events.append({"event": "fixture.host_rejected", "route": route, "forwarded": False})
                     self.send_response(403)
                     self.send_header("Content-Length", "0")
+                    self.send_header("Connection", "close")
                     self.end_headers()
                     return
-                connection = http.client.HTTPConnection(fixture.target.hostname, fixture.target.port, timeout=325 if route == "/mcp" else 45)
                 with fixture.lock:
+                    target = fixture.target
+                    connection = http.client.HTTPConnection(target.hostname, target.port, timeout=325 if route == "/mcp" else 45)
                     fixture.connections.append(connection)
+                client_io = False
                 try:
-                    body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
-                    phase = json.loads(body).get("phase") if path == "/api/v1/worker/enroll" and body and (
-                        fixture.drop_enrollment_requests or fixture.drop_enrollment_replies or fixture.observe_staged_credential) else None
+                    client_io = True
+                    body = self.rfile.read(content_length)
+                    client_io = False
+                    with fixture.lock:
+                        enrollment_faults = bool(fixture.drop_enrollment_requests or fixture.drop_enrollment_replies or fixture.observe_staged_credential)
+                    phase = json.loads(body).get("phase") if path == "/api/v1/worker/enroll" and body and enrollment_faults else None
                     operation = self.headers.get("X-Muse-Enrollment-Operation")
                     with fixture.lock:
                         if path.startswith("/api/v1/worker/"):
@@ -104,7 +300,7 @@ class TLSFixture:
                             return
                         failures = fixture.worker_route_failures.get(path)
                         injected = failures.pop(0) if failures else None
-                        reject = self.path.endswith("/claim") and fixture.fail_claims > 0
+                        reject = path.endswith("/claim") and fixture.fail_claims > 0
                         if reject:
                             fixture.fail_claims -= 1
                             fixture.failed_claims.append(json.loads(body))
@@ -122,21 +318,25 @@ class TLSFixture:
                         with fixture.lock:
                             fixture.events.append({"event": "fixture.request_rejected", "route": path, "request_id": request_id, "status": 404, "forwarded": False})
                         payload = b"404 page not found\n"
+                        client_io = True
                         self.send_response(404)
                         self.send_header("Content-Type", "text/plain")
                         self.send_header("Content-Length", str(len(payload)))
                         self.send_header("X-Request-Id", request_id)
+                        self.send_header("Connection", "close")
                         self.end_headers()
                         self.wfile.write(payload)
                         return
                     if reject:
                         with fixture.lock:
-                            fixture.events.append({"event": "fixture.request_rejected", "route": self.path, "request_id": self.headers.get("X-Request-Id", "fixture-unavailable"), "status": 503, "forwarded": False})
+                            fixture.events.append({"event": "fixture.request_rejected", "route": route, "request_id": self.headers.get("X-Request-Id", "fixture-unavailable"), "status": 503, "forwarded": False})
                         payload = b'{"error":"fixture_unavailable"}'
+                        client_io = True
                         self.send_response(503)
                         self.send_header("Content-Type", "application/json")
                         self.send_header("Content-Length", str(len(payload)))
                         self.send_header("X-Request-Id", self.headers.get("X-Request-Id", "fixture-unavailable"))
+                        self.send_header("Connection", "close")
                         self.end_headers()
                         self.wfile.write(payload)
                         return
@@ -159,19 +359,24 @@ class TLSFixture:
                                "X-Muse-Worker-Model-Report", "X-Muse-Worker-Weekly-Usage", "X-Muse-Media-Jobs", "X-Muse-Prompt-Wav",
                                "X-Muse-Artifact-Sha256", "X-Muse-Artifact-Size", "X-Muse-Connection-Id", "X-Muse-Connection-Generation",
                                "X-Muse-Generation", "X-Muse-Lease-Id") if key in self.headers}
-                    if self.command == "PUT" and path.endswith("/artifact"):
-                        with fixture.lock:
+                    with fixture.lock:
+                        if self.command == "PUT" and path.endswith("/artifact"):
                             fixture.media_puts[path] = fixture.media_puts.get(path, 0) + 1
-                    if self.command == "PUT" and fixture.interrupt_media:
+                        interrupt_media = self.command == "PUT" and fixture.interrupt_media
+                        pause = self.command == "PUT" and path == fixture.media_pause_path
+                        slow_media = self.command == "PUT" and fixture.slow_media
+                        if slow_media and not pause and not interrupt_media:
+                            fixture.slow_media = False
+                    if interrupt_media:
                         headers["Content-Length"] = str(len(body))
                         connection.request("PUT", self.path, body=body[:len(body) // 2], headers=headers)
                         connection.sock.shutdown(socket.SHUT_WR)
                         connection.getresponse().read()
                         fixture.media_interrupted.set()
+                        client_io = True
                         self.send_error(503)
                         return
-                    pause = self.command == "PUT" and path == fixture.media_pause_path
-                    if self.command == "PUT" and (fixture.slow_media or pause):
+                    if self.command == "PUT" and (slow_media or pause):
                         split = max(1, len(body) // 2)
                         headers["Content-Length"] = str(len(body))
                         connection.request("PUT", self.path, body=body[:split], headers=headers)
@@ -179,7 +384,6 @@ class TLSFixture:
                             if not fixture.media_release.wait(timeout=35):
                                 raise TimeoutError("media precommit checkpoint expired")
                         else:
-                            fixture.slow_media = False
                             time.sleep(11)
                         connection.send(body[split:])
                     else:
@@ -188,9 +392,10 @@ class TLSFixture:
                     if pause:
                         fixture.media_status = response.status
                         fixture.media_finished.set()
-                    streaming = self.path == "/api/v1/worker/events" and response.status == 200
+                    streaming = path == "/api/v1/worker/events" and response.status == 200
+                    bodyless = response.status < 200 or response.status in (204, 304)
                     if not streaming:
-                        payload = response.read()
+                        payload = b"" if bodyless else response.read()
                         if phase and response.status == 201:
                             with fixture.lock:
                                 if phase == "prepare" and fixture.observe_staged_credential:
@@ -213,43 +418,47 @@ class TLSFixture:
                                 self.connection.shutdown(socket.SHUT_RDWR)
                                 self.close_connection = True
                                 return
-                        if route == "/mcp" and fixture.lose_mcp_reply and response.status == 200:
-                            params = json.loads(body).get("params", {})
-                            if params.get("name") == "ask_muse":
+                        with fixture.lock:
+                            drop_mcp = (route == "/mcp" and fixture.lose_mcp_reply and response.status == 200 and
+                                        json.loads(body).get("params", {}).get("name") == "ask_muse")
+                            if drop_mcp:
                                 fixture.lose_mcp_reply = False
-                                fixture.mcp_reply_lost.set()
-                                self.connection.shutdown(socket.SHUT_RDWR)
-                                self.close_connection = True
-                                return
-                        if self.command == "PUT" and fixture.lose_media_ack and response.status == 200:
-                            fixture.lose_media_ack = False
+                            drop_media_ack = self.command == "PUT" and fixture.lose_media_ack and response.status == 200
+                            if drop_media_ack:
+                                fixture.lose_media_ack = False
+                        if drop_mcp:
+                            fixture.mcp_reply_lost.set()
+                            self.connection.shutdown(socket.SHUT_RDWR)
+                            return
+                        if drop_media_ack:
                             fixture.media_ack_lost.set()
                             self.connection.shutdown(socket.SHUT_RDWR)
-                            self.close_connection = True
                             return
                         with fixture.lock:
-                            paused_claim = fixture.pause_claim and self.path.endswith('/claim') and response.status == 200
+                            paused_claim = fixture.pause_claim and path.endswith('/claim') and response.status == 200
                             if paused_claim:
                                 fixture.pause_claim = False
-                            if self.path.endswith('/decisions') and response.status == 200:
+                            if path.endswith('/decisions') and response.status == 200:
                                 fixture.decision_sizes.append(len(payload))
-                            paused_decision = fixture.pause_decision and self.path.endswith('/decisions') and response.status == 200
+                            paused_decision = fixture.pause_decision and path.endswith('/decisions') and response.status == 200
                             if paused_decision:
                                 fixture.pause_decision = False
-                            delayed_context = self.command == "GET" and fixture.delay_context_job is not None and self.path == "/api/v1/worker/jobs/" + fixture.delay_context_job
+                            delayed_context = self.command == "GET" and fixture.delay_context_job is not None and path == "/api/v1/worker/jobs/" + fixture.delay_context_job
                             if delayed_context:
                                 fixture.delay_context_job = None
-                            drop = fixture.drop_decision and self.path.endswith("/decisions") and response.status == 200
+                            drop = fixture.drop_decision and path.endswith("/decisions") and response.status == 200
                             if drop:
                                 fixture.drop_decision = False
                                 fixture.dropped += 1
                         if delayed_context:
                             fixture.context_captured.set()
                             fixture.release_context.wait(timeout=8)
-                        if path == "/api/v1/worker/enroll" and response.status == 201 and fixture.enrollment_accepted is not None:
+                        with fixture.lock:
+                            enrollment_accepted = fixture.enrollment_accepted
+                        if path == "/api/v1/worker/enroll" and response.status == 201 and enrollment_accepted is not None:
                             worker = json.loads(payload).get("worker")
                             if worker:
-                                fixture.enrollment_accepted(worker["id"])
+                                enrollment_accepted(worker["id"])
                         if paused_claim:
                             fixture.claim_captured.set()
                             fixture.release_claim.wait(timeout=8)
@@ -262,25 +471,31 @@ class TLSFixture:
                             self.connection.shutdown(socket.SHUT_RDWR)
                             self.close_connection = True
                             return
+                    client_io = True
                     self.send_response(response.status)
                     for key in ("Content-Type", "X-Request-Id", "X-Muse-Service-Version", "X-Muse-Paired-Worker-SHA256", "Cache-Control", "Content-Security-Policy",
                                 "Referrer-Policy", "X-Content-Type-Options", "WWW-Authenticate", "Retry-After", "Allow", "Set-Cookie",
                                 "Content-Disposition", "Mcp-Session-Id"):
                         for value in response.headers.get_all(key, []):
                             self.send_header(key, value)
-                    if not streaming:
+                    if not streaming and not bodyless:
                         self.send_header("Content-Length", str(len(payload)))
+                    self.send_header("Connection", "close")
                     self.end_headers()
                     if streaming:
                         while True:
+                            client_io = False
                             line = response.readline()
                             if not line:
                                 break
+                            client_io = True
                             self.wfile.write(line)
                             self.wfile.flush()
-                    else:
+                    elif not bodyless:
                         self.wfile.write(payload)
                 except (OSError, http.client.HTTPException) as error:
+                    if client_io:
+                        self.server.record_error("fixture.client_error", error)
                     with fixture.lock:
                         fixture.events.append({"event": "fixture.connection_closed", "cause": type(error).__name__, "route": route})
                 finally:
@@ -289,27 +504,38 @@ class TLSFixture:
                         fixture.connections.remove(connection)
                     self.close_connection = True
 
-        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        self.server.daemon_threads = True
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.load_cert_chain(str(self.cert), str(key))
-        self.server.socket = context.wrap_socket(self.server.socket, server_side=True)
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
-        self.thread.start()
+        self.server = ThreadingTLSServer(("127.0.0.1", 0), Handler, context, on_event=self.events.append)
         self.origin = "https://localhost:" + str(self.server.server_port)
+        self.thread = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+        self.thread.start()
+
+    def release_pauses(self):
+        self.media_release.set()
+        self.release_decision.set()
+        self.release_claim.set()
+        self.release_context.set()
 
     def interrupt(self):
+        self.release_pauses()
+        self.server.interrupt_clients()
         with self.lock:
-            for connection in self.connections:
-                if connection.sock:
-                    try:
-                        connection.sock.shutdown(socket.SHUT_RDWR)
-                    except OSError:
-                        continue
+            sockets = [connection.sock for connection in self.connections]
+        for sock in sockets:
+            if sock is not None:
+                try:
+                    socket.socket.shutdown(sock, socket.SHUT_RDWR)
+                except OSError:
+                    continue
 
     def close(self):
-        self.interrupt()
+        self.server.interrupt_clients(closing=True)
+        self.release_pauses()
         self.server.shutdown()
+        self.interrupt()
         self.server.server_close()
         self.thread.join(timeout=5)
-        self.harness.private("tls-fixture-events.json", __import__("json").dumps(self.events))
+        with self.lock:
+            events = list(self.events)
+        self.harness.private("tls-fixture-events.json", json.dumps(events))

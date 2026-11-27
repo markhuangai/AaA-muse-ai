@@ -10,7 +10,7 @@ import stat
 import struct
 import subprocess
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from media_mcp import MCPMedia
@@ -401,8 +401,20 @@ class MediaFlow(MCPMedia, Product):
             require(prompt not in capture and self.sentinel.decode() not in capture, "raw media content retained")
         self.add("media.private_diagnostics")
 
+    def restore_media_permissions(self, directory):
+        self.docker("stop", "-t", "2", self.sibling, self.broker)
+        require(all(not self.inspect(container)["State"]["Running"] for container in (self.sibling, self.broker)),
+                "brokers must be stopped before restoring media permissions")
+        self.docker("exec", self.media_fixture, "chmod", "0700", directory)
+
     def expire(self, jobs, links):
-        last, deadline = jobs[-1]
+        identities = [identity for identity, _ in jobs]
+        require(len(identities) == 8 and len(set(identities)) == 8 and
+                all(len(identity) == 32 and all(char in "0123456789abcdef" for char in identity) for identity in identities),
+                "invalid committed fixture job identities")
+        require(self.api("/api/v1/media/jobs/" + jobs[0][0] + "/artifact", self.client)[0] == 200,
+                "first file unavailable before expiry")
+        last, _ = jobs[-1]
         url = "/api/v1/media/jobs/" + last + "/artifact"
         require(self.api(url, self.client)[0] == 200, "file unavailable before expiry")
         path = links[last]
@@ -415,7 +427,19 @@ class MediaFlow(MCPMedia, Product):
         # Hold the file on disk while the application crosses its receipt expiry.
         self.docker("exec", self.media_fixture, "chmod", "0500", directory)
         try:
-            time.sleep(max(0, deadline - time.time() + 0.1))
+            expiration = datetime.now(timezone.utc) - timedelta(seconds=2)
+            microseconds = (expiration - datetime(1970, 1, 1, tzinfo=timezone.utc)) // timedelta(microseconds=1)
+            expiration_json = expiration.isoformat(timespec="microseconds").replace("+00:00", "Z")
+            selected = ",".join("'" + identity + "'" for identity in identities)
+            matching = (f"id IN ({selected}) AND state = 'accepted' AND has_media = 1 "
+                        "AND media_expires_at IS NOT NULL AND json_type(CAST(data AS TEXT), '$.media.expires_at') = 'text'")
+            changed = self.sql("BEGIN IMMEDIATE; "
+                               f"UPDATE aaa_inference_jobs SET media_expires_at = {microseconds}, "
+                               "data = CAST(json_set(CAST(data AS TEXT), '$.media.expires_at', "
+                               f"'{expiration_json}') AS BLOB) WHERE {matching} "
+                               f"AND (SELECT COUNT(*) FROM aaa_inference_jobs WHERE {matching}) = {len(identities)}; "
+                               "SELECT changes(); COMMIT;")
+            require(changed == str(len(identities)), "expiry shift did not update every committed fixture job")
             self.docker("exec", self.media_fixture, "test", "-f", directory + "/artifact")
             code, headers, _ = self.proxy_exchange(path)
             require(code == self.api(path, origin=self.sibling_origin)[0] == 404,
@@ -424,9 +448,7 @@ class MediaFlow(MCPMedia, Product):
             expired = self.mcp_call("download_wav", {"job_id": last})
             require(expired["status"] == "expired" and "download_url" not in expired, "expired job retained a download URL")
         finally:
-            self.docker("stop", "-t", "2", self.sibling)
-            self.docker("exec", self.media_fixture, "chmod", "0700", directory)
-        self.docker("stop", "-t", "2", self.broker)
+            self.restore_media_permissions(directory)
         self.docker("start", self.broker)
         self.origin_url = self.origin(self.broker)
         self.proxy.target = urllib.parse.urlsplit(self.origin_url)
@@ -437,7 +459,7 @@ class MediaFlow(MCPMedia, Product):
             route = "/api/v1/media/jobs/" + identity
             require(self.api(route + "/artifact", self.client)[0] == 410 and self.api(route, self.client)[0] == 200, "restart lost receipt or served expired media")
             self.docker("exec", self.media_fixture, "test", "!", "-e", "/var/lib/aaa-muse-ai/media/" + identity)
-        self.add("media.expiry_across_restart", window_seconds=600)
+        self.add("media.expiry_across_restart", window_seconds=600, fixture_expiry_advanced=True)
         self.add("mcp.expiry_before_cleanup", brokers=2)
 
     def verified_video_diagnosis(self, worker, grant, bad_id, execution):

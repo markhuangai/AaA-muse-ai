@@ -1,5 +1,5 @@
 import { chromium, expect } from '@playwright/test';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { inspectTaste } from './taste.mjs';
@@ -9,11 +9,96 @@ const fixture = JSON.parse(readFileSync(process.argv[process.argv.indexOf('--fix
 const origin = fixture.browser_origin;
 const secrets = [];
 const receipt = { source_sha: fixture.source_sha, outcome: 'failed', cases: [], diagnostics: [], screenshots: [], design: [] };
-const save = (name, value) => writeFileSync(join(fixture.directory, name), JSON.stringify(value, null, 2), { mode: 0o600 });
-const passed = (name, details = {}) => receipt.cases.push({ case: name, outcome: 'passed', ...details });
+const recentEvents = [];
+let step = 'initializing';
+let canaryError;
+const writeAtomic = (name, value) => {
+  const path = join(fixture.directory, name);
+  writeFileSync(`${path}.tmp`, value, { mode: 0o600 });
+  renameSync(`${path}.tmp`, path);
+};
+const save = (name, value) => writeAtomic(name, JSON.stringify(value, null, 2));
+const redactSafe = value => {
+  let text = String(value);
+  for (const secret of [fixture.password, ...secrets].filter(value => typeof value === 'string' && value).sort((left, right) => right.length - left.length)) {
+    text = text.split(secret).join('[REDACTED]');
+  }
+  return text.replace(/__Host-muse_portal\s*=\s*[^\s;,"']+/gi, '__Host-muse_portal=[REDACTED]')
+    .replace(/\bBearer\s+[^\s;,"']+/gi, 'Bearer [REDACTED]')
+    .replace(/\b(?:muse|aaa_muse_ai)_[A-Za-z0-9_-]+/gi, '[REDACTED]');
+};
+const progress = () => ({ step, passed_cases: receipt.cases.map(item => item.case).slice(-100), recent_events: recentEvents });
+const saveProgress = () => save(`worker-browser-progress-${fixture.phase}.json`, progress());
+const setStep = value => { step = value; saveProgress(); };
+const passed = (name, details = {}) => { receipt.cases.push({ case: name, outcome: 'passed', ...details }); saveProgress(); };
 const remember = secret => { secrets.push(secret); save(`worker-browser-secrets-${fixture.phase}.json`, secrets); };
 const pause = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
 let browser;
+
+const pathSegments = new Set(['api', 'v1', 'admin', 'portal', 'worker', 'workers', 'hook', 'settings', 'login', 'logout', 'events',
+  'status', 'readyz', 'enroll', 'enrollments', 'setup-prompts', 'agent-tasks', 'pull', 'revoke', 'start', 'result', 'interrupt']);
+function safePath(url) {
+  try {
+    const path = new URL(url, origin).pathname;
+    if (path.startsWith('/assets/')) return '/assets/{asset}';
+    return redactSafe(path.split('/').map(segment => !segment || pathSegments.has(segment) || /^[a-f0-9]{32}$/.test(segment) ? segment : '{omitted}').join('/')).slice(0, 240);
+  } catch {
+    return '/{omitted}';
+  }
+}
+
+function recordEvent(event) {
+  recentEvents.push(event);
+  if (recentEvents.length > 10) recentEvents.shift();
+  saveProgress();
+}
+
+async function newContext(options) {
+  const context = await browser.newContext(options);
+  context.on('page', page => {
+    page.on('response', response => {
+      const request = response.request();
+      const requestID = response.headers()['x-request-id'];
+      const method = /^(?:GET|POST|PATCH|PUT|DELETE|OPTIONS|HEAD)$/.test(request.method()) ? request.method() : 'OTHER';
+      recordEvent({ kind: 'response', method, path: safePath(request.url()), status: response.status(),
+        request_id: /^[a-f0-9]{32}$/.test(requestID || '') ? redactSafe(requestID) : null });
+    });
+    page.on('requestfailed', request => {
+      const error = redactSafe(request.failure()?.errorText.match(/\bnet::ERR_[A-Z0-9_]+\b/)?.[0] || 'request_failed').slice(0, 100);
+      const method = /^(?:GET|POST|PATCH|PUT|DELETE|OPTIONS|HEAD)$/.test(request.method()) ? request.method() : 'OTHER';
+      recordEvent({ kind: 'requestfailed', method, path: safePath(request.url()), error });
+    });
+    page.on('pageerror', error => {
+      const name = /^(?:Error|TypeError|ReferenceError|SyntaxError|RangeError|URIError|EvalError|AggregateError)$/.test(error.name) ? error.name : 'Error';
+      recordEvent({ kind: 'pageerror', error: name });
+    });
+  });
+  return context;
+}
+
+function failureDetails(error) {
+  const text = String(error?.message || '');
+  const name = /^(?:Error|AssertionError|TimeoutError|TypeError|ReferenceError|SyntaxError|RangeError)$/.test(error?.name) ? error.name : 'Error';
+  const operation = text.match(/^(?:page|browser|browserType|browserContext|locator)\.(?:goto|click|fill|close|launch|newContext|newPage|screenshot|waitForResponse|evaluate|press|route|unroute)\b/)?.[0] ||
+    text.match(/^expect\([^\n]*?\)\.(toBeVisible|toBeEnabled|toBeFocused|toHaveText|toContainText|toHaveCount|toEqual|toBe)\b/)?.[1];
+  const cause = text.match(/\b(?:Timeout \d+ms exceeded|net::ERR_[A-Z0-9_]+)\b/)?.[0];
+  const classifications = [
+    ['browser_executable_missing', /Executable doesn't exist/i],
+    ['browser_shared_library_missing', /error while loading shared libraries/i],
+    ['browser_sandbox_unavailable', /No usable sandbox|sandbox.*(?:not permitted|permission denied)/i],
+    ['browser_process_closed', /Target page, context or browser has been closed|browser has been closed/i],
+    ['browser_timeout', /Timeout \d+ms exceeded/i],
+    ['browser_launch_failed', /^browserType\.launch:/i],
+  ];
+  const diagnosticCause = canaryError && error === canaryError ? 'diagnostic_canary' :
+    text.match(/\bnet::ERR_[A-Z0-9_]+\b/)?.[0] || classifications.find(([, pattern]) => pattern.test(text))?.[0] || 'unclassified';
+  const message = canaryError && error === canaryError
+    ? redactSafe(text).slice(0, 500)
+    : redactSafe(['Browser operation failed', operation, cause].filter(Boolean).join(': ')).slice(0, 500);
+  const stackHead = String(error?.stack || '').split('\n').map(line => line.match(/(?:^|\/)tests\/portal\/workers\.mjs:(\d+):(\d+)/))
+    .filter(Boolean).slice(0, 10).map(match => `tests/portal/workers.mjs:${match[1]}:${match[2]}`);
+  return { ...progress(), error_name: name, message, diagnostic_cause: redactSafe(diagnosticCause), stack_head: stackHead };
+}
 
 async function control(path, { method = 'GET', key, body, cookie, workerVersion, workerHeaders } = {}) {
   const headers = { 'Content-Type': 'application/json' };
@@ -22,7 +107,19 @@ async function control(path, { method = 'GET', key, body, cookie, workerVersion,
   if (workerVersion) Object.assign(headers, { 'X-Muse-Worker-Version': workerVersion, 'X-Muse-Worker-Updater': 'managed-hook-v1',
     'X-Muse-Worker-SHA256': fixture.pin.sha256 });
   Object.assign(headers, workerHeaders);
-  const response = await fetch(fixture.origin + path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(10_000) });
+  const safeMethod = /^(?:GET|POST|PATCH|PUT|DELETE|OPTIONS|HEAD)$/.test(method) ? method : 'OTHER';
+  let response;
+  try {
+    response = await fetch(fixture.origin + path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(10_000) });
+  } catch (error) {
+    const code = String(error?.cause?.code || error?.code || '');
+    const cause = /^(?:ECONNREFUSED|ECONNRESET|EHOSTUNREACH|EPIPE|ETIMEDOUT|UND_ERR_[A-Z0-9_]{1,60})$/.test(code) ? code : 'request_failed';
+    recordEvent({ kind: 'requestfailed', method: safeMethod, path: safePath(path), error: redactSafe(cause) });
+    throw error;
+  }
+  const requestID = response.headers.get('x-request-id');
+  recordEvent({ kind: 'response', method: safeMethod, path: safePath(path), status: response.status,
+    request_id: /^[a-f0-9]{32}$/.test(requestID || '') ? redactSafe(requestID) : null });
   const data = response.status === 204 ? null : await response.json();
   return { response, data };
 }
@@ -164,8 +261,10 @@ async function report(page, cause) {
 
 async function emptyViews() {
   for (const width of [1440, 768, 390]) {
-    const context = await browser.newContext({ ignoreHTTPSErrors: true, viewport: { width, height: width === 390 ? 844 : 900 }, serviceWorkers: 'block' }); const page = await context.newPage();
+    setStep(`empty/${width}/login`);
+    const context = await newContext({ ignoreHTTPSErrors: true, viewport: { width, height: width === 390 ? 844 : 900 }, serviceWorkers: 'block' }); const page = await context.newPage();
     await login(page); await expect(page.getByText(/No workers have access/)).toBeVisible();
+    setStep(`empty/${width}/screenshot`);
     await screenshot(page, 'empty', width); await privateStorage(page, context);
     passed('portal.workers_empty', { width }); await context.close();
   }
@@ -225,13 +324,15 @@ async function verifyDrawerDismissal(page, opener, width, scroll) {
 
 async function viewports() {
   for (const width of [1440, 768, 390]) {
-    const context = await browser.newContext({ ignoreHTTPSErrors: true, viewport: { width, height: width === 390 ? 844 : 900 }, hasTouch: width === 390,
+    setStep(`viewports/${width}/login`);
+    const context = await newContext({ ignoreHTTPSErrors: true, viewport: { width, height: width === 390 ? 844 : 900 }, hasTouch: width === 390,
       serviceWorkers: 'block', permissions: ['clipboard-read', 'clipboard-write'] }); const page = await context.newPage();
     const origins = new Set(); const telemetry = []; page.on('request', request => {
       origins.add(new URL(request.url()).origin);
       if (new URL(request.url()).pathname === '/api/v1/portal/events') telemetry.push(request.postData() || '');
     });
     const session = await login(page);
+    setStep(`viewports/${width}/worker-list`);
     const row = id => page.locator('tbody tr').filter({ hasText: id });
     await expect(row(fixture.workers.offline_id)).toContainText('Offline');
     await expect(row(fixture.workers.offline_id).locator('.offline-duration .num')).toHaveText(/^\d+h \d+m \d+s$/);
@@ -256,6 +357,7 @@ async function viewports() {
     const listScroll = await page.evaluate(() => scrollY);
     expect(listScroll).toBeGreaterThan(0);
     await openWorker(page, fixture.workers.transport_id);
+    setStep(`viewports/${width}/worker-drawer`);
     await expect(page.getByRole('heading', { name: 'Reported by Muse during setup' })).toBeVisible();
     await expect(page.getByText('Used at last sample', { exact: true }).locator('..')).toContainText('33%');
     await expect(page.getByText('Sample time', { exact: true }).locator('..')).toContainText('UTC');
@@ -298,6 +400,7 @@ async function viewports() {
     await screenshot(page, 'detail-dark', width);
     await page.emulateMedia({ colorScheme: 'light', reducedMotion: 'no-preference' });
     await page.getByRole('button', { name: 'Close', exact: true }).click(); await expect(row(fixture.workers.busy_id)).toContainText(acceptedName);
+    setStep(`viewports/${width}/enrollment`);
     const generated = await action(page, '/api/v1/admin/setup-prompts', () => page.getByRole('button', { name: 'Generate setup prompt' }).click(), 201);
     const code = generated.data.setup_prompt.match(/muse_enroll_[A-Za-z0-9_-]{43}/)?.[0]; expect(!!code).toBe(true); remember(code);
     const text = page.getByLabel('Complete setup prompt', { exact: true });
@@ -329,7 +432,9 @@ async function viewports() {
     await page.getByRole('link', { name: 'Workers', exact: true }).click();
     await expect(page.getByRole('button', { name: 'Refresh workers' })).toBeEnabled();
     await openWorker(page, enrolled.data.worker.id);
+    setStep(`viewports/${width}/remote-actions`);
     await remoteActions(page, enrolled.data, width);
+    setStep(`viewports/${width}/revocation`);
     await page.getByRole('button', { name: 'Revoke worker', exact: true }).focus(); await page.keyboard.press('Enter');
     const dialog = page.getByRole('dialog', { name: 'Revoke this worker?' }); await expect(dialog).toBeVisible();
     await expect(dialog.getByRole('button', { name: 'Cancel', exact: true })).toBeFocused();
@@ -357,7 +462,8 @@ async function offlineDuration() {
   const views = [];
   try {
     for (const width of [1440, 768, 390]) {
-      const context = await browser.newContext({ ignoreHTTPSErrors: true, serviceWorkers: 'block', viewport: { width, height: 844 } });
+      setStep(`offline-duration/${width}/login`);
+      const context = await newContext({ ignoreHTTPSErrors: true, serviceWorkers: 'block', viewport: { width, height: 844 } });
       contexts.push(context);
       const page = await context.newPage();
       await page.clock.install({ time: new Date('2026-11-20T00:00:00Z') });
@@ -375,9 +481,11 @@ async function offlineDuration() {
       expect(reads).toBe(before);
       views.push({ page, row, cell, width });
     }
+    setStep('offline-duration/wait-for-poll');
     save('worker-browser-resume-poll', {});
     await expect.poll(() => existsSync(join(fixture.directory, 'worker-browser-poll-ready')), { timeout: 25_000 }).toBe(true);
     for (const { page, row, cell, width } of views) {
+      setStep(`offline-duration/${width}/refresh`);
       await page.locator('.page-heading').getByRole('button', { name: 'Refresh workers', exact: true }).click();
       await expect(row.getByText('Recent contact', { exact: true })).toBeVisible();
       await expect(cell).toHaveText('-');
@@ -389,8 +497,10 @@ async function offlineDuration() {
 }
 
 async function orderingAndUncertainty(width) {
-  const context = await browser.newContext({ ignoreHTTPSErrors: true, viewport: { width, height: 900 }, serviceWorkers: 'block' }); const page = await context.newPage();
+  setStep(`ordering/${width}/login`);
+  const context = await newContext({ ignoreHTTPSErrors: true, viewport: { width, height: 900 }, serviceWorkers: 'block' }); const page = await context.newPage();
   const session = await login(page); await openWorker(page, fixture.workers.busy_id);
+  setStep(`ordering/${width}/rename`);
   let release, seen; const gate = new Promise(resolve => { release = resolve; }); const observed = new Promise(resolve => { seen = resolve; });
   await page.route('**/api/v1/admin/workers', async route => { const response = await route.fetch(); seen(); await gate; await route.fulfill({ response }); });
   await page.locator('.worker-drawer').getByRole('button', { name: 'Refresh workers' }).click(); await observed;
@@ -413,6 +523,7 @@ async function orderingAndUncertainty(width) {
   if (width === 1440) await screenshot(page, 'error', width);
   passed('portal.worker_ordering_and_uncertainty', { width, obsolete_response_discarded: true, committed_response_loss_reconciled: true, automatic_mutation_retry: false });
   await page.getByRole('button', { name: 'Close', exact: true }).click();
+  setStep(`ordering/${width}/revocation`);
   await page.getByLabel('Enrollment format').selectOption('code');
   const registration = await action(page, '/api/v1/admin/enrollments', () => page.getByRole('button', { name: 'Generate enrollment code' }).click(), 201);
   remember(registration.data.enrollment_code);
@@ -466,7 +577,7 @@ function verifyOwner(identity) {
 
 async function independentRevocation() {
   const options = { ignoreHTTPSErrors: true, serviceWorkers: 'block' };
-  const first = await browser.newContext(options), second = await browser.newContext(options);
+  const first = await newContext(options), second = await newContext(options);
   try {
     const primary = await first.newPage(), other = await second.newPage();
     await primary.clock.install();
@@ -502,7 +613,7 @@ function fixtureSQL(sql) {
 }
 
 async function outageAndDenial() {
-  const context = await browser.newContext({ ignoreHTTPSErrors: true, serviceWorkers: 'block' }); const page = await context.newPage(); const session = await login(page);
+  const context = await newContext({ ignoreHTTPSErrors: true, serviceWorkers: 'block' }); const page = await context.newPage(); const session = await login(page);
   fixtureSQL('ALTER TABLE aaa_workers RENAME TO hidden_aaa_workers;');
   try {
     const backend = page.waitForResponse(response => new URL(response.url()).pathname === '/api/v1/admin/workers' && response.status() === 503);
@@ -529,19 +640,19 @@ async function outageAndDenial() {
 }
 
 async function expiryAndLateLogout() {
-  const context = await browser.newContext({ ignoreHTTPSErrors: true, serviceWorkers: 'block' }); const page = await context.newPage(); await page.clock.install(); await login(page);
+  const context = await newContext({ ignoreHTTPSErrors: true, serviceWorkers: 'block' }); const page = await context.newPage(); await page.clock.install(); await login(page);
   await page.getByLabel('Enrollment format').selectOption('code');
   const issued = await action(page, '/api/v1/admin/enrollments', () => page.getByRole('button', { name: 'Generate enrollment code' }).click(), 201); remember(issued.data.enrollment_code);
   await page.clock.fastForward(900_001); await expect(page.getByText(/Enrollment expired/)).toBeVisible();
   expect(await page.locator('[data-sensitive]').count()).toBe(0); expect(await page.getByRole('button', { name: 'Copy enrollment code' }).count()).toBe(0);
   passed('portal.worker_browser_enrollment_expiry', { browser_clock_controlled: true, server_expiry_tested_separately: true }); await context.close();
-  const second = await browser.newContext({ ignoreHTTPSErrors: true, serviceWorkers: 'block' }); const delayed = await second.newPage(); await login(delayed);
+  const second = await newContext({ ignoreHTTPSErrors: true, serviceWorkers: 'block' }); const delayed = await second.newPage(); await login(delayed);
   let release, seen, done; const gate = new Promise(resolve => { release = resolve; }); const observed = new Promise(resolve => { seen = resolve; }); const finished = new Promise(resolve => { done = resolve; });
   await delayed.route('**/api/v1/admin/workers', async route => { const response = await route.fetch(); seen(); await gate; try { await route.fulfill({ response }); } catch (error) { if (!route.request().failure()) throw error; } finally { done(); } });
   await delayed.getByRole('button', { name: 'Refresh workers' }).click(); await observed; await delayed.getByRole('button', { name: 'Sign out' }).click(); release(); await finished;
   await expect(delayed.getByRole('heading', { name: 'Service access' })).toBeVisible(); expect(await delayed.getByRole('region', { name: 'Registered workers' }).count()).toBe(0);
   passed('portal.worker_late_response_after_logout'); await second.close();
-  const third = await browser.newContext({ ignoreHTTPSErrors: true, serviceWorkers: 'block' }); const timed = await third.newPage(); await timed.clock.install(); await login(timed);
+  const third = await newContext({ ignoreHTTPSErrors: true, serviceWorkers: 'block' }); const timed = await third.newPage(); await timed.clock.install(); await login(timed);
   let unblock, reached; const blocked = new Promise(resolve => { unblock = resolve; }); const requested = new Promise(resolve => { reached = resolve; });
   await timed.route('**/api/v1/admin/workers', async route => { const response = await route.fetch(); reached(); await blocked; try { await route.fulfill({ response }); } catch (error) { if (!route.request().failure()) throw error; } });
   const deadlineReport = report(timed, 'request_timeout'); await timed.getByRole('button', { name: 'Refresh workers' }).click(); await requested;
@@ -550,21 +661,47 @@ async function expiryAndLateLogout() {
 }
 
 try {
+  save(`worker-browser-secrets-${fixture.phase}.json`, secrets);
+  setStep('browser/launch');
+  const canary = process.env.PORTAL_WORKERS_DIAGNOSTIC_CANARY;
+  if (canary) {
+    remember(canary);
+    if (process.env.PORTAL_WORKERS_DIAGNOSTIC_HTTP === '1') {
+      setStep('diagnostics/direct-http');
+      const response = await control('/api/v1/worker/pull?credential=' + encodeURIComponent(canary), { method: 'POST', key: canary, body: {} });
+      expect(response.response.status).toBe(200);
+    }
+    canaryError = new Error(`Controlled diagnostics canary: ${canary} muse_worker_DIAGNOSTICREGEXCANARY aaa_muse_ai_DIAGNOSTICREGEXCANARY Bearer DIAGNOSTICBEARERCANARY __Host-muse_portal=DIAGNOSTICCOOKIECANARY`);
+    throw canaryError;
+  }
   browser = await chromium.launch({ headless: true });
   if (fixture.phase === 'empty') await emptyViews();
   else {
+    setStep('offline-duration');
     await offlineDuration();
+    setStep('viewports');
     await viewports();
     for (const width of [1440, 768, 390]) await orderingAndUncertainty(width);
+    setStep('independent-revocation');
     await independentRevocation();
+    setStep('expiry-and-logout');
     await expiryAndLateLogout();
+    setStep('outage-and-denial');
     await outageAndDenial();
   }
+  setStep('browser/close');
+  await browser.close();
+  browser = null;
   receipt.outcome = 'passed';
   console.log(JSON.stringify({ case: 'portal.workers_browser_conformance', outcome: 'passed', cases: receipt.cases.length, screenshots: receipt.screenshots.length }));
 } catch (error) {
-  let detail = String(error?.stack || error).replace(/muse_(?:portal|worker|enroll)_[A-Za-z0-9_-]{43}/g, '[REDACTED]');
-  for (const value of [fixture.password, ...secrets]) detail = detail.split(value).join('[REDACTED]');
-  writeFileSync(join(fixture.directory, `worker-browser-failure-${fixture.phase}.txt`), detail, { mode: 0o600 });
+  receipt.failure = failureDetails(error);
+  save(`worker-browser-failure-${fixture.phase}.json`, receipt.failure);
+  writeAtomic(`worker-browser-failure-${fixture.phase}.txt`, [receipt.failure.message, ...receipt.failure.stack_head].join('\n'));
   console.error('Worker browser conformance failed; inspect private worker-browser evidence.'); process.exitCode = 1;
-} finally { save(`worker-browser-receipt-${fixture.phase}.json`, receipt); if (browser) await browser.close(); }
+} finally {
+  save(`worker-browser-receipt-${fixture.phase}.json`, receipt);
+  if (browser) {
+    try { await browser.close(); } catch { console.error('Worker browser shutdown failed.'); process.exitCode = 1; }
+  }
+}

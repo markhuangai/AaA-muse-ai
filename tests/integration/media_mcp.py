@@ -220,6 +220,9 @@ class MCPMedia:
             require(self.tick(worker)["outcome"] == "settled" and not progress.exists(), "WAV acknowledgement did not settle the native claim")
             path = self.ready_link(identity, "wav", expected)
             view = self.checked("/api/v1/media/jobs/" + identity, self.client)[0]
+            require(abs((datetime.fromisoformat(view["expires_at"]) -
+                         datetime.fromisoformat(view["committed_at"])).total_seconds() - 600) < 0.001,
+                    "download lifetime changed")
             digest = hashlib.sha256(expected).hexdigest()
             require(view["artifact"]["sha256"] == digest and view["artifact"]["media_type"] == "audio/wav",
                     "verified WAV receipt differs")

@@ -220,18 +220,20 @@ jobs:
         run: npm ci --ignore-scripts --no-audit --no-fund
       - name: Check service
         run: make check-service
+      - name: Build the paired service image once
+        run: make image
       - name: Real HTTP and SQLite integration
-        run: make test-service
+        run: PREBUILT_IMAGE=1 make test-service
       - name: Worker enrollment, revocation, and diagnosis
-        run: make test-worker-auth
+        run: PREBUILT_IMAGE=1 make test-worker-auth
       - name: Native work pulls, fenced starts, and client-tool continuation
-        run: make test-inference
+        run: PREBUILT_IMAGE=1 make test-inference
       - name: Owned canonical history, request timelines and diagnostics
-        run: make test-history
+        run: PREBUILT_IMAGE=1 make test-history
       - name: Capability routing, concurrency, affinity and log-only diagnosis
-        run: make test-routing
+        run: PREBUILT_IMAGE=1 make test-routing
       - name: Broker restart reconciliation, durable receipts and uncertainty
-        run: make test-broker-recovery
+        run: PREBUILT_IMAGE=1 make test-broker-recovery
 
   media:
     name: CI / media
@@ -271,10 +273,12 @@ jobs:
         run: test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
       - name: Install locked protocol dependencies
         run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Build the paired service image once
+        run: make image
       - name: SDK, raw SSE, canonical tools, isolation and log-only diagnosis
-        run: make test-chat
+        run: PREBUILT_IMAGE=1 make test-chat
       - name: Responses typed items, owned chaining, lifecycle events and diagnosis
-        run: make test-responses
+        run: PREBUILT_IMAGE=1 make test-responses
       - name: Retain safe protocol and cleanup receipts
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -287,11 +291,14 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  portal:
-    name: CI / portal
-    needs: unit
+  portal-cases:
+    name: CI / portal (${{ matrix.shard }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [shell, workers, history]
     steps:
       - uses: actions/checkout@v7
         with:
@@ -306,14 +313,49 @@ jobs:
         run: npm ci --ignore-scripts --no-audit --no-fund
       - name: Install the pinned Chromium runtime
         run: npx --no-install playwright install --with-deps chromium
-      - name: Built-image desktop, tablet, phone, authentication and log-only diagnosis
-        run: make test-portal-shell
-      - name: Worker management, enrollment, activity, ordering and log-only diagnosis
-        run: make test-portal-workers
-      - name: Request histories, cancellation, uncertainty, pagination and log-only diagnosis
-        run: make test-portal-history
-      - name: Retain only safe browser and cleanup evidence
+      - name: Exercise concurrent TLS fixture and teardown
+        if: matrix.shard == 'workers'
+        run: make test-worker-tls
+      - name: Run the selected browser suite
+        run: make test-portal-${{ matrix.shard }}
+      - name: Retain only safe shard evidence
         if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: portal-shard-${{ env.SOURCE_SHA }}-${{ matrix.shard }}-${{ github.run_attempt }}
+          path: .artifacts/ci/portal/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+
+  portal:
+    name: CI / portal
+    needs: portal-cases
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          ref: ${{ env.SOURCE_SHA }}
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24.22.2
+      - name: Verify exact source
+        run: test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+      - name: Download this run's portal shards
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: portal-shard-${{ env.SOURCE_SHA }}-*
+          path: .artifacts/downloaded-portal
+      - name: Require all passing source-bound portal shards
+        if: always()
+        env:
+          PORTAL_CASES_RESULT: ${{ needs.portal-cases.result }}
+        run: node tools/portal-ci.mjs .artifacts/downloaded-portal .artifacts/ci/portal
+      - name: Retain merged browser and cleanup evidence
+        if: success()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: portal-${{ env.SOURCE_SHA }}-${{ github.run_attempt }}
@@ -427,10 +469,12 @@ jobs:
         run: npm ci --ignore-scripts --no-audit --no-fund
       - name: Check worker types
         run: npm run check --workspace worker
+      - name: Build the paired service image once
+        run: make image
       - name: Packed cron helper with real HTTPS and SQLite
-        run: make test-worker-transport
+        run: PREBUILT_IMAGE=1 make test-worker-transport
       - name: Worker startup outages, abrupt crashes, receipt replay and uncertainty
-        run: make test-worker-recovery
+        run: PREBUILT_IMAGE=1 make test-worker-recovery
 
   worker-updates:
     name: CI / worker updates
@@ -478,10 +522,10 @@ jobs:
         run: test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
       - name: Install locked build dependencies
         run: npm ci --ignore-scripts --no-audit --no-fund
-      - name: Build and verify Node 24 archive
-        run: make worker-package
+      - name: Build and verify the paired image and Node 24 archive
+        run: make image
       - name: Shipped installer, cron registration, and protected diagnostics
-        run: make test-worker-setup
+        run: PREBUILT_IMAGE=1 make test-worker-setup
       - uses: actions/setup-node@v7
         with:
           node-version: 22.12.0

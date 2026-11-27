@@ -16,7 +16,7 @@ import urllib.request
 from inference import Inference
 from native_cron import ManagedHookFixture
 from service import LABEL, require
-from worker_tls import TLSFixture
+from worker_tls import ThreadingTLSServer, TLSFixture
 
 NODE_URL = "https://nodejs.org/dist/v24.22.2/node-v24.22.2-linux-x64.tar.xz"
 NODE_SHA = "48cc0e21e048790e54c0cf5749c2725005313d652651c40b7a21feb9697aaf75"
@@ -48,12 +48,10 @@ class Assets:
                 self.end_headers()
                 self.wfile.write(body)
 
-        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        self.server.daemon_threads = True
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.load_cert_chain(str(harness.proxy.cert), str(harness.root.resolve() / "tls-key.pem"))
-        self.server.socket = context.wrap_socket(self.server.socket, server_side=True)
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.server = ThreadingTLSServer(("127.0.0.1", 0), Handler, context)
+        self.thread = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
         self.thread.start()
         origin = "https://localhost:" + str(self.server.server_port)
         # Replace the downloader boundary only: shipped scripts still use real curl, TLS and archive bytes.
@@ -68,6 +66,7 @@ class Assets:
         (shim / "curl").chmod(0o755)
 
     def close(self):
+        self.server.interrupt_clients(closing=True)
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=5)

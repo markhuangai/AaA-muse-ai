@@ -12,6 +12,7 @@ const rc = /^0\.1\.0-rc\.(0|[1-9][0-9]*)$/;
 const sha = /^[a-f0-9]{40}$/;
 const hash = value => createHash('sha256').update(value).digest('hex');
 
+export const npmPublishMaxBuffer = 1024 * 1024;
 export { ReleaseFailure };
 function requireThat(ok, code, fields) { if (!ok) throw new ReleaseFailure(code, fields); }
 
@@ -107,10 +108,10 @@ function matchingBytes(actual, expected, destination) {
 }
 
 export async function publishRelease({ github, context, prepared, receipt, archive, token, fetcher = fetch, verifySource = () => resolvePublication({ github, context }), publishNpm = path => {
-  try { execFileSync('npm', ['publish', path, '--ignore-scripts', '--registry', 'https://npm.pkg.github.com', '--tag', prepared.candidate ? candidateNpmTag(prepared.version) : 'rc', '--json', '--silent'], { env: { ...process.env, NODE_AUTH_TOKEN: token }, stdio: 'pipe', maxBuffer: 6144 }); }
+  try { execFileSync('npm', ['publish', path, '--ignore-scripts', '--registry', 'https://npm.pkg.github.com', '--tag', prepared.candidate ? candidateNpmTag(prepared.version) : 'rc', '--json', '--silent'], { env: { ...process.env, NODE_AUTH_TOKEN: token }, stdio: 'pipe', maxBuffer: npmPublishMaxBuffer }); }
   catch (error) {
     let npmCode = 'unavailable';
-    try { const value = JSON.parse(String(error.stdout)); if (/^E[A-Z0-9_]+$/.test(value.error?.code ?? '')) npmCode = value.error.code; } catch { /* Raw registry error bodies are excluded by the repository CI exposure policy. */ }
+    try { const value = JSON.parse(String(error.stdout)); const code = value.error?.code; if (typeof code === 'string' && /^E[A-Z0-9_]+$/.test(code) && !(typeof token === 'string' && token && code.includes(token))) npmCode = code; } catch { /* Raw registry error bodies are excluded by the repository CI exposure policy. */ }
     throw new ReleaseFailure('worker_release_npm_publish_failed', { process_status: error.status ?? null, process_code: typeof error.code === 'string' ? error.code : null, npm_code: npmCode, raw_output_omitted: true, omission_reason: 'authentication_material_protection' });
   }
 } }) {
