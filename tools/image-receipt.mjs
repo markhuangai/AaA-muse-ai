@@ -7,7 +7,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { logEvent } from '../.github/scripts/ci-log.mjs';
 import { inspectSource } from './source-inventory.mjs';
 
-const decoderPaths = ['worker/dist/diagnostics.js', 'worker/dist/state.js'];
+const decoderPaths = ['worker/dist/diagnostics.js', 'worker/dist/state.js', 'worker/dist/errors.js', 'worker/dist/json.js'];
 const versionPattern = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(dev|rc)\.(0|[1-9][0-9]*))?$/;
 const digest = data => createHash('sha256').update(data).digest('hex');
 const same = (left, right) => isDeepStrictEqual(left, right);
@@ -20,6 +20,18 @@ const safeSource = value => value && typeof value === 'object' ? {
   tree_sha256: safeHash(value.tree_sha256),
 } : null;
 const safeDecoders = value => value && typeof value === 'object' ? Object.fromEntries(decoderPaths.map(path => [path, safeHash(value[path])])) : null;
+
+function safeEvidence(fields) {
+  const secrets = Object.entries(process.env).filter(([name, value]) =>
+    /(?:TOKEN|PASSWORD|PASSWD|SECRET|CREDENTIAL|API[_-]?KEY|(?:^|_)PAT(?:_|$)|PRIVATE[_-]?KEY)/i.test(name) && value).map(([, value]) => value);
+  return JSON.parse(JSON.stringify(fields, (_key, value) => {
+    if (typeof value !== 'string') return value;
+    for (const secret of secrets) value = value.split(secret).join('[REDACTED]');
+    return value.replace(/\b(?:muse|aaa_muse_ai)_[A-Za-z0-9_-]+/gi, '[REDACTED]')
+      .replace(/\b(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]+/gi, '[REDACTED]')
+      .replace(/\bBearer\s+[^\s;,"']+/gi, 'Bearer [REDACTED]');
+  }));
+}
 
 function readJSON(path, cause) {
   try { return JSON.parse(readFileSync(path, 'utf8')); } catch { return fail(cause); }
@@ -73,13 +85,21 @@ function workerSnapshot(root, source, options, evidence) {
   } catch (error) { if (error.cause === 'worker_archive_path_invalid') throw error; return fail('worker_archive_unavailable'); }
   evidence.observed_worker_sha256 = digest(data);
   need(evidence.observed_worker_sha256 === worker.sha256, 'worker_archive_digest_mismatch');
+  const installerPath = join(dirname(archive), 'unpacked/package/setup/install.sh');
+  let installer;
+  try {
+    const resolved = realpathSync(installerPath), within = relative(realpathSync(directory), resolved);
+    need(within !== '' && !within.startsWith('..') && !within.startsWith('/') && lstatSync(installerPath).isFile(), 'worker_installer_path_invalid');
+    installer = digest(readFileSync(installerPath));
+  } catch (error) { if (error.cause === 'worker_installer_path_invalid') throw error; return fail('worker_installer_unavailable'); }
+  evidence.observed_installer_sha256 = installer;
   const decoders = {};
   for (const path of decoderPaths) {
     try { decoders[path] = digest(readFileSync(join(root, path))); } catch { evidence.missing_dist_files.push(path); }
   }
   evidence.observed_decoder_sha256 = decoders;
   need(evidence.missing_dist_files.length === 0, 'worker_decoders_unavailable');
-  return { archive: worker.archive, worker_sha256: worker.sha256, decoder_sha256: decoders };
+  return { archive: worker.archive, worker_sha256: worker.sha256, installer_sha256: installer, decoder_sha256: decoders };
 }
 
 function inspectImage(options, evidence, execute) {
@@ -88,13 +108,20 @@ function inspectImage(options, evidence, execute) {
   catch { return fail('image_inspection_failed'); }
   evidence.observed_image_id = /^sha256:[a-f0-9]{64}$/.test(image?.Id ?? '') ? image.Id : null;
   const labels = image?.Config?.Labels ?? {};
-  evidence.observed_labels = Object.fromEntries(Object.keys(evidence.expected_labels).map(key => {
+  const observedLabels = Object.fromEntries(Object.keys(evidence.expected_labels).map(key => {
     const value = labels[key];
     const pattern = key.endsWith('.revision') ? /^[a-f0-9]{40}$/ : key.endsWith('.version') ? versionPattern : /^(true|false)$/;
     return [key, typeof value === 'string' && pattern.test(value) ? value : null];
   }));
+  evidence.label_mismatches = Object.keys(evidence.expected_labels).filter(key => observedLabels[key] !== evidence.expected_labels[key]);
+  evidence.observed_labels = Object.fromEntries(Object.keys(evidence.expected_labels).map(key => {
+    if (observedLabels[key] === evidence.expected_labels[key]) return [key, observedLabels[key]];
+    if (!Object.hasOwn(labels, key)) return [key, 'missing'];
+    if (observedLabels[key] === null) return [key, 'invalid'];
+    return [key, 'sha256:' + digest(observedLabels[key])];
+  }));
   need(evidence.observed_image_id, 'image_id_invalid');
-  need(same(evidence.observed_labels, evidence.expected_labels), 'image_labels_mismatch');
+  need(same(observedLabels, evidence.expected_labels), 'image_labels_mismatch');
   return evidence.observed_image_id;
 }
 
@@ -102,17 +129,20 @@ function expectedSnapshot(snapshot, source, worker, evidence) {
   need(snapshot && snapshot.schema_version === 1, 'image_receipt_invalid');
   evidence.expected_source = safeSource(snapshot.source);
   evidence.expected_worker_sha256 = safeHash(snapshot.worker_sha256);
+  evidence.expected_installer_sha256 = safeHash(snapshot.installer_sha256);
   evidence.expected_decoder_sha256 = safeDecoders(snapshot.decoder_sha256);
   need(same(snapshot.source, source), 'source_drift');
   need(snapshot.worker_sha256 === worker.worker_sha256 && snapshot.archive === worker.archive, 'worker_archive_binding_mismatch');
+  need(snapshot.installer_sha256 === worker.installer_sha256, 'worker_installer_digest_mismatch');
   need(same(snapshot.decoder_sha256, worker.decoder_sha256), 'worker_decoder_digest_mismatch');
 }
 
 export function main(args = process.argv.slice(2), { root = process.cwd(), inspect = inspectSource, execute = execFileSync } = {}) {
   let options;
   const evidence = { cause: null, image: null, expected_image_id: null, observed_image_id: null, expected_labels: null,
-    observed_labels: null, expected_source: null, observed_source: null, expected_product_version: null, observed_product_version: null,
-    expected_worker_sha256: null, observed_worker_sha256: null, expected_decoder_sha256: null, observed_decoder_sha256: null,
+    observed_labels: null, label_mismatches: [], expected_source: null, observed_source: null, expected_product_version: null, observed_product_version: null,
+    expected_worker_sha256: null, observed_worker_sha256: null, expected_installer_sha256: null, observed_installer_sha256: null,
+    expected_decoder_sha256: null, observed_decoder_sha256: null,
     missing_dist_files: [], remediation: 'make image' };
   try {
     options = parseArgs(args);
@@ -132,7 +162,9 @@ export function main(args = process.argv.slice(2), { root = process.cwd(), inspe
       need(prior && prior.schema_version === 1, 'image_receipt_invalid');
       evidence.expected_source = safeSource(prior.source);
       evidence.expected_worker_sha256 = safeHash(prior.worker_sha256);
+      evidence.expected_installer_sha256 = safeHash(prior.installer_sha256);
       evidence.expected_decoder_sha256 = safeDecoders(prior.decoder_sha256);
+      if (options.mode === 'verify') evidence.expected_image_id = /^sha256:[a-f0-9]{64}$/.test(prior.image_id ?? '') ? prior.image_id : null;
       need(same(prior.source, source), 'source_drift');
       const worker = workerSnapshot(root, source, options, evidence);
       if (preparing) {
@@ -144,7 +176,6 @@ export function main(args = process.argv.slice(2), { root = process.cwd(), inspe
         if (options.mode === 'write') {
           writeJSON(receiptPath, { ...prior, image: options.image, image_id: imageID, labels: evidence.observed_labels, product_version: options.version });
         } else {
-          evidence.expected_image_id = /^sha256:[a-f0-9]{64}$/.test(prior.image_id ?? '') ? prior.image_id : null;
           need(prior.product_version === options.version && same(prior.labels, evidence.expected_labels), 'receipt_labels_mismatch');
           need(prior.image_id === imageID, 'image_id_mismatch');
         }
@@ -152,11 +183,11 @@ export function main(args = process.argv.slice(2), { root = process.cwd(), inspe
     }
     const event = { capture: 'ci.image_source_captured', prepare: 'ci.image_build_prepared',
       write: 'ci.image_receipt_written', verify: 'ci.image_receipt_verified' }[options.mode];
-    logEvent(null, 'info', event, { ...evidence, operation: options.mode });
+    logEvent(null, 'info', event, safeEvidence({ ...evidence, operation: options.mode }));
     return 0;
   } catch (error) {
     evidence.cause = /^[a-z_]+$/.test(error.cause ?? '') ? error.cause : 'image_receipt_failed';
-    logEvent(null, 'error', 'ci.image_receipt_rejected', evidence);
+    logEvent(null, 'error', 'ci.image_receipt_rejected', safeEvidence(evidence));
     return 1;
   }
 }

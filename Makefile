@@ -56,6 +56,7 @@ test-history: $(IMAGE_PREREQ)
 	python3 -B tests/integration/history.py --image $(SERVICE_IMAGE) --source-sha $(SOURCE_SHA) --source-dirty $(SOURCE_DIRTY)
 
 test-media: $(IMAGE_PREREQ)
+	python3 -B -m unittest tests/integration/test_media_cleanup.py
 	sh scripts/go.sh mcp-client
 	python3 -B tests/integration/media.py --image $(SERVICE_IMAGE) --source-sha $(SOURCE_SHA) --source-dirty $(SOURCE_DIRTY) --package-receipt .artifacts/worker-package/latest.json
 
@@ -79,6 +80,7 @@ test-portal-shell: $(IMAGE_PREREQ)
 	python3 -B tests/integration/portal.py --image $(SERVICE_IMAGE) --source-sha $(SOURCE_SHA) --source-dirty $(SOURCE_DIRTY)
 
 test-portal-workers: $(IMAGE_PREREQ)
+	python3 -B -m unittest tests/integration/test_portal_workers_diagnostics.py
 	python3 -B tests/integration/portal_workers.py --image $(SERVICE_IMAGE) --source-sha $(SOURCE_SHA) --source-dirty $(SOURCE_DIRTY)
 
 test-portal-history: $(IMAGE_PREREQ)

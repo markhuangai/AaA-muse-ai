@@ -401,6 +401,12 @@ class MediaFlow(MCPMedia, Product):
             require(prompt not in capture and self.sentinel.decode() not in capture, "raw media content retained")
         self.add("media.private_diagnostics")
 
+    def restore_media_permissions(self, directory):
+        self.docker("stop", "-t", "2", self.sibling, self.broker)
+        require(all(not self.inspect(container)["State"]["Running"] for container in (self.sibling, self.broker)),
+                "brokers must be stopped before restoring media permissions")
+        self.docker("exec", self.media_fixture, "chmod", "0700", directory)
+
     def expire(self, jobs, links):
         identities = [identity for identity, _ in jobs]
         require(len(identities) == 8 and len(set(identities)) == 8 and
@@ -442,10 +448,7 @@ class MediaFlow(MCPMedia, Product):
             expired = self.mcp_call("download_wav", {"job_id": last})
             require(expired["status"] == "expired" and "download_url" not in expired, "expired job retained a download URL")
         finally:
-            try:
-                self.docker("stop", "-t", "2", self.sibling, self.broker)
-            finally:
-                self.docker("exec", self.media_fixture, "chmod", "0700", directory)
+            self.restore_media_permissions(directory)
         self.docker("start", self.broker)
         self.origin_url = self.origin(self.broker)
         self.proxy.target = urllib.parse.urlsplit(self.origin_url)

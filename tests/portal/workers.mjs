@@ -79,15 +79,25 @@ async function newContext(options) {
 function failureDetails(error) {
   const text = String(error?.message || '');
   const name = /^(?:Error|AssertionError|TimeoutError|TypeError|ReferenceError|SyntaxError|RangeError)$/.test(error?.name) ? error.name : 'Error';
-  const operation = text.match(/^(?:page|browser|browserContext|locator)\.(?:goto|click|fill|close|launch|newContext|newPage|screenshot|waitForResponse|evaluate|press|route|unroute)\b/)?.[0] ||
+  const operation = text.match(/^(?:page|browser|browserType|browserContext|locator)\.(?:goto|click|fill|close|launch|newContext|newPage|screenshot|waitForResponse|evaluate|press|route|unroute)\b/)?.[0] ||
     text.match(/^expect\([^\n]*?\)\.(toBeVisible|toBeEnabled|toBeFocused|toHaveText|toContainText|toHaveCount|toEqual|toBe)\b/)?.[1];
   const cause = text.match(/\b(?:Timeout \d+ms exceeded|net::ERR_[A-Z0-9_]+)\b/)?.[0];
+  const classifications = [
+    ['browser_executable_missing', /Executable doesn't exist/i],
+    ['browser_shared_library_missing', /error while loading shared libraries/i],
+    ['browser_sandbox_unavailable', /No usable sandbox|sandbox.*(?:not permitted|permission denied)/i],
+    ['browser_process_closed', /Target page, context or browser has been closed|browser has been closed/i],
+    ['browser_timeout', /Timeout \d+ms exceeded/i],
+    ['browser_launch_failed', /^browserType\.launch:/i],
+  ];
+  const diagnosticCause = canaryError && error === canaryError ? 'diagnostic_canary' :
+    text.match(/\bnet::ERR_[A-Z0-9_]+\b/)?.[0] || classifications.find(([, pattern]) => pattern.test(text))?.[0] || 'unclassified';
   const message = canaryError && error === canaryError
     ? redactSafe(text).slice(0, 500)
     : redactSafe(['Browser operation failed', operation, cause].filter(Boolean).join(': ')).slice(0, 500);
   const stackHead = String(error?.stack || '').split('\n').map(line => line.match(/(?:^|\/)tests\/portal\/workers\.mjs:(\d+):(\d+)/))
     .filter(Boolean).slice(0, 10).map(match => `tests/portal/workers.mjs:${match[1]}:${match[2]}`);
-  return { ...progress(), error_name: name, message, stack_head: stackHead };
+  return { ...progress(), error_name: name, message, diagnostic_cause: redactSafe(diagnosticCause), stack_head: stackHead };
 }
 
 async function control(path, { method = 'GET', key, body, cookie, workerVersion, workerHeaders } = {}) {
@@ -97,7 +107,19 @@ async function control(path, { method = 'GET', key, body, cookie, workerVersion,
   if (workerVersion) Object.assign(headers, { 'X-Muse-Worker-Version': workerVersion, 'X-Muse-Worker-Updater': 'managed-hook-v1',
     'X-Muse-Worker-SHA256': fixture.pin.sha256 });
   Object.assign(headers, workerHeaders);
-  const response = await fetch(fixture.origin + path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(10_000) });
+  const safeMethod = /^(?:GET|POST|PATCH|PUT|DELETE|OPTIONS|HEAD)$/.test(method) ? method : 'OTHER';
+  let response;
+  try {
+    response = await fetch(fixture.origin + path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(10_000) });
+  } catch (error) {
+    const code = String(error?.cause?.code || error?.code || '');
+    const cause = /^(?:ECONNREFUSED|ECONNRESET|EHOSTUNREACH|EPIPE|ETIMEDOUT|UND_ERR_[A-Z0-9_]{1,60})$/.test(code) ? code : 'request_failed';
+    recordEvent({ kind: 'requestfailed', method: safeMethod, path: safePath(path), error: redactSafe(cause) });
+    throw error;
+  }
+  const requestID = response.headers.get('x-request-id');
+  recordEvent({ kind: 'response', method: safeMethod, path: safePath(path), status: response.status,
+    request_id: /^[a-f0-9]{32}$/.test(requestID || '') ? redactSafe(requestID) : null });
   const data = response.status === 204 ? null : await response.json();
   return { response, data };
 }
@@ -644,6 +666,11 @@ try {
   const canary = process.env.PORTAL_WORKERS_DIAGNOSTIC_CANARY;
   if (canary) {
     remember(canary);
+    if (process.env.PORTAL_WORKERS_DIAGNOSTIC_HTTP === '1') {
+      setStep('diagnostics/direct-http');
+      const response = await control('/api/v1/worker/pull?credential=' + encodeURIComponent(canary), { method: 'POST', key: canary, body: {} });
+      expect(response.response.status).toBe(200);
+    }
     canaryError = new Error(`Controlled diagnostics canary: ${canary} muse_worker_DIAGNOSTICREGEXCANARY aaa_muse_ai_DIAGNOSTICREGEXCANARY Bearer DIAGNOSTICBEARERCANARY __Host-muse_portal=DIAGNOSTICCOOKIECANARY`);
     throw canaryError;
   }

@@ -372,7 +372,7 @@ test('imports and reports a missing shard without worker build or installed depe
     mkdirSync(dirname(join(isolated, name)), { recursive: true });
     copyFileSync(join(root, name), join(isolated, name));
   }
-  const script = `import { main } from './tools/portal-ci.mjs'; process.exitCode = main(['missing', 'out'], { source: () => ${JSON.stringify(source)}, env: ${JSON.stringify(f.env)} });`;
+  const script = `import { main } from './tools/portal-ci.mjs'; process.exitCode = main(['missing', 'out'], { source: () => (${JSON.stringify(source)}), env: ${JSON.stringify(f.env)} });`;
   const result = spawnSync(process.execPath, ['--input-type=module', '-e', script], { cwd: isolated, encoding: 'utf8' });
   assert.equal(result.status, 1, result.stderr);
   const diagnosis = JSON.parse(result.stdout.trim().replace(/^::error::/, ''));

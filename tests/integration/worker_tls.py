@@ -151,7 +151,7 @@ class ThreadingTLSServer(http.server.ThreadingHTTPServer):
             sockets = list(self._client_sockets)
         for client in sockets:
             try:
-                client.shutdown(socket.SHUT_RDWR)
+                socket.socket.shutdown(client, socket.SHUT_RDWR)
             except OSError:
                 continue
 
@@ -281,8 +281,11 @@ class TLSFixture:
                     target = fixture.target
                     connection = http.client.HTTPConnection(target.hostname, target.port, timeout=325 if route == "/mcp" else 45)
                     fixture.connections.append(connection)
+                client_io = False
                 try:
+                    client_io = True
                     body = self.rfile.read(content_length)
+                    client_io = False
                     with fixture.lock:
                         enrollment_faults = bool(fixture.drop_enrollment_requests or fixture.drop_enrollment_replies or fixture.observe_staged_credential)
                     phase = json.loads(body).get("phase") if path == "/api/v1/worker/enroll" and body and enrollment_faults else None
@@ -315,6 +318,7 @@ class TLSFixture:
                         with fixture.lock:
                             fixture.events.append({"event": "fixture.request_rejected", "route": path, "request_id": request_id, "status": 404, "forwarded": False})
                         payload = b"404 page not found\n"
+                        client_io = True
                         self.send_response(404)
                         self.send_header("Content-Type", "text/plain")
                         self.send_header("Content-Length", str(len(payload)))
@@ -327,6 +331,7 @@ class TLSFixture:
                         with fixture.lock:
                             fixture.events.append({"event": "fixture.request_rejected", "route": route, "request_id": self.headers.get("X-Request-Id", "fixture-unavailable"), "status": 503, "forwarded": False})
                         payload = b'{"error":"fixture_unavailable"}'
+                        client_io = True
                         self.send_response(503)
                         self.send_header("Content-Type", "application/json")
                         self.send_header("Content-Length", str(len(payload)))
@@ -368,6 +373,7 @@ class TLSFixture:
                         connection.sock.shutdown(socket.SHUT_WR)
                         connection.getresponse().read()
                         fixture.media_interrupted.set()
+                        client_io = True
                         self.send_error(503)
                         return
                     if self.command == "PUT" and (slow_media or pause):
@@ -465,6 +471,7 @@ class TLSFixture:
                             self.connection.shutdown(socket.SHUT_RDWR)
                             self.close_connection = True
                             return
+                    client_io = True
                     self.send_response(response.status)
                     for key in ("Content-Type", "X-Request-Id", "X-Muse-Service-Version", "X-Muse-Paired-Worker-SHA256", "Cache-Control", "Content-Security-Policy",
                                 "Referrer-Policy", "X-Content-Type-Options", "WWW-Authenticate", "Retry-After", "Allow", "Set-Cookie",
@@ -477,14 +484,18 @@ class TLSFixture:
                     self.end_headers()
                     if streaming:
                         while True:
+                            client_io = False
                             line = response.readline()
                             if not line:
                                 break
+                            client_io = True
                             self.wfile.write(line)
                             self.wfile.flush()
                     elif not bodyless:
                         self.wfile.write(payload)
                 except (OSError, http.client.HTTPException) as error:
+                    if client_io:
+                        self.server.record_error("fixture.client_error", error)
                     with fixture.lock:
                         fixture.events.append({"event": "fixture.connection_closed", "cause": type(error).__name__, "route": route})
                 finally:
@@ -500,23 +511,27 @@ class TLSFixture:
         self.thread = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
         self.thread.start()
 
+    def release_pauses(self):
+        self.media_release.set()
+        self.release_decision.set()
+        self.release_claim.set()
+        self.release_context.set()
+
     def interrupt(self):
+        self.release_pauses()
         self.server.interrupt_clients()
         with self.lock:
             sockets = [connection.sock for connection in self.connections]
         for sock in sockets:
             if sock is not None:
                 try:
-                    sock.shutdown(socket.SHUT_RDWR)
+                    socket.socket.shutdown(sock, socket.SHUT_RDWR)
                 except OSError:
                     continue
 
     def close(self):
         self.server.interrupt_clients(closing=True)
-        self.media_release.set()
-        self.release_decision.set()
-        self.release_claim.set()
-        self.release_context.set()
+        self.release_pauses()
         self.server.shutdown()
         self.interrupt()
         self.server.server_close()

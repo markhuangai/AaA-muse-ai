@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import urllib.parse
 
 from history import History
@@ -66,7 +67,7 @@ class PortalWorkers(Portal, History):
             if type(status) is int and 100 <= status <= 599:
                 item["status"] = status
             error = event.get("error")
-            if isinstance(error, str) and re.fullmatch(r"(?:net::ERR_[A-Z0-9_]+|request_failed|Error|TypeError|ReferenceError|SyntaxError|RangeError|URIError|EvalError|AggregateError)", error):
+            if isinstance(error, str) and re.fullmatch(r"(?:net::ERR_[A-Z0-9_]+|ECONNREFUSED|ECONNRESET|EHOSTUNREACH|EPIPE|ETIMEDOUT|UND_ERR_[A-Z0-9_]{1,60}|request_failed|Error|TypeError|ReferenceError|SyntaxError|RangeError|URIError|EvalError|AggregateError)", error):
                 item["error"] = self.redact_safe(error)[:100]
             request_id = event.get("request_id")
             if isinstance(request_id, str) and re.fullmatch(r"[a-f0-9]{32}", request_id):
@@ -99,7 +100,7 @@ class PortalWorkers(Portal, History):
             result.append(item)
         return result
 
-    def browser_failure(self, phase, returncode, stage, error_name, secrets_available, browser):
+    def browser_failure(self, phase, returncode, stage, error_name, secrets_available, browser, child_output, output_truncated):
         progress = self.browser_json("worker-browser-progress-" + phase + ".json")
         progress = progress if isinstance(progress, dict) else {}
         failure = browser.get("failure") if isinstance(browser, dict) else None
@@ -115,6 +116,16 @@ class PortalWorkers(Portal, History):
         if error_name != "BrowserProcessError":
             summary["monitor_stage"] = stage
             summary["monitor_error"] = error_name
+        if child_output and not isinstance(failure, dict):
+            text = self.redact_safe(child_output.decode("utf8", errors="replace"))
+            causes = ("ERR_MODULE_NOT_FOUND", "MODULE_NOT_FOUND", "ERR_PACKAGE_PATH_NOT_EXPORTED", "ERR_INVALID_PACKAGE_CONFIG",
+                      "ERR_REQUIRE_ESM", "ENOENT", "EACCES", "SyntaxError", "ReferenceError", "TypeError", "RangeError")
+            cause = next((item for item in causes if re.search(r"(?<![A-Za-z0-9_])" + item + r"(?![A-Za-z0-9_])", text)), "unclassified")
+            summary["child_cause"] = self.redact_safe(cause)
+            summary["child_output_truncated"] = output_truncated
+            if error_name == "BrowserProcessError":
+                summary["step"] = "browser/startup" if not progress else stage
+                summary["message"] = self.redact_safe("Node process failed: " + cause)[:500]
         if secrets_available:
             step = detail.get("step")
             if isinstance(step, str) and re.fullmatch(r"[A-Za-z0-9_./-]{1,100}", step):
@@ -122,10 +133,13 @@ class PortalWorkers(Portal, History):
             name = detail.get("error_name")
             if name in ("Error", "AssertionError", "TimeoutError", "TypeError", "ReferenceError", "SyntaxError", "RangeError"):
                 summary["error_name"] = name
+            diagnostic_cause = detail.get("diagnostic_cause")
+            if isinstance(diagnostic_cause, str) and re.fullmatch(r"(?:browser_executable_missing|browser_shared_library_missing|browser_sandbox_unavailable|browser_process_closed|browser_timeout|browser_launch_failed|diagnostic_canary|unclassified|net::ERR_[A-Z0-9_]+)", diagnostic_cause):
+                summary["diagnostic_cause"] = self.redact_safe(diagnostic_cause)
             message = detail.get("message")
             if isinstance(message, str):
                 message = self.redact_safe(message)
-                operation = r"(?:(?:page|browser|browserContext|locator)\.(?:goto|click|fill|close|launch|newContext|newPage|screenshot|waitForResponse|evaluate|press|route|unroute)|toBeVisible|toBeEnabled|toBeFocused|toHaveText|toContainText|toHaveCount|toEqual|toBe)"
+                operation = r"(?:(?:page|browser|browserType|browserContext|locator)\.(?:goto|click|fill|close|launch|newContext|newPage|screenshot|waitForResponse|evaluate|press|route|unroute)|toBeVisible|toBeEnabled|toBeFocused|toHaveText|toContainText|toHaveCount|toEqual|toBe)"
                 cause = r"(?:Timeout \d{1,8}ms exceeded|net::ERR_[A-Z0-9_]{1,80})"
                 canary_message = "Controlled diagnostics canary: [REDACTED] [REDACTED] [REDACTED] Bearer [REDACTED] __Host-[REDACTED]=[REDACTED]"
                 if re.fullmatch(r"Browser operation failed(?:: (?:" + operation + "|" + cause + r")){0,2}", message) or (
@@ -152,6 +166,21 @@ class PortalWorkers(Portal, History):
             self.assert_private(encoded)
         self.worker_failure = summary
         print(encoded, file=sys.stderr, flush=True)
+
+    def write_worker_receipt(self, safe, identity, outcome, image_id):
+        cleanup = self.browser_json("cleanup.json")
+        missing_cleanup = not isinstance(cleanup, dict)
+        if missing_cleanup:
+            cleanup = {"failures": [{"cause": "cleanup_receipt_unavailable"}]}
+            outcome = "failed"
+        receipt = {"suite": "portal-workers", "outcome": outcome, "source_sha": self.args.source_sha, "source_dirty": self.args.source_dirty,
+                   "working_source": identity, "image_id": image_id, "run_id": os.environ.get("GITHUB_RUN_ID", "local"),
+                   "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT", "1"), "cases": self.receipts, "cleanup": cleanup}
+        if outcome == "failed" and getattr(self, "worker_failure", None):
+            receipt["failure"] = self.worker_failure
+        self.assert_private(json.dumps(receipt))
+        (safe / "workers-receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")
+        return missing_cleanup
 
     def named_worker(self, name):
         worker = self.new_worker()
@@ -228,8 +257,26 @@ class PortalWorkers(Portal, History):
             "source_sha": self.args.source_sha, "container": self.main_service, "database": self.db, "owner": self.owner,
             "directory": str(self.root.resolve()), "phase": phase, "workers": workers, "pin": self.checked("/api/v1/admin/status", self.admin)[0]["build"]["worker_package"]}))
         process, stage, monitor_error = None, "browser/start", None
+        output, output_lock, output_truncated = bytearray(), threading.Lock(), [False]
+
+        def capture_output(stream):
+            while True:
+                try:
+                    chunk = stream.read(4096)
+                except (OSError, ValueError):
+                    return
+                if not chunk:
+                    return
+                with output_lock:
+                    output.extend(chunk)
+                    if len(output) > 16384:
+                        del output[:-16384]
+                        output_truncated[0] = True
+
         try:
-            with subprocess.Popen(["node", "tests/portal/workers.mjs", "--fixture", str(fixture)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) as process:
+            with subprocess.Popen(["node", "tests/portal/workers.mjs", "--fixture", str(fixture)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0) as process:
+                reader = threading.Thread(target=capture_output, args=(process.stdout,), daemon=True)
+                reader.start()
                 try:
                     if phase == "actions":
                         stage = "browser/offline-poll"
@@ -244,6 +291,7 @@ class PortalWorkers(Portal, History):
                     if process.poll() is None:
                         process.kill()
                         process.wait()
+                    reader.join(timeout=5)
         except subprocess.TimeoutExpired:
             monitor_error = "TimeoutExpired"
         except OSError:
@@ -260,7 +308,9 @@ class PortalWorkers(Portal, History):
         valid_browser = (isinstance(browser, dict) and browser.get("outcome") == "passed" and browser.get("source_sha") == self.args.source_sha and
                          all(isinstance(browser.get(field), list) for field in ("diagnostics", "screenshots", "cases")))
         if monitor_error or process is None or process.returncode != 0 or not secrets_available or not valid_browser:
-            self.browser_failure(phase, process.returncode if process else None, stage, monitor_error or "BrowserProcessError", secrets_available, browser)
+            with output_lock:
+                child_output, truncated = bytes(output), output_truncated[0]
+            self.browser_failure(phase, process.returncode if process else None, stage, monitor_error or "BrowserProcessError", secrets_available, browser, child_output, truncated)
             raise AssertionError("worker browser conformance failed; see redacted diagnostic summary") from None
         for diagnostic in browser["diagnostics"]:
             if diagnostic.get("request_id"):
@@ -402,18 +452,7 @@ def main():
             outcome = "failed"
             raise
         finally:
-            cleanup = h.browser_json("cleanup.json")
-            missing_cleanup = not isinstance(cleanup, dict)
-            if missing_cleanup:
-                cleanup = {"failures": [{"cause": "cleanup_receipt_unavailable"}]}
-                outcome = "failed"
-            receipt = {"suite": "portal-workers", "outcome": outcome, "source_sha": args.source_sha, "source_dirty": args.source_dirty,
-                       "working_source": identity, "image_id": image_id, "run_id": os.environ.get("GITHUB_RUN_ID", "local"),
-                       "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT", "1"), "cases": h.receipts, "cleanup": cleanup}
-            if outcome == "failed" and getattr(h, "worker_failure", None):
-                receipt["failure"] = h.worker_failure
-            h.assert_private(json.dumps(receipt))
-            (safe / "workers-receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")
+            missing_cleanup = h.write_worker_receipt(safe, identity, outcome, image_id)
             if missing_cleanup and sys.exc_info()[0] is None:
                 raise AssertionError("worker browser cleanup evidence unavailable")
 

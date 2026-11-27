@@ -8,12 +8,14 @@ import json
 from pathlib import Path
 import socket
 import ssl
+import struct
 import sys
 import tempfile
 import threading
 import time
 import unittest
 import urllib.parse
+from unittest.mock import patch
 
 from .worker_tls import TLSFixture
 
@@ -155,6 +157,8 @@ class TLSFixtureTest(unittest.TestCase):
             time.sleep(0.01)
 
     def test_idle_connections_and_forty_concurrent_requests(self):
+        self.fixture.server.handshake_timeout = 120
+        self.fixture.server.io_timeout = 120
         sockets = []
         self.addCleanup(lambda: [client.close() for client in sockets])
         for _ in range(5):
@@ -163,11 +167,14 @@ class TLSFixtureTest(unittest.TestCase):
             raw = socket.create_connection(("127.0.0.1", self.port), timeout=10)
             sockets.append(self.context.wrap_socket(raw, server_hostname="localhost"))
 
-        def all_clients_tracked():
-            with self.fixture.server._client_lock:
-                return len(self.fixture.server._client_sockets) >= 10
+        idle_peers = {client.getsockname() for client in sockets}
+        self.assertEqual(len(idle_peers), 10)
 
-        self.wait_for(all_clients_tracked)
+        def tracked_peers():
+            with self.fixture.server._client_lock:
+                return {client.getpeername() for client in self.fixture.server._client_sockets}
+
+        self.wait_for(lambda: idle_peers.issubset(tracked_peers()))
         barrier = threading.Barrier(40, timeout=20)
 
         def fetch(_):
@@ -180,6 +187,7 @@ class TLSFixtureTest(unittest.TestCase):
         for status, headers, body in results:
             self.assertEqual((status, body), (200, b"ok"))
             self.assertEqual(headers.get("Connection"), "close")
+        self.assertTrue(idle_peers.issubset(tracked_peers()))
         started = time.monotonic()
         self.close_fixture()
         self.assertLess(time.monotonic() - started, 2)
@@ -290,6 +298,44 @@ class TLSFixtureTest(unittest.TestCase):
             if event.get("event") == "fixture.tls_handshake_failed":
                 self.assertEqual(set(event), {"event", "cause"})
 
+    def test_disconnected_forwarding_client_reports_safe_error(self):
+        raw = socket.create_connection(("127.0.0.1", self.port), timeout=10)
+        client = self.context.wrap_socket(raw, server_hostname="localhost")
+        self.addCleanup(client.close)
+        client.sendall(b"GET /hold HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        with self.upstream.condition:
+            self.assertTrue(self.upstream.condition.wait_for(lambda: self.upstream.waiting == 1, timeout=10))
+        client.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        client.close()
+        self.upstream.hold_release.set()
+        self.wait_for(lambda: any(event.get("event") == "fixture.client_error" for event in self.fixture.events))
+        events = [event for event in self.fixture.events if event.get("event") == "fixture.client_error"]
+        self.assertTrue(all(set(event) == {"event", "cause"} and event["cause"] for event in events))
+
+    def test_interrupt_between_registration_and_handshake_preserves_tls_state(self):
+        entered, release, sockets = threading.Event(), threading.Event(), []
+        handshake = ssl.SSLSocket.do_handshake
+
+        def paused_handshake(client, *args, **kwargs):
+            sockets.append(client)
+            entered.set()
+            if not release.wait(5):
+                raise TimeoutError("controlled handshake was not released")
+            return handshake(client, *args, **kwargs)
+
+        with patch.object(ssl.SSLSocket, "do_handshake", paused_handshake):
+            raw = socket.create_connection(("127.0.0.1", self.port), timeout=10)
+            try:
+                self.assertTrue(entered.wait(5))
+                self.fixture.interrupt()
+                self.assertIsNotNone(sockets[0]._sslobj)
+            finally:
+                release.set()
+                raw.close()
+            self.wait_for(lambda: any(event.get("event") == "fixture.tls_handshake_failed" for event in self.fixture.events))
+        failures = [event for event in self.fixture.events if event.get("event") == "fixture.tls_handshake_failed"]
+        self.assertTrue(all(event.get("cause") != "AttributeError" for event in failures))
+
     def test_concurrent_fault_consumption_is_atomic(self):
         path = "/api/v1/worker/pull"
         self.fixture.lose_worker_replies[path] = 20
@@ -393,6 +439,28 @@ class TLSFixtureTest(unittest.TestCase):
             self.close_fixture()
             self.assertTrue(fixture.release_claim.is_set())
             request.result(timeout=10)
+
+    def test_interrupt_releases_a_paused_claim(self):
+        self.fixture.pause_claim = True
+
+        def claim():
+            try:
+                return self.request("/api/v1/worker/claim", "POST", b"{}")
+            except (OSError, http.client.HTTPException):
+                return None
+
+        def no_connections():
+            with self.fixture.lock:
+                return not self.fixture.connections
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            request = pool.submit(claim)
+            self.assertTrue(self.fixture.claim_captured.wait(5))
+            self.fixture.interrupt()
+            self.assertTrue(all(event.is_set() for event in (self.fixture.media_release, self.fixture.release_claim,
+                                                            self.fixture.release_decision, self.fixture.release_context)))
+            request.result(timeout=5)
+            self.wait_for(no_connections)
 
 
 if __name__ == "__main__":
