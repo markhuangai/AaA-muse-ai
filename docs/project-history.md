@@ -2,6 +2,12 @@
 
 These entries record decisions and evidence at the dates shown. See the release guide for the current publication and qualification rules. [Paired product releases](releases.md)
 
+## CI reliability and runtime
+
+On November 27, 2026 the owner approved the CI reliability plan at base `8858ecc9cc0f507823668b73f43cb52889e7b747`. The frozen plan SHA-256 is `784f54e508b53c7704a291f8e62061e4d55eca2d68b162f59cb54591c40cdcee`. It selects threaded TLS fixture handshakes, secret-safe browser failure evidence, a 1 MiB npm publication buffer, a two-second capacity-export bound, controlled SQLite expiry advancement, parallel portal shards and source-bound image reuse. No live Muse action, deployment, publication or merge is authorized. CodeRabbit is exempt for this delivery; independent audit, local controlled checks, full CI, CodeQL, Codex and complete configured AI review remain required.
+
+The approved plan reports idle browser preconnections blocking the fixture, npm publication output exceeding the former 6 KiB buffer, and a host-to-container timing failure. It rejects a new external proxy and Docker Buildx GHA caching. Thread-owned socket closure mitigates shutdown races, while image and shard receipts bind reuse to exact source and artifacts. The existing 1 MiB packument and commit response caps in `.github/scripts/release-io.mjs:18` and `.github/scripts/release-verify.mjs:20` remain unchanged watch-items. Audit and controlled verification results are not yet established for this implementation.
+
 ## Portal responsiveness with enrolled pools
 
 On November 26, 2026 the owner approved the portal-scale plan at `ecdb2c914e26527fab02a5c76dbe9526e53c0bd5`, then amended the diagnostics durability criterion at `03:44:46Z`. The broker uses background sync with a 250 ms target, not a hard power-loss bound. Completed, unpruned appends survive a process-only crash. The delivery preserves the existing export wire format and legacy capture files. Rolling-log libraries and SQLite diagnostics storage were rejected because they could not preserve the small byte limits, conservative retention watermark and independent diagnostic export together.

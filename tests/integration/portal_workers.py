@@ -6,6 +6,8 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
+import urllib.parse
 
 from history import History
 from native_cron import utc_stamp
@@ -15,6 +17,142 @@ from worker_tls import TLSFixture
 
 
 class PortalWorkers(Portal, History):
+    def redact_safe(self, value):
+        text = str(value)
+        known = (self.admin, self.portal, self.client, *self.secrets)
+        for secret in sorted((item for item in known if isinstance(item, str) and item), key=len, reverse=True):
+            text = text.replace(secret, "[REDACTED]")
+        text = re.sub(r"__Host-muse_portal\s*=\s*[^\s;,\"']+", "__Host-muse_portal=[REDACTED]", text, flags=re.IGNORECASE)
+        text = re.sub(r"\bBearer\s+[^\s;,\"']+", "Bearer [REDACTED]", text, flags=re.IGNORECASE)
+        return re.sub(r"\b(?:muse|aaa_muse_ai)_[A-Za-z0-9_-]+", "[REDACTED]", text, flags=re.IGNORECASE)
+
+    def browser_json(self, name):
+        try:
+            with (self.root / name).open(encoding="utf8") as stream:
+                data = stream.read(1024 * 1024 + 1)
+            if len(data) > 1024 * 1024:
+                return None
+            return json.loads(data)
+        except (OSError, UnicodeError, json.JSONDecodeError, ValueError, RecursionError):
+            return None
+
+    def safe_browser_path(self, value):
+        segments = {"api", "v1", "admin", "portal", "worker", "workers", "hook", "settings", "login", "logout", "events",
+                    "status", "readyz", "enroll", "enrollments", "setup-prompts", "agent-tasks", "pull", "revoke", "start", "result", "interrupt"}
+        try:
+            path = urllib.parse.urlsplit(value).path if isinstance(value, str) else ""
+        except ValueError:
+            path = ""
+        if not path.startswith("/"):
+            return "/{omitted}"
+        if path.startswith("/assets/"):
+            return "/assets/{asset}"
+        parts = (part if not part or part in segments or re.fullmatch(r"[a-f0-9]{32}", part) else "{omitted}" for part in path.split("/"))
+        return self.redact_safe("/".join(parts))[:240]
+
+    def browser_events(self, events):
+        if not isinstance(events, list):
+            return []
+        result = []
+        for event in events[-10:]:
+            if not isinstance(event, dict) or event.get("kind") not in ("response", "requestfailed", "pageerror"):
+                continue
+            item = {"kind": event["kind"]}
+            if event["kind"] != "pageerror":
+                method = event.get("method")
+                item["method"] = method if method in ("GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS", "HEAD") else "OTHER"
+                item["path"] = self.safe_browser_path(event.get("path"))
+            status = event.get("status")
+            if type(status) is int and 100 <= status <= 599:
+                item["status"] = status
+            error = event.get("error")
+            if isinstance(error, str) and re.fullmatch(r"(?:net::ERR_[A-Z0-9_]+|request_failed|Error|TypeError|ReferenceError|SyntaxError|RangeError|URIError|EvalError|AggregateError)", error):
+                item["error"] = self.redact_safe(error)[:100]
+            request_id = event.get("request_id")
+            if isinstance(request_id, str) and re.fullmatch(r"[a-f0-9]{32}", request_id):
+                item["request_id"] = self.redact_safe(request_id)
+            result.append(item)
+        return result
+
+    def tls_events(self):
+        with self.browser_proxy.lock:
+            events = list(self.browser_proxy.events[-20:])
+        result = []
+        for event in events:
+            if not isinstance(event, dict) or not isinstance(event.get("event"), str) or not re.fullmatch(r"fixture\.[a-z_]+", event["event"]):
+                continue
+            item = {"event": self.redact_safe(event["event"])[:100]}
+            cause = event.get("cause")
+            if isinstance(cause, str) and re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,79}", cause):
+                item["cause"] = self.redact_safe(cause)
+            if "route" in event:
+                item["route"] = self.safe_browser_path(event["route"])
+            if event.get("phase") in ("prepare", "activate"):
+                item["phase"] = event["phase"]
+            if type(event.get("status")) is int and 100 <= event["status"] <= 599:
+                item["status"] = event["status"]
+            if type(event.get("forwarded")) is bool:
+                item["forwarded"] = event["forwarded"]
+            request_id = event.get("request_id")
+            if isinstance(request_id, str) and re.fullmatch(r"[a-f0-9]{32}", request_id):
+                item["request_id"] = self.redact_safe(request_id)
+            result.append(item)
+        return result
+
+    def browser_failure(self, phase, returncode, stage, error_name, secrets_available, browser):
+        progress = self.browser_json("worker-browser-progress-" + phase + ".json")
+        progress = progress if isinstance(progress, dict) else {}
+        failure = browser.get("failure") if isinstance(browser, dict) else None
+        if not isinstance(failure, dict):
+            failure = self.browser_json("worker-browser-failure-" + phase + ".json")
+        detail = failure if isinstance(failure, dict) else progress
+        messages = {"TimeoutExpired": "Worker browser exceeded its 300-second process deadline.",
+                    "AssertionError": "Worker browser failed during offline timer coordination.",
+                    "OSError": "Worker browser process could not be started or monitored."}
+        summary = {"phase": phase, "returncode": returncode, "step": stage, "error_name": error_name,
+                   "message": messages.get(error_name, "Worker browser failed; diagnostic details unavailable."), "stack_head": [], "passed_cases": [],
+                   "recent_events": [], "tls_fixture_events": []}
+        if error_name != "BrowserProcessError":
+            summary["monitor_stage"] = stage
+            summary["monitor_error"] = error_name
+        if secrets_available:
+            step = detail.get("step")
+            if isinstance(step, str) and re.fullmatch(r"[A-Za-z0-9_./-]{1,100}", step):
+                summary["step"] = self.redact_safe(step)
+            name = detail.get("error_name")
+            if name in ("Error", "AssertionError", "TimeoutError", "TypeError", "ReferenceError", "SyntaxError", "RangeError"):
+                summary["error_name"] = name
+            message = detail.get("message")
+            if isinstance(message, str):
+                message = self.redact_safe(message)
+                operation = r"(?:(?:page|browser|browserContext|locator)\.(?:goto|click|fill|close|launch|newContext|newPage|screenshot|waitForResponse|evaluate|press|route|unroute)|toBeVisible|toBeEnabled|toBeFocused|toHaveText|toContainText|toHaveCount|toEqual|toBe)"
+                cause = r"(?:Timeout \d{1,8}ms exceeded|net::ERR_[A-Z0-9_]{1,80})"
+                canary_message = "Controlled diagnostics canary: [REDACTED] [REDACTED] [REDACTED] Bearer [REDACTED] __Host-[REDACTED]=[REDACTED]"
+                if re.fullmatch(r"Browser operation failed(?:: (?:" + operation + "|" + cause + r")){0,2}", message) or (
+                        os.environ.get("PORTAL_WORKERS_DIAGNOSTIC_CANARY") and message == canary_message):
+                    summary["message"] = message[:500]
+            stack = detail.get("stack_head")
+            if isinstance(stack, list):
+                summary["stack_head"] = [self.redact_safe(line) for line in stack[:10] if isinstance(line, str) and
+                                         re.fullmatch(r"tests/portal/workers\.mjs:\d{1,7}:\d{1,5}", line)]
+            cases = detail.get("passed_cases")
+            if isinstance(cases, list):
+                summary["passed_cases"] = [self.redact_safe(case) for case in cases[-100:] if isinstance(case, str) and
+                                            re.fullmatch(r"portal\.[a-z_]{1,100}", case)]
+            summary["recent_events"] = self.browser_events(detail.get("recent_events"))
+            summary["tls_fixture_events"] = self.tls_events()
+        encoded = json.dumps(summary, ensure_ascii=True)
+        try:
+            self.assert_private(encoded)
+        except AssertionError:
+            summary = {"phase": phase, "returncode": returncode, "step": stage, "error_name": error_name,
+                       "message": "Worker browser failed; diagnostic details withheld by privacy check.", "stack_head": [],
+                       "passed_cases": [], "recent_events": [], "tls_fixture_events": []}
+            encoded = json.dumps(summary, ensure_ascii=True)
+            self.assert_private(encoded)
+        self.worker_failure = summary
+        print(encoded, file=sys.stderr, flush=True)
+
     def named_worker(self, name):
         worker = self.new_worker()
         self.checked("/api/v1/admin/workers/" + worker["worker"]["id"], self.admin, "PATCH", {"name": name})
@@ -77,6 +215,9 @@ class PortalWorkers(Portal, History):
         self.receipt("portal.worker_role_and_shell_boundaries")
 
     def worker_browser(self, phase, workers):
+        canary = os.environ.get("PORTAL_WORKERS_DIAGNOSTIC_CANARY")
+        if canary:
+            self.secrets.append(canary)
         if phase == "actions":
             reconnecting = self.named_worker("Offline timer fixture")
             timer = self.pull_peer(reconnecting)
@@ -86,26 +227,41 @@ class PortalWorkers(Portal, History):
         fixture = self.private("worker-browser-" + phase + ".json", json.dumps({"origin": self.origin_url, "browser_origin": self.browser_proxy.origin, "password": self.portal,
             "source_sha": self.args.source_sha, "container": self.main_service, "database": self.db, "owner": self.owner,
             "directory": str(self.root.resolve()), "phase": phase, "workers": workers, "pin": self.checked("/api/v1/admin/status", self.admin)[0]["build"]["worker_package"]}))
-        with (self.root / ("worker-browser-" + phase + ".log")).open("w") as log:
-            with subprocess.Popen(["node", "tests/portal/workers.mjs", "--fixture", str(fixture)], stdout=log, stderr=subprocess.STDOUT) as process:
+        process, stage, monitor_error = None, "browser/start", None
+        try:
+            with subprocess.Popen(["node", "tests/portal/workers.mjs", "--fixture", str(fixture)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) as process:
                 try:
                     if phase == "actions":
+                        stage = "browser/offline-poll"
                         signal = self.root / "worker-browser-resume-poll"
                         self.until(lambda: signal.exists() or process.poll() is not None, "browser did not reach the offline timer check", timeout=300)
                         if signal.exists():
                             require(timer.poll() is None, "offline timer fixture unexpectedly claimed work")
                             self.private("worker-browser-poll-ready", "")
+                    stage = "browser/wait"
                     process.wait(timeout=300)
                 finally:
                     if process.poll() is None:
                         process.kill()
                         process.wait()
-        secret_path = self.root / ("worker-browser-secrets-" + phase + ".json")
-        if secret_path.exists():
-            self.secrets.extend(json.loads(secret_path.read_text()))
-        require(process.returncode == 0, "worker browser conformance failed; inspect private worker-browser evidence")
-        browser = json.loads((self.root / ("worker-browser-receipt-" + phase + ".json")).read_text())
-        require(browser["outcome"] == "passed" and browser["source_sha"] == self.args.source_sha, "worker browser source/result mismatch")
+        except subprocess.TimeoutExpired:
+            monitor_error = "TimeoutExpired"
+        except OSError:
+            monitor_error = "OSError"
+        except AssertionError:
+            monitor_error = "AssertionError"
+        except Exception as error:
+            monitor_error = type(error).__name__ if type(error).__module__ == "builtins" else "BrowserProcessError"
+        known = self.browser_json("worker-browser-secrets-" + phase + ".json")
+        secrets_available = isinstance(known, list) and all(isinstance(secret, str) and secret for secret in known)
+        if secrets_available:
+            self.secrets.extend(known)
+        browser = self.browser_json("worker-browser-receipt-" + phase + ".json")
+        valid_browser = (isinstance(browser, dict) and browser.get("outcome") == "passed" and browser.get("source_sha") == self.args.source_sha and
+                         all(isinstance(browser.get(field), list) for field in ("diagnostics", "screenshots", "cases")))
+        if monitor_error or process is None or process.returncode != 0 or not secrets_available or not valid_browser:
+            self.browser_failure(phase, process.returncode if process else None, stage, monitor_error or "BrowserProcessError", secrets_available, browser)
+            raise AssertionError("worker browser conformance failed; see redacted diagnostic summary") from None
         for diagnostic in browser["diagnostics"]:
             if diagnostic.get("request_id"):
                 diagnosis = self.backend_diagnosis(diagnostic)
@@ -235,18 +391,31 @@ def main():
         require(source_identity() == identity, "source changed during worker browser validation")
         outcome = "passed"
     finally:
-        if proxy:
-            proxy.close()
-        for peer in h.peers:
-            if peer.thread.is_alive():
-                peer.stop()
-        h.cleanup()
-        cleanup = json.loads((h.root / "cleanup.json").read_text())
-        receipt = {"suite": "portal-workers", "outcome": outcome, "source_sha": args.source_sha, "source_dirty": args.source_dirty,
-                   "working_source": identity, "image_id": image_id, "run_id": os.environ.get("GITHUB_RUN_ID", "local"),
-                   "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT", "1"), "cases": h.receipts, "cleanup": cleanup}
-        h.assert_private(json.dumps(receipt))
-        (safe / "workers-receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")
+        try:
+            if proxy:
+                proxy.close()
+            for peer in h.peers:
+                if peer.thread.is_alive():
+                    peer.stop()
+            h.cleanup()
+        except Exception:
+            outcome = "failed"
+            raise
+        finally:
+            cleanup = h.browser_json("cleanup.json")
+            missing_cleanup = not isinstance(cleanup, dict)
+            if missing_cleanup:
+                cleanup = {"failures": [{"cause": "cleanup_receipt_unavailable"}]}
+                outcome = "failed"
+            receipt = {"suite": "portal-workers", "outcome": outcome, "source_sha": args.source_sha, "source_dirty": args.source_dirty,
+                       "working_source": identity, "image_id": image_id, "run_id": os.environ.get("GITHUB_RUN_ID", "local"),
+                       "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT", "1"), "cases": h.receipts, "cleanup": cleanup}
+            if outcome == "failed" and getattr(h, "worker_failure", None):
+                receipt["failure"] = h.worker_failure
+            h.assert_private(json.dumps(receipt))
+            (safe / "workers-receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")
+            if missing_cleanup and sys.exc_info()[0] is None:
+                raise AssertionError("worker browser cleanup evidence unavailable")
 
 
 if __name__ == "__main__":

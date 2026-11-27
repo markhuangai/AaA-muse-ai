@@ -20,7 +20,7 @@ from native_cron import utc_stamp
 from portal import source_identity
 from service import LABEL, require
 from worker_setup import WorkerSetup
-from worker_tls import TLSFixture
+from worker_tls import ThreadingTLSServer, TLSFixture
 
 STOCK = "ghcr.io/markhuangai/aaa-muse-ai@sha256:2bf7b945914881dd5e989cac135bc94273090b4f97d431984d3ee697d7783467"
 STOCK_SHA = "86af219e72b7ac44ce19c41ca7557277d299132d49de2f1dab9240c6834baf14"
@@ -69,11 +69,10 @@ class Releases:
                 self.end_headers()
                 self.wfile.write(body)
 
-        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Download)
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.load_cert_chain(str(h.proxy.cert), str(h.root.resolve() / "tls-key.pem"))
-        self.server.socket = ctx.wrap_socket(self.server.socket, server_side=True)
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.server = ThreadingTLSServer(("127.0.0.1", 0), Download, ctx)
+        self.thread = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
         self.thread.start()
         shim = self.public / "bin"
         shim.mkdir(mode=0o755)
@@ -93,6 +92,7 @@ exec /usr/bin/curl "${args[@]}"
 
     def close(self):
         self.release.set()
+        self.server.interrupt_clients(closing=True)
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(5)
